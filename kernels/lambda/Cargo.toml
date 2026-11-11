@@ -1,0 +1,21 @@
+[package]
+name = "lambda"
+description = "Carbon's Linux kernel: Linux programs on exec, from an image's own userland"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+exec.workspace = true
+kernels-core.workspace = true
+layers.workspace = true
+host.workspace = true
+net.workspace = true
+
+[dev-dependencies]
+layers.workspace = true
+host.workspace = true

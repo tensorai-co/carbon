@@ -1,0 +1,10 @@
+[package]
+name = "exec-translate"
+description = "Running one instruction set's code on another, and rewriting code for the same one"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

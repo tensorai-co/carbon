@@ -1,0 +1,10 @@
+[package]
+name = "display"
+description = "A machine's screen: the pixels its windows are drawn in, drawing, a font, PNG, and showing them on the host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

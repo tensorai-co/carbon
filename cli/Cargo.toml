@@ -1,0 +1,19 @@
+[package]
+name = "cli"
+description = "The carbon command"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "carbon"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+exec.workspace = true
+machine.workspace = true
+images.workspace = true

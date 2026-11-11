@@ -1,0 +1,20 @@
+[package]
+name = "images"
+description = "Images on the host's disk: the chunk store, pulling OCI images, importing, and frozen machines"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+layers.workspace = true
+host.workspace = true
+rustls.workspace = true
+pki-types.workspace = true
+ureq.workspace = true
+flate2.workspace = true
+sha2.workspace = true
+serde_json.workspace = true

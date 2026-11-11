@@ -1,0 +1,375 @@
+//! Structured exception handling, as Windows does it on x64 and ARM64: atlas delivers a fault here with its CONTEXT and
+//! EXCEPTION_RECORD; the dispatcher walks up the stack by each function's unwind data, asking each language handler in
+//! turn; a handler that takes it unwinds to its target with `RtlUnwindEx`, running termination handlers on the way.
+//! `RtlRaiseException` does the same for an exception the program raises itself.
+
+use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+
+use atlas_abi::{record, status};
+
+use crate::arch::{Context, RESULT, RtlCaptureContext};
+use crate::strings::Message;
+use crate::sys;
+use crate::unwind::{self, CALL_BACK, EHANDLER, UHANDLER, Unwound};
+
+/// EXCEPTION_RECORD.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Record {
+    pub code: u32,
+    pub flags: u32,
+    pub record: u64,
+    pub address: u64,
+    pub count: u32,
+    pub pad: u32,
+    pub information: [u64; 15],
+}
+
+const _: () = assert!(size_of::<Record>() == record::SIZE as usize);
+
+/// DISPATCHER_CONTEXT, as both ISAs have it (ARM64's last two fields are padding on x64).
+#[repr(C)]
+pub struct Dispatcher {
+    pub control_pc: u64,
+    pub image_base: u64,
+    pub function_entry: u64,
+    pub establisher_frame: u64,
+    pub target_ip: u64,
+    pub context: *mut Context,
+    pub language_handler: u64,
+    pub handler_data: u64,
+    pub history_table: u64,
+    pub scope_index: u32,
+    pub control_pc_is_unwound: u8,
+    pub pad: [u8; 3],
+    pub non_volatile: u64,
+}
+
+#[repr(C)]
+pub struct Pointers {
+    pub record: *mut Record,
+    pub context: *mut Context,
+}
+
+type Handler = extern "system" fn(*mut Record, u64, *mut Context, *mut Dispatcher) -> u32;
+
+const CONTINUE_EXECUTION: u32 = 0;
+const CONTINUE_SEARCH: u32 = 1;
+const UNWINDING: u32 = 2;
+const EXIT_UNWIND: u32 = 4;
+const TARGET_UNWIND: u32 = 0x20;
+
+/// A dispatch in progress: the context it started from, which unwinding from inside it starts from too (the frames
+/// between are atlas-guest's own, with no handlers), and the one it interrupted.
+struct Dispatch {
+    context: *mut Context,
+    previous: *mut Dispatch,
+}
+
+/// This thread's dispatch in progress, kept in its TEB.
+fn dispatching() -> &'static AtomicPtr<Dispatch> {
+    // SAFETY: atlas-guest's own slot in this thread's TEB, a pointer in size and alignment.
+    unsafe { &*crate::teb().add(atlas_abi::teb::ATLAS_DISPATCH as usize).cast::<AtomicPtr<Dispatch>>() }
+}
+/// `SetUnhandledExceptionFilter`'s.
+static UNHANDLED_FILTER: AtomicU64 = AtomicU64::new(0);
+
+/// One frame up: `c` becomes its caller. `unwound` says `c.pc` is a return address, not where it stopped. None at the
+/// top of the stack, or where it can't be unwound.
+fn step(c: &mut Context, handler_type: u32, unwound: bool) -> Option<(Unwound, u64, u64)> {
+    let sp = c.sp();
+    let found = unwind::lookup(if unwound { c.pc - CALL_BACK } else { c.pc });
+    let result = match found {
+        Some((base, entry)) => {
+            // SAFETY: the function's own entry, and its stack.
+            let u = unsafe { unwind::virtual_unwind(base, entry, c, handler_type) }.ok()?;
+            (u, base, entry)
+        }
+        // Only the frame something stopped in can be a leaf. Its establisher frame is its own stack pointer, from
+        // before its return address is popped: after, it's its caller's, and unwinding would stop a frame early.
+        None if !unwound => {
+            unwind::unwind_leaf(c);
+            (Unwound { establisher: sp, ..Unwound::default() }, 0, 0)
+        }
+        None => return None,
+    };
+    // A frame's caller is higher up the stack.
+    (c.pc != 0 && c.sp() >= sp).then_some(result)
+}
+
+/// Asks each frame's handler about an exception, from where it happened up. True to carry on from `context`.
+fn dispatch(record: &mut Record, context: &mut Context) -> bool {
+    let mut c = *context;
+    let mut unwound = false;
+    for _ in 0..1024 {
+        let pc = c.pc;
+        let Some((found, base, entry)) = step(&mut c, EHANDLER, unwound) else { break };
+        if found.handler != 0 {
+            let mut d = Dispatcher {
+                control_pc: pc,
+                image_base: base,
+                function_entry: entry,
+                establisher_frame: found.establisher,
+                target_ip: 0,
+                context,
+                language_handler: found.handler,
+                handler_data: found.handler_data,
+                history_table: 0,
+                scope_index: 0,
+                control_pc_is_unwound: u8::from(unwound),
+                pad: [0; 3],
+                non_volatile: 0,
+            };
+            // SAFETY: a language handler from the image's unwind data.
+            let handler: Handler = unsafe { core::mem::transmute(found.handler) };
+            match handler(record, found.establisher, context, &mut d) {
+                CONTINUE_EXECUTION if record.flags & record::NONCONTINUABLE != 0 => {
+                    raise_simple(status::NONCONTINUABLE_EXCEPTION, record::NONCONTINUABLE);
+                }
+                CONTINUE_EXECUTION => return true,
+                _ => {}
+            }
+        }
+        unwound = true;
+    }
+    false
+}
+
+/// Nothing took it: `SetUnhandledExceptionFilter`'s filter may, or else the process ends with it.
+fn unhandled(record: &mut Record, context: &mut Context) -> ! {
+    let filter = UNHANDLED_FILTER.load(Ordering::Acquire);
+    if filter != 0 {
+        let mut pointers = Pointers { record, context };
+        // SAFETY: the program's filter.
+        let filter: extern "system" fn(*mut Pointers) -> i32 = unsafe { core::mem::transmute(filter) };
+        if filter(&mut pointers) == -1 {
+            sys::continue_with(context);
+        }
+    }
+    Message::new().text(b"atlas-guest: unhandled exception ").hex(u64::from(record.code)).text(b" at ").hex(record.address).text(b"\n").print();
+    sys::terminate(record.code)
+}
+
+/// Runs a dispatch with `context` as the current one.
+fn dispatch_from(record: &mut Record, context: &mut Context) -> ! {
+    let mut frame = Dispatch { context, previous: dispatching().load(Ordering::Acquire) };
+    dispatching().store(&mut frame, Ordering::Release);
+    let handled = dispatch(record, context);
+    dispatching().store(frame.previous, Ordering::Release);
+    if handled {
+        sys::continue_with(context);
+    }
+    unhandled(record, context)
+}
+
+/// Where atlas delivers an exception: its record and the context it happened in, both on the stack.
+#[unsafe(no_mangle)]
+pub extern "system" fn AtlasDispatchException(record: *mut Record, context: *mut Context) -> ! {
+    // SAFETY: what atlas put on the stack for this.
+    let (record, context) = unsafe { (&mut *record, &mut *context) };
+    dispatch_from(record, context)
+}
+
+fn raise_simple(code: u32, flags: u32) {
+    let mut r = Record { code, flags, record: 0, address: 0, count: 0, pad: 0, information: [0; 15] };
+    RtlRaiseException(&mut r);
+}
+
+/// Raises an exception in this thread, as if it had happened where this was called from.
+#[unsafe(no_mangle)]
+pub extern "system" fn RtlRaiseException(record: *mut Record) {
+    let mut c = crate::arch::empty();
+    // SAFETY: a context to fill in.
+    unsafe { RtlCaptureContext(&mut c) };
+    // `c` is this function's own: one frame up is its caller's.
+    if step(&mut c, 0, false).is_none() {
+        sys::terminate(status::INVALID_PARAMETER);
+    }
+    // SAFETY: the caller's record.
+    let record = unsafe { &mut *record };
+    if record.address == 0 {
+        record.address = c.pc;
+    }
+    // This returns when a handler says to carry on: the dispatcher continues at `c`, which is this call's return.
+    // The compiler mustn't see that it never returns otherwise, or its caller's code after the call is gone.
+    if core::hint::black_box(true) {
+        dispatch_from(record, &mut c)
+    }
+}
+
+/// `RaiseException`, as kernel32 has it.
+#[unsafe(no_mangle)]
+pub extern "system" fn AtlasRaiseException(code: u32, flags: u32, count: u32, arguments: *const u64) {
+    let mut r = Record { code, flags: flags & record::NONCONTINUABLE, record: 0, address: 0, count: count.min(15), pad: 0, information: [0; 15] };
+    for i in 0..r.count as usize {
+        // SAFETY: the caller's arguments, `count` of them.
+        r.information[i] = unsafe { *arguments.add(i) };
+    }
+    RtlRaiseException(&mut r);
+}
+
+/// Unwinds to `target_frame`, calling each frame's termination handlers on the way, then carries on at `target_ip`
+/// with `return_value` as the function's result. With no target frame, unwinds the whole stack.
+#[unsafe(no_mangle)]
+pub extern "system" fn RtlUnwindEx(target_frame: u64, target_ip: u64, record: *mut Record, return_value: u64, _context: *mut Context, _history: u64) -> ! {
+    let current = dispatching().load(Ordering::Acquire);
+    let mut c = if current.is_null() {
+        let mut c = crate::arch::empty();
+        // SAFETY: a context to fill in.
+        unsafe { RtlCaptureContext(&mut c) };
+        c
+    } else {
+        // SAFETY: the dispatch in progress, whose context is on the stack below it.
+        unsafe { *(*current).context }
+    };
+    let mut own = Record { code: status::UNWIND, flags: 0, record: 0, address: c.pc, count: 0, pad: 0, information: [0; 15] };
+    // SAFETY: the caller's record, if it gave one.
+    let record = if record.is_null() { &mut own } else { unsafe { &mut *record } };
+    record.flags |= UNWINDING;
+    if target_frame == 0 {
+        record.flags |= EXIT_UNWIND;
+    }
+    let mut unwound = false;
+    for _ in 0..1024 {
+        let mut before = c;
+        let Some((found, base, entry)) = step(&mut c, UHANDLER, unwound) else { break };
+        if found.establisher == target_frame {
+            record.flags |= TARGET_UNWIND;
+        }
+        if found.handler != 0 {
+            let mut d = Dispatcher {
+                control_pc: before.pc,
+                image_base: base,
+                function_entry: entry,
+                establisher_frame: found.establisher,
+                target_ip,
+                context: &mut before,
+                language_handler: found.handler,
+                handler_data: found.handler_data,
+                history_table: 0,
+                scope_index: 0,
+                control_pc_is_unwound: u8::from(unwound),
+                pad: [0; 3],
+                non_volatile: 0,
+            };
+            // SAFETY: a language handler from the image's unwind data.
+            let handler: Handler = unsafe { core::mem::transmute(found.handler) };
+            handler(record, found.establisher, &mut before, &mut d);
+        }
+        if found.establisher == target_frame {
+            // The target's own registers, at the target.
+            c = before;
+            break;
+        }
+        unwound = true;
+    }
+    c.pc = target_ip;
+    c.x[RESULT] = return_value;
+    // This dispatch is over: the stack it ran on is let go.
+    if !current.is_null() {
+        // SAFETY: as above.
+        dispatching().store(unsafe { (*current).previous }, Ordering::Release);
+    }
+    sys::continue_with(&c)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn RtlUnwind(target_frame: u64, target_ip: u64, record: *mut Record, return_value: u64) -> ! {
+    RtlUnwindEx(target_frame, target_ip, record, return_value, core::ptr::null_mut(), 0)
+}
+
+/// The handler C's `__try` uses: its data is a table of scopes, each a range of code with a filter and where its
+/// `__except` is, or with a `__finally` and no target.
+#[unsafe(no_mangle)]
+pub extern "system" fn __C_specific_handler(record: *mut Record, frame: u64, context: *mut Context, d: *mut Dispatcher) -> u32 {
+    // SAFETY: what the dispatcher or unwinder gives every handler.
+    let (r, d) = unsafe { (&mut *record, &mut *d) };
+    let base = d.image_base;
+    let table = d.handler_data;
+    // SAFETY: the scope table, in the image's unwind data.
+    let count = unsafe { crate::pe::u32_at(table) };
+    let scope = |i: u32| -> [u32; 4] {
+        let at = table + 4 + u64::from(i) * 16;
+        // SAFETY: as above.
+        unsafe { [crate::pe::u32_at(at), crate::pe::u32_at(at + 4), crate::pe::u32_at(at + 8), crate::pe::u32_at(at + 12)] }
+    };
+    let back = if d.control_pc_is_unwound != 0 && cfg!(target_arch = "aarch64") { CALL_BACK } else { 0 };
+    let pc = (d.control_pc - back - base) as u32;
+    if r.flags & (UNWINDING | EXIT_UNWIND) == 0 {
+        let mut pointers = Pointers { record, context };
+        for i in d.scope_index..count {
+            let [begin, end, filter, target] = scope(i);
+            if pc < begin || pc >= end || target == 0 {
+                continue;
+            }
+            let decision = if filter == 1 {
+                1
+            } else {
+                // SAFETY: the scope's filter, in the image.
+                let filter: extern "system" fn(*mut Pointers, u64) -> i32 = unsafe { core::mem::transmute(base + u64::from(filter)) };
+                filter(&mut pointers, frame)
+            };
+            if decision < 0 {
+                return CONTINUE_EXECUTION;
+            }
+            if decision > 0 {
+                RtlUnwind(frame, base + u64::from(target), record, u64::from(r.code));
+            }
+        }
+    } else {
+        let target_rva = d.target_ip.wrapping_sub(base) as u32;
+        for i in d.scope_index..count {
+            let [begin, end, handler, target] = scope(i);
+            if pc < begin || pc >= end {
+                continue;
+            }
+            if r.flags & TARGET_UNWIND != 0 && target != 0 && target == target_rva {
+                break;
+            }
+            if target == 0 {
+                // A `__finally`, left by an exception: run it.
+                d.scope_index = i + 1;
+                // SAFETY: the scope's termination handler, in the image.
+                let finally: extern "system" fn(u8, u64) = unsafe { core::mem::transmute(base + u64::from(handler)) };
+                finally(1, frame);
+            }
+        }
+    }
+    CONTINUE_SEARCH
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn AtlasSetUnhandledExceptionFilter(filter: u64) -> u64 {
+    UNHANDLED_FILTER.swap(filter, Ordering::AcqRel)
+}
+
+/// `RtlLookupFunctionEntry`: the `.pdata` entry for `pc`, and its image's base.
+#[unsafe(no_mangle)]
+pub extern "system" fn RtlLookupFunctionEntry(pc: u64, base: *mut u64, _history: u64) -> u64 {
+    match unwind::lookup(pc) {
+        Some((image, entry)) => {
+            // SAFETY: the caller's out-parameter.
+            unsafe { *base = image };
+            entry
+        }
+        None => 0,
+    }
+}
+
+/// `RtlVirtualUnwind`: unwinds `context` one frame, giving its language handler, if it has one of `handler_type`.
+#[unsafe(no_mangle)]
+pub extern "system" fn RtlVirtualUnwind(handler_type: u32, base: u64, pc: u64, entry: u64, context: *mut Context, handler_data: *mut u64, establisher: *mut u64, _pointers: u64) -> u64 {
+    // SAFETY: the caller's context and out-parameters.
+    unsafe {
+        let c = &mut *context;
+        c.pc = pc;
+        match unwind::virtual_unwind(base, entry, c, handler_type) {
+            Ok(u) => {
+                *establisher = u.establisher;
+                *handler_data = u.handler_data;
+                u.handler
+            }
+            Err(()) => 0,
+        }
+    }
+}

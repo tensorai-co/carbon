@@ -1,0 +1,22 @@
+[package]
+name = "exec"
+description = "Runs a program's machine code, in a hardware VM or a process sandbox, and stops it when it needs its kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+exec-core.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+exec-macos.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+exec-linux.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+exec-windows.workspace = true

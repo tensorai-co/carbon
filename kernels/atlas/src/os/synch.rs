@@ -1,0 +1,410 @@
+//! kernel32's threads and synchronization objects, in host Rust: what NT does in its kernel. The fast paths
+//! (critical sections, SRW locks, condition variables, TLS) are guest code in ntdll.
+
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+use kernels_core::lock;
+use kernels_core::thread::Cx;
+use kernels_core::user;
+
+use super::Reply;
+use crate::handles::{CURRENT_PROCESS, CURRENT_THREAD, Handle};
+use crate::objects::{Kind, Object, State, WAIT_FAILED};
+use crate::process::Task;
+
+const TRUE: u64 = 1;
+const FALSE: u64 = 0;
+const STILL_ACTIVE: u32 = 259;
+const ERROR_INVALID_HANDLE: u32 = 6;
+const ERROR_ALREADY_EXISTS: u32 = 183;
+const ERROR_NOT_OWNER: u32 = 288;
+const ERROR_TOO_MANY_POSTS: u32 = 298;
+const ERROR_INVALID_PARAMETER: u32 = 87;
+const ERROR_FILE_NOT_FOUND: u32 = 2;
+
+impl Task {
+    /// The object a handle stands for, including the current process's and thread's pseudo-handles.
+    pub fn object(&self, handle: u64) -> Option<Arc<Object>> {
+        match handle {
+            CURRENT_PROCESS => Some(self.process.object.clone()),
+            CURRENT_THREAD => Some(self.control.object.clone()),
+            _ => match lock(&self.process.state).handles.get(handle)? {
+                Handle::Object(object) => Some(object),
+                _ => None,
+            },
+        }
+    }
+
+    fn new_handle(&self, object: Arc<Object>) -> u64 {
+        lock(&self.process.state).handles.add(Handle::Object(object))
+    }
+
+    /// The program's last error, in its TEB.
+    pub fn set_last_error(&mut self, cx: &mut Cx<'_>, error: u32) {
+        let at = self.control.teb + atlas_abi::teb::LAST_ERROR;
+        let _ = self.mem(cx, true, |t| user::write_u32(&mut t.space(), at, error));
+    }
+
+    fn name(&mut self, cx: &mut Cx<'_>, at: u64, wide: bool) -> Option<String> {
+        if at == 0 {
+            return None;
+        }
+        if wide {
+            self.mem(cx, false, |t| user::read_wstr(&t.space(), at, 260)).ok()
+        } else {
+            self.mem(cx, false, |t| user::read_cstr(&t.space(), at, 260)).ok().map(|b| String::from_utf8_lossy(&b).into_owned())
+        }
+    }
+
+    /// Makes a named or unnamed object and a handle to it, setting ERROR_ALREADY_EXISTS if the name was taken.
+    fn create_object(&mut self, cx: &mut Cx<'_>, name: Option<String>, kind: Kind, state: State) -> Reply {
+        match self.k.objects.create(name.as_deref(), kind, state) {
+            Ok((object, existed)) => {
+                self.set_last_error(cx, if existed { ERROR_ALREADY_EXISTS } else { 0 });
+                Reply::Value(self.new_handle(object))
+            }
+            Err(()) => {
+                self.set_last_error(cx, ERROR_INVALID_HANDLE);
+                Reply::Value(0)
+            }
+        }
+    }
+
+    fn open_object(&mut self, cx: &mut Cx<'_>, name: u64, kind: fn(&Kind) -> bool) -> Reply {
+        let found = self.name(cx, name, true).and_then(|n| self.k.objects.named(&n)).filter(|o| kind(&o.kind));
+        match found {
+            Some(object) => Reply::Value(self.new_handle(object)),
+            None => {
+                self.set_last_error(cx, ERROR_FILE_NOT_FOUND);
+                Reply::Value(0)
+            }
+        }
+    }
+
+    fn wait_reply(&mut self, cx: &mut Cx<'_>, handles: &[u64], all: bool, timeout: u32, alertable: bool) -> Reply {
+        let objects: Option<Vec<_>> = handles.iter().map(|&h| self.object(h)).collect();
+        let Some(objects) = objects.filter(|o| !o.is_empty() && o.len() <= 64) else {
+            self.set_last_error(cx, ERROR_INVALID_HANDLE);
+            return Reply::Value(u64::from(WAIT_FAILED));
+        };
+        match self.wait_for(cx, &objects, all, timeout, alertable) {
+            Ok(code) => Reply::Value(u64::from(code)),
+            Err(reply) => reply,
+        }
+    }
+
+    fn thread_of(&self, handle: u64) -> Option<Arc<crate::threads::ThreadControl>> {
+        let object = self.object(handle)?;
+        let Kind::Thread(tid) = object.kind else { return None };
+        lock(&self.process.state).threads.get(&tid).cloned()
+    }
+}
+
+pub fn create_thread(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    match task.create_thread(cx, a[1], a[2], a[3], a[4] as u32) {
+        Ok((object, tid)) => {
+            if a[5] != 0 {
+                let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[5], tid as u32));
+            }
+            Reply::Value(task.new_handle(object))
+        }
+        Err(_) => {
+            task.set_last_error(cx, 8); // ERROR_NOT_ENOUGH_MEMORY
+            Reply::Value(0)
+        }
+    }
+}
+
+fn exit_code(task: &mut Task, cx: &mut Cx<'_>, handle: u64, out: u64) -> Reply {
+    let Some(object) = task.object(handle) else {
+        task.set_last_error(cx, ERROR_INVALID_HANDLE);
+        return Reply::Value(FALSE);
+    };
+    let code = lock(&object.state).exit.unwrap_or(STILL_ACTIVE);
+    Reply::Value(if task.mem(cx, true, |t| user::write_u32(&mut t.space(), out, code)).is_ok() { TRUE } else { FALSE })
+}
+
+pub fn get_exit_code_thread(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    exit_code(task, cx, a[0], a[1])
+}
+
+pub fn get_exit_code_process(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    exit_code(task, cx, a[0], a[1])
+}
+
+pub fn get_thread_id(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(match task.object(a[0]).map(|o| o.kind) {
+        Some(Kind::Thread(tid)) => tid,
+        _ => 0,
+    })
+}
+
+pub fn get_process_id(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(match task.object(a[0]).map(|o| o.kind) {
+        Some(Kind::Process(pid)) => pid,
+        _ => 0,
+    })
+}
+
+pub fn suspend_thread(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(thread) = task.thread_of(a[0]) else {
+        task.set_last_error(cx, ERROR_INVALID_HANDLE);
+        return Reply::Value(u64::from(u32::MAX));
+    };
+    let previous = thread.suspend.fetch_add(1, Ordering::AcqRel);
+    // It stops at its next chance: a running CPU is preempted, and parks on its way back to the program.
+    thread.cpu.preempt();
+    Reply::Value(u64::from(previous))
+}
+
+pub fn resume_thread(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(thread) = task.thread_of(a[0]) else {
+        task.set_last_error(cx, ERROR_INVALID_HANDLE);
+        return Reply::Value(u64::from(u32::MAX));
+    };
+    // A compare-and-swap loop: `fetch_update` is renamed in newer Rust, and this reads the same in both.
+    let mut previous = thread.suspend.load(Ordering::Acquire);
+    while let Err(now) = thread.suspend.compare_exchange_weak(previous, previous.saturating_sub(1), Ordering::AcqRel, Ordering::Acquire) {
+        previous = now;
+    }
+    if previous == 1 {
+        thread.waiter.wake();
+    }
+    Reply::Value(u64::from(previous))
+}
+
+pub fn terminate_thread(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(thread) = task.thread_of(a[0]) else {
+        task.set_last_error(cx, ERROR_INVALID_HANDLE);
+        return Reply::Value(FALSE);
+    };
+    if thread.tid == task.tid {
+        return Reply::ExitThread(a[1] as u32);
+    }
+    lock(&thread.killed).get_or_insert(a[1] as u32);
+    thread.waiter.interrupt();
+    thread.cpu.preempt();
+    Reply::Value(TRUE)
+}
+
+pub fn terminate_process(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if task.object(a[0]).is_some_and(|o| o.kind == Kind::Process(task.process.pid)) {
+        return Reply::ExitProcess(a[1] as u32);
+    }
+    task.set_last_error(cx, ERROR_INVALID_HANDLE);
+    Reply::Value(FALSE)
+}
+
+pub fn switch_to_thread(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    std::thread::yield_now();
+    Reply::Value(TRUE)
+}
+
+fn create_event(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let name = task.name(cx, a[3], wide);
+    task.create_object(cx, name, Kind::Event { manual: a[1] as u32 != 0 }, State { set: a[2] as u32 != 0, ..State::default() })
+}
+
+pub fn create_event_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    create_event(task, cx, a, true)
+}
+
+pub fn create_event_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    create_event(task, cx, a, false)
+}
+
+pub fn open_event_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    task.open_object(cx, a[2], |k| matches!(k, Kind::Event { .. }))
+}
+
+fn change_event(task: &mut Task, cx: &mut Cx<'_>, handle: u64, set: bool) -> Reply {
+    match task.object(handle).filter(|o| matches!(o.kind, Kind::Event { .. })) {
+        Some(event) => {
+            task.k.objects.signal(&event, |s| s.set = set);
+            Reply::Value(TRUE)
+        }
+        None => {
+            task.set_last_error(cx, ERROR_INVALID_HANDLE);
+            Reply::Value(FALSE)
+        }
+    }
+}
+
+pub fn set_event(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    change_event(task, cx, a[0], true)
+}
+
+pub fn reset_event(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    change_event(task, cx, a[0], false)
+}
+
+fn create_mutex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let name = task.name(cx, a[2], wide);
+    let owned = a[1] as u32 != 0;
+    let state = if owned { State { owner: task.tid, count: 1, ..State::default() } } else { State::default() };
+    let reply = task.create_object(cx, name, Kind::Mutant, state);
+    if owned && let Reply::Value(handle) = reply && let Some(object) = task.object(handle) {
+        lock(&task.control.owned).push(Arc::downgrade(&object));
+    }
+    reply
+}
+
+pub fn create_mutex_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    create_mutex(task, cx, a, true)
+}
+
+pub fn create_mutex_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    create_mutex(task, cx, a, false)
+}
+
+pub fn open_mutex_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    task.open_object(cx, a[2], |k| *k == Kind::Mutant)
+}
+
+pub fn release_mutex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(mutant) = task.object(a[0]).filter(|o| o.kind == Kind::Mutant) else {
+        task.set_last_error(cx, ERROR_INVALID_HANDLE);
+        return Reply::Value(FALSE);
+    };
+    let tid = task.tid;
+    let released = task.k.objects.signal(&mutant, |s| {
+        if s.owner != tid {
+            return false;
+        }
+        s.count -= 1;
+        if s.count == 0 {
+            s.owner = 0;
+        }
+        true
+    });
+    if !released {
+        task.set_last_error(cx, ERROR_NOT_OWNER);
+    }
+    Reply::Value(if released { TRUE } else { FALSE })
+}
+
+fn create_semaphore(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let (initial, max) = (a[1] as i32 as i64, a[2] as i32 as i64);
+    if max <= 0 || initial < 0 || initial > max {
+        task.set_last_error(cx, ERROR_INVALID_PARAMETER);
+        return Reply::Value(0);
+    }
+    let name = task.name(cx, a[3], wide);
+    task.create_object(cx, name, Kind::Semaphore { max }, State { count: initial, ..State::default() })
+}
+
+pub fn create_semaphore_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    create_semaphore(task, cx, a, true)
+}
+
+pub fn create_semaphore_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    create_semaphore(task, cx, a, false)
+}
+
+pub fn release_semaphore(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(semaphore) = task.object(a[0]) else {
+        task.set_last_error(cx, ERROR_INVALID_HANDLE);
+        return Reply::Value(FALSE);
+    };
+    let Kind::Semaphore { max } = semaphore.kind else {
+        task.set_last_error(cx, ERROR_INVALID_HANDLE);
+        return Reply::Value(FALSE);
+    };
+    let by = a[1] as i32 as i64;
+    let previous = task.k.objects.signal(&semaphore, |s| {
+        if by <= 0 || s.count + by > max {
+            return None;
+        }
+        let previous = s.count;
+        s.count += by;
+        Some(previous)
+    });
+    let Some(previous) = previous else {
+        task.set_last_error(cx, ERROR_TOO_MANY_POSTS);
+        return Reply::Value(FALSE);
+    };
+    if a[2] != 0 {
+        let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[2], previous as u32));
+    }
+    Reply::Value(TRUE)
+}
+
+pub fn wait_for_single_object(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    task.wait_reply(cx, &[a[0]], false, a[1] as u32, false)
+}
+
+pub fn wait_for_single_object_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    task.wait_reply(cx, &[a[0]], false, a[1] as u32, a[2] as u32 != 0)
+}
+
+fn wait_multiple(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], alertable: bool) -> Reply {
+    let count = (a[0] as u32).min(64) as usize;
+    let width = task.convention().width();
+    let Ok(handles) = task.mem(cx, false, |t| (0..count as u64).map(|i| user::read_ptr(&t.space(), a[1] + i * width, width)).collect::<Result<Vec<_>, _>>()) else {
+        return Reply::Value(u64::from(WAIT_FAILED));
+    };
+    task.wait_reply(cx, &handles, a[2] as u32 != 0, a[3] as u32, alertable)
+}
+
+pub fn wait_for_multiple_objects(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    wait_multiple(task, cx, a, false)
+}
+
+pub fn wait_for_multiple_objects_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    wait_multiple(task, cx, a, a[4] as u32 != 0)
+}
+
+/// `Sleep` and `SleepEx`: a wait on nothing, which an APC ends if it's alertable.
+pub fn sleep_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (ms, alertable) = (a[0] as u32, a[1] as u32 != 0);
+    if ms == 0 && !alertable {
+        std::thread::yield_now();
+        return Reply::Value(0);
+    }
+    match task.wait_for(cx, &[], false, ms, alertable) {
+        Ok(code) if code == crate::objects::WAIT_IO_COMPLETION => Reply::Value(u64::from(code)),
+        Ok(_) => Reply::Value(0),
+        Err(reply) => reply,
+    }
+}
+
+pub fn sleep(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    sleep_ex(task, cx, &[a[0], 0])
+}
+
+pub fn queue_user_apc(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(thread) = task.thread_of(a[1]) else {
+        task.set_last_error(cx, ERROR_INVALID_HANDLE);
+        return Reply::Value(FALSE);
+    };
+    lock(&thread.apcs).push_back((a[0], a[2]));
+    thread.waiter.wake();
+    Reply::Value(TRUE)
+}
+
+/// `DuplicateHandle`, within this process: a new handle to the same object. DUPLICATE_CLOSE_SOURCE closes the old.
+pub fn duplicate_handle(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let [source_process, source, target_process, out, _, _, options] = [a[0], a[1], a[2], a[3], a[4], a[5], a[6]];
+    let own = |h: u64| task.object(h).is_some_and(|o| o.kind == Kind::Process(task.process.pid));
+    if !own(source_process) || !own(target_process) {
+        task.set_last_error(cx, ERROR_INVALID_HANDLE);
+        return Reply::Value(FALSE);
+    }
+    let handle = match source {
+        CURRENT_PROCESS | CURRENT_THREAD => task.object(source).map(Handle::Object),
+        _ => lock(&task.process.state).handles.get(source),
+    };
+    let Some(handle) = handle else {
+        task.set_last_error(cx, ERROR_INVALID_HANDLE);
+        return Reply::Value(FALSE);
+    };
+    let new = lock(&task.process.state).handles.add(handle);
+    if options & 1 != 0 {
+        lock(&task.process.state).handles.close(source);
+    }
+    if out != 0 {
+        let _ = task.mem(cx, true, |t| user::write_u64(&mut t.space(), out, new));
+    }
+    Reply::Value(TRUE)
+}

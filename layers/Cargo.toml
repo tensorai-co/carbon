@@ -1,0 +1,10 @@
+[package]
+name = "layers"
+description = "The file system programs see: what's true of any file, for any kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

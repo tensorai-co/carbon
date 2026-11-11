@@ -1,0 +1,26 @@
+[package]
+name = "atlas"
+description = "Carbon's Windows kernel: all of Windows as one Rust module, on exec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+exec.workspace = true
+kernels-core.workspace = true
+layers.workspace = true
+host.workspace = true
+atlas-abi.workspace = true
+display.workspace = true
+
+[dev-dependencies]
+layers.workspace = true
+host.workspace = true
+
+[[example]]
+name = "run-windows"
+path = "examples/run.rs"

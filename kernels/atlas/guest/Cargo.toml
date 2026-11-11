@@ -1,0 +1,24 @@
+[package]
+name = "atlas-guest"
+description = "The part of Windows that runs inside programs: ntdll, built for each ISA a program can use, embedded in atlas"
+version = "0.2.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+# Built by atlas's build.rs for Windows targets, not with the workspace.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+atlas-abi = { path = "../abi" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+
+[profile.dev]
+panic = "abort"

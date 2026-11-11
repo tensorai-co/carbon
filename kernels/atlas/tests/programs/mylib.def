@@ -1,0 +1,7 @@
+LIBRARY mylib.dll
+EXPORTS
+add
+word
+attached DATA
+thread_attached DATA
+heap_alloc=KERNEL32.HeapAlloc

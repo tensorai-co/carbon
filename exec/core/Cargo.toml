@@ -1,0 +1,14 @@
+[package]
+name = "exec-core"
+description = "exec's types, ISA facts, backend contract, shims, and the one implementation every backend shares"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+exec-mmu.workspace = true
+exec-translate.workspace = true

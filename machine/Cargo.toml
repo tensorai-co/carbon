@@ -1,0 +1,23 @@
+[package]
+name = "machine"
+description = "Puts one machine together (kernel, exec, disk, display, host) and owns its life"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+exec.workspace = true
+layers.workspace = true
+images.workspace = true
+host.workspace = true
+display.workspace = true
+lambda.workspace = true
+atlas.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

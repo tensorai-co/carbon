@@ -1,0 +1,3 @@
+LIBRARY mylib2.dll
+EXPORTS
+mul @5

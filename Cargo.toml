@@ -1,0 +1,64 @@
+[workspace]
+members = [
+    "exec",
+    "exec/core",
+    "exec/mmu",
+    "exec/translate",
+    "exec/macos",
+    "exec/linux",
+    "exec/windows",
+    "layers",
+    "images",
+    "machine",
+    "cli",
+    "display",
+    "host",
+    "net",
+    "kernels/core",
+    "kernels/lambda",
+    "kernels/atlas",
+    "kernels/atlas/abi",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+exec = { path = "exec" }
+exec-core = { path = "exec/core" }
+exec-mmu = { path = "exec/mmu" }
+exec-translate = { path = "exec/translate" }
+exec-macos = { path = "exec/macos" }
+exec-linux = { path = "exec/linux" }
+exec-windows = { path = "exec/windows" }
+layers = { path = "layers" }
+images = { path = "images" }
+machine = { path = "machine" }
+display = { path = "display" }
+host = { path = "host" }
+net = { path = "net" }
+kernels-core = { path = "kernels/core" }
+lambda = { path = "kernels/lambda" }
+atlas = { path = "kernels/atlas" }
+atlas-abi = { path = "kernels/atlas/abi" }
+
+libc = "0.2"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"] }
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std", "ring"] }
+pki-types = { package = "rustls-pki-types", version = "1", features = ["std"] }
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+flate2 = "1"
+sha2 = "0.10"
+serde_json = "1"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+dbg_macro = "deny"
+todo = "deny"
