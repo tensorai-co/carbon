@@ -72,6 +72,7 @@ unsafe extern "C" {
     pub fn hv_vcpu_get_simd_fp_reg(vcpu: hv_vcpu_t, reg: u32, value: *mut u128) -> hv_return_t;
     pub fn hv_vcpu_get_sys_reg(vcpu: hv_vcpu_t, reg: u16, value: *mut u64) -> hv_return_t;
     pub fn hv_vcpu_set_sys_reg(vcpu: hv_vcpu_t, reg: u16, value: u64) -> hv_return_t;
+    pub fn hv_vcpu_set_vtimer_offset(vcpu: hv_vcpu_t, vtimer_offset: u64) -> hv_return_t;
 }
 
 // `hv_vcpu_set_simd_fp_reg` takes its value in v0, which Rust can't pass to C, so this loads it from a pointer and

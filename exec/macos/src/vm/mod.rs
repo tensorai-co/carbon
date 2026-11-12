@@ -93,6 +93,10 @@ impl HvfCpu {
         let (mut id, mut exit) = (0, ptr::null());
         // SAFETY: out-parameters; `exit` stays valid until the vCPU is destroyed.
         check("creating a vCPU", unsafe { hv_vcpu_create(&mut id, &mut exit, ptr::null_mut()) })?;
+        // Every vCPU's virtual counter is the host's, with no offset: the same on all of them, and what the kernel's
+        // clock page pairs with its monotonic clock, for the vDSO.
+        // SAFETY: a vCPU this thread just made.
+        check("setting a vCPU's counter", unsafe { hv_vcpu_set_vtimer_offset(id, 0) })?;
         Ok(HvfCpu { id, exit, regs: Arm64VcpuRegs::default(), regs_dirty: false, fp: Arm64Fp::default(), fp_loaded: false, fp_dirty: false })
     }
 
