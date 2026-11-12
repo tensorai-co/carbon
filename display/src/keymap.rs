@@ -271,6 +271,12 @@ pub fn levels() -> impl Iterator<Item = (u16, &'static [&'static str])> {
     KEYS.iter().map(|(code, _, _, syms)| (*code, *syms))
 }
 
+/// Each key: its evdev number, its XKB name, its type (`ONE_LEVEL` for a key with one keysym, unless it says), and
+/// its keysym names by level: what an X server's XKEYBOARD map is made from.
+pub fn keys() -> impl Iterator<Item = (u16, &'static str, &'static str, &'static [&'static str])> {
+    KEYS.iter().map(|(code, name, kind, syms)| (*code, *name, kind.unwrap_or(if syms.len() > 1 { "TWO_LEVEL" } else { "ONE_LEVEL" }), *syms))
+}
+
 /// A keysym's value, from its name as `keysymdef.h` has it (the names `KEYS` uses): Latin-1's are their characters'
 /// codes, the rest X11's own. 0 (`NoSymbol`) for a name that isn't one.
 pub fn keysym(name: &str) -> u32 {

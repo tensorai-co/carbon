@@ -146,8 +146,7 @@ in memory, in the host's own windows, or (through [`remote`](../remote/README.md
 - **The keymap** (`keymap.rs`): one description of the keyboard the servers derive theirs from: a US layout over the
   desktop's evdev numbers, as a fully compiled XKB text keymap (in the form libxkbcommon writes one), with the
   desktop's modifiers as XKB's (`xkb_mods`). lambda's Wayland server sends it to every `wl_keyboard`; its X
-  server makes its core keyboard mapping from the same keys' keysyms (`levels`, `keysym`), and `XKEYBOARD` is to read
-  the same.
+  server makes its core keyboard mapping and its XKEYBOARD map from the same keys (`levels`, `keys`, `keysym`).
 - **Several servers on one desktop**: a kernel with two (lambda's Wayland and X11) wakes both (`add_waker`) and each
   takes only its own clients' events (`take_events_where`), by the windows' `ClientId`s.
 - **Keys by name** (`keys.rs`): `by_name`, for `carbon display key` (`enter`, `ctrl`, `f4`, `pageup`, ...).
