@@ -158,6 +158,42 @@ static void live(void *arg) {
     __atomic_fetch_add(&lived, 1, __ATOMIC_RELAXED);
 }
 
+// More threads alive at once than a VM has CPUs (64 on an M1): all waiting together, so most have given their CPU up
+// by the time they're let go. Each keeps values in registers across its wait (callee-saved ones, and a SIMD one the
+// system call doesn't touch) and checks them after, with its thread pointer and its stack.
+#define CROWD 160
+#define CROWD_STACK 16384
+static char crowd_stacks[CROWD][CROWD_STACK] __attribute__((aligned(16)));
+static void *crowd_tls[CROWD][4] __attribute__((aligned(16)));
+static volatile u32 crowd_tids[CROWD];
+static volatile u32 arrived, gate, kept;
+static void crowd(void *arg) {
+    i64 i = (i64)arg;
+    volatile u64 on_stack = (u64)i * 7 + 3;
+#if defined(__aarch64__)
+    register u64 a __asm__("x20") = (u64)i * 0x9e3779b97f4a7c15ull;
+    register u64 b __asm__("x21") = ~(u64)i;
+    register double d __asm__("d8") = (double)i * 1.5;
+    __asm__ volatile("" : "+r"(a), "+r"(b), "+w"(d));
+#else
+    register u64 a __asm__("rbx") = (u64)i * 0x9e3779b97f4a7c15ull;
+    register u64 b __asm__("r12") = ~(u64)i;
+    register double d __asm__("xmm6") = (double)i * 1.5;
+    __asm__ volatile("" : "+r"(a), "+r"(b), "+x"(d));
+#endif
+    __atomic_fetch_add(&arrived, 1, __ATOMIC_RELEASE);
+    futex(&arrived, FUTEX_WAKE, 1);
+    while (__atomic_load_n(&gate, __ATOMIC_ACQUIRE) == 0) futex(&gate, FUTEX_WAIT, 0);
+#if defined(__aarch64__)
+    __asm__ volatile("" : "+r"(a), "+r"(b), "+w"(d));
+#else
+    __asm__ volatile("" : "+r"(a), "+r"(b), "+x"(d));
+#endif
+    int ok = a == (u64)i * 0x9e3779b97f4a7c15ull && b == ~(u64)i && d == (double)i * 1.5 && on_stack == (u64)i * 7 + 3 &&
+             tls_self() == &crowd_tls[i][0];
+    if (ok) __atomic_fetch_add(&kept, 1, __ATOMIC_RELAXED);
+}
+
 static void run(void (*fn)(void *), int n) {
     for (int i = 0; i < n; i++) {
         tls[i][0] = &tls[i][0];
@@ -207,6 +243,22 @@ void cmain(i64 *sp) {
         join(&tids[0]);
     }
     check(lived == LIVES, "300 threads, one after another: more than there are CPUs at once");
+    int made = 0;
+    for (int i = 0; i < CROWD; i++) {
+        crowd_tls[i][0] = &crowd_tls[i][0];
+        if (spawn(crowd, (void *)(i64)i, crowd_stacks[i] + CROWD_STACK, &crowd_tls[i][0], &crowd_tids[i]) <= 0) break;
+        made++;
+    }
+    for (;;) {
+        u32 now = __atomic_load_n(&arrived, __ATOMIC_ACQUIRE);
+        if (now >= (u32)made) break;
+        futex(&arrived, FUTEX_WAIT, now);
+    }
+    __atomic_store_n(&gate, 1, __ATOMIC_RELEASE);
+    futex(&gate, FUTEX_WAKE, 0x7fffffff);
+    for (int i = 0; i < made; i++) join(&crowd_tids[i]);
+    check(made == CROWD, "160 threads alive at once, all waiting: more than a VM has CPUs");
+    check(kept == CROWD, "each with its registers, SIMD, stack and thread pointer as it left them, after its wait");
     int forked = 0;
     for (int i = 0; i < LIVES; i++) {
         i64 child = sys(SYS_clone, 17 /* SIGCHLD */, 0, 0, 0, 0, 0);

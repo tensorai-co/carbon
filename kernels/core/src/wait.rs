@@ -23,6 +23,8 @@ pub enum Woke {
 struct State {
     woken: bool,
     interrupted: bool,
+    /// Another thread wants a CPU: this one gives its up (`thread`'s seats) and goes on waiting.
+    nudged: bool,
 }
 
 /// One guest thread's way to wait.
@@ -57,6 +59,12 @@ impl Waiter {
         lock(&self.state).interrupted
     }
 
+    /// Asks it, while it waits, to give its CPU up for a thread that needs one. Not a wake: it goes on waiting.
+    pub(crate) fn nudge(&self) {
+        lock(&self.state).nudged = true;
+        self.ready.notify_all();
+    }
+
     /// Forgets a wake that came before the thread started waiting for this.
     pub fn reset(&self) {
         lock(&self.state).woken = false;
@@ -64,7 +72,11 @@ impl Waiter {
 
     /// Waits until woken, interrupted, or `deadline`. Woken wins over interrupted, as on Linux: what was waited for
     /// happened, and the interruption (it stays) is dealt with next.
+    /// While it waits, a guest thread's CPU may be asked for by a thread that has none (`thread`'s seats).
     pub fn wait(&self, deadline: Option<Instant>) -> Woke {
+        // An ask left over from a wait that ended first is no longer meant.
+        lock(&self.state).nudged = false;
+        let mut blocking = crate::thread::Blocking::begin(self);
         let mut state = lock(&self.state);
         loop {
             if state.woken {
@@ -73,6 +85,13 @@ impl Waiter {
             }
             if state.interrupted {
                 return Woke::Interrupted;
+            }
+            if state.nudged {
+                state.nudged = false;
+                drop(state);
+                blocking.give_up();
+                state = lock(&self.state);
+                continue;
             }
             match deadline {
                 None => state = self.ready.wait(state).unwrap_or_else(|p| p.into_inner()),
