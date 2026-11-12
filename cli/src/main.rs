@@ -7,6 +7,8 @@
 //! carbon run setup.exe                      # a Windows program, with atlas
 //! carbon ls | stop NAME | rm NAME | freeze NAME IMAGE
 //! carbon display screenshot NAME -o screen.png
+//! carbon display windows NAME
+//! carbon display click NAME 640 400 && carbon display type NAME hello && carbon display key NAME ctrl+s
 //! carbon pull IMAGE | images | rmi IMAGE
 //! ```
 //!
@@ -27,7 +29,10 @@ usage: carbon <command> ...
       --isolation vm|sandbox|auto            a hardware VM, the process sandbox, or the best there is (the default)
       --name NAME                            the machine's name (else one from its image or program)
       --platform OS/ARCH                     which build of an image to pull (linux for this CPU by default)
-      --display headless=WxH|none            where its windows go (headless=1280x800 by default)
+      --display headless=WxH[@SCALE]|host[=WxH]|host-windows|none
+                                             where its windows go: a screen in memory (headless=1280x800 by
+                                             default; @2 for 2×), the whole desktop in a window on this Mac's
+                                             screen, or each of its windows in a Mac window of its own
       --audio none                           where its sound goes (only none, until audio is there)
       -e, --env NAME=VALUE                   an environment variable, over the image's
       --memory SIZE                          how much memory it may use, as 512m or 4g (4g by default)
@@ -36,6 +41,17 @@ usage: carbon <command> ...
   rm NAME                                    remove a stopped machine and its files
   freeze NAME IMAGE                          make an image of a stopped machine's disk
   display screenshot NAME [-o FILE]          a running machine's screen, as a PNG (screen.png by default)
+  display windows NAME                       a running machine's windows, top first: ID, place, size, state, title
+  display move NAME X Y                      moves its pointer
+  display click NAME X Y [BUTTON] [COUNT]    clicks there (left by default; COUNT 2 for a double click)
+  display drag NAME X1 Y1 X2 Y2              drags with the left button
+  display scroll NAME X Y NOTCHES [SIDEWAYS] scrolls there (up and right positive)
+  display type NAME TEXT...                  types text, as keys on a US keyboard
+  display key NAME COMBO...                  presses keys: enter, esc, ctrl+s, alt+f4, ...
+  display resize NAME WxH[@SCALE]            changes its screen's size and scale (1, 1.5, 2, ...)
+  display clipboard NAME [TEXT...]           prints its clipboard's text, or sets it, as copied on the host
+  display drop NAME X Y TEXT...              drops text there, as dragged in from the host
+  display drop NAME X Y --files PATH...      drops files there (paths as the machine has them: C:\\..., /home/...)
   pull IMAGE [--platform OS/ARCH]            pull an image
   images                                     the images here
   rmi IMAGE                                  forget an image
@@ -70,10 +86,16 @@ fn size(text: &str) -> Option<u64> {
 fn display(text: &str) -> Option<Display> {
     match text {
         "none" => Some(Display::None),
-        "host" => fail("--display host needs the desktop on the host, which isn't there yet: use headless=WxH"),
+        "host" => Some(Display::Host(1280, 800)),
+        "host-windows" => Some(Display::HostWindows),
+        _ if text.starts_with("host=") => {
+            let (w, h, scale) = machine::parse_display_size(&text["host=".len()..])?;
+            // The window's scale is the Mac's own: no @SCALE (120ths: 120 is 1×).
+            (scale == 120).then_some(Display::Host(w, h))
+        }
         _ => {
-            let (w, h) = text.strip_prefix("headless=")?.split_once('x')?;
-            Some(Display::Headless(w.parse().ok()?, h.parse().ok()?))
+            let (w, h, scale) = machine::parse_display_size(text.strip_prefix("headless=")?)?;
+            Some(Display::Headless(w, h, scale))
         }
     }
 }
@@ -103,7 +125,7 @@ fn run(machines: &Machines, mut args: impl Iterator<Item = String>) -> ! {
             }
             "--display" => {
                 let text = value("--display");
-                spec.display = display(&text).unwrap_or_else(|| fail(format!("--display is headless=WxH or none, not {text}")));
+                spec.display = display(&text).unwrap_or_else(|| fail(format!("--display is headless=WxH, headless=WxH@SCALE, host, host=WxH, host-windows or none, not {text}")));
             }
             "--audio" => match value("--audio").as_str() {
                 "none" => {}
@@ -198,7 +220,44 @@ fn main() {
                 std::fs::write(&out, png).unwrap_or_else(|e| fail(format!("{out}: {e}")));
                 println!("{out}");
             }
-            other => fail(format!("display doesn't {other} yet: screenshot")),
+            "windows" => {
+                let name = one("a machine's name");
+                print!("{}", machines.display_windows(&name).unwrap_or_else(|e| fail(e)));
+            }
+            "clipboard" => {
+                let name = one("a machine's name");
+                let text: Vec<String> = args.by_ref().collect();
+                if text.is_empty() {
+                    print!("{}", machines.display_clipboard(&name, None).unwrap_or_else(|e| fail(e)));
+                } else {
+                    machines.display_clipboard(&name, Some(&text.join(" "))).unwrap_or_else(|e| fail(e));
+                }
+            }
+            "drop" => {
+                let name = one("a machine's name");
+                let mut point = |what| one(what).parse::<i32>().unwrap_or_else(|_| fail("a drop needs a point: X Y"));
+                let (x, y) = (point("X"), point("Y"));
+                let mut rest: Vec<String> = args.by_ref().collect();
+                let files = rest.first().is_some_and(|f| f == "--files");
+                if files {
+                    rest.remove(0);
+                }
+                if rest.is_empty() {
+                    fail(if files { "drop --files needs a path" } else { "drop needs text" });
+                }
+                println!("{}", machines.display_drop(&name, x, y, files, &rest).unwrap_or_else(|e| fail(e)));
+            }
+            "resize" => {
+                let name = one("a machine's name");
+                let size = one("a size: WIDTHxHEIGHT, or WIDTHxHEIGHT@SCALE");
+                machines.display_resize(&name, &size).unwrap_or_else(|e| fail(e));
+            }
+            verb @ ("move" | "click" | "drag" | "scroll" | "type" | "key") => {
+                let name = one("a machine's name");
+                let rest: Vec<String> = args.by_ref().collect();
+                machines.display_input(&name, verb, &rest).unwrap_or_else(|e| fail(e));
+            }
+            other => fail(format!("display doesn't {other} yet: screenshot, windows, move, click, drag, scroll, type, key")),
         },
         "pull" => {
             let name = one("an image");
@@ -238,8 +297,13 @@ mod tests {
         assert_eq!(size("2gib"), Some(2 << 30));
         assert_eq!(size("100"), Some(100));
         assert_eq!(size("lots"), None);
-        assert_eq!(display("headless=800x600"), Some(Display::Headless(800, 600)));
+        assert_eq!(display("headless=800x600"), Some(Display::Headless(800, 600, 120)));
+        assert_eq!(display("headless=1440x900@2"), Some(Display::Headless(1440, 900, 240)));
         assert_eq!(display("none"), Some(Display::None));
+        assert_eq!(display("host"), Some(Display::Host(1280, 800)));
+        assert_eq!(display("host=1024x700"), Some(Display::Host(1024, 700)));
+        assert_eq!(display("host=1024x700@2"), None);
+        assert_eq!(display("host-windows"), Some(Display::HostWindows));
         assert_eq!(display("big"), None);
     }
 }

@@ -30,11 +30,20 @@ pub enum Source {
     Program(PathBuf),
 }
 
+/// `WxH` or `WxH@SCALE`, as `--display headless=` and `carbon display resize` take it.
+pub use display::output::parse_size as parse_display_size;
+
 /// Where a machine's windows go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Display {
-    /// A screen in memory this big, for screenshots.
-    Headless(i32, i32),
+    /// A screen in memory this big (in logical pixels), at a scale (in 120ths: 120 is 1×, 240 is 2×).
+    Headless(i32, i32, u32),
+    /// On the host's screen, in a window whose content starts this big (in points), resized as the user likes:
+    /// `display-macos`'s desktop mode.
+    Host(i32, i32),
+    /// On the host's screen, each window in a host window of its own, among the host's other windows:
+    /// `display-macos`'s windows mode.
+    HostWindows,
     None,
 }
 
@@ -75,7 +84,7 @@ pub struct Run {
 
 impl Default for Run {
     fn default() -> Run {
-        Run { name: None, source: None, args: Vec::new(), isolation: Isolation::Auto, platform: None, env: Vec::new(), display: Display::Headless(1280, 800), memory: 4 << 30 }
+        Run { name: None, source: None, args: Vec::new(), isolation: Isolation::Auto, platform: None, env: Vec::new(), display: Display::Headless(1280, 800, display::output::SCALE_1X), memory: 4 << 30 }
     }
 }
 
@@ -248,6 +257,60 @@ impl Machines {
         control::ask(&self.images.machine_dir(name), "screenshot")
     }
 
+    /// Input for a running machine's desktop, as `carbon display` sends it: `move X Y`, `click X Y [BUTTON] [COUNT]`,
+    /// `drag X1 Y1 X2 Y2`, `scroll X Y NOTCHES [SIDEWAYS]`, `type TEXT`, or `key COMBO...`.
+    pub fn display_input(&self, name: &str, verb: &str, args: &[String]) -> Result<(), String> {
+        let record = self.record(name).ok_or_else(|| format!("there's no machine called {name}"))?;
+        if !record.running() {
+            return Err(format!("{name} isn't running"));
+        }
+        let rest = if verb == "type" { control::escape(&args.join(" ")) } else { args.join(" ") };
+        control::ask(&self.images.machine_dir(name), &format!("{verb} {rest}")).map(|_| ())
+    }
+
+    /// Changes a running machine's output: `WxH`, or `WxH@SCALE` (1, 1.5, 2, ...), as a viewer's window resized would.
+    pub fn display_resize(&self, name: &str, size: &str) -> Result<(), String> {
+        let record = self.record(name).ok_or_else(|| format!("there's no machine called {name}"))?;
+        if !record.running() {
+            return Err(format!("{name} isn't running"));
+        }
+        control::ask(&self.images.machine_dir(name), &format!("resize {size}")).map(|_| ())
+    }
+
+    /// Drops text, or files (paths in the machine's own namespace), on a running machine at a point on its screen, as
+    /// the host's drag would: what the window there did with it.
+    pub fn display_drop(&self, name: &str, x: i32, y: i32, files: bool, what: &[String]) -> Result<String, String> {
+        let record = self.record(name).ok_or_else(|| format!("there's no machine called {name}"))?;
+        if !record.running() {
+            return Err(format!("{name} isn't running"));
+        }
+        let (kind, body) = if files { ("files", what.join("\n")) } else { ("text", what.join(" ")) };
+        let request = format!("drop {x} {y} {kind} {}", control::escape(&body));
+        control::ask(&self.images.machine_dir(name), &request).map(|b| String::from_utf8_lossy(&b).into_owned())
+    }
+
+    /// A running machine's clipboard as text, or with `set`, the clipboard made that text, as if copied on the host.
+    pub fn display_clipboard(&self, name: &str, set: Option<&str>) -> Result<String, String> {
+        let record = self.record(name).ok_or_else(|| format!("there's no machine called {name}"))?;
+        if !record.running() {
+            return Err(format!("{name} isn't running"));
+        }
+        let dir = self.images.machine_dir(name);
+        match set {
+            Some(text) => control::ask(&dir, &format!("clipboard {}", control::escape(text))).map(|_| String::new()),
+            None => control::ask(&dir, "clipboard").map(|b| String::from_utf8_lossy(&b).into_owned()),
+        }
+    }
+
+    /// A running machine's windows, top first: their IDs, places, sizes, states and titles, as text.
+    pub fn display_windows(&self, name: &str) -> Result<String, String> {
+        let record = self.record(name).ok_or_else(|| format!("there's no machine called {name}"))?;
+        if !record.running() {
+            return Err(format!("{name} isn't running"));
+        }
+        control::ask(&self.images.machine_dir(name), "windows").map(|b| String::from_utf8_lossy(&b).into_owned())
+    }
+
     /// Freezes a stopped machine's disk, as it is, into an image called `image`.
     pub fn freeze(&self, name: &str, image: &str) -> Result<Image, String> {
         let record = self.record(name).ok_or_else(|| format!("there's no machine called {name}"))?;
@@ -368,17 +431,61 @@ impl Machines {
         let relay = signals::Relay::start();
 
         let tso = record.platform.arch == "amd64" && cfg!(target_arch = "aarch64");
-        let (exec, cpu) = open_exec(run.isolation, tso, run.memory)?;
-        record.backend = exec.backend().to_string();
-        record.pid = Some(std::process::id());
-        self.save_record(&record)?;
-        let ended = self.boot(&record, &run, exec, cpu, program, #[cfg(unix)] &relay);
-        record.pid = None;
-        let _ = self.save_record(&record);
-        ended
+        // Opens exec and boots the kernel on this thread, which its CPUs belong to.
+        let start = |record: &mut Record, desktop: Option<display::desktop::Shared>| {
+            let (exec, cpu) = open_exec(run.isolation, tso, run.memory)?;
+            record.backend = exec.backend().to_string();
+            record.pid = Some(std::process::id());
+            self.save_record(record)?;
+            let ended = self.boot(record, &run, (exec, cpu), program.clone(), desktop, #[cfg(unix)] &relay);
+            record.pid = None;
+            let _ = self.save_record(record);
+            ended
+        };
+        match run.display {
+            // Windows on the host's screen: AppKit takes this, the main thread, and the kernel boots on another.
+            Display::Host(..) | Display::HostWindows => {
+                #[cfg(target_os = "macos")]
+                {
+                    let (width, height) = match run.display {
+                        Display::Host(w, h) => (w, h),
+                        _ => (1280, 800),
+                    };
+                    let desktop = display::Desktop::shared(width, height);
+                    let done = std::sync::atomic::AtomicBool::new(false);
+                    let title = format!("{} — carbon", record.name);
+                    std::thread::scope(|scope| {
+                        let kernel = scope.spawn(|| {
+                            let ended = start(&mut record, Some(desktop.clone()));
+                            done.store(true, std::sync::atomic::Ordering::Release);
+                            ended
+                        });
+                        let shown = match run.display {
+                            Display::Host(..) => {
+                                let options = display_macos::Options { title, width, height };
+                                // Closing the window stops the machine, as Ctrl-C does.
+                                let close = || signals::raise(libc::SIGTERM);
+                                display_macos::run(desktop.clone(), options, &done, &close)
+                            }
+                            _ => display_macos::run_windows(desktop.clone(), &done),
+                        };
+                        if let Err(e) = shown {
+                            eprintln!("carbon: {e}");
+                        }
+                        kernel.join().unwrap_or_else(|_| Err("the machine's kernel thread panicked".into()))
+                    })
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = start;
+                    Err("--display host isn't there on this host yet: use headless=WxH".into())
+                }
+            }
+            _ => start(&mut record, None),
+        }
     }
 
-    fn boot(&self, record: &Record, run: &Run, exec: Exec, cpu: Cpu, program: Option<Vec<u8>>, #[cfg(unix)] relay: &signals::Relay) -> Result<i32, String> {
+    fn boot(&self, record: &Record, run: &Run, (exec, cpu): (Exec, Cpu), program: Option<Vec<u8>>, host_desktop: Option<display::desktop::Shared>, #[cfg(unix)] relay: &signals::Relay) -> Result<i32, String> {
         let host: Arc<dyn host::Host> = Arc::new(host::Std::new());
         let mut env = record.config.env.clone();
         for var in &run.env {
@@ -410,8 +517,20 @@ impl Machines {
                     let stop = stop.clone();
                     move |signal, first| if first { stop.signal(signal); } else { stop.end(); }
                 });
-                let _control = control::serve(self.images.machine_dir(&record.name), None);
-                let mut options = lambda::Options { stop, ..lambda::Options::default() };
+                // A Linux machine's windows go on a desktop as a Windows machine's do, through its Wayland server.
+                let desktop = match run.display {
+                    Display::Headless(width, height, scale) => {
+                        let desktop = display::Desktop::shared(width, height);
+                        display::desktop::lock(&desktop).set_output(display::output::Output::headless(width, height, scale));
+                        Some(desktop)
+                    }
+                    Display::Host(..) | Display::HostWindows => host_desktop.clone(),
+                    Display::None => None,
+                };
+                let headless = matches!(run.display, Display::Headless(..));
+                let _clock = desktop.clone().filter(|_| headless).map(|d| display::clock::Clock::start(d, 60));
+                let _control = control::serve(self.images.machine_dir(&record.name), desktop.clone());
+                let mut options = lambda::Options { stop, display: desktop.clone(), ..lambda::Options::default() };
                 if !env.is_empty() {
                     options.env = env;
                 }
@@ -433,10 +552,19 @@ impl Machines {
                     }
                 });
                 let desktop = match run.display {
-                    Display::Headless(width, height) => Some(display::Desktop::shared(width, height)),
+                    Display::Headless(width, height, scale) => {
+                        let desktop = display::Desktop::shared(width, height);
+                        display::desktop::lock(&desktop).set_output(display::output::Output::headless(width, height, scale));
+                        Some(desktop)
+                    }
+                    Display::Host(..) | Display::HostWindows => host_desktop.clone(),
                     Display::None => None,
                 };
                 let _control = control::serve(self.images.machine_dir(&record.name), desktop.clone());
+                // A headless desktop's frames come from a clock of its own, ticking only while a window waits for one;
+                // on the host's screen, its refresh is the clock.
+                let headless = matches!(run.display, Display::Headless(..));
+                let _clock = desktop.clone().filter(|_| headless).map(|d| display::clock::Clock::start(d, 60));
                 let env = env.iter().filter_map(|e| e.split_once('=')).map(|(k, v)| (k.to_string(), v.to_string())).collect();
                 let options = atlas::Options { stop, env, display: desktop, trace: std::env::var_os("CARBON_TRACE").is_some() };
                 let argv: Vec<&str> = args.iter().map(String::as_str).collect();

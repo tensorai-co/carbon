@@ -23,6 +23,13 @@ carbon stop dev                             # SIGTERM to its first process; ever
 carbon rm dev                               # a stopped machine and its files
 carbon freeze dev mine:1                    # an image of a stopped machine's disk
 carbon display screenshot app -o screen.png # a running machine's screen
+carbon display windows app                  # its windows, top first: ID, place, size, state, title
+carbon display click app 640 400            # input, as a user's: move, click, drag, scroll, type, key
+carbon display type app 'Hello, world!'
+carbon display key app ctrl+s
+carbon display resize app 1600x900@2        # its screen's size and scale, changed while it runs
+carbon display clipboard app                # its clipboard's text (with text after: set, as copied on the host)
+carbon display drop app 300 200 --files 'C:\notes.txt'  # drops files there, as dragged in from the host (or text)
 carbon pull debian:13 [--platform OS/ARCH] | images | rmi IMAGE
 ```
 
@@ -31,7 +38,7 @@ carbon pull debian:13 [--platform OS/ARCH] | images | rmi IMAGE
 | `--isolation vm\|sandbox\|auto` | A hardware VM, the process sandbox, or the best there is (the default, which says so when it falls back) |
 | `--name NAME` | The machine's name; else one from its image or program |
 | `--platform OS/ARCH` | Which build of an image to pull; Linux for this CPU by default |
-| `--display headless=WxH\|none` | Where its windows go; `headless=1280x800` by default |
+| `--display headless=WxH[@SCALE]\|host[=WxH]\|host-windows\|none` | Where its windows go: a screen in memory (`headless=1280x800` by default), the whole desktop in a window on this Mac's screen (which closing stops the machine), or each window in a Mac window of its own |
 | `--audio none` | Where its sound goes: only `none` until `audio` is built |
 | `-e`, `--env NAME=VALUE` | An environment variable, over the image's |
 | `--memory SIZE` | How much memory it may use, as `512m` or `4g` (`4g` by default; only what's touched is taken) |

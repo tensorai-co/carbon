@@ -25,6 +25,12 @@ fn set() -> libc::sigset_t {
     }
 }
 
+/// Sends this process a signal, as if from outside: the relay takes it as it would Ctrl-C's.
+pub fn raise(signal: i32) {
+    // SAFETY: a signal to this process.
+    unsafe { libc::kill(libc::getpid(), signal) };
+}
+
 impl Relay {
     /// Blocks the signals in this thread, and so in every thread it makes from now on, and starts the one that waits.
     pub fn start() -> Relay {
