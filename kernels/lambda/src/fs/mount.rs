@@ -59,6 +59,7 @@ pub(crate) enum What {
     Disk,
     Tmpfs,
     Proc,
+    Sysfs,
     Devpts,
     Mqueue,
 }
@@ -70,6 +71,7 @@ impl What {
             What::Disk => 0xef53,
             What::Tmpfs => 0x0102_1994,
             What::Proc => 0x9fa0,
+            What::Sysfs => 0x6265_6572,
             What::Devpts => 0x1cd1,
             What::Mqueue => 0x1980_0202,
         }
@@ -194,6 +196,7 @@ impl Mounts {
         mounts.add(root);
         for (path, what, fstype, source, flags, options) in [
             ("/proc", What::Proc, "proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_RELATIME, ""),
+            ("/sys", What::Sysfs, "sysfs", "sysfs", MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_RELATIME, ""),
             ("/dev/pts", What::Devpts, "devpts", "devpts", MS_NOSUID | MS_NOEXEC | MS_RELATIME, "gid=5,mode=620,ptmxmode=666"),
         ] {
             if let Ok(point) = disk.resolve(ROOT, path, true) {
@@ -216,7 +219,7 @@ impl Mounts {
     pub fn cover(&self, ino: Ino) -> Ino {
         let mut at = ino;
         for _ in 0..=self.list.len() {
-            match self.list.iter().rev().find(|m| m.point == at && m.root != at && m.what != What::Proc && m.what != What::Devpts && m.what != What::Mqueue) {
+            match self.list.iter().rev().find(|m| m.point == at && m.root != at && m.what != What::Proc && m.what != What::Sysfs && m.what != What::Devpts && m.what != What::Mqueue) {
                 Some(m) => at = m.root,
                 None => break,
             }
@@ -278,6 +281,7 @@ impl Mount {
             What::Disk => (8, 3),
             What::Tmpfs => (0, tmpfs_dev(self.tree.unwrap_or(0)) as u32),
             What::Proc => (0, 22),
+            What::Sysfs => (0, 21),
             What::Devpts => (0, 24),
             What::Mqueue => (0, 25),
         }
@@ -486,9 +490,10 @@ fn what_of(fstype: &str) -> Option<What> {
     match fstype {
         "tmpfs" => Some(What::Tmpfs),
         "proc" => Some(What::Proc),
+        "sysfs" => Some(What::Sysfs),
         "devpts" => Some(What::Devpts),
         "mqueue" => Some(What::Mqueue),
-        // sysfs, cgroups, overlay and disks aren't here.
+        // cgroups, overlay and disks aren't here.
         _ => None,
     }
 }
@@ -976,6 +981,7 @@ impl Task {
         let fstype = match what {
             What::Tmpfs => "tmpfs",
             What::Proc => "proc",
+            What::Sysfs => "sysfs",
             What::Devpts => "devpts",
             What::Mqueue => "mqueue",
             What::Disk => "ext4",

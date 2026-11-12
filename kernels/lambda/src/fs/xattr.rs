@@ -41,7 +41,7 @@ impl Task {
             Form::Path | Form::Link => {
                 let path = self.read_path(cx, at)?;
                 let (dir, dir_path) = self.start_dir(AT_FDCWD)?;
-                if crate::os::stat(&crate::process::exe_path(&dir_path, &path)).is_some() {
+                if crate::os::stat(&self.k, &crate::process::exe_path(&dir_path, &path)).is_some() {
                     return Err(ENOTSUP);
                 }
                 self.view().resolve(&lock(&self.k.disk), dir, &path, form == Form::Path)?
@@ -172,7 +172,7 @@ impl Task {
             };
         }
         let (dir, dir_path) = self.start_dir(dfd)?;
-        if crate::os::stat(&crate::process::exe_path(&dir_path, &path)).is_some() {
+        if crate::os::stat(&self.k, &crate::process::exe_path(&dir_path, &path)).is_some() {
             return Err(ENOTSUP);
         }
         let ino = self.view().resolve(&lock(&self.k.disk), dir, &path, at_flags & AT_SYMLINK_NOFOLLOW == 0)?;

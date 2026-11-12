@@ -153,8 +153,8 @@ void cmain(i64 *sp) {
     check(mount(0, "/", 0, MS_REC | MS_PRIVATE, 0) == 0 && mount(0, "/tmp/m2", 0, MS_SHARED, 0) == 0, "propagation: / private, recursively; a tmpfs shared");
     n = slurp("/proc/self/mountinfo", buf, sizeof buf);
     check(contains(buf, n, " /tmp/m2 rw,relatime shared:"), "mountinfo has its peer group");
-    check(mount("sys", "/tmp/m2", "sysfs", 0, 0) == -ENODEV && umount("/", 0) == -EBUSY && umount("/tmp", 0) == -EINVAL && umount("/tmp/m2", 99) == -EINVAL,
-          "sysfs ENODEV; / busy; not a mount point, a bad flag: EINVAL");
+    check(mount("none", "/tmp/m2", "nosuchfs", 0, 0) == -ENODEV && umount("/", 0) == -EBUSY && umount("/tmp", 0) == -EINVAL && umount("/tmp/m2", 99) == -EINVAL,
+          "a file system that isn't one ENODEV; / busy; not a mount point, a bad flag: EINVAL");
     check(umount("/tmp/m2", 0) == 0 && slurp("/tmp/m2/f", buf, sizeof buf) == -ENOENT, "the tmpfs unmounted, and its files gone");
     i64 child = fork();
     if (child == 0) {

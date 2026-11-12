@@ -38,7 +38,7 @@ impl Task {
         }
         let (dir, dir_path) = self.start_dir(dirfd)?;
         let absolute = crate::process::exe_path(&dir_path, &path);
-        if crate::os::stat(&absolute).is_some() {
+        if crate::os::stat(&self.k, &absolute).is_some() {
             return Ok(None);
         }
         let view = self.view();

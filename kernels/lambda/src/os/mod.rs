@@ -1,9 +1,9 @@
 //! What Linux itself provides beyond system calls: the device files in `/dev`, put on the disk when a machine boots,
 //! `/proc`, made each time it's read, and the machine's own `/etc/resolv.conf`, `/etc/hosts` and `/etc/hostname`.
 //!
-//! The Wayland server is `wayland`, the X server `x11`, the vDSO and its clock page `vdso`. Still to come here, as the
-//! proposal has them: sysfs.
+//! `/sys` is `sysfs`, the Wayland server `wayland`, the X server `x11`, and the vDSO and its clock page `vdso`.
 
+pub(crate) mod sysfs;
 pub(crate) mod vdso;
 pub(crate) mod wayland;
 pub(crate) mod x11;
@@ -17,7 +17,7 @@ use crate::abi::*;
 use crate::fs::{Node, Open};
 use crate::mm::Backing;
 use crate::process::{Process, Task};
-use crate::{Disk, Meta};
+use crate::{Disk, Kernel, Meta};
 
 /// Puts what every Linux machine has onto the disk, where the image hasn't: `/dev`'s devices, `/proc`, `/tmp`.
 pub(crate) fn populate(disk: &mut Disk) {
@@ -30,6 +30,7 @@ pub(crate) fn populate(disk: &mut Disk) {
         let _ = disk.put(link, New::Symlink(target.to_string()), &[], Meta::file(0o777), dir);
     }
     let _ = disk.put("/proc", New::Dir, &[], dir, dir);
+    let _ = disk.put("/sys", New::Dir, &[], dir, dir);
     let _ = disk.put("/dev/pts", New::Dir, &[], dir, dir);
     let _ = disk.put("/tmp", New::Dir, &[], Meta::dir(0o1777), dir);
 }
@@ -88,6 +89,42 @@ fn parse<'p>(task: &Task, path: &'p str) -> Option<Proc<'p>> {
     }
 }
 
+/// Whether a path under `/proc` (`rest`, past `/proc/`) is one lambda makes, as `parse` would find it: a process's
+/// files (its own, `self`, always there), the machine's, a setting.
+fn proc_exists(k: &Kernel, rest: &str) -> bool {
+    let (who, what) = rest.split_once('/').unwrap_or((rest, ""));
+    let process = who == "self" || who == "thread-self" || who.parse().ok().is_some_and(|pid| k.process(pid).is_some());
+    match (process, what) {
+        (true, "" | "exe" | "cwd" | "maps" | "status" | "mounts" | "mountinfo" | "fd" | "fd/" | "task" | "task/") => true,
+        (true, ns) if ns.strip_prefix("ns/").is_some_and(|k| ns_kind(k).is_some()) => true,
+        (true, fd) if fd.starts_with("fd/") => fd[3..].parse::<i32>().is_ok(),
+        (true, net) => net.starts_with("net/"),
+        (false, "") => matches!(who, "mounts" | "cpuinfo" | "meminfo" | "uptime" | "version" | "net" | "sys"),
+        (false, net) if who == "net" => !net.is_empty(),
+        (false, setting) => who == "sys" && SYSCTLS.contains(&setting),
+    }
+}
+
+/// `/proc/cpuinfo` for a process of an ISA: each CPU as that ISA describes it, with what its programs are told it
+/// has (ARM64's `AT_HWCAP`, the translator's `cpuid` for x86-64).
+fn cpuinfo(isa: exec::Isa, cpus: usize) -> String {
+    let mut out = String::new();
+    for i in 0..cpus.max(1) {
+        out += &match isa {
+            exec::Isa::Arm64 => format!(
+                "processor\t: {i}\nBogoMIPS\t: 48.00\nFeatures\t: fp asimd\nCPU implementer\t: 0x61\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0x000\nCPU revision\t: 0\n\n"
+            ),
+            _ => format!(
+                "processor\t: {i}\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 15\nmodel name\t: x86-64 baseline\nstepping\t: 0\n\
+                 physical id\t: 0\nsiblings\t: {cpus}\ncore id\t\t: {i}\ncpu cores\t: {cpus}\napicid\t\t: {i}\nfpu\t\t: yes\n\
+                 flags\t\t: fpu tsc cx8 cmov mmx fxsr sse sse2 syscall nx lm\nbogomips\t: 48.00\nclflush size\t: 64\n\
+                 address sizes\t: 48 bits physical, 48 bits virtual\n\n"
+            ),
+        };
+    }
+    out
+}
+
 /// The `/proc/sys` settings there are.
 const SYSCTLS: [&str; 7] = [
     "kernel/cap_last_cap",
@@ -130,6 +167,13 @@ pub(crate) fn open(task: &Task, path: &str) -> Option<Result<Arc<Open>, Errno>> 
         return Some(match tty {
             Some(tty) => tty.open_slave().map(|()| Open::new(Node::Tty(tty), O_RDWR, path)),
             None => Err(ENOENT),
+        });
+    }
+    if sysfs::is_sys(path) {
+        return Some(match sysfs::lookup(&task.k, path, true) {
+            Some((_, sysfs::Entry::Dir(list))) => Ok(Open::new(Node::Listing(list), O_DIRECTORY, path)),
+            Some((_, sysfs::Entry::File(text))) => Ok(Open::new(Node::Made(text.into_bytes()), 0, path)),
+            _ => Err(ENOENT),
         });
     }
     if let Some(bytes) = crate::net::etc_file(&task.k, path) {
@@ -189,7 +233,7 @@ pub(crate) fn open(task: &Task, path: &str) -> Option<Result<Arc<Open>, Errno>> 
                 u8::from(state.security.no_new_privs),
             ))
         }
-        Proc::Global("cpuinfo") => made((0..task.k.host.cpus()).map(|i| format!("processor\t: {i}\n\n")).collect()),
+        Proc::Global("cpuinfo") => made(cpuinfo(task.isa, task.k.host.cpus())),
         Proc::Global("meminfo") => {
             let size = lock(&task.k.exec).memory().size();
             made(format!("MemTotal:\t{} kB\nMemFree:\t{} kB\nMemAvailable:\t{} kB\n", size.limit / 1024, size.available / 1024, size.available / 1024))
@@ -214,17 +258,31 @@ pub(crate) fn open(task: &Task, path: &str) -> Option<Result<Arc<Open>, Errno>> 
     }
 }
 
-/// `stat` for a `/proc` path, or None if it isn't one lambda makes.
-pub(crate) fn stat(path: &str) -> Option<Stat> {
+/// `stat` for a `/proc` or `/sys` path (its last link not followed), or None if it isn't one lambda makes.
+pub(crate) fn stat(k: &Kernel, path: &str) -> Option<Stat> {
     if let Some(n) = pts_number(path) {
         return Some(pts_stat(n));
     }
     let (dev, ino) = made_identity(path);
+    if sysfs::is_sys(path) {
+        let mode = match sysfs::lookup(k, path, false)?.1 {
+            sysfs::Entry::Dir(_) => S_IFDIR | 0o755,
+            sysfs::Entry::File(_) => S_IFREG | 0o444,
+            sysfs::Entry::Link(_) => S_IFLNK | 0o777,
+        };
+        let size = if mode & S_IFMT == S_IFREG { 4096 } else { 0 };
+        return Some(Stat { dev, ino, mode, nlink: if mode & S_IFMT == S_IFDIR { 2 } else { 1 }, size, blksize: 4096, ..Stat::default() });
+    }
     if matches!(path, "/etc/resolv.conf" | "/etc/hosts" | "/etc/hostname") {
         return Some(Stat { dev, ino, mode: S_IFREG | 0o644, nlink: 1, blksize: 4096, ..Stat::default() });
     }
     let rest = path.strip_prefix("/proc/")?;
-    if is_listing(path) {
+    if !proc_exists(k, rest) {
+        return None;
+    }
+    // A process's directory, `/proc/net` and `/proc/sys`, and the directories listed when they're opened.
+    let (who, what) = rest.split_once('/').unwrap_or((rest, ""));
+    if is_listing(path) || (what.is_empty() && !matches!(who, "mounts" | "cpuinfo" | "meminfo" | "uptime" | "version")) {
         return Some(Stat { dev, ino, mode: S_IFDIR | 0o555, nlink: 2, blksize: 4096, ..Stat::default() });
     }
     let link = rest.ends_with("/exe") || rest.ends_with("/cwd") || rest.contains("/fd/") || rest.rsplit_once("/ns/").is_some_and(|(_, k)| ns_kind(k).is_some());
@@ -244,14 +302,27 @@ pub(crate) fn is_listing(path: &str) -> bool {
 /// file with no identity looks like any other with none: GNU grep took `/proc/self/status` for its own output, a
 /// pipe's zeroes, and wouldn't read it.
 pub(crate) fn made_identity(path: &str) -> (u64, u64) {
-    let dev = if path.starts_with("/proc/") { 0x16 } else { 0x17 };
+    let dev = if path.starts_with("/proc/") {
+        0x16
+    } else if sysfs::is_sys(path) {
+        0x15
+    } else {
+        0x17
+    };
     // FNV-1a.
     let hash = path.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
     (dev, hash >> 32 | 1)
 }
 
-/// The target of a `/proc` link, or None if `path` isn't one lambda makes.
+/// The target of a `/proc` or `/sys` link, or None if `path` isn't one lambda makes.
 pub(crate) fn read_link(task: &Task, path: &str) -> Option<Result<String, Errno>> {
+    if sysfs::is_sys(path) {
+        return Some(match sysfs::lookup(&task.k, path, false) {
+            Some((_, sysfs::Entry::Link(target))) => Ok(target),
+            Some(_) => Err(EINVAL),
+            None => Err(ENOENT),
+        });
+    }
     match parse(task, path)? {
         Proc::Exe(p) => Some(Ok(lock(&p.state).exe.clone())),
         Proc::Cwd(p) => Some(Ok(lock(&p.state).cwd.1.clone())),

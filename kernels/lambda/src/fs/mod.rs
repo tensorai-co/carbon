@@ -715,8 +715,13 @@ impl Task {
                 continue;
             }
             let at: String = walked.iter().map(|(name, _)| format!("/{name}")).collect::<String>() + "/" + &word;
-            if os::stat(&at).is_some() {
-                return Some(rest.iter().fold(at, |path, w| path + "/" + w));
+            if os::stat(&self.k, &at).is_some() {
+                let made = rest.iter().fold(at, |path, w| path + "/" + w);
+                // sysfs follows its own links, and has the whole path or doesn't.
+                if os::sysfs::is_sys(&made) {
+                    return os::sysfs::lookup(&self.k, &made, follow_last).map(|(real, _)| real);
+                }
+                return Some(made);
             }
             let ino = view.mounts.cover(disk.lookup(here, &word).ok()?);
             if disk.stat(ino).ok()?.kind == Kind::Symlink && (follow_last || !rest.is_empty()) {
@@ -989,7 +994,8 @@ impl Task {
         let open = self.file(fd)?;
         let size = match &open.node {
             Node::File(ino) => lock(&self.k.disk).stat(*ino)?.size,
-            Node::Dir(_) | Node::Null | Node::Zero => 0,
+            // A directory's offset is an entry's place in it (`rewinddir` seeks to 0), a made one's too.
+            Node::Dir(_) | Node::Listing(_) | Node::Null | Node::Zero => 0,
             Node::Made(bytes) => bytes.len() as u64,
             Node::Memfd(mem, _) => mem.size(),
             _ => return Err(ESPIPE),
@@ -1042,10 +1048,16 @@ impl Task {
     /// `stat` for a path lambda makes, or None if it isn't one. Followed, `/proc/<pid>/fd/<n>` is the file it's open
     /// on (so two pipes are two files), and ENOENT if nothing is.
     fn made_stat(&self, path: &str, follow: bool) -> Option<Result<Stat, Errno>> {
+        if os::sysfs::is_sys(path) {
+            return Some(match os::sysfs::lookup(&self.k, path, follow) {
+                Some((real, _)) => os::stat(&self.k, &real).ok_or(ENOENT),
+                None => Err(ENOENT),
+            });
+        }
         if (follow && path.starts_with("/proc/") && path.contains("/fd/")) || os::is_listing(path) {
             return os::open(self, path).map(|open| open.and_then(|open| stat_of_open(&lock(&self.k.disk), &open)));
         }
-        os::stat(path).map(Ok)
+        os::stat(&self.k, path).map(Ok)
     }
 
     pub(crate) fn newfstatat(&mut self, cx: &mut Cx<'_>, dirfd: i32, path_at: u64, at: u64, flags: u64) -> Result<u64, Errno> {
@@ -1389,7 +1401,7 @@ impl Task {
         let path = self.read_path(cx, path_at)?;
         let (dir, dir_path) = self.start_dir(dirfd)?;
         let absolute = exe_path(&dir_path, &path);
-        if os::stat(&absolute).is_some() {
+        if os::stat(&self.k, &absolute).is_some() {
             return Ok(0);
         }
         let view = self.view();
@@ -1574,7 +1586,7 @@ impl Task {
                 let path = self.read_path(cx, path_at)?;
                 let (dir, dir_path) = self.start_dir(AT_FDCWD)?;
                 let absolute = exe_path(&dir_path, &path);
-                if os::stat(&absolute).is_none() {
+                if os::stat(&self.k, &absolute).is_none() {
                     let view = self.view();
                     view.resolve(&lock(&self.k.disk), dir, &path, true)?;
                 }
