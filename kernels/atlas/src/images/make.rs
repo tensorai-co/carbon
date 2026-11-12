@@ -112,7 +112,13 @@ pub fn dll(isa: Isa, name: &str, base: u64, exports: &[(&str, Body)], gate: bool
     }
     edata.extend(&strings);
     let edata_size = edata.len();
-    let size_of_image = edata_rva + edata_size.next_multiple_of(PAGE);
+
+    // .rsrc: its version information, as Windows' own DLLs have.
+    let rsrc_rva = edata_rva + edata_size.next_multiple_of(PAGE);
+    let mut resources = std::collections::BTreeMap::new();
+    resources.insert((crate::resources::RT_VERSION, 1, 0x409), crate::resources::system_version(name));
+    let rsrc = crate::resources::build(rsrc_rva as u32, &resources);
+    let size_of_image = rsrc_rva + rsrc.len().next_multiple_of(PAGE);
 
     // Headers.
     let mut image = vec![0u8; size_of_image];
@@ -123,7 +129,7 @@ pub fn dll(isa: Isa, name: &str, base: u64, exports: &[(&str, Body)], gate: bool
     let coff = 0x44;
     let machine = if isa == Isa::Arm64 { MACHINE_ARM64 } else { MACHINE_AMD64 };
     put(&mut image, coff, &machine.to_le_bytes());
-    put(&mut image, coff + 2, &2u16.to_le_bytes());
+    put(&mut image, coff + 2, &3u16.to_le_bytes());
     put(&mut image, coff + 16, &240u16.to_le_bytes());
     put(&mut image, coff + 18, &0x2022u16.to_le_bytes()); // an executable, large-address-aware DLL
     let opt = coff + 20;
@@ -142,8 +148,10 @@ pub fn dll(isa: Isa, name: &str, base: u64, exports: &[(&str, Body)], gate: bool
     put(&mut image, opt + 108, &16u32.to_le_bytes());
     put(&mut image, opt + 112, &(edata_rva as u32).to_le_bytes());
     put(&mut image, opt + 116, &(edata_size as u32).to_le_bytes());
+    put(&mut image, opt + 128, &(rsrc_rva as u32).to_le_bytes());
+    put(&mut image, opt + 132, &(rsrc.len() as u32).to_le_bytes());
     let table = opt + 240;
-    for (i, (name, rva, size, flags)) in [(b".text\0\0\0", text_rva, text_size, 0x6000_0020u32), (b".edata\0\0", edata_rva, edata_size, 0x4000_0040)].into_iter().enumerate() {
+    for (i, (name, rva, size, flags)) in [(b".text\0\0\0", text_rva, text_size, 0x6000_0020u32), (b".edata\0\0", edata_rva, edata_size, 0x4000_0040), (b".rsrc\0\0\0", rsrc_rva, rsrc.len(), 0x4000_0040)].into_iter().enumerate() {
         let at = table + i * 40;
         put(&mut image, at, name);
         put(&mut image, at + 8, &(size as u32).to_le_bytes());
@@ -154,6 +162,7 @@ pub fn dll(isa: Isa, name: &str, base: u64, exports: &[(&str, Body)], gate: bool
     }
     put(&mut image, text_rva, &text);
     put(&mut image, edata_rva, &edata);
+    put(&mut image, rsrc_rva, &rsrc);
     image
 }
 
@@ -176,6 +185,12 @@ mod tests {
             assert_eq!(pe.export(&laid, &Wanted::Name("HeapAlloc".into())).unwrap(), Some(Found::Forward("ntdll.RtlAllocateHeap".into())));
             assert_eq!(pe.export(&laid, &Wanted::Ordinal(1)).unwrap(), pe.export(&laid, &Wanted::Name("WriteFile".into())).unwrap());
             assert_eq!(pe.export(&laid, &Wanted::Name("Nope".into())).unwrap(), None);
+            // Its version information, where its resource directory says.
+            let (root, _) = pe.directory(2).unwrap();
+            let mut tree = crate::resources::Tree::new(root, |at, len| laid.get(at as usize..at as usize + len).map(<[u8]>::to_vec));
+            let found = tree.find(&crate::resources::Id::Num(16), &crate::resources::Id::Num(1), None).unwrap();
+            let block = &laid[found.data as usize..][..found.size as usize];
+            assert!(crate::resources::query(block, "\\StringFileInfo\\040904B0\\OriginalFilename").is_some());
         }
     }
 }

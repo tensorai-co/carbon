@@ -6,6 +6,7 @@ use display::selection::{Selection, TEXT};
 use kernels_core::thread::Cx;
 use kernels_core::user;
 
+use super::resapi::{load_string_a, load_string_w};
 use super::{Reply, dll};
 use crate::process::Task;
 use crate::win32k::{self, Class, DESKTOP, Filter, Msg, WM_GETTEXT, WM_GETTEXTLENGTH, WM_SETTEXT, gdi, keys};
@@ -14,6 +15,8 @@ dll! {
     "USER32.dll";
     host MessageBoxW(4) => message_box_w;
     host MessageBoxA(4) => message_box_a;
+    host LoadStringW(4) => load_string_w;
+    host LoadStringA(4) => load_string_a;
     host RegisterClassExW(1) => register_class_ex_w;
     host RegisterClassW(1) => register_class_w;
     host UnregisterClassW(2) => unregister_class_w;

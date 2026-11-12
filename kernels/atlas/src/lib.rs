@@ -24,6 +24,7 @@ mod ports;
 mod process;
 mod threads;
 mod registry;
+mod resources;
 mod sections;
 mod security;
 mod system;

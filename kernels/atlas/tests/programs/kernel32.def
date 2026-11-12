@@ -178,3 +178,12 @@ SystemTimeToTzSpecificLocalTime
 TzSpecificLocalTimeToSystemTime
 GetSystemTimes
 LocalFree
+FindResourceW
+FindResourceA
+FindResourceExW
+LoadResource
+LockResource
+SizeofResource
+EnumResourceTypesW
+EnumResourceNamesW
+EnumResourceLanguagesW

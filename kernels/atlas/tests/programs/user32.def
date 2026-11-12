@@ -79,3 +79,5 @@ ClientToScreen
 ScreenToClient
 WindowFromPoint
 GetSystemMetrics
+LoadStringW
+LoadStringA

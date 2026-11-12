@@ -9,11 +9,13 @@ pub mod kernel32;
 pub mod memapi;
 pub mod pipeapi;
 pub mod procapi;
+pub mod resapi;
 pub mod secapi;
 pub mod shell32;
 pub mod synch;
 pub mod sysapi;
 pub mod user32;
+pub mod version;
 
 use kernels_core::thread::Cx;
 
@@ -78,7 +80,7 @@ macro_rules! dll {
 pub(crate) use dll;
 
 /// Every system DLL atlas has.
-pub static DLLS: &[&Dll] = &[&kernel32::DLL, &user32::DLL, &advapi32::DLL, &gdi32::DLL, &shell32::DLL];
+pub static DLLS: &[&Dll] = &[&kernel32::DLL, &user32::DLL, &advapi32::DLL, &gdi32::DLL, &shell32::DLL, &version::DLL];
 
 /// The DLL called `name` (`kernel32`, `KERNEL32.DLL`, …), by its index in [`DLLS`].
 pub fn find(name: &str) -> Option<usize> {
