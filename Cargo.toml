@@ -12,6 +12,7 @@ members = [
     "machine",
     "cli",
     "display",
+    "display/macos",
     "host",
     "net",
     "kernels/core",
@@ -39,6 +40,7 @@ layers = { path = "layers" }
 images = { path = "images" }
 machine = { path = "machine" }
 display = { path = "display" }
+display-macos = { path = "display/macos" }
 host = { path = "host" }
 net = { path = "net" }
 kernels-core = { path = "kernels/core" }

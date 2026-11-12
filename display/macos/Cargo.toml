@@ -1,0 +1,13 @@
+[package]
+name = "display-macos"
+description = "The desktop on a Mac's screen: desktop mode, the whole desktop in one window, with the Mac's keyboard, mouse, trackpad and refresh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+display.workspace = true

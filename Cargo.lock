@@ -107,6 +107,13 @@ name = "display"
 version = "0.2.0"
 
 [[package]]
+name = "display-macos"
+version = "0.2.0"
+dependencies = [
+ "display",
+]
+
+[[package]]
 name = "displaydoc"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -358,6 +365,7 @@ dependencies = [
 name = "lambda"
 version = "0.2.0"
 dependencies = [
+ "display",
  "exec",
  "host",
  "kernels-core",
@@ -393,6 +401,7 @@ version = "0.2.0"
 dependencies = [
  "atlas",
  "display",
+ "display-macos",
  "exec",
  "host",
  "images",
