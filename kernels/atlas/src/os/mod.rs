@@ -5,6 +5,7 @@ pub mod advapi32;
 pub mod fileapi;
 pub mod gdi32;
 pub mod kernel32;
+pub mod procapi;
 pub mod shell32;
 pub mod synch;
 pub mod user32;

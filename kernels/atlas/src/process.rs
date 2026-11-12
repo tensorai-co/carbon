@@ -437,8 +437,6 @@ fn utf16z(s: &str) -> Vec<u8> {
     s.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect()
 }
 
-/// Starts process 1: `argv[0]` from the disk, loaded with its system DLLs, with the host's console as its standard
-/// handles.
 /// Windows starts every x86 thread with x87 at double precision (control word 0x27F), where exec's fresh thread has
 /// `fninit`'s extended precision (0x37F), as Linux's do.
 pub(crate) fn windows_fp(t: &mut Turn<'_>, isa: Isa) {
@@ -448,6 +446,24 @@ pub(crate) fn windows_fp(t: &mut Turn<'_>, isa: Isa) {
     }
 }
 
+/// What a new process starts with: its program, command line, environment, current directory and handles.
+pub(crate) struct Launch {
+    /// The program, on the disk (`/app.exe`), and its bytes.
+    pub path: String,
+    pub bytes: Vec<u8>,
+    pub command_line: String,
+    /// Its environment block: UTF-16 `NAME=VALUE` strings, each with its NUL, then a NUL.
+    pub environment: Vec<u8>,
+    /// Its current directory, as a full Windows path; else the program's folder.
+    pub cwd: Option<String>,
+    pub handles: Handles,
+    pub std_handles: [u64; 3],
+    /// Made with `CREATE_SUSPENDED`: its first thread waits for `ResumeThread`.
+    pub suspended: bool,
+}
+
+/// Starts process 1: `argv[0]` from the disk, loaded with its system DLLs, with the host's console as its standard
+/// handles and the environment a fresh logon gives.
 pub(crate) fn start(k: &Arc<Kernel>, cx: &mut Cx<'_>, argv: &[String]) -> Result<Task, String> {
     let path = disk_path(argv.first().ok_or("nothing to run")?);
     let bytes = {
@@ -455,6 +471,16 @@ pub(crate) fn start(k: &Arc<Kernel>, cx: &mut Cx<'_>, argv: &[String]) -> Result
         let ino = disk.resolve(layers::ROOT, &path, true).map_err(|e| format!("{path}: {e}"))?;
         disk.contents(ino).map_err(|e| format!("{path}: {e}"))?.to_vec()
     };
+    let isa = Pe::parse(&bytes).map_err(|_| format!("{path} isn't a Windows program"))?.isa;
+    let mut handles = Handles::default();
+    let std_handles = [handles.add(Handle::Input), handles.add(Handle::Console(host::Stream::Out)), handles.add(Handle::Console(host::Stream::Err))];
+    let environment = crate::environment::block(&crate::environment::first(k, isa));
+    launch(k, cx, Launch { path, bytes, command_line: command_line(argv), environment, cwd: None, handles, std_handles, suspended: false })
+}
+
+/// Starts a process on this host thread (whose CPU becomes its first thread's), giving that thread's task to run.
+pub(crate) fn launch(k: &Arc<Kernel>, cx: &mut Cx<'_>, launch: Launch) -> Result<Task, String> {
+    let Launch { path, bytes, command_line: line, environment, cwd, handles, std_handles, suspended } = launch;
     let pe = Pe::parse(&bytes).map_err(|_| format!("{path} isn't a Windows program"))?;
     if pe.is_dll {
         return Err(format!("{path} is a DLL"));
@@ -462,10 +488,7 @@ pub(crate) fn start(k: &Arc<Kernel>, cx: &mut Cx<'_>, argv: &[String]) -> Result
     let isa = pe.isa;
     let mut image = pe.layout().map_err(|_| format!("{path}: its sections don't fit its image"))?;
     let windows_path = format!("C:{}", path.replace('/', "\\"));
-    let mut handles = Handles::default();
-    let std_handles = [handles.add(Handle::Input), handles.add(Handle::Console(host::Stream::Out)), handles.add(Handle::Console(host::Stream::Err))];
     let pid = k.new_id();
-    let environment = crate::environment::block(&crate::environment::first(k, isa));
     let tid = k.new_id();
 
     let mut regions: Regions<Area> = Regions::default();
@@ -508,7 +531,6 @@ pub(crate) fn start(k: &Arc<Kernel>, cx: &mut Cx<'_>, argv: &[String]) -> Result
                 t.space().map(at..at + 0x2000, Prot::RW).zeroed().map_err(|_| "no memory for the thread block")?;
                 teb_at = at;
             }
-            let line = command_line(argv);
             let wide = utf16z(&line);
             let ansi: Vec<u8> = line.bytes().chain([0]).collect();
             let image_path = utf16z(&windows_path);
@@ -584,13 +606,14 @@ pub(crate) fn start(k: &Arc<Kernel>, cx: &mut Cx<'_>, argv: &[String]) -> Result
     mapped.insert("ntdll.dll".to_string(), (ntdll, "C:\\Windows\\System32\\ntdll.dll".to_string()));
     let exe_dir = path.rsplit_once('/').map(|(dir, _)| dir.to_string()).unwrap_or_default();
     let waiter = Waiter::new();
-    let control = ThreadControl::new(tid, teb_at, waiter.clone(), cx.handle(), false);
+    let control = ThreadControl::new(tid, teb_at, waiter.clone(), cx.handle(), suspended);
     let mut threads = BTreeMap::new();
     threads.insert(tid, control.clone());
-    let cwd = format!("C:\\{}", exe_dir.trim_start_matches('/').replace('/', "\\"));
+    let cwd = cwd.unwrap_or_else(|| format!("C:\\{}", exe_dir.trim_start_matches('/').replace('/', "\\")));
     let state = ProcState { space, dispatcher, thread_start, peb, threads, mapped, exe_dir, cwd, regions, handles, std_handles, command_line: command, exiting: None };
     let object = Object::new(objects_mod::Kind::Process(pid), State::default());
     let process = Arc::new(Process { pid, state: Mutex::new(state), object, ended: (Mutex::new(None), Condvar::new()) });
+    k.started(&process);
     Ok(Task { k: k.clone(), process, tid, waiter, isa, depth: 0, nested: 0, control, ending: None })
 }
 

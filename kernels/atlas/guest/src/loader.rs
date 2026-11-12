@@ -316,6 +316,8 @@ fn run_tls_callbacks(image: Image, reason: u32) {
 /// Where the first thread starts: loads what the program imports, runs every DLL's start, then the program.
 #[unsafe(no_mangle)]
 pub extern "system" fn AtlasProcessStart(peb_at: u64, ntdll: u64) -> ! {
+    // A process made suspended waits here for `ResumeThread`, before anything of it has run.
+    sys::call4(atlas_abi::call::THREAD_STARTED, 0, 0, 0, 0);
     let mut ntdll_path = [0u16; 260];
     for (i, b) in b"C:\\Windows\\System32\\ntdll.dll".iter().enumerate() {
         ntdll_path[i] = u16::from(*b);

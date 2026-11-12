@@ -17,15 +17,17 @@ mod images;
 pub mod imports;
 mod mapping;
 mod objects;
-mod threads;
 mod os;
+mod pipes;
 mod process;
+mod threads;
 mod registry;
 mod upcall;
 mod win32k;
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 
 use exec::{Cpu, Exec};
 use host::Host;
@@ -70,7 +72,7 @@ pub struct Options {
 
 /// A running machine, from outside it: how `carbon stop` reaches in, from any thread.
 #[derive(Clone, Default)]
-pub struct Stop(Arc<Mutex<Option<std::sync::Weak<process::Process>>>>);
+pub struct Stop(Arc<Mutex<Option<std::sync::Weak<Kernel>>>>);
 
 impl std::fmt::Debug for Stop {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -79,11 +81,14 @@ impl std::fmt::Debug for Stop {
 }
 
 impl Stop {
-    /// Ends the machine's program with `code`, as `TerminateProcess` would. Whether it was running.
+    /// Ends every process the machine is running with `code`, as `TerminateProcess` would. Whether any was.
     pub fn end(&self, code: u32) -> bool {
-        let Some(process) = lock(&self.0).as_ref().and_then(std::sync::Weak::upgrade) else { return false };
-        process.end(code);
-        true
+        let Some(k) = lock(&self.0).as_ref().and_then(std::sync::Weak::upgrade) else { return false };
+        let running = k.processes();
+        for process in &running {
+            process.end(code);
+        }
+        !running.is_empty()
     }
 }
 
@@ -115,6 +120,8 @@ pub fn boot(exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&str]
         objects: objects::Objects::default(),
         futexes: kernels_core::wait::Futexes::default(),
         next_id: AtomicU64::new(4),
+        processes: Mutex::new(BTreeMap::new()),
+        live: (Mutex::new(0), Condvar::new()),
         options,
     });
     // Input on the desktop wakes the threads that have windows, to take it as messages.
@@ -128,18 +135,18 @@ pub fn boot(exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&str]
     let mut cx = Cx::new(&exec, cpu);
     let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
     let mut task = process::start(&kernel, &mut cx, &argv)?;
-    *lock(&kernel.options.stop.0) = Some(Arc::downgrade(&task.process));
+    *lock(&kernel.options.stop.0) = Some(Arc::downgrade(&kernel));
+    let first = task.process.clone();
     kernels_core::thread::run(&mut cx, &mut task);
-    // The first thread is over; the process lasts until its last thread is.
-    let process = task.process.clone();
-    let (ended, done) = &process.ended;
-    let mut code = lock(ended);
-    while code.is_none() {
-        code = done.wait(code).unwrap_or_else(|p| p.into_inner());
+    drop(task);
+    // The machine runs until its last process is over: the first may have started others that go on after it.
+    let (live, done) = &kernel.live;
+    let mut count = lock(live);
+    while *count > 0 {
+        count = done.wait(count).unwrap_or_else(|p| p.into_inner());
     }
-    let code = code.unwrap_or(0);
-    let space = lock(&process.state).space;
-    cx.turn(|t| t.destroy_space(space));
+    drop(count);
+    let code = lock(&first.ended.0).unwrap_or(0);
     kernel.save_registry();
     // Whatever the machine wrote is kept, if its disk has somewhere to keep it.
     if let Err(e) = lock(&kernel.disk).sync() {
@@ -164,6 +171,10 @@ pub(crate) struct Kernel {
     futexes: kernels_core::wait::Futexes,
     /// Process and thread IDs share one count, in fours, as on Windows.
     next_id: AtomicU64,
+    /// Every process that hasn't ended, by ID.
+    processes: Mutex<BTreeMap<u64, Weak<process::Process>>>,
+    /// How many processes haven't ended: the machine stops at 0.
+    live: (Mutex<usize>, Condvar),
     options: Options,
 }
 
@@ -182,5 +193,33 @@ impl Kernel {
 
     fn new_id(&self) -> u64 {
         self.next_id.fetch_add(4, Ordering::Relaxed)
+    }
+
+    /// A process that's started: it counts until it ends.
+    fn started(&self, process: &Arc<process::Process>) {
+        lock(&self.processes).insert(process.pid, Arc::downgrade(process));
+        *lock(&self.live.0) += 1;
+    }
+
+    /// A process that's over.
+    fn ended(&self, pid: u64) {
+        lock(&self.processes).remove(&pid);
+        *lock(&self.live.0) -= 1;
+        self.live.1.notify_all();
+    }
+
+    /// The process with this ID, if it hasn't ended.
+    fn process(&self, pid: u64) -> Option<Arc<process::Process>> {
+        lock(&self.processes).get(&pid).and_then(Weak::upgrade)
+    }
+
+    /// Every process that hasn't ended.
+    fn processes(&self) -> Vec<Arc<process::Process>> {
+        lock(&self.processes).values().filter_map(Weak::upgrade).collect()
+    }
+
+    /// A thread of any process, by its ID.
+    fn thread(&self, tid: u64) -> Option<Arc<threads::ThreadControl>> {
+        self.processes().iter().find_map(|p| lock(&p.state).threads.get(&tid).cloned())
     }
 }

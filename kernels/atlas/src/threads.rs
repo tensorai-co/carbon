@@ -159,11 +159,20 @@ impl Task {
         };
         if last {
             let code = process_exit.unwrap_or(code);
-            let _ = cx;
+            // It lets go of every handle at once (a pipe's other end, in another process, sees it close), and its
+            // memory.
+            let (handles, space) = {
+                let mut state = lock(&self.process.state);
+                state.exiting.get_or_insert(code);
+                (state.handles.take(), state.space)
+            };
+            drop(handles);
+            cx.turn(|t| t.destroy_space(space));
             self.k.exited(&self.process.object, code);
             let (ended, done) = &self.process.ended;
             *lock(ended) = Some(code);
             done.notify_all();
+            self.k.ended(self.process.pid);
         }
     }
 }

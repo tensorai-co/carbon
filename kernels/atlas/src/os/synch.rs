@@ -37,7 +37,12 @@ impl Task {
     }
 
     fn new_handle(&self, object: Arc<Object>) -> u64 {
-        lock(&self.process.state).handles.add(Handle::Object(object))
+        self.new_handle_with(object, false)
+    }
+
+    /// A handle to an object, inheritable or not.
+    fn new_handle_with(&self, object: Arc<Object>, inheritable: bool) -> u64 {
+        lock(&self.process.state).handles.add_with(Handle::Object(object), inheritable)
     }
 
     /// The program's last error, in its TEB.
@@ -58,11 +63,13 @@ impl Task {
     }
 
     /// Makes a named or unnamed object and a handle to it, setting ERROR_ALREADY_EXISTS if the name was taken.
-    fn create_object(&mut self, cx: &mut Cx<'_>, name: Option<String>, kind: Kind, state: State) -> Reply {
+    /// `attributes` is the SECURITY_ATTRIBUTES the program gave, which says whether the handle is inheritable.
+    fn create_object(&mut self, cx: &mut Cx<'_>, attributes: u64, name: Option<String>, kind: Kind, state: State) -> Reply {
+        let inheritable = self.inheritable_by(cx, attributes);
         match self.k.objects.create(name.as_deref(), kind, state) {
             Ok((object, existed)) => {
                 self.set_last_error(cx, if existed { ERROR_ALREADY_EXISTS } else { 0 });
-                Reply::Value(self.new_handle(object))
+                Reply::Value(self.new_handle_with(object, inheritable))
             }
             Err(()) => {
                 self.set_last_error(cx, ERROR_INVALID_HANDLE);
@@ -97,7 +104,8 @@ impl Task {
     fn thread_of(&self, handle: u64) -> Option<Arc<crate::threads::ThreadControl>> {
         let object = self.object(handle)?;
         let Kind::Thread(tid) = object.kind else { return None };
-        lock(&self.process.state).threads.get(&tid).cloned()
+        let own = lock(&self.process.state).threads.get(&tid).cloned();
+        own.or_else(|| self.k.thread(tid))
     }
 }
 
@@ -188,14 +196,6 @@ pub fn terminate_thread(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     Reply::Value(TRUE)
 }
 
-pub fn terminate_process(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    if task.object(a[0]).is_some_and(|o| o.kind == Kind::Process(task.process.pid)) {
-        return Reply::ExitProcess(a[1] as u32);
-    }
-    task.set_last_error(cx, ERROR_INVALID_HANDLE);
-    Reply::Value(FALSE)
-}
-
 pub fn switch_to_thread(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
     std::thread::yield_now();
     Reply::Value(TRUE)
@@ -203,7 +203,7 @@ pub fn switch_to_thread(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
 
 fn create_event(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
     let name = task.name(cx, a[3], wide);
-    task.create_object(cx, name, Kind::Event { manual: a[1] as u32 != 0 }, State { set: a[2] as u32 != 0, ..State::default() })
+    task.create_object(cx, a[0], name, Kind::Event { manual: a[1] as u32 != 0 }, State { set: a[2] as u32 != 0, ..State::default() })
 }
 
 pub fn create_event_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
@@ -243,7 +243,7 @@ fn create_mutex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Repl
     let name = task.name(cx, a[2], wide);
     let owned = a[1] as u32 != 0;
     let state = if owned { State { owner: task.tid, count: 1, ..State::default() } } else { State::default() };
-    let reply = task.create_object(cx, name, Kind::Mutant, state);
+    let reply = task.create_object(cx, a[0], name, Kind::Mutant, state);
     if owned && let Reply::Value(handle) = reply && let Some(object) = task.object(handle) {
         lock(&task.control.owned).push(Arc::downgrade(&object));
     }
@@ -291,7 +291,7 @@ fn create_semaphore(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> 
         return Reply::Value(0);
     }
     let name = task.name(cx, a[3], wide);
-    task.create_object(cx, name, Kind::Semaphore { max }, State { count: initial, ..State::default() })
+    task.create_object(cx, a[0], name, Kind::Semaphore { max }, State { count: initial, ..State::default() })
 }
 
 pub fn create_semaphore_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
@@ -384,24 +384,29 @@ pub fn queue_user_apc(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 }
 
 /// `DuplicateHandle`, within this process: a new handle to the same object. DUPLICATE_CLOSE_SOURCE closes the old.
+/// `DuplicateHandle(source process, source, target process, &target, access, inherit, options)`, between any two
+/// processes: the new handle goes in the target's table, and its value back to the caller.
 pub fn duplicate_handle(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let [source_process, source, target_process, out, _, _, options] = [a[0], a[1], a[2], a[3], a[4], a[5], a[6]];
-    let own = |h: u64| task.object(h).is_some_and(|o| o.kind == Kind::Process(task.process.pid));
-    if !own(source_process) || !own(target_process) {
+    const DUPLICATE_CLOSE_SOURCE: u64 = 1;
+    let [source_process, source, target_process, out, _, inherit, options] = [a[0], a[1], a[2], a[3], a[4], a[5], a[6]];
+    let (Some(from), Some(to)) = (task.process_of(source_process), task.process_of(target_process)) else {
         task.set_last_error(cx, ERROR_INVALID_HANDLE);
         return Reply::Value(FALSE);
-    }
+    };
+    // The pseudo-handles mean the source process's own self and thread; only the caller's are known here.
     let handle = match source {
-        CURRENT_PROCESS | CURRENT_THREAD => task.object(source).map(Handle::Object),
-        _ => lock(&task.process.state).handles.get(source),
+        CURRENT_PROCESS if Arc::ptr_eq(&from, &task.process) => task.object(source).map(Handle::Object),
+        CURRENT_THREAD if Arc::ptr_eq(&from, &task.process) => task.object(source).map(Handle::Object),
+        CURRENT_PROCESS => Some(Handle::Object(from.object.clone())),
+        _ => lock(&from.state).handles.get(source),
     };
     let Some(handle) = handle else {
         task.set_last_error(cx, ERROR_INVALID_HANDLE);
         return Reply::Value(FALSE);
     };
-    let new = lock(&task.process.state).handles.add(handle);
-    if options & 1 != 0 {
-        lock(&task.process.state).handles.close(source);
+    let new = lock(&to.state).handles.add_with(handle, inherit as u32 != 0);
+    if options & DUPLICATE_CLOSE_SOURCE != 0 {
+        lock(&from.state).handles.close(source);
     }
     if out != 0 {
         let _ = task.mem(cx, true, |t| user::write_u64(&mut t.space(), out, new));

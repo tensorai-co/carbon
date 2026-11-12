@@ -11,6 +11,7 @@ use kernels_core::user;
 use super::Reply;
 use crate::files::{self, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, File, Found, Info, Node, filetime};
 use crate::handles::Handle;
+use crate::pipes;
 use crate::process::Task;
 
 const TRUE: u64 = 1;
@@ -36,14 +37,14 @@ impl Task {
     fn file_handle(&self, handle: u64) -> Option<Arc<File>> {
         match lock(&self.process.state).handles.get(handle)? {
             Handle::File(file) => Some(file),
-            Handle::Console(stream) => Some(Arc::new(File { node: Node::Console(stream), read: false, write: true, append: false, position: Default::default(), path: String::new(), disk: String::new(), delete_on_close: false })),
-            Handle::Input => Some(Arc::new(File { node: Node::Input, read: true, write: false, append: false, position: Default::default(), path: String::new(), disk: String::new(), delete_on_close: false })),
+            Handle::Console(stream) => Some(Arc::new(File::device(Node::Console(stream), false, true))),
+            Handle::Input => Some(Arc::new(File::device(Node::Input, true, false))),
             _ => None,
         }
     }
 
     /// FALSE with the last error set.
-    fn fail(&mut self, cx: &mut Cx<'_>, error: u32) -> Reply {
+    pub(crate) fn fail(&mut self, cx: &mut Cx<'_>, error: u32) -> Reply {
         self.set_last_error(cx, error);
         Reply::Value(FALSE)
     }
@@ -95,7 +96,8 @@ fn create_file(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply
             // CREATE_ALWAYS and OPEN_ALWAYS say whether it was already there.
             let said = if existed && matches!(a[4], 2 | 4) { ERROR_ALREADY_EXISTS } else { 0 };
             task.set_last_error(cx, said);
-            Reply::Value(lock(&task.process.state).handles.add(Handle::File(file)))
+            let inheritable = task.inheritable_by(cx, a[3]);
+            Reply::Value(lock(&task.process.state).handles.add_with(Handle::File(file), inheritable))
         }
         Err(e) => {
             task.set_last_error(cx, e);
@@ -123,8 +125,23 @@ fn overlapped(task: &mut Task, cx: &mut Cx<'_>, at: u64) -> Option<u64> {
 
 pub fn read_file(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let Some(file) = task.file_handle(a[0]) else { return task.fail(cx, ERROR_INVALID_HANDLE) };
-    let at = overlapped(task, cx, a[4]);
-    match task.read_from(&file, (a[2] as u32 as usize).min(1 << 24), at) {
+    let len = (a[2] as u32 as usize).min(1 << 24);
+    let read = match &file.node {
+        Node::Pipe(end) if file.read => match task.read_pipe(end, len) {
+            Ok(data) => Ok(data),
+            Err(pipes::Failed::Error(e)) => Err(e),
+            Err(pipes::Failed::Ended(reply)) => return reply,
+        },
+        _ => {
+            let at = overlapped(task, cx, a[4]);
+            task.read_from(&file, len, at)
+        }
+    };
+    // A pipe that's ended still says it read nothing.
+    if read.is_err() && a[3] != 0 {
+        let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[3], 0));
+    }
+    match read {
         Ok(data) => {
             let n = data.len() as u32;
             let wrote = task.mem(cx, true, |t| {
@@ -140,8 +157,18 @@ pub fn read_file(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 pub fn write_file(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let Some(file) = task.file_handle(a[0]) else { return task.fail(cx, ERROR_INVALID_HANDLE) };
     let Ok(data) = task.mem(cx, false, |t| user::read_vec(&t.space(), a[1], (a[2] as u32 as usize).min(1 << 24))) else { return task.fail(cx, 998) };
-    let at = overlapped(task, cx, a[4]);
-    match task.write_to_file(&file, &data, at) {
+    let written = match &file.node {
+        Node::Pipe(end) if file.write => match task.write_pipe(end, &data) {
+            Ok(n) => Ok(n),
+            Err(pipes::Failed::Error(e)) => Err(e),
+            Err(pipes::Failed::Ended(reply)) => return reply,
+        },
+        _ => {
+            let at = overlapped(task, cx, a[4]);
+            task.write_to_file(&file, &data, at)
+        }
+    };
+    match written {
         Ok(n) => {
             if a[3] != 0 && task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[3], n as u32)).is_err() {
                 return task.fail(cx, 998);
@@ -252,7 +279,11 @@ pub fn get_file_size_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 pub fn get_file_type(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let handle = lock(&task.process.state).handles.get(a[0]);
     match handle {
-        Some(Handle::File(file)) => Reply::Value(if matches!(file.node, Node::Null | Node::Console(_) | Node::Input) { 2 } else { 1 }),
+        Some(Handle::File(file)) => Reply::Value(match file.node {
+            Node::Null | Node::Console(_) | Node::Input => 2,
+            Node::Pipe(_) => 3,
+            _ => 1,
+        }),
         Some(Handle::Console(_) | Handle::Input) => Reply::Value(2),
         Some(_) => Reply::Value(0),
         None => {

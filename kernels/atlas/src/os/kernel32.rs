@@ -7,6 +7,7 @@ use kernels_core::thread::Cx;
 use kernels_core::user;
 
 use super::fileapi::*;
+use super::procapi::*;
 use super::synch::*;
 use super::{Reply, dll};
 use crate::handles::Handle;
@@ -92,6 +93,15 @@ dll! {
     host ResumeThread(1) => resume_thread;
     host TerminateThread(2) => terminate_thread;
     host TerminateProcess(2) => terminate_process;
+    host CreateProcessW(10) => create_process_w;
+    host CreateProcessA(10) => create_process_a;
+    host OpenProcess(3) => open_process;
+    host GetStartupInfoW(1) => get_startup_info;
+    host GetStartupInfoA(1) => get_startup_info;
+    host CreatePipe(4) => create_pipe;
+    host PeekNamedPipe(6) => peek_named_pipe;
+    host GetHandleInformation(2) => get_handle_information;
+    host SetHandleInformation(3) => set_handle_information;
     host SwitchToThread(0) => switch_to_thread;
     host CreateEventW(4) => create_event_w;
     host CreateEventA(4) => create_event_a;

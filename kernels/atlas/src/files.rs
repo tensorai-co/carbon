@@ -67,6 +67,8 @@ pub enum Node {
     /// `CONOUT$` and `CONIN$`.
     Console(host::Stream),
     Input,
+    /// One end of a pipe.
+    Pipe(crate::pipes::End),
 }
 
 pub struct File {
@@ -80,6 +82,13 @@ pub struct File {
     pub path: String,
     pub disk: String,
     pub delete_on_close: bool,
+}
+
+impl File {
+    /// An open file that isn't on the disk: a console stream, the console's input, or a pipe's end.
+    pub fn device(node: Node, read: bool, write: bool) -> File {
+        File { node, read, write, append: false, position: Mutex::new(0), path: String::new(), disk: String::new(), delete_on_close: false }
+    }
 }
 
 /// One entry `FindFirstFile` found.
@@ -379,7 +388,7 @@ impl Task {
                 buffer.truncate(n);
                 return Ok(buffer);
             }
-            Node::Dir(_) | Node::Console(_) => return Err(ERROR_ACCESS_DENIED),
+            Node::Dir(_) | Node::Console(_) | Node::Pipe(_) => return Err(ERROR_ACCESS_DENIED),
         };
         *position = start + data.len() as u64;
         Ok(data)
