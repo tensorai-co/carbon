@@ -4,7 +4,10 @@
 pub mod advapi32;
 pub mod fileapi;
 pub mod gdi32;
+pub mod ioapi;
 pub mod kernel32;
+pub mod memapi;
+pub mod pipeapi;
 pub mod procapi;
 pub mod shell32;
 pub mod synch;

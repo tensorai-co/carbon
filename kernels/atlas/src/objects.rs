@@ -28,6 +28,8 @@ pub enum Kind {
     Event { manual: bool },
     Mutant,
     Semaphore { max: i64 },
+    /// A waitable timer: a notification timer (manual) stays set; a synchronization timer lets one wait through.
+    Timer { manual: bool },
     /// A thread, by its ID.
     Thread(u64),
     /// A process, by its ID.
@@ -38,7 +40,8 @@ pub enum Kind {
 pub struct State {
     /// An event's.
     pub set: bool,
-    /// A semaphore's count, or a mutant's recursion count.
+    /// A semaphore's count, a mutant's recursion count, or how many times a timer's been set (so an expiry from
+    /// before it was set again, or cancelled, does nothing).
     pub count: i64,
     /// The thread that owns a mutant, or 0.
     pub owner: u64,
@@ -62,7 +65,7 @@ impl Object {
     /// Whether a wait by thread `tid` would be satisfied now.
     fn ready(&self, s: &State, tid: u64) -> bool {
         match self.kind {
-            Kind::Event { .. } => s.set,
+            Kind::Event { .. } | Kind::Timer { .. } => s.set,
             Kind::Mutant => s.owner == 0 || s.owner == tid,
             Kind::Semaphore { .. } => s.count > 0,
             Kind::Thread(_) | Kind::Process(_) => s.exit.is_some(),
@@ -72,7 +75,7 @@ impl Object {
     /// Takes the object for thread `tid`: what a satisfied wait does. True if it was an abandoned mutant.
     fn take(&self, s: &mut State, tid: u64) -> bool {
         match self.kind {
-            Kind::Event { manual: false } => s.set = false,
+            Kind::Event { manual: false } | Kind::Timer { manual: false } => s.set = false,
             Kind::Mutant => {
                 s.owner = tid;
                 s.count += 1;
@@ -197,14 +200,14 @@ impl Task {
     pub fn run_apcs(&mut self, cx: &mut Cx<'_>) -> Result<(), Reply> {
         loop {
             let next = lock(&self.control.apcs).pop_front();
-            let Some((function, argument)) = next else { return Ok(()) };
-            self.upcall(cx, function, &[argument])?;
+            let Some((function, arguments)) = next else { return Ok(()) };
+            self.upcall(cx, function, &arguments)?;
         }
     }
 }
 
-/// A thread's queue of APCs: a function and its argument each.
-pub type Apcs = Mutex<VecDeque<(u64, u64)>>;
+/// A thread's queue of APCs: a function and its arguments each (`QueueUserAPC`'s one, a timer's three).
+pub type Apcs = Mutex<VecDeque<(u64, Vec<u64>)>>;
 
 impl Kernel {
     /// Ends a thread's or process's object with `code`, waking what waits on it.

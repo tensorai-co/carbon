@@ -21,6 +21,10 @@ pub enum Handle {
     Find(Arc<Find>),
     /// A registry key, by its ID.
     Key(u64),
+    /// A section: `CreateFileMapping`'s.
+    Section(Arc<crate::sections::Section>),
+    /// An I/O completion port.
+    Port(Arc<crate::ports::Port>),
 }
 
 /// `GetCurrentProcess()` and `GetCurrentThread()`.

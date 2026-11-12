@@ -25,6 +25,9 @@ for arch in aarch64 x86_64; do
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console registry.c "$out/kernel32-$arch.lib" "$out/advapi32-$arch.lib" \
         -o "$out/loader-$arch/registry.exe"
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console process.c "$out/kernel32-$arch.lib" -o "$out/loader-$arch/process.exe"
+    $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console sections.c "$out/kernel32-$arch.lib" -o "$out/loader-$arch/sections.exe"
+    $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console io.c "$out/kernel32-$arch.lib" -o "$out/loader-$arch/io.exe"
+    $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console pipes.c "$out/kernel32-$arch.lib" -o "$out/loader-$arch/pipes.exe"
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console environment.c "$out/kernel32-$arch.lib" -o "$out/loader-$arch/environment.exe"
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:windows desktop.c "$out/kernel32-$arch.lib" "$out/user32-$arch.lib" "$out/shell32-$arch.lib" -o "$out/loader-$arch/desktop.exe"
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:windows windows.c "$out/kernel32-$arch.lib" "$out/user32-$arch.lib" "$out/gdi32-$arch.lib" \

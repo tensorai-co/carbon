@@ -62,9 +62,9 @@ impl Task {
         let (teb_at, stack, peb, thread_start) = {
             let mut state = lock(&self.process.state);
             let teb_at = state.regions.free_above(ALLOC, GRANULE, GRANULE).ok_or(atlas_abi::status::NO_MEMORY)?;
-            state.regions.insert(teb_at..teb_at + GRANULE, Area { prot: Prot::RW, kind: AreaKind::Committed });
+            state.regions.insert(teb_at..teb_at + GRANULE, Area::of(Prot::RW, AreaKind::Committed));
             let stack = state.regions.free_above(ALLOC, size, GRANULE).ok_or(atlas_abi::status::NO_MEMORY)?;
-            state.regions.insert(stack..stack + size, Area { prot: Prot::RW, kind: AreaKind::Committed });
+            state.regions.insert(stack..stack + size, Area::of(Prot::RW, AreaKind::Committed));
             (teb_at, stack, state.peb, state.thread_start)
         };
         let top = stack + size;
@@ -159,6 +159,10 @@ impl Task {
         };
         if last {
             let code = process_exit.unwrap_or(code);
+            // What its views of file mappings wrote goes to their files.
+            for (range, section, offset) in self.views() {
+                self.write_back(cx, &section, offset..offset + (range.end - range.start));
+            }
             // It lets go of every handle at once (a pipe's other end, in another process, sees it close), and its
             // memory.
             let (handles, space) = {
@@ -167,7 +171,10 @@ impl Task {
                 (state.handles.take(), state.space)
             };
             drop(handles);
+            let mut gone = lock(&self.process.remote);
+            *gone = true;
             cx.turn(|t| t.destroy_space(space));
+            drop(gone);
             self.k.exited(&self.process.object, code);
             let (ended, done) = &self.process.ended;
             *lock(ended) = Some(code);

@@ -51,7 +51,7 @@ pub(crate) fn map_image(t: &mut Turn<'_>, regions: &mut Regions<Area>, pe: &Pe<'
             let (from, to) = (page * PAGE as usize, (end * PAGE as usize).min(image.len()));
             let range = base + from as u64..base + (end as u64) * PAGE;
             t.space().map(range.clone(), prot).with(&image[from..to]).map_err(|_| "no memory for the image")?;
-            regions.insert(range, Area { prot, kind: AreaKind::Image });
+            regions.insert(range, Area::of(prot, AreaKind::Image));
         }
         page = end;
     }
@@ -74,7 +74,7 @@ pub(crate) fn module_name(raw: &str) -> String {
     if file.contains('.') { file } else { format!("{file}.dll") }
 }
 
-fn prot_to_page(prot: Prot) -> u32 {
+pub(crate) fn prot_to_page(prot: Prot) -> u32 {
     match (prot.read(), prot.write(), prot.exec()) {
         (_, true, true) => 0x40,
         (_, false, true) if prot.read() => 0x20,
@@ -169,6 +169,10 @@ impl Task {
             while at < range.end {
                 let Some((r, a)) = state.regions.find(at) else { return status::INVALID_PARAMETER };
                 if matches!(a.kind, AreaKind::Kept | AreaKind::Reserved) {
+                    return status::INVALID_PARAMETER;
+                }
+                // A shared view is no more writable than its section.
+                if prot.write() && a.view.as_ref().is_some_and(|v| !v.copy && !v.section.writable) {
                     return status::INVALID_PARAMETER;
                 }
                 old.get_or_insert(a.prot);

@@ -378,12 +378,11 @@ pub fn queue_user_apc(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
         task.set_last_error(cx, ERROR_INVALID_HANDLE);
         return Reply::Value(FALSE);
     };
-    lock(&thread.apcs).push_back((a[0], a[2]));
+    lock(&thread.apcs).push_back((a[0], vec![a[2]]));
     thread.waiter.wake();
     Reply::Value(TRUE)
 }
 
-/// `DuplicateHandle`, within this process: a new handle to the same object. DUPLICATE_CLOSE_SOURCE closes the old.
 /// `DuplicateHandle(source process, source, target process, &target, access, inherit, options)`, between any two
 /// processes: the new handle goes in the target's table, and its value back to the caller.
 pub fn duplicate_handle(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
@@ -411,5 +410,107 @@ pub fn duplicate_handle(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     if out != 0 {
         let _ = task.mem(cx, true, |t| user::write_u64(&mut t.space(), out, new));
     }
+    Reply::Value(TRUE)
+}
+
+// Waitable timers.
+
+/// `CreateWaitableTimerW(attributes, manual, name)`.
+pub fn create_waitable_timer_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let name = task.name(cx, a[2], true);
+    task.create_object(cx, a[0], name, Kind::Timer { manual: a[1] as u32 != 0 }, State::default())
+}
+
+/// `CreateWaitableTimerA(attributes, manual, name)`.
+pub fn create_waitable_timer_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let name = task.name(cx, a[2], false);
+    task.create_object(cx, a[0], name, Kind::Timer { manual: a[1] as u32 != 0 }, State::default())
+}
+
+/// `CreateWaitableTimerExW(attributes, name, flags, access)`: `CREATE_WAITABLE_TIMER_MANUAL_RESET` is 1.
+pub fn create_waitable_timer_ex_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let name = task.name(cx, a[1], true);
+    task.create_object(cx, a[0], name, Kind::Timer { manual: a[2] as u32 & 1 != 0 }, State::default())
+}
+
+pub fn open_waitable_timer_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    task.open_object(cx, a[2], |k| matches!(k, Kind::Timer { .. }))
+}
+
+/// Arms a timer's expiry at `when`, for setting number `generation`: it sets the timer, queues its APC, and arms the
+/// next if it's periodic.
+fn arm(k: std::sync::Weak<crate::Kernel>, timer: std::sync::Weak<Object>, generation: i64, when: std::time::Instant, period_ms: u64, apc: Option<(std::sync::Weak<crate::threads::ThreadControl>, u64, u64)>) {
+    let Some(kernel) = k.upgrade() else { return };
+    let timers = kernel.timers.clone();
+    drop(kernel);
+    timers.at(when, move || {
+        let (Some(kernel), Some(object)) = (k.upgrade(), timer.upgrade()) else { return };
+        let current = kernel.objects.signal(&object, |s| {
+            if s.count != generation {
+                return false;
+            }
+            s.set = true;
+            true
+        });
+        if !current {
+            return;
+        }
+        if let Some((thread, routine, argument)) = &apc
+            && let Some(thread) = thread.upgrade()
+        {
+            // The APC gets its argument and the time it went off, as a FILETIME's two halves.
+            let now = crate::files::filetime(kernel.host.wall());
+            lock(&thread.apcs).push_back((*routine, vec![*argument, now & 0xffff_ffff, now >> 32]));
+            thread.waiter.wake();
+        }
+        drop(kernel);
+        if period_ms > 0 {
+            arm(k, timer, generation, when + std::time::Duration::from_millis(period_ms), period_ms, apc);
+        }
+    });
+}
+
+/// `SetWaitableTimer(timer, &due, period, routine, argument, resume)`: due in 100 ns units, negative from now or
+/// positive as a FILETIME; then every `period` milliseconds, if that's not 0. Setting it unsets it first.
+pub fn set_waitable_timer(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(timer) = task.object(a[0]).filter(|o| matches!(o.kind, Kind::Timer { .. })) else {
+        task.set_last_error(cx, ERROR_INVALID_HANDLE);
+        return Reply::Value(FALSE);
+    };
+    let Ok(due) = task.mem(cx, false, |t| user::read_u64(&t.space(), a[1])) else {
+        task.set_last_error(cx, ERROR_INVALID_PARAMETER);
+        return Reply::Value(FALSE);
+    };
+    let due = due as i64;
+    let from_now = if due < 0 {
+        due.unsigned_abs() * 100
+    } else {
+        let now = crate::files::filetime(task.k.host.wall()) as i64;
+        (due - now).max(0) as u64 * 100
+    };
+    let when = std::time::Instant::now() + std::time::Duration::from_nanos(from_now);
+    let generation = task.k.objects.signal(&timer, |s| {
+        s.set = false;
+        s.count += 1;
+        s.count
+    });
+    let apc = (a[3] != 0).then(|| (Arc::downgrade(&task.control), a[3], a[4]));
+    arm(Arc::downgrade(&task.k), Arc::downgrade(&timer), generation, when, u64::from(a[2] as u32), apc);
+    task.set_last_error(cx, 0);
+    Reply::Value(TRUE)
+}
+
+/// `SetWaitableTimerEx(timer, &due, period, routine, argument, wake context, tolerable delay)`.
+pub fn set_waitable_timer_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    set_waitable_timer(task, cx, &a[..5])
+}
+
+/// `CancelWaitableTimer`: its expiries to come don't happen; whether it's set stays as it is.
+pub fn cancel_waitable_timer(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(timer) = task.object(a[0]).filter(|o| matches!(o.kind, Kind::Timer { .. })) else {
+        task.set_last_error(cx, ERROR_INVALID_HANDLE);
+        return Reply::Value(FALSE);
+    };
+    task.k.objects.signal(&timer, |s| s.count += 1);
     Reply::Value(TRUE)
 }

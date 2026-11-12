@@ -11,8 +11,8 @@ use kernels_core::user;
 use super::Reply;
 use crate::files::{self, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, File, Found, Info, Node, filetime};
 use crate::handles::Handle;
-use crate::pipes;
 use crate::process::Task;
+use crate::{pipes, ports};
 
 const TRUE: u64 = 1;
 const FALSE: u64 = 0;
@@ -34,7 +34,7 @@ impl Task {
         }
     }
 
-    fn file_handle(&self, handle: u64) -> Option<Arc<File>> {
+    pub(crate) fn file_handle(&self, handle: u64) -> Option<Arc<File>> {
         match lock(&self.process.state).handles.get(handle)? {
             Handle::File(file) => Some(file),
             Handle::Console(stream) => Some(Arc::new(File::device(Node::Console(stream), false, true))),
@@ -91,6 +91,20 @@ fn create_file(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply
         task.set_last_error(cx, ERROR_INVALID_PARAMETER);
         return Reply::Value(INVALID_HANDLE_VALUE);
     };
+    // `\\.\pipe\NAME`: a client connecting to a named pipe.
+    if let Some(key) = crate::named_pipes::key(&name) {
+        return match super::pipeapi::open_client(task, cx, &key, &name, a[1] as u32, a[5] as u32) {
+            Ok(file) => {
+                let inheritable = task.inheritable_by(cx, a[3]);
+                task.set_last_error(cx, 0);
+                Reply::Value(lock(&task.process.state).handles.add_with(Handle::File(file), inheritable))
+            }
+            Err(e) => {
+                task.set_last_error(cx, e);
+                Reply::Value(INVALID_HANDLE_VALUE)
+            }
+        };
+    }
     match task.open_file(&name, a[1] as u32, a[4] as u32, a[5] as u32) {
         Ok((file, existed)) => {
             // CREATE_ALWAYS and OPEN_ALWAYS say whether it was already there.
@@ -115,68 +129,208 @@ pub fn create_file_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 }
 
 /// An OVERLAPPED's offset, for a read or write at a place of its own.
-fn overlapped(task: &mut Task, cx: &mut Cx<'_>, at: u64) -> Option<u64> {
+/// An OVERLAPPED's offset and event (64-bit: `Internal`, `InternalHigh`, `Offset`, `OffsetHigh`, `hEvent`).
+fn overlapped(task: &mut Task, cx: &mut Cx<'_>, at: u64) -> Option<(u64, u64)> {
     if at == 0 {
         return None;
     }
-    let (lo, hi) = task.mem(cx, false, |t| Ok((user::read_u32(&t.space(), at + 16)?, user::read_u32(&t.space(), at + 20)?))).ok()?;
-    Some(u64::from(hi) << 32 | u64::from(lo))
+    task.mem(cx, false, |t| {
+        let (lo, hi) = (user::read_u32(&t.space(), at + 16)?, user::read_u32(&t.space(), at + 20)?);
+        Ok((u64::from(hi) << 32 | u64::from(lo), user::read_u64(&t.space(), at + 24)?))
+    })
+    .ok()
+}
+
+/// How a transfer says it's done, besides its return value.
+#[derive(Clone, Copy)]
+pub(crate) enum Notify {
+    /// `ReadFile`/`WriteFile`: the OVERLAPPED's event, and the file's port.
+    Plain,
+    /// `ReadFileEx`/`WriteFileEx`: an APC to the thread, with the routine.
+    Routine(u64),
+}
+
+/// What a transfer did.
+enum Outcome {
+    /// Done: what it read (empty for a write), how many bytes, and the error (ERROR_MORE_DATA comes with data).
+    Done(Vec<u8>, usize, u32),
+    /// An overlapped read that's waiting: another thread completes it.
+    Pending,
+}
+
+impl Task {
+    /// Where an I/O that's pending completes to.
+    fn new_op(&self, file: &File, overlapped: u64, buffer: u64, event: Option<Arc<crate::objects::Object>>, notify: Notify) -> Arc<ports::Op> {
+        let (port, routine) = match notify {
+            Notify::Plain => (lock(&file.port).clone(), None),
+            Notify::Routine(r) => (None, Some(r)),
+        };
+        Arc::new(ports::Op { process: Arc::downgrade(&self.process), thread: Arc::downgrade(&self.control), overlapped, buffer, event, port, routine })
+    }
+}
+
+/// `ReadFile`/`WriteFile` and their `Ex` forms: the transfer, then its completion as the handle and the call ask.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn transfer(task: &mut Task, cx: &mut Cx<'_>, handle: u64, buffer: u64, len: u32, done_out: u64, ov: u64, write: bool, notify: Notify) -> Reply {
+    let Some(file) = task.file_handle(handle) else { return task.fail(cx, ERROR_INVALID_HANDLE) };
+    let len = (len as usize).min(1 << 24);
+    let (offset, event) = match overlapped(task, cx, ov) {
+        Some((offset, event)) => (Some(offset), if matches!(notify, Notify::Plain) { event } else { 0 }),
+        None => (None, 0),
+    };
+    // The event is unset while the I/O is under way.
+    let event = (event != 0).then(|| task.object(event)).flatten();
+    if let Some(event) = &event {
+        task.k.objects.signal(event, |s| s.set = false);
+    }
+    // Overlapped I/O can wait as pending: only an overlapped handle's, with an OVERLAPPED.
+    let asynchronous = file.overlapped && ov != 0;
+    let on_disk = matches!(file.node, Node::File(_));
+    let finished = |r: Result<usize, u32>| match r {
+        Ok(n) => Outcome::Done(Vec::new(), n, 0),
+        Err(e) => Outcome::Done(Vec::new(), 0, e),
+    };
+    let outcome = if write {
+        let data = match task.mem(cx, false, |t| user::read_vec(&t.space(), buffer, len)) {
+            Ok(data) => data,
+            Err(_) => return task.fail(cx, 998),
+        };
+        let pipe = match &file.node {
+            Node::Pipe(end) if file.write => Some(Ok(end.pipe.clone())),
+            Node::NamedPipe(end) if file.write => Some(end.outgoing()),
+            _ => None,
+        };
+        match pipe {
+            Some(Err(e)) => finished(Err(e)),
+            // An overlapped write always goes in at once: the pending reads it completes are completed here.
+            Some(Ok(pipe)) if asynchronous => match pipe.write_all(&data) {
+                Ok(done) => {
+                    for c in done {
+                        let k = task.k.clone();
+                        k.complete(cx, c);
+                    }
+                    finished(Ok(data.len()))
+                }
+                Err(e) => finished(Err(e)),
+            },
+            Some(Ok(pipe)) => match task.write_pipe(cx, &pipe, &data) {
+                Ok(n) => finished(Ok(n)),
+                Err(pipes::Failed::Error(e)) => finished(Err(e)),
+                Err(pipes::Failed::Ended(reply)) => return reply,
+            },
+            None => finished(task.write_to_file(&file, &data, offset)),
+        }
+    } else {
+        let pipe = match &file.node {
+            Node::Pipe(end) if file.read => Some(Ok((end.pipe.clone(), false, false))),
+            Node::NamedPipe(end) if file.read => Some(end.incoming().map(|p| (p, end.message_mode(), end.nowait()))),
+            _ => None,
+        };
+        let read = |data: Vec<u8>, more: bool| {
+            let n = data.len();
+            Outcome::Done(data, n, if more { ports::ERROR_MORE_DATA } else { 0 })
+        };
+        match pipe {
+            Some(Err(e)) => finished(Err(e)),
+            Some(Ok((pipe, message_mode, nowait))) if asynchronous || nowait => {
+                let op = asynchronous.then(|| task.new_op(&file, ov, buffer, event.clone(), notify));
+                match pipe.read(len, message_mode, op) {
+                    pipes::Read::Data(data, more) => read(data, more),
+                    pipes::Read::Ended(e) => finished(Err(e)),
+                    pipes::Read::Empty if asynchronous => Outcome::Pending,
+                    pipes::Read::Empty => finished(Err(pipes::ERROR_NO_DATA)),
+                }
+            }
+            Some(Ok((pipe, message_mode, _))) => match task.read_pipe(&pipe, len, message_mode) {
+                Ok((data, more)) => read(data, more),
+                Err(pipes::Failed::Error(e)) => finished(Err(e)),
+                Err(pipes::Failed::Ended(reply)) => return reply,
+            },
+            None => match task.read_from(&file, len, offset) {
+                // Reading at or past the end, at an offset the OVERLAPPED gave, is ERROR_HANDLE_EOF.
+                Ok(data) if data.is_empty() && len > 0 && offset.is_some() && on_disk => finished(Err(ports::ERROR_HANDLE_EOF)),
+                Ok(data) => read(data, false),
+                Err(e) => finished(Err(e)),
+            },
+        }
+    };
+    let (data, n, error) = match outcome {
+        Outcome::Pending => {
+            let pending = [u64::from(ports::STATUS_PENDING).to_le_bytes(), 0u64.to_le_bytes()].concat();
+            let _ = task.mem(cx, true, |t| user::write(&mut t.space(), ov, &pending));
+            // `ReadFileEx` says it's under way by succeeding; `ReadFile`, by ERROR_IO_PENDING.
+            return match notify {
+                Notify::Routine(_) => Reply::Value(TRUE),
+                Notify::Plain => task.fail(cx, ports::ERROR_IO_PENDING),
+            };
+        }
+        Outcome::Done(data, n, error) => (data, n, error),
+    };
+    // What was read, the count, and the OVERLAPPED's status and count, whatever happened.
+    let wrote = task.mem(cx, true, |t| {
+        if !data.is_empty() {
+            user::write(&mut t.space(), buffer, &data)?;
+        }
+        if done_out != 0 {
+            user::write_u32(&mut t.space(), done_out, n as u32)?;
+        }
+        if ov != 0 {
+            user::write_u64(&mut t.space(), ov, u64::from(ports::status(error)))?;
+            user::write_u64(&mut t.space(), ov + 8, n as u64)?;
+        }
+        Ok(())
+    });
+    if wrote.is_err() {
+        return task.fail(cx, 998);
+    }
+    // A failure (but a message that didn't all fit) says so at once, with nothing else told.
+    if error != 0 && error != ports::ERROR_MORE_DATA {
+        return task.fail(cx, error);
+    }
+    match notify {
+        Notify::Plain => {
+            const SKIP_PORT_ON_SUCCESS: u32 = 1;
+            if let Some(event) = &event {
+                task.k.objects.signal(event, |s| s.set = true);
+            }
+            let port = lock(&file.port).clone();
+            if let Some((port, key)) = port
+                && asynchronous
+                && (error != 0 || file.modes.load(std::sync::atomic::Ordering::Relaxed) & SKIP_PORT_ON_SUCCESS == 0)
+            {
+                port.post(ports::Packet { bytes: n as u32, key, overlapped: ov, status: ports::status(error) });
+            }
+        }
+        Notify::Routine(routine) => {
+            // The routine runs in this thread's next alertable wait: (error, bytes, OVERLAPPED).
+            lock(&task.control.apcs).push_back((routine, vec![u64::from(error), n as u64, ov]));
+        }
+    }
+    if error != 0 { task.fail(cx, error) } else { Reply::Value(TRUE) }
 }
 
 pub fn read_file(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(file) = task.file_handle(a[0]) else { return task.fail(cx, ERROR_INVALID_HANDLE) };
-    let len = (a[2] as u32 as usize).min(1 << 24);
-    let read = match &file.node {
-        Node::Pipe(end) if file.read => match task.read_pipe(end, len) {
-            Ok(data) => Ok(data),
-            Err(pipes::Failed::Error(e)) => Err(e),
-            Err(pipes::Failed::Ended(reply)) => return reply,
-        },
-        _ => {
-            let at = overlapped(task, cx, a[4]);
-            task.read_from(&file, len, at)
-        }
-    };
-    // A pipe that's ended still says it read nothing.
-    if read.is_err() && a[3] != 0 {
-        let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[3], 0));
-    }
-    match read {
-        Ok(data) => {
-            let n = data.len() as u32;
-            let wrote = task.mem(cx, true, |t| {
-                user::write(&mut t.space(), a[1], &data)?;
-                if a[3] != 0 { user::write_u32(&mut t.space(), a[3], n) } else { Ok(()) }
-            });
-            if wrote.is_err() { task.fail(cx, 998) } else { Reply::Value(TRUE) }
-        }
-        Err(e) => task.fail(cx, e),
-    }
+    transfer(task, cx, a[0], a[1], a[2] as u32, a[3], a[4], false, Notify::Plain)
 }
 
 pub fn write_file(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(file) = task.file_handle(a[0]) else { return task.fail(cx, ERROR_INVALID_HANDLE) };
-    let Ok(data) = task.mem(cx, false, |t| user::read_vec(&t.space(), a[1], (a[2] as u32 as usize).min(1 << 24))) else { return task.fail(cx, 998) };
-    let written = match &file.node {
-        Node::Pipe(end) if file.write => match task.write_pipe(end, &data) {
-            Ok(n) => Ok(n),
-            Err(pipes::Failed::Error(e)) => Err(e),
-            Err(pipes::Failed::Ended(reply)) => return reply,
-        },
-        _ => {
-            let at = overlapped(task, cx, a[4]);
-            task.write_to_file(&file, &data, at)
-        }
-    };
-    match written {
-        Ok(n) => {
-            if a[3] != 0 && task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[3], n as u32)).is_err() {
-                return task.fail(cx, 998);
-            }
-            Reply::Value(TRUE)
-        }
-        Err(e) => task.fail(cx, e),
+    transfer(task, cx, a[0], a[1], a[2] as u32, a[3], a[4], true, Notify::Plain)
+}
+
+/// `ReadFileEx(file, buffer, size, overlapped, routine)`.
+pub fn read_file_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[3] == 0 {
+        return task.fail(cx, ERROR_INVALID_PARAMETER);
     }
+    transfer(task, cx, a[0], a[1], a[2] as u32, 0, a[3], false, Notify::Routine(a[4]))
+}
+
+/// `WriteFileEx(file, buffer, size, overlapped, routine)`.
+pub fn write_file_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[3] == 0 {
+        return task.fail(cx, ERROR_INVALID_PARAMETER);
+    }
+    transfer(task, cx, a[0], a[1], a[2] as u32, 0, a[3], true, Notify::Routine(a[4]))
 }
 
 pub fn close_handle(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
@@ -281,7 +435,7 @@ pub fn get_file_type(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     match handle {
         Some(Handle::File(file)) => Reply::Value(match file.node {
             Node::Null | Node::Console(_) | Node::Input => 2,
-            Node::Pipe(_) => 3,
+            Node::Pipe(_) | Node::NamedPipe(_) => 3,
             _ => 1,
         }),
         Some(Handle::Console(_) | Handle::Input) => Reply::Value(2),

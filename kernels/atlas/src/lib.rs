@@ -16,16 +16,19 @@ mod handles;
 mod images;
 pub mod imports;
 mod mapping;
+mod named_pipes;
 mod objects;
 mod os;
 mod pipes;
+mod ports;
 mod process;
 mod threads;
 mod registry;
+mod sections;
 mod upcall;
 mod win32k;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
@@ -121,6 +124,10 @@ pub fn boot(exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&str]
         futexes: kernels_core::wait::Futexes::default(),
         next_id: AtomicU64::new(4),
         processes: Mutex::new(BTreeMap::new()),
+        sections: Mutex::new(HashMap::new()),
+        timers: kernels_core::timers::Timers::default(),
+        deferred: Mutex::new(Vec::new()),
+        named_pipes: Mutex::new(HashMap::new()),
         live: (Mutex::new(0), Condvar::new()),
         options,
     });
@@ -147,6 +154,7 @@ pub fn boot(exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&str]
     }
     drop(count);
     let code = lock(&first.ended.0).unwrap_or(0);
+    kernel.timers.stop();
     kernel.save_registry();
     // Whatever the machine wrote is kept, if its disk has somewhere to keep it.
     if let Err(e) = lock(&kernel.disk).sync() {
@@ -175,6 +183,14 @@ pub(crate) struct Kernel {
     processes: Mutex<BTreeMap<u64, Weak<process::Process>>>,
     /// How many processes haven't ended: the machine stops at 0.
     live: (Mutex<usize>, Condvar),
+    /// Sections by name (`CreateFileMapping`'s, which `OpenFileMapping` finds).
+    sections: Mutex<HashMap<String, Weak<sections::Section>>>,
+    /// Waitable timers' expiries, on a host thread of their own.
+    timers: kernels_core::timers::Timers,
+    /// I/O finished with no CPU to write its OVERLAPPED with, for the next thread that calls in.
+    deferred: Mutex<Vec<ports::Completion>>,
+    /// Named pipes by name (lower case, without `\\.\pipe\`).
+    named_pipes: Mutex<HashMap<String, Weak<named_pipes::Server>>>,
     options: Options,
 }
 

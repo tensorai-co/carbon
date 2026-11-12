@@ -248,7 +248,6 @@ fn create_process(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Re
     if wrote.is_err() {
         return task.fail(cx, ERROR_INVALID_PARAMETER);
     }
-    task.set_last_error(cx, 0);
     Reply::Value(TRUE)
 }
 
@@ -323,9 +322,13 @@ pub fn peek_named_pipe(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
         Some(_) => return task.fail(cx, ERROR_INVALID_FUNCTION),
         None => return task.fail(cx, ERROR_INVALID_HANDLE),
     };
-    let Node::Pipe(end) = &file.node else { return task.fail(cx, ERROR_INVALID_FUNCTION) };
+    let pipe = match &file.node {
+        Node::Pipe(end) => Ok(end.pipe.clone()),
+        Node::NamedPipe(end) => end.incoming(),
+        _ => return task.fail(cx, ERROR_INVALID_FUNCTION),
+    };
     let size = if a[1] == 0 { 0 } else { a[2] as u32 as usize };
-    let (data, available) = match end.pipe.peek(size) {
+    let (data, available, left) = match pipe.and_then(|p| p.peek(size)) {
         Ok(peeked) => peeked,
         Err(e) => return task.fail(cx, e),
     };
@@ -334,7 +337,7 @@ pub fn peek_named_pipe(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
         if !data.is_empty() {
             user::write(&mut space, a[1], &data)?;
         }
-        for (at, value) in [(a[3], data.len()), (a[4], available), (a[5], 0)] {
+        for (at, value) in [(a[3], data.len()), (a[4], available), (a[5], left)] {
             if at != 0 {
                 user::write_u32(&mut space, at, value as u32)?;
             }

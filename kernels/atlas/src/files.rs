@@ -67,8 +67,10 @@ pub enum Node {
     /// `CONOUT$` and `CONIN$`.
     Console(host::Stream),
     Input,
-    /// One end of a pipe.
+    /// One end of an anonymous pipe.
     Pipe(crate::pipes::End),
+    /// One end of a named pipe: a server's instance, or a client's connection to one.
+    NamedPipe(crate::named_pipes::PipeEnd),
 }
 
 pub struct File {
@@ -82,12 +84,23 @@ pub struct File {
     pub path: String,
     pub disk: String,
     pub delete_on_close: bool,
+    /// Opened with `FILE_FLAG_OVERLAPPED`: its I/O says it's done through the OVERLAPPED, and its port.
+    pub overlapped: bool,
+    /// The completion port it's associated with, and its key there.
+    pub port: Mutex<Option<(Arc<crate::ports::Port>, u64)>>,
+    /// `SetFileCompletionNotificationModes`' flags.
+    pub modes: std::sync::atomic::AtomicU32,
 }
 
 impl File {
     /// An open file that isn't on the disk: a console stream, the console's input, or a pipe's end.
     pub fn device(node: Node, read: bool, write: bool) -> File {
-        File { node, read, write, append: false, position: Mutex::new(0), path: String::new(), disk: String::new(), delete_on_close: false }
+        File::new(node, read, write, false, String::new(), String::new(), false, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(node: Node, read: bool, write: bool, append: bool, path: String, disk: String, delete_on_close: bool, overlapped: bool) -> File {
+        File { node, read, write, append, position: Mutex::new(0), path, disk, delete_on_close, overlapped, port: Mutex::new(None), modes: Default::default() }
     }
 }
 
@@ -313,7 +326,8 @@ impl Task {
         let read = access & (GENERIC_READ | GENERIC_ALL | FILE_READ_DATA) != 0;
         let write = access & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA) != 0;
         let append = access & FILE_APPEND_DATA != 0 && access & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA) == 0;
-        let make = |node: Node, path: String, disk: String| Arc::new(File { node, read, write, append, position: Mutex::new(0), path, disk, delete_on_close: flags & DELETE_ON_CLOSE != 0 });
+        const OVERLAPPED: u32 = 0x4000_0000;
+        let make = |node: Node, path: String, disk: String| Arc::new(File::new(node, read, write, append, path, disk, flags & DELETE_ON_CLOSE != 0, flags & OVERLAPPED != 0));
         if let Some(node) = device(raw) {
             return Ok((make(node, raw.to_string(), String::new()), true));
         }
@@ -388,7 +402,7 @@ impl Task {
                 buffer.truncate(n);
                 return Ok(buffer);
             }
-            Node::Dir(_) | Node::Console(_) | Node::Pipe(_) => return Err(ERROR_ACCESS_DENIED),
+            Node::Dir(_) | Node::Console(_) | Node::Pipe(_) | Node::NamedPipe(_) => return Err(ERROR_ACCESS_DENIED),
         };
         *position = start + data.len() as u64;
         Ok(data)

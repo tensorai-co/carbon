@@ -36,6 +36,8 @@ const STACK_MAPPED: u64 = 64 << 10;
 pub(crate) struct Process {
     pub pid: u64,
     pub state: Mutex<ProcState>,
+    /// Set once its space is gone, under this lock, which other processes' threads hold while they write into it.
+    pub remote: Mutex<bool>,
     /// Signalled when its last thread ends.
     pub object: Arc<Object>,
     /// Its exit code, once its last thread has ended.
@@ -72,6 +74,16 @@ pub(crate) struct ProcState {
 pub(crate) struct Area {
     pub prot: Prot,
     pub kind: AreaKind,
+    /// Where the allocation it's part of starts (`VirtualQuery`'s `AllocationBase`), or 0 for the region's own start.
+    pub base: u64,
+    /// A view's section, and where in it this region starts.
+    pub view: Option<crate::sections::View>,
+}
+
+impl Area {
+    pub fn of(prot: Prot, kind: AreaKind) -> Area {
+        Area { prot, kind, base: 0, view: None }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,11 +96,17 @@ pub(crate) enum AreaKind {
     Image,
     /// What the backend keeps for itself.
     Kept,
+    /// A view of a section.
+    View,
 }
 
 impl Region for Area {
-    fn advanced(&self, _: u64) -> Area {
-        self.clone()
+    fn advanced(&self, by: u64) -> Area {
+        let mut area = self.clone();
+        if let Some(view) = &mut area.view {
+            view.offset += by;
+        }
+        area
     }
 }
 
@@ -261,6 +279,10 @@ impl Task {
                             };
                             self.k.host.write(host::Stream::Err, format!("[{}] {}!{}({a:x?}) = {shown}\n", self.tid, dll.name, export.name).as_bytes());
                         }
+                        if !lock(&self.k.deferred).is_empty() {
+                            let k = self.k.clone();
+                            k.drain(cx);
+                        }
                         self.reply(cx, reply)
                     }
                     Kind::Guest(target) => {
@@ -328,19 +350,7 @@ impl Task {
 
     /// The program touched a page exec hasn't mapped: zeros, if it's committed memory it may touch that way.
     fn fault(&mut self, cx: &mut Cx<'_>, addr: u64, access: Prot) -> bool {
-        let page = addr & !(PAGE - 1);
-        let state = lock(&self.process.state);
-        let Some((_, area)) = state.regions.find(addr) else { return false };
-        if area.kind != AreaKind::Committed || !area.prot.contains(access) {
-            return false;
-        }
-        let prot = area.prot;
-        cx.turn(|t| match t.space().page(page) {
-            Some(present) if access.write() && present.shared => t.space().make_writable(page, prot).is_ok(),
-            // Another thread touched it first, and it's there now: just run again.
-            Some(present) => present.prot.contains(access),
-            None => t.space().map(page..page + PAGE, prot).zeroed().is_ok(),
-        })
+        fault_in(&self.k, &self.process, cx, addr, access)
     }
 
     /// `VirtualAlloc`: reserves, commits, or both. Gives the base, or None.
@@ -353,7 +363,7 @@ impl Task {
         }
         let mut state = lock(&self.process.state);
         let commit = kind & MEM_COMMIT != 0;
-        let area = Area { prot, kind: if commit { AreaKind::Committed } else { AreaKind::Reserved } };
+        let area = Area::of(prot, if commit { AreaKind::Committed } else { AreaKind::Reserved });
         if addr == 0 || kind & MEM_RESERVE != 0 {
             let size = size.next_multiple_of(GRANULE);
             let base = if addr == 0 {
@@ -365,7 +375,7 @@ impl Task {
                 }
                 base
             };
-            state.regions.insert(base..base + size, area);
+            state.regions.insert(base..base + size, Area { base, ..area });
             return Some(base);
         }
         // Committing part of what's reserved.
@@ -373,12 +383,15 @@ impl Task {
         let mut at = range.start;
         while at < range.end {
             let (r, a) = state.regions.find(at)?;
-            if matches!(a.kind, AreaKind::Kept | AreaKind::Image) {
+            if matches!(a.kind, AreaKind::Kept | AreaKind::Image | AreaKind::View) {
                 return None;
             }
             at = r.end;
         }
-        state.regions.update(range.clone(), |a| *a = area.clone());
+        state.regions.update(range.clone(), |a| {
+            a.prot = area.prot;
+            a.kind = area.kind;
+        });
         cx.turn(|t| t.space().protect(range.clone(), prot));
         Some(range.start)
     }
@@ -389,7 +402,7 @@ impl Task {
         const MEM_RELEASE: u32 = 0x8000;
         let mut state = lock(&self.process.state);
         let Some((range, area)) = state.regions.find(addr).map(|(r, a)| (r, a.clone())) else { return false };
-        if matches!(area.kind, AreaKind::Kept | AreaKind::Image) {
+        if matches!(area.kind, AreaKind::Kept | AreaKind::Image | AreaKind::View) {
             return false;
         }
         let range = match kind {
@@ -407,6 +420,54 @@ impl Task {
         cx.turn(|t| t.space().unmap(range));
         true
     }
+}
+
+/// A page of `process` that isn't mapped, touched by `access`: brought in if the process may touch it so (committed
+/// memory as zeros, a view's page of its section), in whichever space the turns of `cx` are in, the process's own or
+/// (from another process's thread, completing its I/O) through `Cx::elsewhere`.
+pub(crate) fn fault_in(k: &Kernel, process: &Process, cx: &mut Cx<'_>, addr: u64, access: Prot) -> bool {
+    let page = addr & !(PAGE - 1);
+    let state = lock(&process.state);
+    let Some((range, area)) = state.regions.find(addr) else { return false };
+    if area.kind == AreaKind::View && area.prot.contains(access) {
+        let Some(mut view) = area.view.clone() else { return false };
+        view.offset += page - range.start;
+        let prot = area.prot;
+        drop(state);
+        // A copy-on-write page that's there already, written: this view's own copy now.
+        let there = cx.turn(|t| t.space().page(page));
+        if let Some(present) = there {
+            if access.write() && present.shared {
+                return cx.turn(|t| t.space().make_writable(page, prot).is_ok());
+            }
+            return present.prot.contains(access);
+        }
+        return crate::sections::fault_view(k, cx, &view, page, prot, access.write());
+    }
+    if area.kind != AreaKind::Committed || !area.prot.contains(access) {
+        return false;
+    }
+    let prot = area.prot;
+    cx.turn(|t| match t.space().page(page) {
+        Some(present) if access.write() && present.shared => t.space().make_writable(page, prot).is_ok(),
+        // Another thread touched it first, and it's there now: just run again.
+        Some(present) => present.prot.contains(access),
+        None => t.space().map(page..page + PAGE, prot).zeroed().is_ok(),
+    })
+}
+
+/// Writes into another process's memory (or this one's), bringing its pages in as its own touch would: how one thread
+/// completes I/O another process is waiting for. False if the process has ended or the memory isn't writable.
+pub(crate) fn write_remote(k: &Kernel, cx: &mut Cx<'_>, process: &Process, writes: &[(u64, &[u8])]) -> bool {
+    // Its space stays while this is held: it goes only once `gone` is set, under the same lock.
+    let gone = lock(&process.remote);
+    if *gone {
+        return false;
+    }
+    let space = lock(&process.state).space;
+    cx.elsewhere(space, |cx| {
+        writes.iter().all(|(at, data)| user::with_faults(cx, true, |cx, a, access| fault_in(k, process, cx, a, access), |t| user::write(&mut t.space(), *at, data)).is_ok())
+    })
 }
 
 /// A `PAGE_*` protection, or None for one atlas doesn't take.
@@ -498,7 +559,7 @@ pub(crate) fn launch(k: &Arc<Kernel>, cx: &mut Cx<'_>, launch: Launch) -> Result
             t.use_space(space);
             let layout = t.space().layout();
             for kept in &layout.kept {
-                regions.insert(kept.clone(), Area { prot: Prot::NONE, kind: AreaKind::Kept });
+                regions.insert(kept.clone(), Area::of(Prot::NONE, AreaKind::Kept));
             }
 
             // The program, and ntdll, whose loader does the rest.
@@ -517,17 +578,17 @@ pub(crate) fn launch(k: &Arc<Kernel>, cx: &mut Cx<'_>, launch: Launch) -> Result
             let gate = t.space().layout().gate;
             k.images.use_gate(gate.is_some());
             t.space().map(ATLAS_PAGE..ATLAS_PAGE + PAGE, Prot::RX).with(&images::atlas_page(isa, gate)).map_err(|_| "no memory")?;
-            regions.insert(ATLAS_PAGE..ATLAS_PAGE + PAGE, Area { prot: Prot::RX, kind: AreaKind::Image });
+            regions.insert(ATLAS_PAGE..ATLAS_PAGE + PAGE, Area::of(Prot::RX, AreaKind::Image));
 
             // The PEB, its process parameters and strings, and the TEB, in one committed block.
             let block = regions.free_above(ALLOC, GRANULE * 2, GRANULE).ok_or("no room")?;
-            regions.insert(block..block + GRANULE * 2, Area { prot: Prot::RW, kind: AreaKind::Committed });
+            regions.insert(block..block + GRANULE * 2, Area::of(Prot::RW, AreaKind::Committed));
             t.space().map(block..block + GRANULE * 2, Prot::RW).zeroed().map_err(|_| "no memory")?;
             let (peb_at, params_at, mut teb_at, strings_at) = (block, block + 0x1000, block + 0x2000, block + 0x4000);
             // Where the host decides the thread's block goes (Windows' sandbox: the stub thread's own TEB, since
             // Windows owns gs), the TEB goes there, and the host copies it in and out around each run.
             if let Some(at) = t.space().thread_block(0x2000) {
-                regions.insert(at..at + 0x2000, Area { prot: Prot::RW, kind: AreaKind::Committed });
+                regions.insert(at..at + 0x2000, Area::of(Prot::RW, AreaKind::Committed));
                 t.space().map(at..at + 0x2000, Prot::RW).zeroed().map_err(|_| "no memory for the thread block")?;
                 teb_at = at;
             }
@@ -567,7 +628,7 @@ pub(crate) fn launch(k: &Arc<Kernel>, cx: &mut Cx<'_>, launch: Launch) -> Result
             // The stack.
             let stack = regions.free_above(ALLOC, STACK, GRANULE).ok_or("no room for the stack")?;
             let stack_top = stack + STACK;
-            regions.insert(stack..stack_top, Area { prot: Prot::RW, kind: AreaKind::Committed });
+            regions.insert(stack..stack_top, Area::of(Prot::RW, AreaKind::Committed));
             t.space().map(stack_top - STACK_MAPPED..stack_top, Prot::RW).zeroed().map_err(|_| "no memory")?;
             let mut memory = t.space();
             let mut put = |at: u64, bytes: &[u8]| user::write(&mut memory, at, bytes).map_err(|_| "writing the TEB".to_string());
@@ -612,7 +673,7 @@ pub(crate) fn launch(k: &Arc<Kernel>, cx: &mut Cx<'_>, launch: Launch) -> Result
     let cwd = cwd.unwrap_or_else(|| format!("C:\\{}", exe_dir.trim_start_matches('/').replace('/', "\\")));
     let state = ProcState { space, dispatcher, thread_start, peb, threads, mapped, exe_dir, cwd, regions, handles, std_handles, command_line: command, exiting: None };
     let object = Object::new(objects_mod::Kind::Process(pid), State::default());
-    let process = Arc::new(Process { pid, state: Mutex::new(state), object, ended: (Mutex::new(None), Condvar::new()) });
+    let process = Arc::new(Process { pid, state: Mutex::new(state), remote: Mutex::new(false), object, ended: (Mutex::new(None), Condvar::new()) });
     k.started(&process);
     Ok(Task { k: k.clone(), process, tid, waiter, isa, depth: 0, nested: 0, control, ending: None })
 }
