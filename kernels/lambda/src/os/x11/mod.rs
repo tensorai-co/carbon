@@ -10,13 +10,16 @@
 //! the pointer and keyboard with grabs and focus, selections (bridged to the desktop's clipboard and primary
 //! selection as text), cursors (the cursor font as the desktop's named shapes, and pictures), pixmaps, GCs, images,
 //! fills, lines, arcs, polygons, and the core font: the display's own `fixed`), and the extensions BIG-REQUESTS,
-//! XC-MISC, SHAPE and MIT-SHM (SysV segments and memfds) in `ext`, RENDER in `render` and XKEYBOARD in `xkb`. Not
-//! yet: RANDR, XFIXES, XInput 2, Present, DRI3 and GLX; fonts from the image's own files; drag and drop (XDND).
+//! XC-MISC, SHAPE and MIT-SHM (SysV segments and memfds) in `ext`, RENDER in `render`, XKEYBOARD in `xkb`, RANDR in
+//! `randr` and XFIXES in `xfixes`. Not yet: XInput 2, DAMAGE, SYNC, Present, DRI3 and GLX; fonts from the image's own
+//! files; drag and drop (XDND).
 
 mod draw;
 mod ext;
+mod randr;
 mod render;
 mod wire;
+mod xfixes;
 mod xkb;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -228,6 +231,8 @@ enum Res {
     Picture(Box<render::Picture>),
     /// Shared by every ID that names it (ReferenceGlyphSet).
     GlyphSet(Arc<Mutex<render::GlyphSet>>),
+    /// XFIXES'.
+    Region(Region),
 }
 
 /// A pointer grab, the client's own (`GrabPointer`) or the one a press makes.
@@ -314,6 +319,15 @@ struct Server {
     exports: HashMap<u32, TransferId>,
     next_export: u32,
     pastes: Vec<Paste>,
+    /// RANDR: how many times the output's changed, when it last did, and who asked to hear of it (client, window,
+    /// mask).
+    output_generation: u32,
+    output_time: u32,
+    randr_selects: Vec<(u32, u32, u16)>,
+    /// XFIXES: who asked to hear of a selection's owner (client, window, selection, mask), and the cursor hidden by a
+    /// client over a window.
+    selection_selects: Vec<(u32, u32, u32, u32)>,
+    cursor_hidden: HashSet<(u32, u32)>,
 }
 
 impl Server {
@@ -376,6 +390,11 @@ impl Server {
             exports: HashMap::new(),
             next_export: 0,
             pastes: Vec::new(),
+            output_generation: 0,
+            output_time: 0,
+            randr_selects: Vec::new(),
+            selection_selects: Vec::new(),
+            cursor_hidden: HashSet::new(),
         };
         s.make_root();
         s
@@ -1488,7 +1507,14 @@ impl Server {
         if self.keyboard_grab.is_some_and(|(_, g)| g == w) {
             self.keyboard_grab = None;
         }
-        self.selections.retain(|_, o| o.0 != w);
+        let lost: Vec<(u32, u32)> = self.selections.iter().filter(|(_, o)| o.0 == w).map(|(&s, o)| (s, o.2)).collect();
+        for (s, time) in lost {
+            self.selections.remove(&s);
+            self.selection_event(s, 0, xfixes::OWNER_WINDOW_GONE, time);
+        }
+        self.randr_selects.retain(|&(_, win, _)| win != w);
+        self.selection_selects.retain(|&(_, win, _, _)| win != w);
+        self.cursor_hidden.retain(|&(_, win)| win != w);
         if let Some((top, r)) = exposed {
             self.expose_area(top, r);
         }
@@ -2015,6 +2041,7 @@ impl Server {
         }
         let time = if time == 0 { self.time() } else { time };
         let old = if owner == 0 { self.selections.remove(&selection) } else { self.selections.insert(selection, (owner, ci, time)) };
+        self.selection_event(selection, owner, xfixes::OWNER_SET, time);
         if let Some((ow, oc, _)) = old
             && (ow != owner || oc != ci)
         {
@@ -2415,7 +2442,7 @@ impl Server {
         let Some(top) = self.top_of(self.under) else { return };
         let Some(window) = self.windows.get(&top).and_then(|t| t.top.as_ref()).map(|t| t.window) else { return };
         let mut w = self.under;
-        let cursor = loop {
+        let cursor = if self.cursor_hidden_over(self.under) { Cursor::Hidden } else { loop {
             let Some(win) = self.windows.get(&w) else { break Cursor::default() };
             if win.cursor != 0 {
                 break match self.res.get(&win.cursor) {
@@ -2427,7 +2454,7 @@ impl Server {
                 break Cursor::default();
             }
             w = win.parent;
-        };
+        } };
         desktop::lock(&self.desktop).set_cursor(window, cursor);
     }
 
@@ -2772,6 +2799,7 @@ impl Server {
             }
             self.root_size_props();
             self.configure_notify(ROOT, false);
+            self.randr_output_changed();
         }
         for event in events {
             match event {
@@ -3029,8 +3057,13 @@ impl Server {
             win.masks.retain(|(c, _)| *c != ci);
         }
         let gone: Vec<u32> = self.selections.iter().filter(|(_, o)| o.1 == ci).map(|(&s, _)| s).collect();
+        self.randr_selects.retain(|&(c, _, _)| c != ci);
+        self.selection_selects.retain(|&(c, _, _, _)| c != ci);
+        self.cursor_hidden.retain(|&(c, _)| c != ci);
         for s in gone {
-            self.selections.remove(&s);
+            if let Some((_, _, time)) = self.selections.remove(&s) {
+                self.selection_event(s, 0, xfixes::OWNER_CLIENT_GONE, time);
+            }
             if let Some(which) = self.desktop_selection(s)
                 && let Some(source) = self.offers.remove(&s)
             {

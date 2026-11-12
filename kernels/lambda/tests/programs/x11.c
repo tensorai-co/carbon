@@ -79,6 +79,9 @@ static u32 r32(const u8 *p) { return p[0] | p[1] << 8 | p[2] << 16 | (u32)p[3] <
 
 // What came besides replies.
 static int mapped, exposed, configured;
+// An extension's event to watch for, and whether it came.
+static u32 watch_code;
+static int watched;
 static u32 error_code, error_seq;
 // The next message: an error, a reply (into `msg`, whole), or an event (noted, and skipped).
 static u8 msg[1 << 17];
@@ -101,6 +104,7 @@ static int next(void) {
         if (code == 19) mapped = 1;
         if (code == 12) exposed = 1;
         if (code == 22) configured = 1;
+        if (watch_code && code == watch_code) watched = 1;
         if (code == 0) { error_code = msg[1]; error_seq = r16(msg + 2); }
         if (code <= 1) return code;
     }
@@ -202,20 +206,22 @@ void cmain(i64 *sp) {
     check(round && copied == 0xaabbcc, "PutImage, GetImage and CopyArea: a pixmap's pixels as put, and copied onto the window");
 
     // The extensions toolkits look for.
-    static const char *exts[] = {"BIG-REQUESTS", "MIT-SHM", "SHAPE", "XC-MISC", "RENDER", "XKEYBOARD"};
+    static const char *exts[] = {"BIG-REQUESTS", "MIT-SHM", "SHAPE", "XC-MISC", "RENDER", "XKEYBOARD", "RANDR", "XFIXES"};
     int found = 1;
-    u32 big = 0, render = 0, xkb = 0;
-    for (int i = 0; i < 6; i++) {
+    u32 big = 0, render = 0, xkb = 0, randr = 0, xfixes = 0, xfixes_event = 0;
+    for (int i = 0; i < 8; i++) {
         req(98, 0); b16(len(exts[i])); b16(0); bytes(exts[i], len(exts[i]));
         s = send();
         found = found && answer(s) == 1 && msg[8] == 1;
         if (i == 0) big = msg[9];
         if (i == 4) render = msg[9];
         if (i == 5) xkb = msg[9];
+        if (i == 6) randr = msg[9];
+        if (i == 7) { xfixes = msg[9]; xfixes_event = msg[10]; }
     }
     req(98, 0); b16(7); b16(0); bytes("NOTHERE", 7);
     s = send();
-    check(found && answer(s) == 1 && msg[8] == 0, "QueryExtension: BIG-REQUESTS, MIT-SHM, SHAPE, XC-MISC, RENDER and XKEYBOARD, and not one that isn't there");
+    check(found && answer(s) == 1 && msg[8] == 0, "QueryExtension: the eight extensions, and not one that isn't there");
 
     // BIG-REQUESTS: enabled, then a request with a length of 0 and the real one after (in words, itself included).
     req(big, 0);
@@ -307,6 +313,66 @@ void cmain(i64 *sp) {
     s = send();
     check(using && mapped_keys && key_named && answer(s) == 1 && msg[1] == 3 && msg[8] == 0,
           "XKEYBOARD: 1.0, four key types, keycode 38 alphabetic with a and A, named AC01, nothing held");
+
+    // RANDR: 1.5; one CRTC, one connected output and one mode, the screen's size; one primary monitor.
+    req(randr, 0); b32(1); b32(5);
+    s = send();
+    int randr_version = answer(s) == 1 && r32(msg + 8) == 1 && r32(msg + 12) == 5;
+    req(randr, 25); b32(root);
+    s = send();
+    u32 crtc = 0, output = 0;
+    int resources = answer(s) == 1 && r16(msg + 16) == 1 && r16(msg + 18) == 1 && r16(msg + 20) == 1;
+    if (resources) {
+        crtc = r32(msg + 32);
+        output = r32(msg + 36);
+        resources = r16(msg + 40 + 4) == width && r16(msg + 40 + 6) == height;
+    }
+    req(randr, 9); b32(output); b32(0);
+    s = send();
+    int connected = answer(s) == 1 && msg[24] == 0 && r32(msg + 12) == crtc;
+    req(randr, 20); b32(crtc); b32(0);
+    s = send();
+    int crtc_ok = answer(s) == 1 && r16(msg + 16) == width && r16(msg + 18) == height;
+    req(randr, 42); b32(root); b8(1); b8(0); b16(0);
+    s = send();
+    int monitors = answer(s) == 1 && r32(msg + 12) == 1 && msg[36] == 1 && r16(msg + 44) == width;
+    check(randr_version && resources && connected && crtc_ok && monitors,
+          "RANDR: 1.5, one CRTC driving one connected output in one mode the screen's size, one primary monitor");
+
+    // XFIXES: 5.0; regions combined and read back; a selection's new owner told to who asked.
+    req(xfixes, 0); b32(5); b32(0);
+    s = send();
+    int xfixes_version = answer(s) == 1 && r32(msg + 8) == 5;
+    u32 ra = base | 20, rb = base | 21, rc = base | 22;
+    req(xfixes, 5); b32(ra); b16(0); b16(0); b16(10); b16(10); b16(5); b16(5); b16(10); b16(10);
+    send();
+    req(xfixes, 5); b32(rb); b16(0); b16(0); b16(5); b16(5);
+    send();
+    req(xfixes, 5); b32(rc);
+    send();
+    req(xfixes, 15); b32(ra); b32(rb); b32(rc);
+    send();
+    req(xfixes, 19); b32(rc);
+    s = send();
+    int fetched = 0;
+    if (answer(s) == 1) {
+        u32 area = 0;
+        for (u32 i = 0; i < r32(msg + 4) / 2; i++) area += r16(msg + 32 + 8 * i + 4) * r16(msg + 32 + 8 * i + 6);
+        fetched = r16(msg + 8) == 0 && r16(msg + 12) == 15 && r16(msg + 14) == 15 && area == 175 - 25;
+    }
+    static const char sel_name[] = "CARBON_WATCHED";
+    req(16, 0); b16(len(sel_name)); b16(0); bytes(sel_name, len(sel_name));
+    s = send();
+    u32 watched_sel = answer(s) == 1 ? r32(msg + 8) : 0;
+    req(xfixes, 2); b32(win); b32(watched_sel); b32(1);
+    send();
+    watch_code = xfixes_event;
+    req(22, 0); b32(win); b32(watched_sel); b32(0);
+    send();
+    req(43, 0);
+    s = send();
+    answer(s);
+    check(xfixes_version && fetched && watched, "XFIXES: 5.0, two regions' union less a third read back, a selection's new owner notified");
 
     // A selection owned.
     req(16, 0); b16(9); b16(0); bytes("CLIPBOARD", 9);

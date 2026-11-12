@@ -1,4 +1,5 @@
-//! The extensions' table (RENDER's and XKEYBOARD's requests are in their own modules), and the small ones:
+//! The extensions' table (RENDER's, XKEYBOARD's, RANDR's and XFIXES' requests are in their own modules), and the
+//! small ones:
 //! BIG-REQUESTS (requests past 256 KiB), XC-MISC (resource IDs), SHAPE (shaped and input-shaped
 //! windows: a top-level's bounding shape is its backing's transparency, its input shape the desktop's input region),
 //! and MIT-SHM (images through shared memory, a SysV segment or a memfd, read and written in place).
@@ -10,6 +11,8 @@ use kernels_core::lock;
 
 use super::draw::{self, Region};
 use super::render::{RENDER, RENDER_ERROR};
+use super::randr::{RANDR, RANDR_ERROR, RANDR_EVENT};
+use super::xfixes::{XFIXES, XFIXES_ERROR, XFIXES_EVENT};
 use super::xkb::{XKB_ERROR, XKB_EVENT, XKEYBOARD};
 use super::wire::{Ev, Reply, Req, err};
 use super::{ID_MASK, MAX_REQUEST, Res, SHIFT, Server, top_input};
@@ -32,6 +35,8 @@ pub const EXTENSIONS: &[(&str, u8, u8, u8)] = &[
     ("MIT-SHM", MIT_SHM, SHM_EVENT, SHM_ERROR),
     ("RENDER", RENDER, 0, RENDER_ERROR),
     ("XKEYBOARD", XKEYBOARD, XKB_EVENT, XKB_ERROR),
+    ("RANDR", RANDR, RANDR_EVENT, RANDR_ERROR),
+    ("XFIXES", XFIXES, XFIXES_EVENT, XFIXES_ERROR),
 ];
 
 impl Server {
@@ -50,6 +55,8 @@ impl Server {
             MIT_SHM => self.shm(ci, r),
             RENDER => self.render(ci, r),
             XKEYBOARD => self.xkb(ci, r),
+            RANDR => self.randr(ci, r),
+            XFIXES => self.xfixes(ci, r),
             _ => self.error(ci, err::REQUEST, 0),
         }
     }
@@ -88,7 +95,7 @@ impl Server {
         shape.clone().unwrap_or_else(|| vec![Rect::new(0, 0, win.w, win.h)])
     }
 
-    fn set_region(&mut self, w: u32, kind: u8, region: Option<Region>) {
+    pub(super) fn set_region(&mut self, w: u32, kind: u8, region: Option<Region>) {
         let Some(win) = self.windows.get_mut(&w) else { return };
         match kind {
             0 => win.bounding = region,
