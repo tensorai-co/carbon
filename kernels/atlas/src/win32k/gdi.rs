@@ -156,9 +156,12 @@ impl Win32k {
         let Some(client) = self.windows.get(&dc.hwnd).map(|w| w.client()) else { return false };
         let clip = dc.clip.intersect(&client).offset(dx, dy);
         let Some(shown) = self.windows.get(&top).map(|w| w.shown).filter(|&s| s != 0) else { return false };
+        let Some(canvas) = self.canvases.get(&shown) else { return false };
+        // Drawn with only the canvas's lock, then committed with what changed: the desktop's lock comes after.
+        canvas.draw(|surface| f(surface, (dx, dy), &clip, &dc));
         let mut d = display::desktop::lock(&self.display);
-        let Some(surface) = d.content_mut(shown) else { return false };
-        f(surface, (dx, dy), &clip, &dc);
+        d.damage(shown, clip);
+        d.commit(shown);
         true
     }
 

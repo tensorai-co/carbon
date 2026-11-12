@@ -7,7 +7,7 @@ out="${1:-.}"
 llvm="${LLVM:-/opt/homebrew/opt/llvm/bin}"
 for arch in aarch64 x86_64; do
     machine=$([ $arch = aarch64 ] && echo arm64 || echo i386:x86-64)
-    for dll in kernel32 user32 ntdll advapi32 gdi32; do
+    for dll in kernel32 user32 ntdll advapi32 gdi32 shell32; do
         "$llvm/llvm-dlltool" -m "$machine" -d $dll.def -l "$out/$dll-$arch.lib"
     done
     # Unwind tables for every function, as MSVC makes them: SEH walks the stack by them.
@@ -25,7 +25,7 @@ for arch in aarch64 x86_64; do
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console registry.c "$out/kernel32-$arch.lib" "$out/advapi32-$arch.lib" \
         -o "$out/loader-$arch/registry.exe"
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console environment.c "$out/kernel32-$arch.lib" -o "$out/loader-$arch/environment.exe"
-    $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:windows desktop.c "$out/kernel32-$arch.lib" "$out/user32-$arch.lib" -o "$out/loader-$arch/desktop.exe"
+    $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:windows desktop.c "$out/kernel32-$arch.lib" "$out/user32-$arch.lib" "$out/shell32-$arch.lib" -o "$out/loader-$arch/desktop.exe"
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:windows windows.c "$out/kernel32-$arch.lib" "$out/user32-$arch.lib" "$out/gdi32-$arch.lib" \
         -o "$out/loader-$arch/windows.exe"
 done

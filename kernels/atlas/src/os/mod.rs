@@ -5,6 +5,7 @@ pub mod advapi32;
 pub mod fileapi;
 pub mod gdi32;
 pub mod kernel32;
+pub mod shell32;
 pub mod synch;
 pub mod user32;
 
@@ -71,7 +72,7 @@ macro_rules! dll {
 pub(crate) use dll;
 
 /// Every system DLL atlas has.
-pub static DLLS: &[&Dll] = &[&kernel32::DLL, &user32::DLL, &advapi32::DLL, &gdi32::DLL];
+pub static DLLS: &[&Dll] = &[&kernel32::DLL, &user32::DLL, &advapi32::DLL, &gdi32::DLL, &shell32::DLL];
 
 /// The DLL called `name` (`kernel32`, `KERNEL32.DLL`, …), by its index in [`DLLS`].
 pub fn find(name: &str) -> Option<usize> {

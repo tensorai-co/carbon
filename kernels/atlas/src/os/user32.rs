@@ -2,6 +2,7 @@
 
 use display::Rect;
 use display::desktop::{self as dt, Button, Input, Insets};
+use display::selection::{Selection, TEXT};
 use kernels_core::thread::Cx;
 use kernels_core::user;
 
@@ -46,10 +47,14 @@ dll! {
     host AdjustWindowRectEx(4) => adjust_window_rect;
     host IsWindow(1) => is_window;
     host IsWindowVisible(1) => is_window_visible;
+    host IsZoomed(1) => is_zoomed;
+    host IsIconic(1) => is_iconic;
     host GetParent(1) => get_parent;
     host GetDesktopWindow(0) => get_desktop_window;
     host FindWindowW(2) => find_window_w;
     host EnumWindows(2) => enum_windows;
+    host GetWindow(2) => get_window;
+    host GetTopWindow(1) => get_top_window;
     host EnumChildWindows(3) => enum_child_windows;
     host GetWindowThreadProcessId(2) => get_window_thread_process_id;
     host SetTimer(4) => set_timer;
@@ -68,13 +73,33 @@ dll! {
     host GetSystemMetrics(1) => get_system_metrics;
     host LoadCursorW(2) => load_resource;
     host LoadIconW(2) => load_resource;
-    host SetCursor(1) => zero;
+    host SetCursor(1) => set_cursor;
+    host GetCursor(0) => get_cursor;
     host GetFocus(0) => get_focus;
+    host OpenClipboard(1) => open_clipboard;
+    host CloseClipboard(0) => close_clipboard;
+    host EmptyClipboard(0) => empty_clipboard;
+    host SetClipboardData(2) => set_clipboard_data;
+    host GetClipboardData(1) => get_clipboard_data;
+    host IsClipboardFormatAvailable(1) => is_clipboard_format_available;
+    host CountClipboardFormats(0) => count_clipboard_formats;
+    host EnumClipboardFormats(1) => enum_clipboard_formats;
+    host GetClipboardOwner(0) => get_clipboard_owner;
+    host RegisterClipboardFormatW(1) => register_clipboard_format_w;
+    host GetDpiForWindow(1) => get_dpi;
+    host GetDpiForSystem(0) => get_dpi;
+    host SetCapture(1) => set_capture;
+    host GetCapture(0) => get_capture;
+    host ReleaseCapture(0) => release_capture;
     host SetFocus(1) => set_focus;
     host GetActiveWindow(0) => get_active_window;
     host GetForegroundWindow(0) => get_active_window;
     host SetActiveWindow(1) => set_active_window;
     host SetForegroundWindow(1) => activate_window;
+    host FlashWindow(2) => flash_window;
+    host FlashWindowEx(1) => flash_window_ex;
+    host ClipCursor(1) => clip_cursor;
+    host GetClipCursor(1) => get_clip_cursor;
     host BringWindowToTop(1) => activate_window;
     host GetKeyState(1) => get_key_state;
     host GetAsyncKeyState(1) => get_async_key_state;
@@ -101,9 +126,6 @@ fn value(result: Result<u64, Reply>) -> Reply {
     }
 }
 
-fn zero(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
-    Reply::Value(0)
-}
 
 
 /// `LoadCursorW` and `LoadIconW`: something that isn't null, until there are resources.
@@ -139,8 +161,9 @@ fn register(task: &mut Task, cx: &mut Cx<'_>, at: u64, ex: bool) -> Reply {
     } else {
         (get32(0), get(8), get32(20), get(24), get(48), get(64))
     };
+    let cursor = get(40);
     let name = if name_at < 0x1_0000 { format!("#{name_at}") } else { task.wstr(cx, name_at) };
-    match task.register_class(Class { name, atom: 0, wndproc, style, extra: extra as usize, background, instance }) {
+    match task.register_class(Class { name, atom: 0, wndproc, style, extra: extra as usize, background, instance, cursor }) {
         Ok(atom) => Reply::Value(u64::from(atom)),
         Err(e) => {
             task.set_last_error(cx, e);
@@ -425,6 +448,8 @@ fn set_window_pos(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     }
     let (shown, visible) = task.win32k().windows.get(&hwnd).map_or((0, false), |w| (w.shown, w.visible));
     if shown != 0 && flags & NOZORDER == 0 {
+        // Another window to go behind: its top-level window's place on the desktop.
+        let behind = if after > 1 { shown_of(task, after as u64) } else { None };
         task.desktop(|d| match after {
             -1 => {
                 d.set_layer(shown, dt::Layer::Top);
@@ -432,7 +457,16 @@ fn set_window_pos(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
             }
             -2 => d.set_layer(shown, dt::Layer::Normal),
             0 => d.raise(shown),
-            _ => {}
+            // HWND_BOTTOM: below the rest, no longer topmost.
+            1 => {
+                d.set_layer(shown, dt::Layer::Normal);
+                d.stack(shown, dt::Stack::Bottom);
+            }
+            _ => {
+                if let Some(b) = behind {
+                    d.stack(shown, dt::Stack::Below(b));
+                }
+            }
         });
     }
     if shown != 0
@@ -454,6 +488,21 @@ fn adjust_window_rect(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 
 fn is_window(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
     Reply::Value(u64::from(task.window_exists(a[0])))
+}
+
+/// Whether a top-level window is in a state on the desktop: maximized, or minimized.
+fn top_level_state(task: &mut Task, hwnd: u64, state: u32) -> Reply {
+    let shown = task.win32k().windows.get(&hwnd).map_or(0, |w| w.shown);
+    let on = shown != 0 && task.desktop(|d| d.states(shown) & state != 0);
+    Reply::Value(u64::from(on))
+}
+
+fn is_zoomed(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    top_level_state(task, a[0], display::desktop::state::MAXIMIZED)
+}
+
+fn is_iconic(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    top_level_state(task, a[0], display::desktop::state::MINIMIZED)
 }
 
 fn is_window_visible(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
@@ -501,8 +550,44 @@ fn enumerate(task: &mut Task, cx: &mut Cx<'_>, windows: Vec<u64>, callback: u64,
 }
 
 fn enum_windows(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let top: Vec<u64> = task.win32k().windows.iter().filter(|(_, w)| w.parent == DESKTOP).map(|(&h, _)| h).collect();
+    // Top first, as Windows enumerates them.
+    let top = task.win32k().z_order(DESKTOP);
     enumerate(task, cx, top, a[0], a[1])
+}
+
+/// `GetWindow`: GW_HWNDFIRST, GW_HWNDLAST, GW_HWNDNEXT (the one below) and GW_HWNDPREV (above) among its siblings
+/// in z-order, GW_OWNER, GW_CHILD (its top child); 0 for none.
+fn get_window(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let w = task.win32k();
+    let Some(win) = w.windows.get(&a[0]) else {
+        drop(w);
+        task.set_last_error(cx, win32k::ERROR_INVALID_WINDOW_HANDLE);
+        return Reply::Value(0);
+    };
+    let (parent, owner) = (win.parent, win.owner);
+    let siblings = || w.z_order(parent);
+    let at = |z: &[u64]| z.iter().position(|&h| h == a[0]);
+    Reply::Value(match a[1] {
+        0 => siblings().first().copied().unwrap_or(0),
+        1 => siblings().last().copied().unwrap_or(0),
+        2 => {
+            let z = siblings();
+            at(&z).and_then(|i| z.get(i + 1)).copied().unwrap_or(0)
+        }
+        3 => {
+            let z = siblings();
+            at(&z).and_then(|i| i.checked_sub(1)).map_or(0, |i| z[i])
+        }
+        4 => owner,
+        5 => w.z_order(a[0]).first().copied().unwrap_or(0),
+        _ => 0,
+    })
+}
+
+/// `GetTopWindow`: a window's top child, or with NULL, the top top-level window.
+fn get_top_window(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let parent = if a[0] == 0 { DESKTOP } else { a[0] };
+    Reply::Value(task.win32k().z_order(parent).first().copied().unwrap_or(0))
 }
 
 fn enum_child_windows(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
@@ -610,6 +695,12 @@ fn get_sys_color_brush(_: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
     Reply::Value(gdi::Gdi::sys_brush(a[0] & 0xff))
 }
 
+/// `GetDpiForWindow` and `GetDpiForSystem`: 96, as a program that isn't DPI aware is told (`win32k::PROGRAM_DPI`);
+/// its windows are magnified to the output's scale.
+fn get_dpi(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(u64::from(win32k::PROGRAM_DPI))
+}
+
 fn get_system_metrics(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
     Reply::Value(match a[0] as u32 {
         0 | 16 | 78 => task.desktop(|d| d.size().0) as u64,
@@ -621,6 +712,50 @@ fn get_system_metrics(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
         // No scroll bars or menus of atlas's own yet.
         _ => 0,
     })
+}
+
+/// `SetCapture`: every mouse message to this window, wherever the pointer is, until `ReleaseCapture`. The window that
+/// had it.
+fn set_capture(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (old, shown) = {
+        let mut w = task.win32k();
+        if !w.windows.contains_key(&a[0]) {
+            return Reply::Value(0);
+        }
+        let shown = w.top_level_of(a[0]).and_then(|t| w.windows.get(&t)).map_or(0, |t| t.shown);
+        (std::mem::replace(&mut w.capture, a[0]), shown)
+    };
+    if shown != 0 {
+        task.desktop(|d| d.set_capture(Some(shown)));
+    }
+    Reply::Value(old)
+}
+
+/// `SetCursor`: what the pointer looks like now, over the window it's in (if it's this machine's), else the active
+/// one's. The cursor before.
+fn set_cursor(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let old = std::mem::replace(&mut task.win32k().cursor, a[0]);
+    task.desktop(|d| {
+        if let Some(id) = d.hovered().or(d.capture()).or(d.active()) {
+            d.set_cursor(id, crate::win32k::cursor_of(a[0]));
+        }
+    });
+    Reply::Value(old)
+}
+
+fn get_cursor(task: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(task.win32k().cursor)
+}
+
+fn get_capture(task: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(task.win32k().capture)
+}
+
+fn release_capture(task: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    task.win32k().capture = 0;
+    task.desktop(|d| d.set_capture(None));
+    task.pump();
+    Reply::Value(TRUE)
 }
 
 fn get_focus(task: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
@@ -644,14 +779,78 @@ fn set_active_window(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 }
 
 /// `SetForegroundWindow` and `BringWindowToTop`: raised and active.
+/// `SetForegroundWindow`: TRUE if it's the foreground window now, FALSE if the foreground rules refused it (and it
+/// flashes instead).
 fn activate_window(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     if !task.window_exists(a[0]) {
         return Reply::Value(FALSE);
     }
-    match task.activate(cx, a[0]) {
-        Ok(_) => Reply::Value(TRUE),
-        Err(reply) => reply,
+    if let Err(reply) = task.activate(cx, a[0]) {
+        return reply;
     }
+    let w = task.win32k();
+    Reply::Value(u64::from(w.top_level_of(a[0]).is_some_and(|t| t == w.active)))
+}
+
+/// A top-level window's place on the desktop, and whether it's the active window.
+fn shown_and_active(task: &mut Task, hwnd: u64) -> Option<(u64, bool)> {
+    let shown = shown_of(task, hwnd)?;
+    let w = task.win32k();
+    Some((shown, w.top_level_of(hwnd).is_some_and(|t| t == w.active)))
+}
+
+/// `FlashWindow`: with `bInvert`, the window asks for the user's attention (until it's active). Whether it was active.
+fn flash_window(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some((shown, active)) = shown_and_active(task, a[0]) else { return Reply::Value(FALSE) };
+    task.desktop(|d| d.set_attention(shown, a[1] != 0));
+    Reply::Value(u64::from(active))
+}
+
+/// `FlashWindowEx`: a FLASHWINFO (cbSize, hwnd, dwFlags, uCount, dwTimeout); FLASHW_STOP (no flags) stops it.
+fn flash_window_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Ok(b) = task.mem(cx, false, |t| user::read_vec(&t.space(), a[0], 24)) else { return Reply::Value(FALSE) };
+    let hwnd = u64::from_le_bytes(b[8..16].try_into().unwrap_or_default());
+    let flags = u32::from_le_bytes(b[16..20].try_into().unwrap_or_default());
+    let Some((shown, active)) = shown_and_active(task, hwnd) else { return Reply::Value(FALSE) };
+    task.desktop(|d| d.set_attention(shown, flags != 0));
+    Reply::Value(u64::from(active))
+}
+
+/// `ClipCursor`: keeps the pointer within a rectangle on the screen, or with NULL, lets it go anywhere. The desktop
+/// keeps it for the active window, while that's active.
+fn clip_cursor(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let old = task.win32k().clip.take();
+    if let Some((shown, _)) = old {
+        task.desktop(|d| d.set_pointer_constraint(shown, None));
+    }
+    if a[0] != 0 {
+        let Ok(b) = task.mem(cx, false, |t| user::read_vec(&t.space(), a[0], 16)) else { return Reply::Value(FALSE) };
+        let at = |i: usize| i32::from_le_bytes(b[i..i + 4].try_into().unwrap_or_default());
+        let (left, top) = (at(0), at(4));
+        let r = Rect::new(left, top, at(8).max(left + 1), at(12).max(top + 1));
+        let shown = task.desktop(|d| {
+            let shown = d.active()?;
+            let c = d.content_rect(shown)?;
+            d.set_pointer_constraint(shown, Some(dt::Constraint::Confine(r.offset(-c.left, -c.top))));
+            Some(shown)
+        });
+        if let Some(shown) = shown {
+            task.win32k().clip = Some((shown, r));
+        }
+    }
+    task.pump();
+    Reply::Value(TRUE)
+}
+
+/// `GetClipCursor`: the rectangle `ClipCursor` set, or the whole screen.
+fn get_clip_cursor(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let clip = task.win32k().clip.map(|(_, r)| r);
+    let r = clip.unwrap_or_else(|| {
+        let (w, h) = task.desktop(|d| d.size());
+        Rect::new(0, 0, w, h)
+    });
+    let b: Vec<u8> = [r.left, r.top, r.right, r.bottom].iter().flat_map(|v| v.to_le_bytes()).collect();
+    Reply::Value(u64::from(task.mem(cx, true, |t| user::write(&mut t.space(), a[0], &b)).is_ok()))
 }
 
 /// A key state as `GetKeyState` gives it: a SHORT, negative while down, its low bit toggled by each press.
@@ -707,8 +906,12 @@ fn send_input(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
                         inputs.push(Input::Button(button, down));
                     }
                 }
+                // MOUSEEVENTF_WHEEL and MOUSEEVENTF_HWHEEL, in WHEEL_DELTA's 120ths of a notch, as they come.
                 if flags & 0x800 != 0 {
-                    inputs.push(Input::Wheel(data / 120));
+                    inputs.push(Input::Scroll { x: 0, y: data });
+                }
+                if flags & 0x1000 != 0 {
+                    inputs.push(Input::Scroll { x: data, y: 0 });
                 }
             }
             1 => {
@@ -716,7 +919,8 @@ fn send_input(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
                 let up = flags & 2 != 0;
                 if flags & 4 != 0 {
                     // KEYEVENTF_UNICODE: the key that types it, on the desktop's US layout, with shift if it needs it.
-                    if let Some((code, shift)) = char::from_u32(u32::from(scan)).and_then(display::keys::for_char).filter(|_| !up) {
+                    let c = char::from_u32(u32::from(scan)).filter(|_| !up);
+                    if let Some((code, shift)) = c.and_then(display::keys::for_char) {
                         if shift {
                             inputs.push(Input::Key(display::keys::LEFT_SHIFT, true));
                         }
@@ -724,6 +928,9 @@ fn send_input(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
                         if shift {
                             inputs.push(Input::Key(display::keys::LEFT_SHIFT, false));
                         }
+                    } else if let Some(c) = c {
+                        // No key types it: text, as Windows sends a VK_PACKET's WM_CHAR.
+                        inputs.push(Input::Text(c.to_string()));
                     }
                 } else {
                     // KEYEVENTF_SCANCODE, with KEYEVENTF_EXTENDEDKEY; else the virtual key.
@@ -784,4 +991,203 @@ fn window_from_point(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
         return Reply::Value(top);
     }
     Reply::Value(w.child_at(top, x - ox, y - oy).0)
+}
+
+// ---- The clipboard ----
+//
+// Windows' clipboard over the desktop's: every machine window's, every kernel's, and the host's. Text is one type,
+// UTF-8, whichever of CF_UNICODETEXT, CF_TEXT and CF_OEMTEXT it was copied as, and each of those is made from it as
+// it's pasted. A format of another number goes as its own bytes; a registered one by its name.
+
+
+const CF_TEXT: u32 = 1;
+const CF_OEMTEXT: u32 = 7;
+const CF_UNICODETEXT: u32 = 13;
+
+/// The type a format's data goes as.
+fn mime_of(task: &mut Task, format: u32) -> String {
+    match format {
+        CF_TEXT | CF_OEMTEXT | CF_UNICODETEXT => TEXT.to_string(),
+        f if f >= 0xc000 => match task.win32k().clipboard.formats.iter().find(|(_, n)| **n == f) {
+            Some((name, _)) => format!("application/x-windows-format;name={name}"),
+            None => format!("application/x-windows-format-{f}"),
+        },
+        f => format!("application/x-windows-format-{f}"),
+    }
+}
+
+/// The formats a type can be pasted as.
+fn formats_of(task: &mut Task, mime: &str) -> Vec<u32> {
+    if mime == TEXT {
+        return vec![CF_UNICODETEXT, CF_TEXT, CF_OEMTEXT];
+    }
+    if let Some(name) = mime.strip_prefix("application/x-windows-format;name=") {
+        return vec![register_format(task, name)];
+    }
+    mime.strip_prefix("application/x-windows-format-").and_then(|n| n.parse().ok()).into_iter().collect()
+}
+
+fn register_format(task: &mut Task, name: &str) -> u32 {
+    let mut w = task.win32k();
+    let next = 0xc000 + w.clipboard.formats.len() as u32;
+    *w.clipboard.formats.entry(name.to_lowercase()).or_insert(next)
+}
+
+/// The window the desktop knows a window by: its top-level window's.
+fn shown_of(task: &mut Task, hwnd: u64) -> Option<u64> {
+    let w = task.win32k();
+    w.top_level_of(hwnd).and_then(|t| w.windows.get(&t)).map(|t| t.shown).filter(|&s| s != 0)
+}
+
+/// Text from a format's bytes: UTF-16 for CF_UNICODETEXT, one byte to a character (Latin-1) for the others, to the
+/// first NUL.
+fn text_from(format: u32, bytes: &[u8]) -> Vec<u8> {
+    let text: String = if format == CF_UNICODETEXT {
+        let units: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|u| u16::from_le_bytes(*u)).take_while(|&u| u != 0).collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        bytes.iter().take_while(|&&b| b != 0).map(|&b| b as char).collect()
+    };
+    text.into_bytes()
+}
+
+/// A format's bytes from text, with its NUL: a character Latin-1 hasn't is `?` in CF_TEXT and CF_OEMTEXT.
+fn text_as(format: u32, utf8: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(utf8);
+    if format == CF_UNICODETEXT {
+        text.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect()
+    } else {
+        text.chars().map(|c| if (c as u32) < 256 { c as u8 } else { b'?' }).chain([0]).collect()
+    }
+}
+
+fn open_clipboard(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let opener = if a[0] == 0 { win32k::OPENED_BY_NONE } else { a[0] };
+    let mut w = task.win32k();
+    match w.clipboard.open {
+        Some(by) if by != opener => Reply::Value(FALSE),
+        _ => {
+            w.clipboard.open = Some(opener);
+            Reply::Value(TRUE)
+        }
+    }
+}
+
+fn close_clipboard(task: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(if task.win32k().clipboard.open.take().is_some() { TRUE } else { FALSE })
+}
+
+/// Takes the clipboard for the window that opened it: an offer of nothing yet, which SetClipboardData fills.
+fn empty_clipboard(task: &mut Task, cx: &mut Cx<'_>, _: &[u64]) -> Reply {
+    let Some(opener) = task.win32k().clipboard.open else { return Reply::Value(FALSE) };
+    let owner = if opener == win32k::OPENED_BY_NONE { 0 } else { opener };
+    let shown = shown_of(task, owner);
+    let source = task.desktop(|d| d.offer(Selection::Clipboard, shown, Vec::new()));
+    let handles = {
+        let mut w = task.win32k();
+        w.clipboard.source = Some(source);
+        w.clipboard.owner = owner;
+        if let Some(s) = shown {
+            w.clipboard.owners.insert(s, owner);
+        }
+        std::mem::take(&mut w.clipboard.handles)
+    };
+    for h in handles {
+        crate::os::kernel32::global_release(task, cx, h);
+    }
+    task.pump();
+    Reply::Value(TRUE)
+}
+
+fn set_clipboard_data(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (format, handle) = (a[0] as u32, a[1]);
+    if task.win32k().clipboard.open.is_none() || handle == 0 {
+        return Reply::Value(0);
+    }
+    let Some(bytes) = crate::os::kernel32::global_read(task, cx, handle) else { return Reply::Value(0) };
+    let mime = mime_of(task, format);
+    let data = if mime == TEXT { text_from(format, &bytes) } else { bytes };
+    let source = task.win32k().clipboard.source;
+    let given = source.is_some_and(|s| task.desktop(|d| d.offer_data(s, &mime, data.clone())));
+    if !given {
+        // Not emptied by this window first, or taken since: an offer of its own.
+        let owner = task.win32k().clipboard.owner;
+        let shown = shown_of(task, owner);
+        let source = task.desktop(|d| {
+            let s = d.offer(Selection::Clipboard, shown, Vec::new());
+            d.offer_data(s, &mime, data);
+            s
+        });
+        let mut w = task.win32k();
+        w.clipboard.source = Some(source);
+        if let Some(s) = shown {
+            w.clipboard.owners.insert(s, owner);
+        }
+    }
+    task.pump();
+    Reply::Value(handle)
+}
+
+/// The clipboard's data in a format, in a global block the clipboard keeps; pasted from whoever offered it, and
+/// waited for (a second at most) if they send it when asked.
+fn get_clipboard_data(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let format = a[0] as u32;
+    if task.win32k().clipboard.open.is_none() {
+        return Reply::Value(0);
+    }
+    let mime = mime_of(task, format);
+    let shared = task.win32k().display.clone();
+    let Some(data) = dt::paste(&shared, Selection::Clipboard, &mime, std::time::Duration::from_secs(1)) else { return Reply::Value(0) };
+    let bytes = if mime == TEXT { text_as(format, &data) } else { data };
+    let handle = crate::os::kernel32::global_new(task, cx, &bytes);
+    if handle != 0 {
+        task.win32k().clipboard.handles.push(handle);
+    }
+    Reply::Value(handle)
+}
+
+/// The formats the clipboard has now, in the order EnumClipboardFormats gives them.
+fn clipboard_formats(task: &mut Task) -> Vec<u32> {
+    let mimes = task.desktop(|d| d.selection(Selection::Clipboard)).map(|(_, m)| m).unwrap_or_default();
+    let mut formats = Vec::new();
+    for m in mimes {
+        for f in formats_of(task, &m) {
+            if !formats.contains(&f) {
+                formats.push(f);
+            }
+        }
+    }
+    formats
+}
+
+fn is_clipboard_format_available(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(u64::from(clipboard_formats(task).contains(&(a[0] as u32))))
+}
+
+fn count_clipboard_formats(task: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(clipboard_formats(task).len() as u64)
+}
+
+fn enum_clipboard_formats(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let formats = clipboard_formats(task);
+    let next = if a[0] == 0 { formats.first() } else { formats.iter().skip_while(|&&f| f != a[0] as u32).nth(1) };
+    Reply::Value(u64::from(next.copied().unwrap_or(0)))
+}
+
+/// The window that emptied the clipboard last, if what it offered is still the clipboard's.
+fn get_clipboard_owner(task: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    let (owner, source) = {
+        let w = task.win32k();
+        (w.clipboard.owner, w.clipboard.source)
+    };
+    let still = source.is_some() && task.desktop(|d| d.selection(Selection::Clipboard)).is_some();
+    Reply::Value(if still { owner } else { 0 })
+}
+
+fn register_clipboard_format_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let name = task.wstr(cx, a[0]);
+    if name.is_empty() {
+        return Reply::Value(0);
+    }
+    Reply::Value(u64::from(register_format(task, &name)))
 }

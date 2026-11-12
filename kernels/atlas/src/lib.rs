@@ -98,7 +98,7 @@ pub struct Ended {
 
 /// Boots a machine: runs `argv[0]` (a path on `disk`, as `C:\app.exe` or `/app.exe`) as its first process, on this
 /// thread with the CPU `Exec::open` gave, and returns how it ended.
-pub fn boot(exec: Exec, mut cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&str], options: Options) -> Result<Ended, String> {
+pub fn boot(exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&str], options: Options) -> Result<Ended, String> {
     let mut disk = disk;
     files::populate(&mut disk);
     // The registry the machine's disk has, else a fresh machine's.
@@ -124,7 +124,7 @@ pub fn boot(exec: Exec, mut cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&
         }
     }));
     let exec = kernel.exec.clone();
-    let mut cx = Cx::new(&exec, &mut cpu);
+    let mut cx = Cx::new(&exec, cpu);
     let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
     let mut task = process::start(&kernel, &mut cx, &argv)?;
     *lock(&kernel.options.stop.0) = Some(Arc::downgrade(&task.process));

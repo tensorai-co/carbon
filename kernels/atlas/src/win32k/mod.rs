@@ -19,7 +19,8 @@ use kernels_core::lock;
 use kernels_core::thread::Cx;
 use kernels_core::user;
 use kernels_core::wait::{Waiter, Woke};
-use display::desktop::{self as dt, Button, Event, Insets, Layer, Pointer, Spec};
+use display::desktop::edge::{BOTTOM, LEFT, RIGHT, TOP};
+use display::desktop::{self as dt, Button, Event, Insets, Keep, Layer, Pointer, Role, Spec};
 use display::{Rect, Surface};
 
 use crate::os::Reply;
@@ -51,6 +52,7 @@ pub const WM_SYSKEYDOWN: u32 = 0x104;
 pub const WM_SYSKEYUP: u32 = 0x105;
 pub const WM_SYSCHAR: u32 = 0x106;
 pub const WM_SYSCOMMAND: u32 = 0x112;
+pub const WM_NCLBUTTONDOWN: u32 = 0xa1;
 pub const WM_TIMER: u32 = 0x113;
 pub const WM_MOUSEMOVE: u32 = 0x200;
 pub const WM_MOUSEWHEEL: u32 = 0x20a;
@@ -67,6 +69,14 @@ const WS_VISIBLE: u32 = 0x1000_0000;
 const WS_CLIPSIBLINGS: u32 = 0x0400_0000;
 const WS_CAPTION: u32 = 0x00c0_0000;
 pub const WS_EX_TOPMOST: u32 = 0x8;
+/// The DPI a program's told: 96, as Windows tells a program that isn't DPI aware, whatever the output's scale. Its
+/// windows are drawn at 1× and magnified to the output's (`Desktop::screen_pixels`), as Windows virtualizes them. A
+/// program that says it's aware (`SetProcessDPIAware`, its manifest) would be told the output's, and draw at it: not
+/// yet.
+pub const PROGRAM_DPI: u32 = 96;
+
+/// A click neither activates nor raises it, and it isn't made active when another goes.
+pub const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
 const CW_USEDEFAULT: i32 = 0x8000_0000_u32 as i32;
 pub const SW_SHOW: u32 = 5;
 const SW_SHOWNA: u32 = 8;
@@ -84,6 +94,8 @@ pub struct Class {
     /// `hbrBackground`: a brush, or a system colour's index plus one.
     pub background: u64,
     pub instance: u64,
+    /// `hCursor`: what the pointer looks like over its windows' client areas, or 0 for what the program sets.
+    pub cursor: u64,
 }
 
 pub struct Window {
@@ -112,6 +124,51 @@ pub struct Window {
     /// Whether the desktop draws it a frame.
     pub framed: bool,
     pub destroying: bool,
+    /// WM_SIZE's kind as it was last sent: `SIZE_RESTORED`, `SIZE_MINIMIZED` or `SIZE_MAXIMIZED`.
+    pub size_kind: u64,
+}
+
+/// The clipboard, as win32k keeps it.
+#[derive(Default)]
+pub struct Clipboard {
+    /// The window that has it open (`OPENED_BY_NONE` if opened with none), or None.
+    pub open: Option<u64>,
+    /// The offer it made last, and the window that emptied it then.
+    pub source: Option<display::selection::SourceId>,
+    pub owner: u64,
+    /// The global blocks `GetClipboardData` gave, which are the clipboard's: freed when it's emptied.
+    pub handles: Vec<u64>,
+    /// Registered formats, by name (in lower case), from 0xC000.
+    pub formats: BTreeMap<String, u32>,
+    /// The window that emptied it, by its top-level window's place on the desktop: who WM_DESTROYCLIPBOARD goes to
+    /// when the desktop says that window's offer was taken.
+    pub owners: BTreeMap<u64, u64>,
+}
+
+/// `OpenClipboard(NULL)`'s opener.
+pub const OPENED_BY_NONE: u64 = u64::MAX;
+
+/// The desktop's cursor for a cursor handle: `LoadCursorW`'s, whose low word is its `IDC_*`; 0 hides it.
+pub fn cursor_of(handle: u64) -> display::cursor::Cursor {
+    use display::cursor::{Cursor, Shape};
+    if handle == 0 {
+        return Cursor::Hidden;
+    }
+    Cursor::Shape(match handle & 0xffff {
+        32513 => Shape::Text,
+        32514 => Shape::Wait,
+        32515 => Shape::Crosshair,
+        32642 => Shape::NwseResize,
+        32643 => Shape::NeswResize,
+        32644 => Shape::EwResize,
+        32645 => Shape::NsResize,
+        32646 => Shape::Move,
+        32648 => Shape::NotAllowed,
+        32649 => Shape::Pointer,
+        32650 => Shape::Progress,
+        32651 => Shape::Help,
+        _ => Shape::Default,
+    })
 }
 
 /// Whether a window with this style has a frame: a top-level window with a caption. Windows gives every overlapped
@@ -273,14 +330,102 @@ pub struct Win32k {
     pub shots: Vec<(String, Surface)>,
     /// The desktop the machine's top-level windows are on.
     pub display: dt::Shared,
+    /// Each top-level window's pixels, by its place on the desktop: GDI draws into them, and the desktop shows them
+    /// in place, as each drawing commits.
+    pub canvases: BTreeMap<u64, display::Canvas>,
     /// The active window, as the desktop last said, and the window keys go to.
     pub active: u64,
     pub focus: u64,
+    /// The window that has the mouse (`SetCapture`): every mouse message is its, wherever the pointer is.
+    pub capture: u64,
+    /// The cursor `SetCursor` (or a class's) set last.
+    pub cursor: u64,
+    /// Files dropped on its windows: the drops whose files it's reading (by the desktop's transfer: the window to tell,
+    /// and where in its client area), and each `HDROP` given in a WM_DROPFILES until `DragFinish`.
+    pub drops: BTreeMap<u64, (u64, i32, i32)>,
+    pub hdrops: BTreeMap<u64, DropFiles>,
+    /// The window a drag carrying files is over now.
+    pub drag_files: Option<u64>,
+    /// `ClipCursor`'s rectangle on the screen, and the window on the desktop it confines the pointer for: the active
+    /// one when it was set.
+    pub clip: Option<(u64, Rect)>,
+    /// The clipboard as Windows has it: the window that opened it (or `OPENED_BY_NONE` for none), the offer this
+    /// machine's windows made of it last and its owner, the handles `GetClipboardData` gave (freed when it's emptied),
+    /// and the formats `RegisterClipboardFormatW` named.
+    pub clipboard: Clipboard,
     /// Each virtual key's state: 0x80 while it's down, 0x01 toggled by each press.
     pub keys: [u8; 256],
 }
 
+/// What an `HDROP` holds: the files dropped (Windows paths), and where in the window's client area. It's win32k's own
+/// handle, read by shell32's `DragQueryFileW` and `DragQueryPoint`; not global memory a program can lock.
+#[derive(Debug, Clone)]
+pub struct DropFiles {
+    pub files: Vec<String>,
+    pub point: (i32, i32),
+}
+
+/// `WS_EX_ACCEPTFILES`: the window takes files dropped on it, as WM_DROPFILES (`DragAcceptFiles`).
+pub const WS_EX_ACCEPTFILES: u32 = 0x10;
+const WM_DROPFILES: u32 = 0x233;
+
 impl Win32k {
+    /// A window's children, or (for `DESKTOP`) the top-level windows, top first: the top-level windows as the desktop
+    /// stacks them, children with the later made above (as `child_at` finds them).
+    pub fn z_order(&self, parent: u64) -> Vec<u64> {
+        if parent == DESKTOP {
+            let stacking = dt::lock(&self.display).stacking().to_vec();
+            let mut top: Vec<u64> = stacking.iter().rev().filter_map(|&s| self.hwnd_of(s)).collect();
+            // Any the desktop doesn't know (none, today), last.
+            let unknown: Vec<u64> = self.windows.iter().filter(|(h, w)| w.top_level() && !top.contains(h)).map(|(&h, _)| h).collect();
+            top.extend(unknown);
+            top
+        } else {
+            self.windows.iter().rev().filter(|(_, w)| w.parent == parent).map(|(&h, _)| h).collect()
+        }
+    }
+
+    /// The window files dropped at a point in a top-level window's client area would go to: the deepest window there
+    /// that takes them, or its nearest ancestor that does; with the point in its own client coordinates.
+    fn drop_target(&self, top: u64, x: i32, y: i32) -> Option<(u64, i32, i32)> {
+        let (sx, sy) = self.screen_origin(top)?;
+        let (mut hwnd, _, _) = self.child_at(top, x, y);
+        loop {
+            let w = self.windows.get(&hwnd)?;
+            if w.ex_style & WS_EX_ACCEPTFILES != 0 {
+                let (ox, oy) = self.screen_origin(hwnd)?;
+                return Some((hwnd, sx + x - ox, sy + y - oy));
+            }
+            if w.top_level() {
+                return None;
+            }
+            hwnd = w.parent;
+        }
+    }
+
+    /// Takes a drag over one of its windows as files, if it carries them and there's a window there that takes them.
+    fn take_drag(&mut self, window: u64, x: i32, y: i32, files: bool) {
+        use display::desktop::action;
+        let target = self.hwnd_of(window).filter(|_| files).and_then(|top| self.drop_target(top, x, y));
+        let mut d = dt::lock(&self.display);
+        match target {
+            Some(_) => d.accept_drag(window, Some(display::selection::URI_LIST), action::COPY, action::COPY),
+            None => d.accept_drag(window, None, 0, 0),
+        }
+    }
+
+    /// A top-level window's canvas, made the size of its content again after it moved or was resized, and shown.
+    pub fn fit(&mut self, shown: u64) {
+        let Some(canvas) = self.canvases.get(&shown) else { return };
+        let mut d = dt::lock(&self.display);
+        let (Some(content), Some(fill)) = (d.content_rect(shown), d.fill(shown)) else { return };
+        // The canvas's lock under the desktop's is the order the desktop composites in.
+        if canvas.resize(content.width(), content.height(), fill) {
+            d.attach(shown, Some(canvas.buffer()));
+            d.commit(shown);
+        }
+    }
+
     pub fn new(display: dt::Shared) -> Win32k {
         Win32k {
             windows: BTreeMap::new(),
@@ -291,8 +436,16 @@ impl Win32k {
             gdi: Gdi::default(),
             shots: Vec::new(),
             display,
+            canvases: BTreeMap::new(),
             active: 0,
             focus: 0,
+            capture: 0,
+            cursor: 0,
+            clip: None,
+            drops: BTreeMap::new(),
+            hdrops: BTreeMap::new(),
+            drag_files: None,
+            clipboard: Clipboard::default(),
             keys: [0; 256],
         }
     }
@@ -393,10 +546,14 @@ impl Win32k {
     /// One of the desktop's events, as the messages Windows has for it.
     fn route(&mut self, event: Event, time: u32) {
         match event {
-            Event::Placed { window, rect } => {
+            Event::Configure { window, rect, states, .. } => {
+                const SIZE_MINIMIZED: u64 = 1;
+                const SIZE_MAXIMIZED: u64 = 2;
                 let Some(hwnd) = self.hwnd_of(window) else { return };
+                self.fit(window);
                 let Some(win) = self.windows.get_mut(&hwnd) else { return };
                 let before = win.client();
+                let moved = (rect.left, rect.top) != (win.rect.left, win.rect.top);
                 win.rect = rect;
                 let after = win.client();
                 let resized = (before.width(), before.height()) != (after.width(), after.height());
@@ -404,10 +561,20 @@ impl Win32k {
                     win.invalid = after;
                     win.erase = true;
                 }
-                let (x, y) = self.move_origin(hwnd);
-                self.deliver(hwnd, WM_MOVE, 0, words(x, y));
-                if resized {
-                    self.deliver(hwnd, WM_SIZE, 0, words(after.width(), after.height()));
+                let kind = if states & dt::state::MINIMIZED != 0 {
+                    SIZE_MINIMIZED
+                } else if states & dt::state::MAXIMIZED != 0 {
+                    SIZE_MAXIMIZED
+                } else {
+                    0
+                };
+                let kind_changed = std::mem::replace(&mut win.size_kind, kind) != kind;
+                if moved || resized {
+                    let (x, y) = self.move_origin(hwnd);
+                    self.deliver(hwnd, WM_MOVE, 0, words(x, y));
+                }
+                if resized || kind_changed {
+                    self.deliver(hwnd, WM_SIZE, kind, words(after.width(), after.height()));
                 }
             }
             Event::Activated { window, active } => {
@@ -446,15 +613,33 @@ impl Win32k {
                     flags |= 8;
                 }
                 let (target, message, wparam, lparam) = match what {
-                    Pointer::Wheel(notches) => {
+                    // WM_MOUSELEAVE only comes to a window that asked with TrackMouseEvent, which isn't there yet;
+                    // relative motion is raw input's (WM_INPUT), which isn't either.
+                    Pointer::Leave | Pointer::Relative { .. } => return,
+                    Pointer::Scroll { x: dx, y: dy } => {
+                        const WM_MOUSEHWHEEL: u32 = 0x20e;
                         let (sx, sy) = self.screen_origin(top).unwrap_or_default();
                         let target = if self.focus != 0 { self.focus } else { top };
-                        (target, WM_MOUSEWHEEL, flags | ((notches * 120) as i16 as u16 as u64) << 16, words(sx + x, sy + y))
+                        for (delta, message) in [(dy, WM_MOUSEWHEEL), (dx, WM_MOUSEHWHEEL)] {
+                            if delta != 0 {
+                                self.post_input(target, message, flags | (delta as i16 as u16 as u64) << 16, words(sx + x, sy + y), time);
+                            }
+                        }
+                        return;
                     }
                     _ => {
                         let client = self.windows.get(&top).map(Window::client).unwrap_or_default();
-                        // Outside its client area (a drag that's left it), it's the top-level window's.
-                        let (target, cx, cy) = if client.contains(x, y) { self.child_at(top, x, y) } else { (top, x, y) };
+                        // The window with the capture has it wherever it is, in its own client coordinates; outside
+                        // the client area (a drag that's left it), it's the top-level window's.
+                        let (target, cx, cy) = if self.capture != 0 && self.windows.contains_key(&self.capture) {
+                            let (sx, sy) = self.screen_origin(top).unwrap_or_default();
+                            let (ox, oy) = self.screen_origin(self.capture).unwrap_or_default();
+                            (self.capture, sx + x - ox, sy + y - oy)
+                        } else if client.contains(x, y) {
+                            self.child_at(top, x, y)
+                        } else {
+                            (top, x, y)
+                        };
                         let message = match what {
                             Pointer::Down(Button::Left) => 0x201,
                             Pointer::Up(Button::Left) => 0x202,
@@ -464,19 +649,100 @@ impl Win32k {
                             Pointer::Up(Button::Middle) => 0x208,
                             _ => WM_MOUSEMOVE,
                         };
+                        // As DefWindowProc's WM_SETCURSOR does: over a client area, its class's cursor, if it has one.
+                        if matches!(what, Pointer::Enter | Pointer::Move) && self.capture == 0 {
+                            let class = self.windows.get(&target).and_then(|w| self.class_by_name(&w.class)).map_or(0, |c| c.cursor);
+                            if class != 0 {
+                                self.cursor = class;
+                                dt::lock(&self.display).set_cursor(window, cursor_of(class));
+                            }
+                        }
                         (target, message, flags, words(cx, cy))
                     }
                 };
                 self.post_input(target, message, wparam, lparam, time);
             }
-            Event::Key { window, code, down, modifiers } => {
+            // win32k's canvases are its own, reused in place; GDI paints when it's asked to, not by frames.
+            // win32k makes no popups yet (menus come with its user interface).
+            // DXGI's frame statistics will read Presented; ClipCursor's confinement stays set while another window's
+            // active, as the desktop keeps it, and GetClipCursor still says it.
+            Event::Released { .. } | Event::Frame { .. } | Event::PopupDone { .. } | Event::Presented { .. } | Event::Constrained { .. } => {}
+            // Another's offer took the clipboard from the window that emptied it: WM_DESTROYCLIPBOARD.
+            Event::SelectionCancelled { window, selection: display::selection::Selection::Clipboard } => {
+                let Some(&hwnd) = self.clipboard.owners.get(&window) else { return };
+                // Not the owner any more, unless it's emptied it again since.
+                let still = dt::lock(&self.display).selection(display::selection::Selection::Clipboard).is_some_and(|(o, _)| o == Some(window));
+                if self.clipboard.owner == hwnd && !still {
+                    self.clipboard.owner = 0;
+                    self.clipboard.source = None;
+                }
+                if self.windows.contains_key(&hwnd) {
+                    self.deliver(hwnd, 0x307, 0, 0);
+                }
+            }
+            // Files dropped: WM_DROPFILES, with an HDROP of their paths, to the window that takes them.
+            Event::SelectionData { window, transfer, data } => {
+                let Some((hwnd, x, y)) = self.drops.remove(&transfer) else { return };
+                let files: Vec<String> = data.map(|d| display::selection::uri_list_paths(&d)).unwrap_or_default().into_iter().map(|p| p.replace('/', "\\")).collect();
+                if !files.is_empty() && self.windows.contains_key(&hwnd) {
+                    let hdrop = 0xd_0000 + 4 * (self.hdrops.keys().next_back().map_or(0, |h| (h - 0xd_0000) / 4) + 1);
+                    self.hdrops.insert(hdrop, DropFiles { files, point: (x, y) });
+                    self.post_input(hwnd, WM_DROPFILES, hdrop, 0, time);
+                }
+                dt::lock(&self.display).finish_drop(window);
+            }
+            Event::SelectionCancelled { .. } => {}
+            // A drag over its windows: taken as files where a window takes them (DragAcceptFiles). OLE's drag and drop
+            // (RegisterDragDrop, DoDragDrop), which carries anything, isn't there yet, so win32k is never a source.
+            Event::DragEnter { window, x, y, mimes, .. } => {
+                let files = mimes.iter().any(|m| m == display::selection::URI_LIST);
+                self.drag_files = files.then_some(window);
+                self.take_drag(window, x, y, files);
+            }
+            Event::DragMotion { window, x, y } => {
+                let files = self.drag_files == Some(window);
+                self.take_drag(window, x, y, files);
+            }
+            Event::DragLeave { .. } => self.drag_files = None,
+            Event::Drop { window, x, y, .. } => {
+                self.drag_files = None;
+                let target = self.hwnd_of(window).and_then(|top| self.drop_target(top, x, y));
+                let mut d = dt::lock(&self.display);
+                match target.and_then(|t| d.request(display::selection::Selection::Drag, display::selection::URI_LIST, Some(window)).map(|id| (id, t))) {
+                    Some((transfer, t)) => {
+                        drop(d);
+                        self.drops.insert(transfer, t);
+                    }
+                    None => d.finish_drop(window),
+                }
+            }
+            Event::DragAction { .. } | Event::Dropped { .. } | Event::DragEnd { .. } => {}
+            // win32k's offers give all their data at once (delayed rendering, WM_RENDERFORMAT, isn't there yet).
+            Event::SendSelection { transfer, .. } => dt::lock(&self.display).provide(transfer, None),
+            // Windows sends WM_DPICHANGED only to a window that's per-monitor DPI aware, which none says it is yet;
+            // GetDpiForWindow reads the output as it is.
+            Event::Scale { .. } => {}
+            // Text an input method committed (or no key types): WM_CHAR for each UTF-16 unit, to the focus, as Windows
+            // sends a VK_PACKET's.
+            Event::Text { window, text } => {
+                let Some(top) = self.hwnd_of(window) else { return };
+                let focus = self.focus;
+                let target = if focus != 0 && (focus == top || is_descendant(&self.windows, focus, top)) { focus } else { top };
+                for unit in text.encode_utf16() {
+                    self.post_input(target, WM_CHAR, u64::from(unit), 1, time);
+                }
+            }
+            // The composition itself is the input method's, shown by the host; IMM's messages aren't there yet.
+            Event::Preedit { .. } => {}
+            Event::Key { window, code, down, repeat, modifiers } => {
                 let Some(top) = self.hwnd_of(window) else { return };
                 let vk = keys::vk(code);
                 if vk == 0 {
                     return;
                 }
                 let generic = keys::generic(vk);
-                let repeat = self.keys[generic as usize] & 0x80 != 0;
+                // A repeat as the desktop marked it, or a down for a key this side has down already (SendInput's).
+                let repeat = repeat || (down && self.keys[generic as usize] & 0x80 != 0);
                 self.set_key(vk, down);
                 if generic != vk {
                     self.set_key(generic, down);
@@ -544,8 +810,8 @@ impl Win32k {
         let mut shots = self.shots.clone();
         let d = dt::lock(&self.display);
         for w in self.windows.values() {
-            if let Some(s) = d.content(w.shown).filter(|_| w.shown != 0) {
-                shots.push((w.text.clone(), s.clone()));
+            if let Some(c) = self.canvases.get(&w.shown).filter(|_| w.shown != 0 && d.exists(w.shown)) {
+                shots.push((w.text.clone(), c.snapshot()));
             }
         }
         shots
@@ -608,8 +874,11 @@ impl Task {
             let w = self.win32k();
             (w.top_level_of(hwnd).and_then(|t| w.windows.get(&t)).map_or(0, |t| t.shown), w.active)
         };
+        // As the foreground rules have it: granted to the process whose window is active or that had the last
+        // input, else the window flashes instead.
         if shown != 0 {
-            self.desktop(|d| d.activate(shown));
+            let pid = self.process.pid;
+            self.desktop(|d| d.request_activation(shown, Some(pid), None));
         }
         self.pump();
         self.take_sent(cx)?;
@@ -716,8 +985,18 @@ impl Task {
             let shown = if top_level {
                 let owner_shown = w.windows.get(&owner).map_or(0, |o| o.shown);
                 let layer = if ex_style & WS_EX_TOPMOST != 0 { Layer::Top } else { Layer::Normal };
-                let spec = Spec { rect: r, title: text.clone(), framed, layer, owner: (owner_shown != 0).then_some(owner_shown), fill: background };
-                dt::lock(&w.display).create(spec)
+                // An owned window is the desktop's dialog: kept above its owner, which is active again when it goes.
+                let role = if owner_shown != 0 { Role::Dialog { parent: owner_shown } } else { Role::Toplevel };
+                let spec = Spec { rect: r, title: text.clone(), framed, layer, role, fill: background, client: self.process.pid, no_activate: ex_style & WS_EX_NOACTIVATE != 0 };
+                let mut d = dt::lock(&w.display);
+                let shown = d.create(spec);
+                let content = d.content_rect(shown).unwrap_or_default();
+                let canvas = display::Canvas::new(content.width(), content.height(), background);
+                d.attach(shown, Some(canvas.buffer()));
+                d.commit(shown);
+                drop(d);
+                w.canvases.insert(shown, canvas);
+                shown
             } else {
                 0
             };
@@ -742,6 +1021,7 @@ impl Task {
                 owner,
                 framed,
                 destroying: false,
+                size_kind: 0,
             };
             w.windows.insert(hwnd, window);
             w.queue(self.tid, &self.waiter.clone());
@@ -813,17 +1093,21 @@ impl Task {
             if let Some(win) = w.windows.remove(h) {
                 if win.shown != 0 {
                     let shared = w.display.clone();
-                    let mut d = dt::lock(&shared);
-                    if let Some(s) = d.content(win.shown) {
-                        w.shots.push((win.text.clone(), s.clone()));
+                    if let Some(c) = w.canvases.remove(&win.shown) {
+                        w.shots.push((win.text.clone(), c.snapshot()));
                     }
-                    d.destroy(win.shown);
+                    dt::lock(&shared).destroy(win.shown);
                 }
                 if w.active == *h {
                     w.active = 0;
                 }
                 if w.focus == *h {
                     w.focus = 0;
+                }
+                if w.capture == *h {
+                    w.capture = 0;
+                    let shared = w.display.clone();
+                    dt::lock(&shared).set_capture(None);
                 }
             }
             for q in w.queues.values_mut() {
@@ -852,7 +1136,22 @@ impl Task {
             (was, win.shown)
         };
         if shown != 0 {
-            self.desktop(|d| d.set_visible(shown, show));
+            self.desktop(|d| {
+                d.set_visible(shown, show);
+                // SW_SHOWMINIMIZED, SW_MINIMIZE, SW_SHOWMINNOACTIVE and SW_FORCEMINIMIZE minimize it; SW_SHOWMAXIMIZED
+                // maximizes it; SW_SHOWNORMAL and SW_RESTORE restore a minimized window, else a maximized one.
+                let states = d.states(shown);
+                match command {
+                    2 | 6 | 7 | 11 => d.set_minimized(shown, true),
+                    3 => {
+                        d.set_minimized(shown, false);
+                        d.set_maximized(shown, true);
+                    }
+                    1 | 9 if states & dt::state::MINIMIZED != 0 => d.set_minimized(shown, false),
+                    1 | 9 if states & dt::state::MAXIMIZED != 0 => d.set_maximized(shown, false),
+                    _ => {}
+                }
+            });
         }
         if was != show {
             self.send_message(cx, hwnd, WM_SHOWWINDOW, u64::from(show), 0)?;
@@ -874,16 +1173,29 @@ impl Task {
         const NOSIZE: u32 = 1;
         const NOMOVE: u32 = 2;
         const NOACTIVATE: u32 = 0x10;
+        const FRAMECHANGED: u32 = 0x20;
         const SHOWWINDOW: u32 = 0x40;
         const HIDEWINDOW: u32 = 0x80;
         let (moved, sized, (cx_, cy_), client) = {
             let mut w = self.win32k();
             let Some(win) = w.windows.get_mut(&hwnd) else { return Ok(false) };
             let old = win.rect;
+            // A style changed with SetWindowLong takes effect here: a top-level window's frame, given or taken
+            // away, keeps its rectangle, and its client area is what's inside.
+            let old_client = win.client();
+            let reframed = flags & FRAMECHANGED != 0 && win.top_level() && win.framed != framed(win.style);
+            if reframed {
+                win.framed = framed(win.style);
+                let (shown, framed_now) = (win.shown, win.framed);
+                if shown != 0 {
+                    dt::lock(&w.display).set_framed(shown, framed_now, Keep::Rect);
+                }
+            }
+            let Some(win) = w.windows.get_mut(&hwnd) else { return Ok(false) };
             let (x, y) = if flags & NOMOVE != 0 { (old.left, old.top) } else { (x, y) };
             let (width, height) = if flags & NOSIZE != 0 { (old.width(), old.height()) } else { (width.max(0), height.max(0)) };
             win.rect = Rect::new(x, y, x + width, y + height);
-            let sized = (width, height) != (old.width(), old.height());
+            let sized = (width, height) != (old.width(), old.height()) || win.client() != old_client;
             if sized {
                 win.invalid = win.client();
                 win.erase = true;
@@ -891,6 +1203,7 @@ impl Task {
             let (rect, shown, client) = (win.rect, win.shown, win.client());
             if shown != 0 {
                 dt::lock(&w.display).set_rect(shown, rect);
+                w.fit(shown);
             }
             ((x, y) != (old.left, old.top), sized, w.move_origin(hwnd), client)
         };
@@ -1104,6 +1417,19 @@ impl Task {
         true
     }
 
+    /// Starts moving a top-level window by the pointer (or with `edges`, resizing it), as its frame would, while the
+    /// button that went down on it is held. Windows enters a loop of its own until the button's up; here the
+    /// desktop moves it as the pointer does, and WM_MOVE and WM_SIZE come as they do from its frame.
+    fn drag_frame(&mut self, top: u64, edges: Option<u8>) {
+        let shown = self.win32k().windows.get(&top).map_or(0, |w| w.shown);
+        if shown != 0 {
+            self.desktop(|d| match edges {
+                Some(edges) => d.begin_resize(shown, edges),
+                None => d.begin_move(shown),
+            });
+        }
+    }
+
     /// `DefWindowProcW`: what a window does with a message its `WndProc` doesn't.
     pub fn def_window_proc(&mut self, cx: &mut Cx<'_>, hwnd: u64, message: u32, wparam: u64, lparam: u64) -> Result<u64, Reply> {
         match message {
@@ -1133,8 +1459,56 @@ impl Task {
                 Ok(0)
             }
             WM_SYSCOMMAND => {
-                if wparam & 0xfff0 == SC_CLOSE {
-                    self.send_message(cx, hwnd, WM_CLOSE, 0, 0)?;
+                const SC_SIZE: u64 = 0xf000;
+                const SC_MOVE: u64 = 0xf010;
+                const SC_MINIMIZE: u64 = 0xf020;
+                const SC_MAXIMIZE: u64 = 0xf030;
+                const SC_RESTORE: u64 = 0xf120;
+                // SC_SIZE's low bits are which edge (WMSZ_LEFT, RIGHT, TOP, TOPLEFT, TOPRIGHT, BOTTOM, BOTTOMLEFT,
+                // BOTTOMRIGHT); SC_MOVE's are HTCAPTION from a click, as programs that draw their own send it.
+                let top = self.win32k().top_level_of(hwnd).unwrap_or(hwnd);
+                match wparam & 0xfff0 {
+                    SC_CLOSE => {
+                        self.send_message(cx, hwnd, WM_CLOSE, 0, 0)?;
+                    }
+                    SC_MOVE => self.drag_frame(top, None),
+                    SC_SIZE => {
+                        const WMSZ: [u8; 9] = [0, LEFT, RIGHT, TOP, TOP | LEFT, TOP | RIGHT, BOTTOM, BOTTOM | LEFT, BOTTOM | RIGHT];
+                        if let Some(&edges) = WMSZ.get((wparam & 0xf) as usize).filter(|&&e| e != 0) {
+                            self.drag_frame(top, Some(edges));
+                        }
+                    }
+                    SC_MAXIMIZE => {
+                        self.show_window(cx, top, 3)?;
+                    }
+                    SC_MINIMIZE => {
+                        self.show_window(cx, top, 6)?;
+                    }
+                    SC_RESTORE => {
+                        self.show_window(cx, top, 9)?;
+                    }
+                    _ => {}
+                }
+                Ok(0)
+            }
+            // A press on a part of the frame (a program's own title bar, from its WM_NCHITTEST, or sent itself, as
+            // programs that draw their own do): its caption moves it, its edges resize it.
+            WM_NCLBUTTONDOWN => {
+                const HTCAPTION: u64 = 2;
+                let edges = match wparam {
+                    10 => Some(LEFT),
+                    11 => Some(RIGHT),
+                    12 => Some(TOP),
+                    13 => Some(TOP | LEFT),
+                    14 => Some(TOP | RIGHT),
+                    15 => Some(BOTTOM),
+                    16 => Some(BOTTOM | LEFT),
+                    17 => Some(BOTTOM | RIGHT),
+                    _ => None,
+                };
+                let top = self.win32k().top_level_of(hwnd).unwrap_or(hwnd);
+                if wparam == HTCAPTION || edges.is_some() {
+                    self.drag_frame(top, edges);
                 }
                 Ok(0)
             }

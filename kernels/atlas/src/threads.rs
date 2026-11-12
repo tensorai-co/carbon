@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use atlas_abi::teb;
-use exec::{CpuHandle, Prot, Regs};
+use exec::{Prot, Regs};
+use kernels_core::thread::Handle;
 use kernels_core::lock;
 use kernels_core::thread::{self, Cx};
 use kernels_core::user;
@@ -21,7 +22,7 @@ pub(crate) struct ThreadControl {
     pub teb: u64,
     pub object: Arc<Object>,
     pub waiter: Arc<Waiter>,
-    pub cpu: CpuHandle,
+    pub cpu: Handle,
     /// How many times it's been suspended, less resumed: it runs only at 0.
     pub suspend: AtomicU32,
     /// Set by `TerminateThread`: it ends at its next chance, with this code.
@@ -32,7 +33,7 @@ pub(crate) struct ThreadControl {
 }
 
 impl ThreadControl {
-    pub fn new(tid: u64, teb: u64, waiter: Arc<Waiter>, cpu: CpuHandle, suspended: bool) -> Arc<ThreadControl> {
+    pub fn new(tid: u64, teb: u64, waiter: Arc<Waiter>, cpu: Handle, suspended: bool) -> Arc<ThreadControl> {
         Arc::new(ThreadControl {
             tid,
             teb,

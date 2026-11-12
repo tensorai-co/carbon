@@ -1,6 +1,11 @@
 LIBRARY KERNEL32.dll
 EXPORTS
 GetStdHandle
+GlobalAlloc
+GlobalLock
+GlobalUnlock
+GlobalSize
+GlobalFree
 WriteFile
 WriteConsoleW
 ExitProcess

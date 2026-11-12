@@ -156,6 +156,12 @@ dll! {
     host QueryPerformanceFrequency(1) => query_performance_frequency;
     host VirtualAlloc(4) => virtual_alloc;
     host VirtualFree(3) => virtual_free;
+    host GlobalAlloc(2) => global_alloc;
+    host GlobalLock(1) => global_lock;
+    host GlobalUnlock(1) => global_unlock;
+    host GlobalSize(1) => global_size;
+    host GlobalFree(1) => global_free;
+    host GlobalHandle(1) => global_lock;
     host EnumSystemLocalesW(2) => enum_system_locales_w;
     guest GetLastError => RtlGetLastWin32Error;
     guest SetLastError => RtlSetLastWin32Error;
@@ -250,6 +256,69 @@ fn virtual_protect(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 
 fn virtual_free(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     Reply::Value(if task.virtual_free(cx, a[0], a[1], a[2] as u32) { TRUE } else { FALSE })
+}
+
+/// Global memory, as the clipboard and drag and drop pass data: each block committed pages of its own, its size in
+/// the 16 bytes before it, and its handle the block itself (as `GMEM_FIXED`'s are; a moveable block never moves here,
+/// so locking one gives its handle back). Pages come zeroed, so `GMEM_ZEROINIT` needs nothing more.
+const GLOBAL_HEADER: u64 = 16;
+
+/// A new global block holding `data`, or 0.
+pub(crate) fn global_new(task: &mut Task, cx: &mut Cx<'_>, data: &[u8]) -> u64 {
+    let size = data.len() as u64;
+    let Some(base) = task.virtual_alloc(cx, 0, size + GLOBAL_HEADER, 0x3000, 4) else { return 0 };
+    let ok = task.mem(cx, true, |t| {
+        user::write_u64(&mut t.space(), base, size)?;
+        user::write(&mut t.space(), base + GLOBAL_HEADER, data)
+    });
+    if ok.is_err() {
+        task.virtual_free(cx, base, 0, 0x8000);
+        return 0;
+    }
+    base + GLOBAL_HEADER
+}
+
+/// What a global block holds: its size from its header, its bytes after (at most 64 MiB). None for one that isn't.
+pub(crate) fn global_read(task: &mut Task, cx: &mut Cx<'_>, handle: u64) -> Option<Vec<u8>> {
+    let size = global_size_of(task, cx, handle)?;
+    task.mem(cx, false, |t| user::read_vec(&t.space(), handle, size as usize)).ok()
+}
+
+/// Frees a global block `global_new` made.
+pub(crate) fn global_release(task: &mut Task, cx: &mut Cx<'_>, handle: u64) -> bool {
+    global_size_of(task, cx, handle).is_some() && task.virtual_free(cx, handle - GLOBAL_HEADER, 0, 0x8000)
+}
+
+fn global_size_of(task: &mut Task, cx: &mut Cx<'_>, handle: u64) -> Option<u64> {
+    if handle < GLOBAL_HEADER {
+        return None;
+    }
+    task.mem(cx, false, |t| user::read_u64(&t.space(), handle - GLOBAL_HEADER)).ok().filter(|&n| n <= 64 << 20)
+}
+
+fn global_alloc(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[1] > 64 << 20 {
+        return Reply::Value(0);
+    }
+    Reply::Value(global_new(task, cx, &vec![0; a[1] as usize]))
+}
+
+fn global_lock(_: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(a[0])
+}
+
+/// Still locked: FALSE, as unlocking a block that isn't moveable says.
+fn global_unlock(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(FALSE)
+}
+
+fn global_size(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(global_size_of(task, cx, a[0]).unwrap_or(0))
+}
+
+/// NULL once it's freed, else the handle back.
+fn global_free(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(if global_release(task, cx, a[0]) { 0 } else { a[0] })
 }
 
 /// Calls the program's callback with each locale's name, until it returns FALSE: an upcall per locale.

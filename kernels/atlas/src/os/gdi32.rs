@@ -130,13 +130,16 @@ fn get_text_extent_point32_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Rep
     Reply::Value(u64::from(task.mem(cx, true, |t| user::write(&mut t.space(), a[3], &bytes)).is_ok()))
 }
 
-fn get_device_caps(_: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+/// `GetDeviceCaps`: the screen's, from the desktop's output.
+fn get_device_caps(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (width, height) = task.desktop(|d| (d.output().width, d.output().height));
+    let dpi = crate::win32k::PROGRAM_DPI;
     Reply::Value(match a[1] as u32 {
-        8 => 1280,          // HORZRES
-        10 => 800,          // VERTRES
-        12 => 32,           // BITSPIXEL
-        14 => 1,            // PLANES
-        88 | 90 => 96,      // LOGPIXELSX, LOGPIXELSY
+        8 => width as u64,          // HORZRES
+        10 => height as u64,        // VERTRES
+        12 => 32,                   // BITSPIXEL
+        14 => 1,                    // PLANES
+        88 | 90 => u64::from(dpi),  // LOGPIXELSX, LOGPIXELSY
         _ => 0,
     })
 }
