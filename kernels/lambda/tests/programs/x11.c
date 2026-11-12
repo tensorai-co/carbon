@@ -202,18 +202,20 @@ void cmain(i64 *sp) {
     check(round && copied == 0xaabbcc, "PutImage, GetImage and CopyArea: a pixmap's pixels as put, and copied onto the window");
 
     // The extensions toolkits look for.
-    static const char *exts[] = {"BIG-REQUESTS", "MIT-SHM", "SHAPE", "XC-MISC"};
+    static const char *exts[] = {"BIG-REQUESTS", "MIT-SHM", "SHAPE", "XC-MISC", "RENDER", "XKEYBOARD"};
     int found = 1;
-    u32 big = 0;
-    for (int i = 0; i < 4; i++) {
+    u32 big = 0, render = 0, xkb = 0;
+    for (int i = 0; i < 6; i++) {
         req(98, 0); b16(len(exts[i])); b16(0); bytes(exts[i], len(exts[i]));
         s = send();
         found = found && answer(s) == 1 && msg[8] == 1;
         if (i == 0) big = msg[9];
+        if (i == 4) render = msg[9];
+        if (i == 5) xkb = msg[9];
     }
     req(98, 0); b16(7); b16(0); bytes("NOTHERE", 7);
     s = send();
-    check(found && answer(s) == 1 && msg[8] == 0, "QueryExtension: BIG-REQUESTS, MIT-SHM, SHAPE and XC-MISC, and not one that isn't there");
+    check(found && answer(s) == 1 && msg[8] == 0, "QueryExtension: BIG-REQUESTS, MIT-SHM, SHAPE, XC-MISC, RENDER and XKEYBOARD, and not one that isn't there");
 
     // BIG-REQUESTS: enabled, then a request with a length of 0 and the real one after (in words, itself included).
     req(big, 0);
@@ -226,6 +228,85 @@ void cmain(i64 *sp) {
     req(73, 2); b32(win); b16(31); b16(71); b16(1); b16(1); b32(0xffffffff);
     s = send();
     check(most >= 65536 && answer(s) == 1 && r32(msg + 32) == 0xff0000, "BIG-REQUESTS: enabled, and a request given its length past the header");
+
+    // RENDER: its version, the formats for depths 24 and 8, a picture of the window.
+    req(render, 0); b32(0); b32(11);
+    s = send();
+    int version = answer(s) == 1 && r32(msg + 8) == 0 && r32(msg + 12) == 11;
+    req(render, 1);
+    s = send();
+    u32 fmt24 = 0, fmt8 = 0;
+    if (answer(s) == 1)
+        for (u32 i = 0; i < r32(msg + 8); i++) {
+            const u8 *f = msg + 32 + 28 * i;
+            if (f[5] == 24) fmt24 = r32(f);
+            if (f[5] == 8) fmt8 = r32(f);
+        }
+    u32 pict = base | 10, green = base | 11, glyphs = base | 12;
+    req(render, 4); b32(pict); b32(win); b32(fmt24); b32(0);
+    send();
+    check(version && fmt24 && fmt8, "RENDER: version 0.11, a format for depth 24 and an alpha one for 8");
+
+    // Half-transparent red, premultiplied, over the window's background.
+    req(render, 26); b8(3); b8(0); b16(0); b32(pict); b16(0x8000); b16(0); b16(0); b16(0x8000);
+    b16(120); b16(20); b16(10); b16(10);
+    send();
+    req(73, 2); b32(win); b16(125); b16(25); b16(1); b16(1); b32(0xffffffff);
+    s = send();
+    u32 blended = answer(s) == 1 ? r32(msg + 32) : 0;
+    int near = 1;
+    u32 want = 0x99334c;
+    for (int sh = 0; sh < 24; sh += 8) {
+        int d = (int)((blended >> sh) & 0xff) - (int)((want >> sh) & 0xff);
+        if (d < -2 || d > 2) near = 0;
+    }
+    check(near, "RENDER FillRectangles: half-transparent red Over the background, blended");
+
+    // A glyph (2 by 2, all covered) composited from a solid green fill.
+    req(render, 17); b32(glyphs); b32(fmt8);
+    send();
+    req(render, 20); b32(glyphs); b32(1); b32(7); b16(2); b16(2); b16(0); b16(0); b16(2); b16(0);
+    b32(0x0000ffff); b32(0x0000ffff);
+    send();
+    req(render, 33); b32(green); b16(0); b16(0xffff); b16(0); b16(0xffff);
+    send();
+    req(render, 23); b8(3); b8(0); b16(0); b32(green); b32(pict); b32(0); b32(glyphs); b16(0); b16(0);
+    b8(1); b8(0); b8(0); b8(0); b16(140); b16(20); b8(7); b8(0); b8(0); b8(0);
+    send();
+    req(73, 2); b32(win); b16(141); b16(21); b16(1); b16(1); b32(0xffffffff);
+    s = send();
+    u32 glyph = answer(s) == 1 ? r32(msg + 32) : 0;
+    req(73, 2); b32(win); b16(142); b16(21); b16(1); b16(1); b32(0xffffffff);
+    s = send();
+    u32 beside = answer(s) == 1 ? r32(msg + 32) : 0;
+    check(glyph == 0x00ff00 && beside == 0x336699, "RENDER glyphs: a glyph set, a glyph added and composited from a solid fill, and nothing past it");
+
+    // XKEYBOARD: 1.0, the map's four key types and the keysyms of keycode 38 (a, A), its name, the state.
+    req(xkb, 0); b16(1); b16(0);
+    s = send();
+    int using = answer(s) == 1 && msg[1] == 1 && r16(msg + 8) == 1;
+    req(xkb, 8); b16(0x100); b16(1 | 2); b16(0); b8(0); b8(0); b8(0); b8(0); b8(0); b8(0); b8(0); b8(0);
+    b16(0); b8(0); b8(0); b8(0); b8(0); b8(0); b8(0); b16(0);
+    s = send();
+    int mapped_keys = 0;
+    if (answer(s) == 1 && msg[15] == 4 && msg[17] == 8) {
+        u32 at = 40;
+        for (int t = 0; t < 4; t++) {
+            u32 entries = msg[at + 5], preserve = msg[at + 6];
+            at += 8 + 8 * entries + (preserve ? 4 * entries : 0);
+        }
+        for (u32 key = 8; key < 38; key++) at += 8 + 4 * r16(msg + at + 6);
+        mapped_keys = msg[at] == 2 && msg[at + 5] == 2 && r32(msg + at + 8) == 'a' && r32(msg + at + 12) == 'A';
+    }
+    req(xkb, 17); b16(0x100); b16(0); b32(512);
+    s = send();
+    int key_named = answer(s) == 1 && msg[18] == 8;
+    const u8 *n = msg + 32 + (38 - 8) * 4;
+    key_named = key_named && n[0] == 'A' && n[1] == 'C' && n[2] == '0' && n[3] == '1';
+    req(xkb, 4); b16(0x100); b16(0);
+    s = send();
+    check(using && mapped_keys && key_named && answer(s) == 1 && msg[1] == 3 && msg[8] == 0,
+          "XKEYBOARD: 1.0, four key types, keycode 38 alphabetic with a and A, named AC01, nothing held");
 
     // A selection owned.
     req(16, 0); b16(9); b16(0); bytes("CLIPBOARD", 9);

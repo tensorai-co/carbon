@@ -1,4 +1,5 @@
-//! The extensions: BIG-REQUESTS (requests past 256 KiB), XC-MISC (resource IDs), SHAPE (shaped and input-shaped
+//! The extensions' table (RENDER's and XKEYBOARD's requests are in their own modules), and the small ones:
+//! BIG-REQUESTS (requests past 256 KiB), XC-MISC (resource IDs), SHAPE (shaped and input-shaped
 //! windows: a top-level's bounding shape is its backing's transparency, its input shape the desktop's input region),
 //! and MIT-SHM (images through shared memory, a SysV segment or a memfd, read and written in place).
 
@@ -8,6 +9,8 @@ use display::Rect;
 use kernels_core::lock;
 
 use super::draw::{self, Region};
+use super::render::{RENDER, RENDER_ERROR};
+use super::xkb::{XKB_ERROR, XKB_EVENT, XKEYBOARD};
 use super::wire::{Ev, Reply, Req, err};
 use super::{ID_MASK, MAX_REQUEST, Res, SHIFT, Server, top_input};
 use crate::fs::{Node, Open};
@@ -22,7 +25,14 @@ const SHM_EVENT: u8 = 65;
 const SHM_ERROR: u8 = 128;
 
 /// Each extension: its name, major opcode, first event and first error.
-pub const EXTENSIONS: &[(&str, u8, u8, u8)] = &[("BIG-REQUESTS", BIG_REQUESTS, 0, 0), ("XC-MISC", XC_MISC, 0, 0), ("SHAPE", SHAPE, SHAPE_EVENT, 0), ("MIT-SHM", MIT_SHM, SHM_EVENT, SHM_ERROR)];
+pub const EXTENSIONS: &[(&str, u8, u8, u8)] = &[
+    ("BIG-REQUESTS", BIG_REQUESTS, 0, 0),
+    ("XC-MISC", XC_MISC, 0, 0),
+    ("SHAPE", SHAPE, SHAPE_EVENT, 0),
+    ("MIT-SHM", MIT_SHM, SHM_EVENT, SHM_ERROR),
+    ("RENDER", RENDER, 0, RENDER_ERROR),
+    ("XKEYBOARD", XKEYBOARD, XKB_EVENT, XKB_ERROR),
+];
 
 impl Server {
     pub(super) fn extension(&mut self, ci: u32, r: Req) {
@@ -38,6 +48,8 @@ impl Server {
             XC_MISC => self.xc_misc(ci, r),
             SHAPE => self.shape(ci, r),
             MIT_SHM => self.shm(ci, r),
+            RENDER => self.render(ci, r),
+            XKEYBOARD => self.xkb(ci, r),
             _ => self.error(ci, err::REQUEST, 0),
         }
     }

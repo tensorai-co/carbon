@@ -10,12 +10,14 @@
 //! the pointer and keyboard with grabs and focus, selections (bridged to the desktop's clipboard and primary
 //! selection as text), cursors (the cursor font as the desktop's named shapes, and pictures), pixmaps, GCs, images,
 //! fills, lines, arcs, polygons, and the core font: the display's own `fixed`), and the extensions BIG-REQUESTS,
-//! XC-MISC, SHAPE and MIT-SHM (SysV segments and memfds). Not yet: RENDER, XKEYBOARD, RANDR, XFIXES, XInput 2,
-//! Present, DRI3 and GLX; fonts from the image's own files; drag and drop (XDND).
+//! XC-MISC, SHAPE and MIT-SHM (SysV segments and memfds) in `ext`, RENDER in `render` and XKEYBOARD in `xkb`. Not
+//! yet: RANDR, XFIXES, XInput 2, Present, DRI3 and GLX; fonts from the image's own files; drag and drop (XDND).
 
 mod draw;
 mod ext;
+mod render;
 mod wire;
+mod xkb;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
@@ -222,6 +224,10 @@ enum Res {
     Colormap,
     /// An MIT-SHM segment.
     Shm(Arc<SharedMem>),
+    /// RENDER's.
+    Picture(Box<render::Picture>),
+    /// Shared by every ID that names it (ReferenceGlyphSet).
+    GlyphSet(Arc<Mutex<render::GlyphSet>>),
 }
 
 /// A pointer grab, the client's own (`GrabPointer`) or the one a press makes.
@@ -244,6 +250,10 @@ struct Client {
     seq: u16,
     gone: bool,
     big: bool,
+    /// XKEYBOARD: whether it's said it uses it, the events it's selected, and its per-client flags.
+    xkb: bool,
+    xkb_events: u16,
+    xkb_flags: u32,
 }
 
 /// A paste for an X client, waiting for the desktop's data.
@@ -294,6 +304,8 @@ struct Server {
     dirty: HashMap<u32, Rect>,
     colors: Option<HashMap<String, (u8, u8, u8)>>,
     keysyms: HashMap<u8, [u32; 2]>,
+    /// The keyboard as XKEYBOARD describes it.
+    keyboard: xkb::Keyboard,
     /// The request being done, for its errors: its major and minor opcodes.
     cur: (u8, u16),
     /// What the desktop's selections are offered as from an X owner's: each X selection's offer.
@@ -358,6 +370,7 @@ impl Server {
             dirty: HashMap::new(),
             colors: None,
             keysyms,
+            keyboard: xkb::Keyboard::new(),
             cur: (0, 0),
             offers: HashMap::new(),
             exports: HashMap::new(),
@@ -447,7 +460,7 @@ impl Server {
                     let _ = socket.shutdown(net::Shutdown::Both);
                     continue;
                 }
-                self.clients.insert(id, Client { socket, _watch: watch, input: Vec::new(), fds: VecDeque::new(), out: Vec::new(), out_fds: Vec::new(), setup: false, seq: 0, gone: false, big: false });
+                self.clients.insert(id, Client { socket, _watch: watch, input: Vec::new(), fds: VecDeque::new(), out: Vec::new(), out_fds: Vec::new(), setup: false, seq: 0, gone: false, big: false, xkb: false, xkb_events: 0, xkb_flags: 0 });
             }
         }
     }
@@ -2925,6 +2938,7 @@ impl Server {
     fn key(&mut self, window: WindowId, code: u16, down: bool, repeat: bool, modifiers: u8) {
         let Some(&top) = self.tops.get(&window) else { return };
         let keycode = (code + 8).min(255) as u8;
+        let before = self.xkb_before();
         if code == keys::CAPS_LOCK && down && !repeat {
             self.caps = !self.caps;
         }
@@ -2951,6 +2965,7 @@ impl Server {
             self.keys_down.remove(&keycode);
         }
         self.mods = keymap::xkb_mods(modifiers) as u16 | if self.caps { keymap::mods::LOCK as u16 } else { 0 };
+        self.xkb_state_changed(before, keycode, down);
     }
 
     /// The desktop asks for an X owner's selection: asked of the owner, into a property of the server's own window.
