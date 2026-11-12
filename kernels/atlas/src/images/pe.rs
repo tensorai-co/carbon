@@ -133,6 +133,19 @@ impl<'a> Pe<'a> {
         self.dirs.get(index).copied().filter(|(rva, size)| *rva != 0 && *size != 0)
     }
 
+    /// A data directory's RVA and size (1 imports, 13 delay-load imports, …), if it has one.
+    pub fn directory(&self, index: usize) -> Option<(u32, u32)> {
+        self.dir(index)
+    }
+
+    /// Every export's name, in the image as laid out in memory.
+    pub fn export_names(&self, image: &[u8]) -> Result<Vec<String>> {
+        let Some((rva, _)) = self.dir(DIR_EXPORT) else { return Ok(Vec::new()) };
+        let at = rva as usize;
+        let (names, name_table) = (u32_at(image, at + 24)?, u32_at(image, at + 32)?);
+        (0..names as usize).map(|i| cstr(image, u32_at(image, name_table as usize + i * 4)? as usize)).collect()
+    }
+
     /// Finds an export, in the image as laid out in memory.
     pub fn export(&self, image: &[u8], wanted: &Wanted) -> Result<Option<Found>> {
         let Some((rva, size)) = self.dir(DIR_EXPORT) else { return Ok(None) };

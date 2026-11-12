@@ -754,8 +754,12 @@ part of it, in more detail. When an item is done it comes off, and this README s
 - [ ] Sound: winmm (`waveOut`), WASAPI (`mmdevapi`), DirectSound, on `audio`.
 - [ ] `msiexec` in host Rust, and the programs installers run: `cmd.exe`, `reg.exe`, `regsvr32.exe`, `rundll32.exe`.
 - [ ] The long tail of exports, as programs ask for them: the `missing` stubs say which.
-- [ ] A coverage tool: run a folder of real packages and installers, and count which
-      `missing` exports they reach, so the long tail is ordered by evidence rather than guesses.
+- [ ] A coverage tool. Its static half is done: `carbon atlas imports` (`imports.rs`) reads what a PE or a folder of
+      them imports (static and delay-loaded, by name or ordinal, PE32 and PE32+), follows API sets to their DLL, and
+      places each import against atlas's declarations: written in host Rust or ntdll, a `missing` stub, not declared,
+      in a DLL atlas lacks, or one the program brings beside itself; across a folder, it ranks the DLLs and functions
+      atlas lacks by how many files want them. Still to do: the runtime half, counting the `missing` exports and
+      `GetProcAddress` names programs reach as they run, so the long tail is ordered by evidence rather than guesses.
 
 **What real programs will ask for next.** Installers, winget and large desktop apps (a browser engine's, say) go
 well past the items above. In rough order:

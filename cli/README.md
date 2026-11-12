@@ -31,6 +31,8 @@ carbon display resize app 1600x900@2        # its screen's size and scale, chang
 carbon display clipboard app                # its clipboard's text (with text after: set, as copied on the host)
 carbon display drop app 300 200 --files 'C:\notes.txt'  # drops files there, as dragged in from the host (or text)
 carbon pull debian:13 [--platform OS/ARCH] | images | rmi IMAGE
+carbon atlas imports setup.exe              # what a Windows program imports that atlas lacks (--all: everything)
+carbon atlas imports ~/installers/          # a folder of them: which load, and what's wanted most
 ```
 
 | `run` option | Meaning |

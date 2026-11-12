@@ -14,6 +14,7 @@ mod exceptions;
 mod files;
 mod handles;
 mod images;
+pub mod imports;
 mod mapping;
 mod objects;
 mod threads;

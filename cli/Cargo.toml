@@ -15,5 +15,6 @@ workspace = true
 
 [dependencies]
 exec.workspace = true
+atlas.workspace = true
 machine.workspace = true
 images.workspace = true

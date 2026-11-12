@@ -10,10 +10,13 @@
 //! carbon display windows NAME
 //! carbon display click NAME 640 400 && carbon display type NAME hello && carbon display key NAME ctrl+s
 //! carbon pull IMAGE | images | rmi IMAGE
+//! carbon atlas imports setup.exe            # what a Windows program imports that atlas doesn't have yet
 //! ```
 //!
 //! On macOS the binary is signed with `carbon.entitlements` to use the hypervisor:
 //! `codesign --force --sign - --entitlements carbon.entitlements target/release/carbon`.
+
+mod imports;
 
 use std::path::{Path, PathBuf};
 use std::process::exit;
@@ -52,6 +55,9 @@ usage: carbon <command> ...
   display clipboard NAME [TEXT...]           prints its clipboard's text, or sets it, as copied on the host
   display drop NAME X Y TEXT...              drops text there, as dragged in from the host
   display drop NAME X Y --files PATH...      drops files there (paths as the machine has them: C:\\..., /home/...)
+  atlas imports PATH... [--all]              what Windows programs import, against what atlas has: for a file,
+                                             each DLL and what of it isn't there; for several or a folder, what's
+                                             wanted most (--all lists everything)
   pull IMAGE [--platform OS/ARCH]            pull an image
   images                                     the images here
   rmi IMAGE                                  forget an image
@@ -258,6 +264,10 @@ fn main() {
                 machines.display_input(&name, verb, &rest).unwrap_or_else(|e| fail(e));
             }
             other => fail(format!("display doesn't {other} yet: screenshot, windows, move, click, drag, scroll, type, key")),
+        },
+        "atlas" => match one("what to do").as_str() {
+            "imports" => imports::run(args.by_ref().collect()),
+            other => fail(format!("atlas doesn't {other}: imports")),
         },
         "pull" => {
             let name = one("an image");
