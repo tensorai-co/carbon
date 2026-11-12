@@ -70,7 +70,8 @@ kernel touches it.
 its `Options`: lambda's signals process 1 or ends everything, atlas's ends its program.
 
 - **lambda's machine**: the root is the image's layers (Debian's, say) plus `os/`'s file systems. lambda loads the
-  command, its ELF interpreter from the image, and its signal trampoline (later, the vDSO) from memory. A static
+  command, its ELF interpreter from the image, and its vDSO (with the code signal handlers return through) from
+  memory. A static
   program needs no image: `run ./static-binary` runs on an empty root plus `os/`.
 - **atlas's machine**: there's no Windows image to bring, so atlas makes the system layer: `C:\Windows`, `System32`
   and `SysWOW64` from `os/`'s declarations, the registry's default hives, and a user profile (fonts to come). The
@@ -181,6 +182,7 @@ On this Mac, through hvf, all of them pass:
 | --- | --- |
 | lambda, ARM64 native and x86-64 translated | argv, getpid, uname, brk and mmap with pages faulted in on touch, files read from and written to the disk, getdents64, clocks, pipes, fork with copy-on-write, a child writing to a pipe, wait4 |
 | lambda's `signals.c`, both ISAs | a handler with siginfo and `rt_sigreturn`, blocked and pending signals, a SIGSEGV handler that moves the program on, SIGTERM to a child, SIGSTOP/SIGCONT/SIGKILL as `wait4` reports them, `SA_RESTART` and EINTR, SIGPIPE and EPIPE, a pty's line editing and echo, ^C on a pty |
+| lambda's `vdso.c`, both ISAs | The vDSO found through `AT_SYSINFO_EHDR`, its `clock_gettime` looked up by hash table and version as a C library does, the clock page ready after its first readings, every clock it keeps agreeing with the system call, `gettimeofday` in microseconds (and a time zone through the system call), 200,000 readings never going backwards, the CPU-time clock passed through and a bad clock EINVAL, at least four times quicker than the system call, `[vvar]` and `[vdso]` in `/proc/self/maps` |
 | lambda's `threads.c`, both ISAs | four threads by `clone`, each with its own tid and thread pointer (`CLONE_SETTLS`), joined by `CLONE_CHILD_CLEARTID`; a futex mutex contended by four threads for 20,000 rounds each, and an atomic add; futex wait and wake, 2,000 turns between two threads; 300 threads and then 300 processes, each ended before the next, more than a machine has CPUs at once; 160 threads alive at once, all waiting together (more than a VM's 64 vCPUs), each with its registers, a SIMD register, its stack and its thread pointer as it left them |
 | lambda's `code.c`, both ISAs | code written at run time, as JITs do: a function written to a writable, runnable page and rewritten 1,000 times; a direct call into code that's then rewritten; W^X (written, `mprotect`, run, and again); `munmap`, then new code at the same address; another thread rewriting a function this one keeps calling; 4,096 functions rewritten 16 times while another thread runs its own. On Apple silicon the x86-64 build checks that the translator forgets what it translated; `CARBON_EXEC_CODE_CACHE=65536` makes its code cache move between halves too |
 | lambda's `events.c`, both ISAs | eventfd counts, `EFD_SEMAPHORE`, EAGAIN, and a blocking read woken by another process; timerfd one-shot and interval expiries, `timerfd_gettime`, disarming; epoll level-triggered, edge-triggered and one-shot, `EPOLLOUT`, `EPOLLHUP`, EEXIST/ENOENT/EPERM, a timeout, a wait woken by another process, an edge-triggered timerfd, a closed file leaving, an epoll inside another and polled, `epoll_pwait2`; a signalfd woken in `poll` and `epoll` by another process's `kill`; the signal masks of `ppoll` and `epoll_pwait`; x86-64's `epoll_create`, `epoll_wait` and `eventfd` |
@@ -310,7 +312,8 @@ kernels/lambda/src/
   os/             what Linux itself provides, made in memory: /dev, /proc; wayland/, the Wayland compositor
                   answering $XDG_RUNTIME_DIR/wayland-0 on the desktop; x11/, the X server (and its window
                   manager's part) answering /tmp/.X11-unix/X0 on the same desktop
-                  to come: sysfs, the vDSO, pulse/ (a PulseAudio server)
+                  vdso.rs, the vDSO and its clock page
+                  to come: sysfs, pulse/ (a PulseAudio server)
 ```
 
 Each ISA's system call numbers become one `Sys` at the edge (`sys/`), with x86-64's old calls (`open`, `stat`, `fork`)
@@ -338,7 +341,7 @@ fix its own quirks (`mmap2`) there the same way.
   echo sockets EACCES, so `ping` says it can't.
 - **Signals** (`signal.rs`): per-thread masks and pending sets, process-wide pending signals with their siginfo,
   default actions (terminate, ignore, stop, continue), handlers with frames on the program's stack for each ISA,
-  `rt_sigreturn` through a trampoline page (`[vdso]`) when there's no `SA_RESTORER`, `SA_RESTART`, `SA_ONSTACK` with
+  `rt_sigreturn` through the vDSO's code when there's no `SA_RESTORER`, `SA_RESTART`, `SA_ONSTACK` with
   `sigaltstack`, `SA_NODEFER`, `SA_RESETHAND`, `rt_sigsuspend`, `rt_sigpending`, `signalfd` (woken when a signal it
   reads becomes pending), the signal mask of `ppoll`, `pselect6` and `epoll_pwait`, SIGCHLD with its code and
   status, SIGPIPE, and faults as SIGSEGV, SIGILL, SIGBUS, SIGFPE and SIGTRAP.
@@ -631,7 +634,13 @@ part of it, in more detail. When an item is done it comes off, and this README s
       memory, memfds and SysV segments are shared already); `remap_file_pages`; `userfaultfd`.
 - [ ] `EPOLLEXCLUSIVE` and `EPOLLWAKEUP` are accepted and ignored.
 - [ ] A console on Windows hosts (raw mode is Unix-only for now), and a full-screen editor tried on it.
-- [ ] A vDSO made in memory for each ISA, reading kernels-core's clock page.
+- [ ] The vDSO (`os/vdso.rs`: an ELF image made in memory for each ISA, with versioned symbols glibc, musl and Go
+      take, and a machine-wide clock page, `[vvar]`, under a sequence lock) answers `clock_gettime` for the wall and
+      monotonic clocks and `gettimeofday` from the CPU's counter with no system call, some 200 times quicker than the
+      call on ARM64 and 400 on translated x86-64, and learns how the guest's counter stands against the host's from
+      its own fallback's first readings (passed beside an ordinary `clock_gettime`, so seccomp sees nothing new).
+      Still to do: the counter on hosts other than Apple silicon (the vDSO makes system calls there), `time` and
+      `getcpu` without a system call, `getrandom`'s, and unwinding information for its signal return.
 - [ ] `clone3`, `rseq`, process groups and sessions as job control needs them; files' permissions checked against
       credentials (the credentials themselves are done).
 - [ ] sysfs, and more of `/proc`.
@@ -673,7 +682,7 @@ part of it, in more detail. When an item is done it comes off, and this README s
       and talk to it, but no page draws: a `data:` URL finishes loading with nothing shown and its title unread, and a
       `file:` URL never starts loading. Found and fixed on the way: `/proc/self/exe` with links followed, more threads
       than vCPUs, a seccomp trap's registers rolled back for its handler, and `/proc/<pid>/fd` and `task` as
-      directories. Its main thread reads the clock thousands of times a second, each a system call without a vDSO.
+      directories. Its main thread reads the clock thousands of times a second, through the vDSO now.
 - [ ] i386 programs: `sys/i386.rs`, with exec's 32-bit translation.
 - [ ] x86-64's `MAP_32BIT`; `/proc/cpuinfo` per ISA.
 - [ ] Tracing: no single-stepping (`PTRACE_SINGLESTEP` and `PTRACE_SYSEMU*` are EIO, as exec has no trap after one

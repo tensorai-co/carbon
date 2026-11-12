@@ -199,12 +199,14 @@ pub fn boot(mut exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&
     let console = (options.console && host.is_terminal()).then(|| Tty::console(host.clone()));
     let klog = admin::Klog::boot(host.cpus(), exec.memory().size().limit);
     let net = options.network.clone().unwrap_or_else(|| ::net::Network::on_this_host(::net::Config { hostname: options.hostname.clone(), dns: None }));
+    let exec = Arc::new(Mutex::new(exec));
     let kernel = Arc::new(Kernel {
         console,
         ptys: Mutex::new(BTreeMap::new()),
         next_pty: AtomicU32::new(0),
         done: AtomicBool::new(false),
-        exec: Arc::new(Mutex::new(exec)),
+        clock: os::vdso::Clock::new(mm::shared::SharedMem::new(exec.clone(), exec::PAGE, 0)),
+        exec,
         host,
         disk: Mutex::new(disk),
         cache: Mutex::new(PageCache::default()),
@@ -222,6 +224,7 @@ pub fn boot(mut exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&
         boot_ns,
         klog: Mutex::new(klog),
     });
+    os::vdso::start(&kernel);
     if let Some(desktop) = kernel.options.display.clone() {
         if let Err(e) = os::wayland::start(&kernel, desktop.clone()) {
             kernel.host.write(host::Stream::Err, format!("lambda: the Wayland server: {e}\n").as_bytes());
@@ -274,6 +277,8 @@ fn run_init(kernel: &Arc<Kernel>, cpu: Cpu, argv: &[&str]) -> Result<Status, Str
 /// One machine's kernel, shared by all its guest threads.
 pub(crate) struct Kernel {
     exec: SharedExec,
+    /// The clock page every process maps as `[vvar]`, for the vDSO, and what it's written from (`os::vdso`).
+    clock: os::vdso::Clock,
     host: Arc<dyn Host>,
     disk: Mutex<Disk>,
     cache: Mutex<PageCache>,

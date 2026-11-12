@@ -26,7 +26,12 @@ impl Task {
         }
     }
 
-    pub(crate) fn clock_gettime(&mut self, cx: &mut Cx<'_>, clock: u64, at: u64) -> Result<u64, Errno> {
+    /// `clock_gettime`. From the vDSO's own fallback, its counter reading comes too (`counter`, with `marker` saying
+    /// so), which tells the clock page how the guest's counter stands against the host's.
+    pub(crate) fn clock_gettime(&mut self, cx: &mut Cx<'_>, clock: u64, at: u64, counter: u64, marker: u64) -> Result<u64, Errno> {
+        if marker == crate::os::vdso::MARKER {
+            crate::os::vdso::sample(&self.k, counter);
+        }
         let now = self.clock_reading(clock).ok_or(EINVAL)?;
         self.write_timespec(cx, at, now)?;
         Ok(0)
@@ -40,13 +45,18 @@ impl Task {
         Ok(0)
     }
 
-    pub(crate) fn gettimeofday(&mut self, cx: &mut Cx<'_>, at: u64) -> Result<u64, Errno> {
+    /// `gettimeofday`: the wall clock in microseconds, and the time zone (Greenwich, no daylight saving, as Linux
+    /// keeps it unless it's told otherwise) if asked for.
+    pub(crate) fn gettimeofday(&mut self, cx: &mut Cx<'_>, at: u64, zone: u64) -> Result<u64, Errno> {
         if at != 0 {
             let now = self.k.host.wall();
             self.mem(cx, true, |t| {
                 user::write_u64(&mut t.space(), at, now / 1_000_000_000)?;
                 user::write_u64(&mut t.space(), at + 8, now % 1_000_000_000 / 1000)
             })?;
+        }
+        if zone != 0 {
+            self.mem(cx, true, |t| user::write_u64(&mut t.space(), zone, 0))?;
         }
         Ok(0)
     }

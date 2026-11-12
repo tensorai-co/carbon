@@ -916,9 +916,9 @@ impl Task {
             Sys::PidfdSendSignal => self.pidfd_send_signal(cx, a[0] as i32, a[1] as i32, a[2], a[3]),
             Sys::PidfdGetfd => self.pidfd_getfd(a[0] as i32, a[1] as i32, a[2]),
             // Time.
-            Sys::ClockGettime => self.clock_gettime(cx, a[0], a[1]),
+            Sys::ClockGettime => self.clock_gettime(cx, a[0], a[1], a[2], a[3]),
             Sys::ClockGetres => self.clock_getres(cx, a[0], a[1]),
-            Sys::Gettimeofday => self.gettimeofday(cx, a[0]),
+            Sys::Gettimeofday => self.gettimeofday(cx, a[0], a[1]),
             Sys::Time => {
                 let now = self.k.host.wall() / 1_000_000_000;
                 if a[0] != 0 {

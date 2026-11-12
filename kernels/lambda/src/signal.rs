@@ -1048,14 +1048,3 @@ impl Task {
         Ok(0)
     }
 }
-
-/// The code `rt_sigreturn` is reached by when a handler returns and the program gave no restorer of its own: on a
-/// page of its own in every process, as the vDSO's is on Linux.
-pub(crate) fn trampoline(isa: exec::Isa) -> Vec<u8> {
-    match isa {
-        // movz x8, #139; svc #0
-        exec::Isa::Arm64 => [0xd280_1168u32, 0xd400_0001].iter().flat_map(|w| w.to_le_bytes()).collect(),
-        // mov eax, 15; syscall
-        _ => vec![0xb8, 15, 0, 0, 0, 0x0f, 0x05],
-    }
-}

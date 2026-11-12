@@ -214,10 +214,14 @@ pub(crate) fn exec_into(k: &Arc<Kernel>, cx: &mut Cx<'_>, state: &mut ProcState,
                 0
             };
             map_image(t, &mut regions, &program, base, &exe)?;
-            // The page handlers return to, between mmap's room and the stack.
-            let trampoline = mmap.end;
-            t.space().map(trampoline..trampoline + PAGE, Prot::RX).with(&crate::signal::trampoline(isa)).map_err(|_| ENOMEM)?;
-            regions.insert(trampoline..trampoline + PAGE, Area::new(Prot::RX, Backing::Anon, "[vdso]"));
+            // The clock page and the vDSO (with the code handlers return through), between mmap's room and the stack.
+            let vvar_at = mmap.end;
+            regions.insert(vvar_at..vvar_at + PAGE, Area::new(Prot::R, Backing::Shared { mem: k.clock.page.clone(), offset: 0, private: false }, "[vvar]"));
+            let vdso = crate::os::vdso::image(isa);
+            let vdso_at = vvar_at + PAGE;
+            t.space().map(vdso_at..vdso_at + PAGE, Prot::RX).with(&vdso.bytes).map_err(|_| ENOMEM)?;
+            regions.insert(vdso_at..vdso_at + PAGE, Area::new(Prot::RX, Backing::Anon, "[vdso]"));
+            let trampoline = vdso_at + vdso.sigreturn;
             let mut interp_base = 0;
             if let Some(interp) = &interp {
                 let (ilo, ihi) = interp.span();
@@ -231,6 +235,7 @@ pub(crate) fn exec_into(k: &Arc<Kernel>, cx: &mut Cx<'_>, state: &mut ProcState,
             };
             let phdr = base + program.phdr.unwrap_or(program.phoff);
             let auxv = [
+                (AT_SYSINFO_EHDR, vdso_at),
                 (AT_PHDR, phdr),
                 (AT_PHENT, 56),
                 (AT_PHNUM, program.phnum),

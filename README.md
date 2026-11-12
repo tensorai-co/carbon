@@ -219,7 +219,7 @@ another process on Windows hosts; a worker process per machine.
 1. Processes: `execve` with other threads running, a `vfork` that shares memory, `clone3`, `rseq`, permissions checked
    against credentials.
 2. Memory and files: shared file mappings written back, `msync`; sysfs and more of `/proc`.
-3. The vDSO, made in memory, reading the clock page.
+3. The vDSO's counter on every host (Apple silicon's reads it already), and `time`, `getcpu` and `getrandom` in it.
 4. Signals' remainder: queued real-time signals, `rt_sigtimedwait`, `setitimer`, `alarm`, SIGTTOU, the FP state in the
    frame, core dumps.
 5. `apt install` on the Linux and Windows hosts, and locks that hold between processes.

@@ -1,8 +1,10 @@
 //! What Linux itself provides beyond system calls: the device files in `/dev`, put on the disk when a machine boots,
 //! `/proc`, made each time it's read, and the machine's own `/etc/resolv.conf`, `/etc/hosts` and `/etc/hostname`.
 //!
-//! The Wayland server is `wayland`, the X server `x11`. Still to come here, as the proposal has them: sysfs and a vDSO.
+//! The Wayland server is `wayland`, the X server `x11`, the vDSO and its clock page `vdso`. Still to come here, as the
+//! proposal has them: sysfs.
 
+pub(crate) mod vdso;
 pub(crate) mod wayland;
 pub(crate) mod x11;
 
