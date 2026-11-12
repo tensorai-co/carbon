@@ -4,6 +4,10 @@
 //! and the program is a path inside it. Without it, the program is a file on the host, put at `/bin/<name>` on an
 //! otherwise empty disk with a file at `/etc/greeting`. Set `CARBON_TRACE=1` to see every system call.
 //!
+//! With `CARBON_DISPLAY=WxH[@SCALE]`, the machine has a desktop that big, and its Wayland server; with
+//! `CARBON_SCREENSHOTS=<folder>` too, the desktop as the machine stopped is saved there as `screen.png`, and each
+//! window's last picture while it was shown beside it.
+//!
 //! ```sh
 //! cargo build --example run
 //! codesign --force --sign - --entitlements carbon.entitlements target/debug/examples/run
@@ -11,7 +15,11 @@
 //! target/debug/examples/run --root debian.tar /bin/bash -c 'echo hello'
 //! ```
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use display::desktop::{self, WindowId};
 
 use exec::{Exec, Isolation, Options};
 use lambda::{Disk, Meta};
@@ -70,13 +78,66 @@ fn main() {
     if let Ok(term) = std::env::var("TERM") {
         options.env.push(format!("TERM={term}"));
     }
-    match lambda::boot(exec, cpu, disk, Arc::new(host::Std::new()), &argv, options) {
+    let desktop = std::env::var("CARBON_DISPLAY").ok().map(|size| {
+        let (w, h, scale) = display::output::parse_size(&size).unwrap_or_else(|| fail(format!("CARBON_DISPLAY is WxH or WxH@SCALE, not {size}")));
+        let d = display::Desktop::shared(w, h);
+        desktop::lock(&d).set_output(display::output::Output::headless(w, h, scale));
+        d
+    });
+    options.display = desktop.clone();
+    let _clock = desktop.clone().map(|d| display::clock::Clock::start(d, 60));
+    let done = Arc::new(AtomicBool::new(false));
+    let pictures = desktop.clone().map(|d| record(d, done.clone()));
+    let ended = lambda::boot(exec, cpu, disk, Arc::new(host::Std::new()), &argv, options);
+    done.store(true, Ordering::Release);
+    if let (Some(d), Ok(folder)) = (&desktop, std::env::var("CARBON_SCREENSHOTS")) {
+        let mut saved = vec![("screen".to_string(), desktop::lock(d).screen().clone())];
+        if let Some(pictures) = pictures {
+            saved.extend(pictures.lock().unwrap_or_else(|p| p.into_inner()).values().enumerate().map(|(i, (title, s))| {
+                let name: String = title.chars().map(|c| if c.is_alphanumeric() { c } else { '-' }).collect();
+                (format!("{i}-{name}"), s.clone())
+            }));
+        }
+        for (name, surface) in saved {
+            let path = format!("{folder}/{name}.png");
+            match std::fs::write(&path, surface.png()) {
+                Ok(()) => eprintln!("[saved {path}, {}x{}]", surface.width, surface.height),
+                Err(e) => eprintln!("[couldn't save {path}: {e}]"),
+            }
+        }
+    }
+    match ended {
         Ok(status) => {
             eprintln!("[{status:?}]");
             std::process::exit(status.code());
         }
         Err(why) => fail(format!("lambda: {why}")),
     }
+}
+
+/// Each window's picture as it was last shown, with its title, kept as the desktop changes until `done`.
+fn record(d: desktop::Shared, done: Arc<AtomicBool>) -> Arc<Mutex<BTreeMap<WindowId, (String, display::Surface)>>> {
+    let pictures: Arc<Mutex<BTreeMap<WindowId, (String, display::Surface)>>> = Arc::default();
+    let kept = pictures.clone();
+    let observer = desktop::lock(&d).observe();
+    std::thread::spawn(move || {
+        while !done.load(Ordering::Acquire) {
+            {
+                let mut d = desktop::lock(&d);
+                let observed = d.take_observed(observer);
+                let changed = observed.damage.iter().map(|(id, _)| *id).chain(observed.windows.iter().map(|w| w.id));
+                let ids: Vec<WindowId> = changed.collect();
+                for id in ids {
+                    let Some(info) = d.window_info(id).filter(|w| w.on_screen) else { continue };
+                    if let Some(s) = d.read(id, display::Rect::new(0, 0, info.content.width(), info.content.height())) {
+                        kept.lock().unwrap_or_else(|p| p.into_inner()).insert(id, (info.title, s));
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    });
+    pictures
 }
 
 /// exec's tuning: the defaults, but for `CARBON_EXEC_CODE_CACHE=<bytes>`, which makes x86's code cache move between

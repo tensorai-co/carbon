@@ -103,6 +103,9 @@ pub struct Options {
     pub stop: Stop,
     /// The machine's network; if None, one of its own on the host's sockets, named `hostname`.
     pub network: Option<::net::Network>,
+    /// The desktop its windows go on, if it has one: the kernel answers `$XDG_RUNTIME_DIR/wayland-0` with a Wayland
+    /// compositor on it, and the first program's environment says where (`XDG_RUNTIME_DIR`, `WAYLAND_DISPLAY`).
+    pub display: Option<display::desktop::Shared>,
 }
 
 /// A running machine, from outside it: how `carbon stop` reaches in, from any thread.
@@ -145,6 +148,7 @@ impl Default for Options {
             console: true,
             stop: Stop::default(),
             network: None,
+            display: None,
         }
     }
 }
@@ -176,8 +180,16 @@ impl Status {
 
 /// Boots a machine: runs `argv[0]`, a path on `disk`, as process 1, on this thread with the CPU `Exec::open` gave, and
 /// returns how it ended. Other processes still running then are ended with it.
-pub fn boot(mut exec: Exec, mut cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&str], options: Options) -> Result<Status, String> {
+pub fn boot(mut exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&str], options: Options) -> Result<Status, String> {
     let mut disk = disk;
+    let mut options = options;
+    if options.display.is_some() {
+        for (key, value) in [("XDG_RUNTIME_DIR", os::wayland::RUNTIME_DIR), ("WAYLAND_DISPLAY", os::wayland::DISPLAY), ("DISPLAY", os::x11::DISPLAY)] {
+            if !options.env.iter().any(|e| e.split('=').next() == Some(key)) {
+                options.env.push(format!("{key}={value}"));
+            }
+        }
+    }
     os::populate(&mut disk);
     let mount_ns = fs::mount::MountNs::new(fs::mount::Mounts::boot(&disk));
     let boot_ns = ns::Namespaces::boot(mount_ns, admin::Names { host: options.hostname.clone(), domain: "(none)".to_string() });
@@ -210,6 +222,14 @@ pub fn boot(mut exec: Exec, mut cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv:
         boot_ns,
         klog: Mutex::new(klog),
     });
+    if let Some(desktop) = kernel.options.display.clone() {
+        if let Err(e) = os::wayland::start(&kernel, desktop.clone()) {
+            kernel.host.write(host::Stream::Err, format!("lambda: the Wayland server: {e}\n").as_bytes());
+        }
+        if let Err(e) = os::x11::start(&kernel, desktop) {
+            kernel.host.write(host::Stream::Err, format!("lambda: the X server: {e}\n").as_bytes());
+        }
+    }
     let watchers = kernel.stdin_watchers.clone();
     kernel.host.watch_input(Arc::new(move || watchers.notify()));
     *lock(&kernel.options.stop.0) = Some(Arc::downgrade(&kernel));
@@ -218,7 +238,7 @@ pub fn boot(mut exec: Exec, mut cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv:
         let k = kernel.clone();
         let _ = std::thread::Builder::new().name("lambda console".into()).spawn(move || feed_console(&k));
     }
-    let result = run_init(&kernel, &mut cpu, argv);
+    let result = run_init(&kernel, cpu, argv);
     kernel.done.store(true, Ordering::Release);
     kernel.timers.stop();
     if kernel.console.is_some() {
@@ -231,7 +251,7 @@ pub fn boot(mut exec: Exec, mut cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv:
     result
 }
 
-fn run_init(kernel: &Arc<Kernel>, cpu: &mut Cpu, argv: &[&str]) -> Result<Status, String> {
+fn run_init(kernel: &Arc<Kernel>, cpu: Cpu, argv: &[&str]) -> Result<Status, String> {
     let exec = kernel.exec.clone();
     let mut cx = Cx::new(&exec, cpu);
     let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();

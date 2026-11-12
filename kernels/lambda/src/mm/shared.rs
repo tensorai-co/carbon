@@ -502,3 +502,8 @@ impl Task {
         }
     }
 }
+
+/// A SysV segment's memory, by its ID, in an IPC namespace: what an X client's `shmid` names to MIT-SHM.
+pub(crate) fn shm_segment(ipc: &crate::ns::IpcNs, id: i32) -> Option<Arc<SharedMem>> {
+    lock(&ipc.shm).segments.get(&id).map(|s| s.mem.clone())
+}

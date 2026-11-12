@@ -15,6 +15,7 @@ kernels-core.workspace = true
 layers.workspace = true
 host.workspace = true
 net.workspace = true
+display.workspace = true
 
 [dev-dependencies]
 layers.workspace = true
