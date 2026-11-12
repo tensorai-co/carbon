@@ -2,7 +2,7 @@
 
 mod trust;
 
-pub use crate::unix::{random, set_raw, terminal_size};
+pub use crate::unix::{random, set_raw, terminal_size, thread_cpu};
 pub use trust::check as check_certificates;
 
 unsafe extern "C" {

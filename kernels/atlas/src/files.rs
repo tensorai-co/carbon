@@ -22,6 +22,8 @@ pub const ERROR_FILE_EXISTS: u32 = 80;
 pub const ERROR_INVALID_PARAMETER: u32 = 87;
 pub const ERROR_INVALID_NAME: u32 = 123;
 pub const ERROR_DIR_NOT_EMPTY: u32 = 145;
+/// A move or link between two volumes.
+pub const ERROR_NOT_SAME_DEVICE: u32 = 17;
 pub const ERROR_ALREADY_EXISTS: u32 = 183;
 pub const ERROR_DIRECTORY: u32 = 267;
 
@@ -184,6 +186,7 @@ pub(crate) fn layers_error(e: layers::Error) -> u32 {
         layers::Error::NotEmpty => ERROR_DIR_NOT_EMPTY,
         layers::Error::Loop => ERROR_PATH_NOT_FOUND,
         layers::Error::BadName => ERROR_INVALID_NAME,
+        layers::Error::CrossFs => ERROR_NOT_SAME_DEVICE,
         layers::Error::Io => ERROR_IO_DEVICE,
     }
 }

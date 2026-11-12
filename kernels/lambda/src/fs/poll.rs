@@ -65,6 +65,13 @@ impl Task {
             Node::Eventfd(eventfd) => (eventfd.readable(), eventfd.writable(), false, false),
             Node::Netlink(netlink) => (netlink.readable(), true, false, false),
             Node::Timerfd(timer) => (timer.readable(self.timer_now(timer.realtime)), false, false, false),
+            Node::Pidfd(process) => (kernels_core::lock(&process.state).zombie.is_some(), false, false, false),
+            Node::Inotify(inotify) => (inotify.readable(), false, false, false),
+            Node::Fanotify(group) => (group.readable(), false, false, false),
+            Node::Mqueue(queue) => {
+                let (readable, writable) = queue.ready();
+                (readable, writable, false, false)
+            }
             Node::Epoll(epoll) => {
                 let any = depth < MOST_NESTED
                     && epoll.live().iter().any(|(interest, file)| Task::interest_report(interest, self.ready(file, u32::MAX, depth + 1), false) != 0);
@@ -100,6 +107,10 @@ impl Task {
             Node::Epoll(epoll) => f(&epoll.watchers),
             Node::Socket(s) => f(&s.watchers),
             Node::Netlink(netlink) => f(&netlink.watchers),
+            Node::Pidfd(process) => f(&process.exit_watchers),
+            Node::Mqueue(queue) => f(&queue.watchers),
+            Node::Inotify(inotify) => f(&inotify.watchers),
+            Node::Fanotify(group) => f(&group.watchers),
             _ => {}
         }
     }

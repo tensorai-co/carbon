@@ -37,10 +37,21 @@ impl Task {
             });
         }
         let (dir, dir_path) = self.start_dir(dirfd)?;
-        if crate::os::stat(&crate::process::exe_path(&dir_path, &path)).is_some() {
+        let absolute = crate::process::exe_path(&dir_path, &path);
+        if crate::os::stat(&absolute).is_some() {
             return Ok(None);
         }
-        Ok(Some(lock(&self.k.disk).resolve(dir, &path, !nofollow)?))
+        let view = self.view();
+        let found = view.resolve(&lock(&self.k.disk), dir, &path, !nofollow).map_err(Errno::from);
+        match found {
+            Ok(ino) => {
+                self.writable(&absolute)?;
+                Ok(Some(ino))
+            }
+            // Through a link to somewhere lambda makes, as `/dev/stdin` is: nothing there to change.
+            Err(e) if (e == ENOENT || e == ENOTDIR) && self.through_links(&absolute, !nofollow).is_some() => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// `fchmodat` and `fchmod`: the permission bits, keeping what kind of file it is.
@@ -93,16 +104,66 @@ impl Task {
         Ok(0)
     }
 
+    /// x86-64's `futimesat` and `utimes`: `utimensat` with two `timeval`s, microseconds rather than nanoseconds.
+    pub(crate) fn futimesat(&mut self, cx: &mut Cx<'_>, dirfd: i32, path_at: u64, times_at: u64) -> Result<u64, Errno> {
+        let modified = if times_at == 0 {
+            self.k.now()
+        } else {
+            let t = self.mem(cx, false, |t| (0..4).map(|i| user::read_u64(&t.space(), times_at + i * 8)).collect::<Result<Vec<u64>, _>>())?;
+            if t[1] >= 1_000_000 || t[3] >= 1_000_000 {
+                return Err(EINVAL);
+            }
+            t[2].saturating_mul(1_000_000_000).saturating_add(t[3] * 1000)
+        };
+        let Some(ino) = self.meta_target(cx, dirfd, path_at, false, path_at == 0)? else { return Ok(0) };
+        lock(&self.k.disk).set_modified(ino, modified)?;
+        Ok(0)
+    }
+
+    /// x86-64's `utime`: a `utimbuf` of access and modification seconds, or none for now.
+    pub(crate) fn utime(&mut self, cx: &mut Cx<'_>, path_at: u64, times_at: u64) -> Result<u64, Errno> {
+        let modified = if times_at == 0 { self.k.now() } else { self.mem(cx, false, |t| user::read_u64(&t.space(), times_at + 8))?.saturating_mul(1_000_000_000) };
+        let Some(ino) = self.meta_target(cx, AT_FDCWD, path_at, false, false)? else { return Ok(0) };
+        lock(&self.k.disk).set_modified(ino, modified)?;
+        Ok(0)
+    }
+
+    /// `name_to_handle_at`: the file must be there, but the disk gives no handles, as a file system without
+    /// export support doesn't. Programs (systemd's, `findmnt`) fall back to comparing `stat`s and mount IDs.
+    pub(crate) fn name_to_handle_at(&mut self, cx: &mut Cx<'_>, dirfd: i32, path_at: u64, flags: u64) -> Result<u64, Errno> {
+        // AT_HANDLE_MNT_ID_UNIQUE, AT_HANDLE_CONNECTABLE, AT_HANDLE_FID, AT_SYMLINK_FOLLOW and AT_EMPTY_PATH.
+        if flags & !(0x001 | 0x002 | 0x200 | AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
+            return Err(EINVAL);
+        }
+        self.meta_target(cx, dirfd, path_at, flags & AT_SYMLINK_FOLLOW == 0, flags & AT_EMPTY_PATH != 0)?;
+        Err(EOPNOTSUPP)
+    }
+
+    /// `open_by_handle_at`: no handle was ever given out, so whatever it's passed is stale.
+    pub(crate) fn open_by_handle_at(&mut self, cx: &mut Cx<'_>, mount_fd: i32, handle_at: u64) -> Result<u64, Errno> {
+        const MAX_HANDLE_SZ: u32 = 128;
+        if mount_fd != AT_FDCWD {
+            self.file(mount_fd)?;
+        }
+        let bytes = self.mem(cx, false, |t| user::read_u32(&t.space(), handle_at))?;
+        if bytes == 0 || bytes > MAX_HANDLE_SZ {
+            return Err(EINVAL);
+        }
+        Err(ESTALE)
+    }
+
     /// `linkat`: another name for a file.
     pub(crate) fn linkat(&mut self, cx: &mut Cx<'_>, olddirfd: i32, old_at: u64, newdirfd: i32, new_at: u64, flags: u64) -> Result<u64, Errno> {
         let ino = self.meta_target(cx, olddirfd, old_at, flags & AT_SYMLINK_FOLLOW == 0, flags & AT_EMPTY_PATH != 0)?.ok_or(EXDEV)?;
         let new = self.read_path(cx, new_at)?;
-        let (dir, _) = self.start_dir(newdirfd)?;
+        let (dir, dir_path) = self.start_dir(newdirfd)?;
+        self.writable(&crate::process::exe_path(&dir_path, &new))?;
+        let view = self.view();
         let mut disk = lock(&self.k.disk);
         if disk.stat(ino)?.kind == Kind::Dir {
             return Err(EPERM);
         }
-        let (parent, name) = disk.resolve_parent(dir, &new)?;
+        let (parent, name) = view.resolve_parent(&disk, dir, &new)?;
         disk.link(parent, name, ino, self.k.now())?;
         Ok(0)
     }

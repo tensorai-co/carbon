@@ -24,6 +24,8 @@ pub(crate) enum Record {
     /// A file's contents since the last of these: cut to `cut` (the smallest it's been since), then `size`, with each
     /// chunk that changed, by its number, with its name or none for a hole; and its time.
     File { ino: Ino, cut: u64, size: u64, modified: u64, chunks: Vec<(u32, Option<Hash>)> },
+    /// An extended attribute set to `value`, or removed (`None`).
+    Xattr { ino: Ino, name: String, value: Option<Vec<u8>> },
 }
 
 /// FNV-1a: enough to tell a record that's whole from one a crash cut short.
@@ -56,6 +58,10 @@ impl Writer {
             self.u32(*word);
         }
     }
+    fn bytes(&mut self, b: &[u8]) {
+        self.u32(b.len() as u32);
+        self.0.extend_from_slice(b);
+    }
 }
 
 struct Reader<'a>(&'a [u8]);
@@ -81,6 +87,10 @@ impl Reader<'_> {
     }
     fn meta(&mut self) -> Option<[u32; 4]> {
         Some([self.u32()?, self.u32()?, self.u32()?, self.u32()?])
+    }
+    fn bytes(&mut self) -> Option<Vec<u8>> {
+        let len = self.u32()? as usize;
+        Some(self.take(len)?.to_vec())
     }
 }
 
@@ -145,6 +155,15 @@ impl Record {
                     }
                 }
             }
+            Record::Xattr { ino, name, value } => {
+                w.u8(8);
+                w.u64(*ino);
+                w.str(name);
+                w.u8(u8::from(value.is_some()));
+                if let Some(value) = value {
+                    w.bytes(value);
+                }
+            }
         }
         let mut out = Vec::with_capacity(w.0.len() + 8);
         out.extend_from_slice(&(w.0.len() as u32).to_le_bytes());
@@ -172,6 +191,11 @@ impl Record {
                     chunks.push((number, hash));
                 }
                 Record::File { ino, cut, size, modified, chunks }
+            }
+            8 => {
+                let (ino, name) = (r.u64()?, r.str()?);
+                let value = if r.u8()? == 1 { Some(r.bytes()?) } else { None };
+                Record::Xattr { ino, name, value }
             }
             _ => return None,
         };

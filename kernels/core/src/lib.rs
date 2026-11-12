@@ -20,6 +20,7 @@ pub mod call;
 pub mod frame;
 pub mod mm;
 pub mod thread;
+pub mod timers;
 pub mod user;
 pub mod wait;
 

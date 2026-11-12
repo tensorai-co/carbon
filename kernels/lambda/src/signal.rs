@@ -4,8 +4,9 @@
 //! A signal is delivered at a thread's next stop: a system call ending, a fault, or a preempt, which sending one makes
 //! happen. A system call a signal interrupted is restarted, unless a handler without `SA_RESTART` ran.
 
-use std::sync::Arc;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use exec::isa::x86::{R8, R9, R10, R11, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP, USER_FLAGS};
 use exec::{FpRegs, Regs};
@@ -14,7 +15,7 @@ use kernels_core::thread::{Cx, Flow};
 use kernels_core::user;
 
 use crate::abi::*;
-use crate::process::{Process, Report, Task};
+use crate::process::{ProcState, Process, Report, Task};
 use crate::sys::Sys;
 use crate::{Kernel, Status};
 
@@ -28,6 +29,9 @@ pub const SIGTSTP: i32 = 20;
 pub const SIGTTIN: i32 = 21;
 pub const SIGTTOU: i32 = 22;
 pub const SIGWINCH: i32 = 28;
+pub const SIGSYS: i32 = 31;
+/// SIGSYS's `si_code` from a seccomp filter's `SECCOMP_RET_TRAP`.
+pub(crate) const SYS_SECCOMP: i32 = 1;
 
 const SIG_DFL: u64 = 0;
 const SIG_IGN: u64 = 1;
@@ -40,16 +44,22 @@ const SA_RESETHAND: u64 = 0x8000_0000;
 const SS_ONSTACK: u32 = 1;
 const SS_DISABLE: u32 = 2;
 /// `si_code`s.
-const SI_USER: i32 = 0;
+pub(crate) const SI_USER: i32 = 0;
 const SI_KERNEL: i32 = 0x80;
+/// From a POSIX timer, with its ID, overrun and value.
+pub(crate) const SI_TIMER: i32 = -2;
 const SI_TKILL: i32 = -6;
+/// The first real-time signal, as the kernel counts: each one sent is queued, not merged with one pending.
+pub(crate) const SIGRTMIN: i32 = 32;
+/// The resource limit on how many signals a process may have queued.
+const RLIMIT_SIGPENDING: usize = 11;
 
 pub const fn bit(signal: i32) -> u64 {
     1 << (signal - 1)
 }
 
 /// SIGKILL and SIGSTOP can't be blocked, caught or ignored.
-const UNBLOCKABLE: u64 = bit(SIGKILL) | bit(SIGSTOP);
+pub(crate) const UNBLOCKABLE: u64 = bit(SIGKILL) | bit(SIGSTOP);
 const STOPS: u64 = bit(SIGSTOP) | bit(SIGTSTP) | bit(SIGTTIN) | bit(SIGTTOU);
 
 /// What a signal does when nothing's been said.
@@ -70,6 +80,11 @@ fn default_of(signal: i32) -> Default {
         SIGQUIT | SIGILL | SIGTRAP | 6 | SIGBUS | SIGFPE | SIGSEGV | 24 | 25 | 31 => Default::Core,
         _ => Default::Term,
     }
+}
+
+/// Whether `signal` ends a process with a core dump, when nothing's been said (`CLD_DUMPED`).
+pub(crate) fn dumps_core(signal: i32) -> bool {
+    default_of(signal) == Default::Core
 }
 
 /// `struct sigaction`, as the kernel has it on both ISAs: handler, flags, restorer, mask.
@@ -135,16 +150,69 @@ impl Signals {
     }
 }
 
-/// A thread's pending signals and mask, shared with whoever sends it signals.
+/// A thread's pending signals and mask, shared with whoever sends it signals, and what each signal sent to it alone
+/// is about.
 #[derive(Debug, Default)]
 pub(crate) struct ThreadSignals {
     pub pending: AtomicU64,
     pub mask: AtomicU64,
+    pub infos: Mutex<Queues>,
 }
 
 impl ThreadSignals {
     pub fn with_mask(mask: u64) -> Arc<ThreadSignals> {
-        Arc::new(ThreadSignals { pending: AtomicU64::new(0), mask: AtomicU64::new(mask) })
+        Arc::new(ThreadSignals { pending: AtomicU64::new(0), mask: AtomicU64::new(mask), infos: Mutex::default() })
+    }
+}
+
+/// What each pending signal is about, oldest first: one for a standard signal, one for each sent for a real-time one.
+pub(crate) type Queues = BTreeMap<i32, VecDeque<Info>>;
+
+/// Puts `info` on `signal`'s queue: a real-time signal's grows, up to `limit`; another's holds one, the first sent.
+/// False if it's full.
+fn queue(infos: &mut Queues, pending: bool, signal: i32, info: Info, limit: usize) -> bool {
+    let q = infos.entry(signal).or_default();
+    if signal >= SIGRTMIN {
+        if q.len() >= limit {
+            return false;
+        }
+        q.push_back(info);
+    } else if !pending || q.is_empty() {
+        q.clear();
+        q.push_back(info);
+    }
+    true
+}
+
+/// The oldest of `signal`'s queue, taking it off.
+fn take(infos: &mut Queues, signal: i32) -> Info {
+    let Some(q) = infos.get_mut(&signal) else { return Info::user(0) };
+    let info = q.pop_front().unwrap_or(Info::user(0));
+    if q.is_empty() {
+        infos.remove(&signal);
+    }
+    info
+}
+
+/// Takes queued signals `drop` picks out of a process's queues and its threads', clearing what's no longer pending: a
+/// deleted timer's.
+pub(crate) fn purge(state: &mut ProcState, drop: impl Fn(&Info) -> bool) {
+    let prune = |infos: &mut Queues| -> u64 {
+        let mut emptied = 0;
+        infos.retain(|signal, q| {
+            q.retain(|info| !drop(info));
+            if q.is_empty() {
+                emptied |= bit(*signal);
+            }
+            !q.is_empty()
+        });
+        emptied
+    };
+    let emptied = prune(&mut state.infos);
+    state.pending &= !emptied;
+    for live in state.threads.values() {
+        let emptied = prune(&mut lock(&live.signals.infos));
+        live.signals.pending.fetch_and(!emptied, Ordering::AcqRel);
     }
 }
 
@@ -159,12 +227,22 @@ pub(crate) struct AltStack {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Info {
     pub code: i32,
-    /// Who sent it, or which child it's about.
+    /// Who sent it, or which child it's about, and their user.
     pub pid: i32,
+    pub uid: u32,
     /// A child's exit code or signal.
     pub status: i32,
     /// Where a fault was.
     pub addr: u64,
+    /// `sigqueue`'s or a timer's `sigval`.
+    pub value: u64,
+    /// A POSIX timer's ID, and how many expiries its signal stands for beyond the first.
+    pub timer: i32,
+    pub overrun: i32,
+    /// `si_errno`.
+    pub errno: i32,
+    /// For SIGSYS from seccomp: the call's number and audit arch (with `addr`, where it was called).
+    pub syscall: (i32, u32),
 }
 
 impl Info {
@@ -173,15 +251,30 @@ impl Info {
     }
 
     /// `siginfo_t`, as a handler gets it.
-    fn siginfo(&self, signal: i32) -> [u8; 128] {
+    pub(crate) fn siginfo(&self, signal: i32) -> [u8; 128] {
         let mut b = [0u8; 128];
         b[0..4].copy_from_slice(&signal.to_le_bytes());
+        b[4..8].copy_from_slice(&self.errno.to_le_bytes());
         b[8..12].copy_from_slice(&self.code.to_le_bytes());
         if self.addr != 0 {
             b[16..24].copy_from_slice(&self.addr.to_le_bytes());
+            if signal == SIGSYS && self.code == SYS_SECCOMP {
+                b[24..28].copy_from_slice(&self.syscall.0.to_le_bytes());
+                b[28..32].copy_from_slice(&self.syscall.1.to_le_bytes());
+            }
+        } else if self.code == SI_TIMER {
+            b[16..20].copy_from_slice(&self.timer.to_le_bytes());
+            b[20..24].copy_from_slice(&self.overrun.to_le_bytes());
+            b[24..32].copy_from_slice(&self.value.to_le_bytes());
         } else {
             b[16..20].copy_from_slice(&self.pid.to_le_bytes());
-            b[24..28].copy_from_slice(&self.status.to_le_bytes());
+            b[20..24].copy_from_slice(&self.uid.to_le_bytes());
+            // A program's own codes (sigqueue's, a message queue's) carry a value; a child's change, its status.
+            if self.code < 0 && self.code != SI_TKILL {
+                b[24..32].copy_from_slice(&self.value.to_le_bytes());
+            } else {
+                b[24..28].copy_from_slice(&self.status.to_le_bytes());
+            }
         }
         b
     }
@@ -192,8 +285,19 @@ impl Info {
         b[0..4].copy_from_slice(&signal.to_le_bytes());
         b[8..12].copy_from_slice(&self.code.to_le_bytes());
         b[12..16].copy_from_slice(&self.pid.to_le_bytes());
+        b[16..20].copy_from_slice(&self.uid.to_le_bytes());
+        b[24..28].copy_from_slice(&self.timer.to_le_bytes());
+        b[32..36].copy_from_slice(&self.overrun.to_le_bytes());
         b[40..44].copy_from_slice(&self.status.to_le_bytes());
+        b[44..48].copy_from_slice(&(self.value as i32).to_le_bytes());
+        b[48..56].copy_from_slice(&self.value.to_le_bytes());
         b[72..80].copy_from_slice(&self.addr.to_le_bytes());
+        b[4..8].copy_from_slice(&self.errno.to_le_bytes());
+        if signal == SIGSYS && self.code == SYS_SECCOMP {
+            b[84..88].copy_from_slice(&self.syscall.0.to_le_bytes());
+            b[88..96].copy_from_slice(&self.addr.to_le_bytes());
+            b[96..100].copy_from_slice(&self.syscall.1.to_le_bytes());
+        }
         b
     }
 }
@@ -234,24 +338,31 @@ impl Kernel {
         !group.is_empty()
     }
 
-    pub(crate) fn send(&self, process: &Arc<Process>, tid: Option<i32>, signal: i32, info: Info) {
+    /// Sends `signal` to a process, or with `tid` to one of its threads, about `info`. A real-time signal is queued
+    /// as many times as it's sent, each with its own `info`; another is pending once. False only if a real-time one
+    /// couldn't be queued, as the process has `RLIMIT_SIGPENDING` of them already.
+    pub(crate) fn send(&self, process: &Arc<Process>, tid: Option<i32>, signal: i32, info: Info) -> bool {
         if signal == 0 {
-            return;
+            return true;
         }
         let mut state = lock(&process.state);
         if state.exiting.is_some() || state.zombie.is_some() {
-            return;
+            return true;
         }
         if signal == SIGKILL {
             drop(state);
             process.end(Status::Killed(SIGKILL));
-            return;
+            return true;
         }
         if signal == SIGCONT {
             // Continuing happens as it's sent, whatever the handler: a stopped process can't take it any other way.
             state.pending &= !STOPS;
             for live in state.threads.values() {
                 live.signals.pending.fetch_and(!STOPS, Ordering::AcqRel);
+            }
+            // A tracee `PTRACE_LISTEN` left in its group stop carries on.
+            for live in state.threads.values() {
+                Task::ptrace_continued(&live.trace, &live.waiter);
             }
             if state.stopped.take().is_some() {
                 state.report = Some(Report::Continued);
@@ -269,18 +380,26 @@ impl Kernel {
         // An ignored signal is dropped, unless something blocks it: then it waits, for `signalfd` or `sigwait`.
         let blocked = state.threads.values().any(|l| l.signals.mask.load(Ordering::Acquire) & bit(signal) != 0);
         if state.signals.ignores(signal) && !blocked {
-            return;
+            return true;
         }
+        let limit = state.limits.get(RLIMIT_SIGPENDING).0.min(1 << 20) as usize;
         // The thread asked for, or the first that isn't blocking it.
         let target = match tid {
             Some(tid) if bit(signal) & (UNBLOCKABLE | STOPS | bit(SIGCONT)) == 0 => {
-                let Some(live) = state.threads.get(&tid) else { return };
+                let Some(live) = state.threads.get(&tid) else { return true };
+                let pending = live.signals.pending.load(Ordering::Acquire) & bit(signal) != 0;
+                if !queue(&mut lock(&live.signals.infos), pending, signal, info, limit) {
+                    return false;
+                }
                 live.signals.pending.fetch_or(bit(signal), Ordering::AcqRel);
                 Some(live)
             }
             _ => {
+                let pending = state.pending & bit(signal) != 0;
+                if !queue(&mut state.infos, pending, signal, info, limit) {
+                    return false;
+                }
                 state.pending |= bit(signal);
-                state.infos.insert(signal, info);
                 state.threads.values().find(|l| l.signals.mask.load(Ordering::Acquire) & bit(signal) & !UNBLOCKABLE == 0)
             }
         };
@@ -289,8 +408,9 @@ impl Kernel {
             live.handle.preempt();
         }
         drop(state);
-        // A signal blocked everywhere wakes no thread, but a `signalfd` being waited on may want it.
+        // A signal blocked everywhere wakes no thread, but a `signalfd` or `sigtimedwait` waiting on it may want it.
         process.signal_watchers.notify();
+        true
     }
 
     /// Child `pid` of `ppid` stopped, continued or ended: wake its parent's waiters, and send it SIGCHLD.
@@ -312,8 +432,31 @@ impl Kernel {
             Change::Continued => (6, SIGCONT),
         };
         if !quiet {
-            self.send(&parent, None, SIGCHLD, Info { code, pid, status, addr: 0 });
+            self.send(&parent, None, SIGCHLD, Info { code, pid, status, ..Info::default() });
         }
+    }
+
+    /// Thread `tid`, which `tracer` traces, stopped with `exit_code` `stopped`, or ended with `ended` (or ended, and
+    /// its parent will say so: neither): wake the tracer's waits, and send it SIGCHLD.
+    pub(crate) fn tracee_changed(&self, tracer: i32, tid: i32, stopped: Option<i32>, ended: Option<Status>) {
+        let Some(tracer) = self.process(tracer) else { return };
+        let nocldstop = {
+            let mut state = lock(&tracer.state);
+            for w in state.child_waiters.drain(..) {
+                w.wake();
+            }
+            state.signals.action(SIGCHLD).flags & SA_NOCLDSTOP != 0
+        };
+        // CLD_TRAPPED, or as a child's end.
+        let (code, status) = match (stopped, ended) {
+            (Some(_), _) if nocldstop => return,
+            (Some(code), _) => (4, code),
+            (None, Some(Status::Exited(code))) => (1, code),
+            (None, Some(Status::Killed(signal))) if default_of(signal) == Default::Core => (3, signal),
+            (None, Some(Status::Killed(signal))) => (2, signal),
+            (None, None) => return,
+        };
+        self.send(&tracer, None, SIGCHLD, Info { code, pid: tid, status, ..Info::default() });
     }
 }
 
@@ -338,6 +481,20 @@ impl Task {
 
     /// The program did something it can't carry on from, and Linux sends it `signal` at once. If it's blocked or
     /// ignored, it's the default action instead: the program can't skip it.
+    /// Sends this thread `signal` with `info`, as the kernel forces one: if it's blocked or ignored, its default action
+    /// comes back and it's let through (SIGSYS from seccomp).
+    pub(crate) fn force_signal(&mut self, signal: i32, info: Info) {
+        {
+            let mut state = lock(&self.process.state);
+            let action = state.signals.action(signal);
+            if action.handler == SIG_IGN || self.mask() & bit(signal) != 0 {
+                state.signals.actions[(signal - 1) as usize] = Action::default();
+                self.signals.mask.fetch_and(!bit(signal), Ordering::AcqRel);
+            }
+        }
+        self.k.send(&self.process.clone(), Some(self.tid), signal, info);
+    }
+
     pub(crate) fn fault_signal(&mut self, signal: i32, addr: u64, what: &str) {
         {
             let mut state = lock(&self.process.state);
@@ -360,6 +517,10 @@ impl Task {
             if self.park() == Flow::End {
                 return Flow::End;
             }
+            // `PTRACE_INTERRUPT`, or a seized new thread's first stop.
+            if self.ptrace_interrupted(cx) {
+                continue;
+            }
             let taken = {
                 let mut state = lock(&self.process.state);
                 let ready = self.deliverable_with(state.pending);
@@ -367,19 +528,27 @@ impl Task {
                     None
                 } else {
                     let signal = ready.trailing_zeros() as i32 + 1;
-                    let mut info = Info::user(0);
-                    if self.signals.pending.fetch_and(!bit(signal), Ordering::AcqRel) & bit(signal) == 0 {
-                        state.pending &= !bit(signal);
-                        info = state.infos.remove(&signal).unwrap_or(info);
-                    }
+                    let info = self.dequeue(&mut state, signal);
                     Some((signal, state.signals.action(signal), info))
                 }
             };
-            let Some((signal, action, info)) = taken else { break };
+            let Some((mut signal, mut action, mut info)) = taken else { break };
+            // A traced thread stops for its tracer first, which may let the signal through, change it, or drop it.
+            if signal != SIGKILL && self.traced() {
+                match self.ptrace_signal(cx, signal, info) {
+                    Some((s, i)) => {
+                        (signal, info) = (s, i);
+                        action = lock(&self.process.state).signals.action(signal);
+                    }
+                    None if self.ending() => return Flow::End,
+                    None => continue,
+                }
+            }
             match action.handler {
                 SIG_IGN if bit(signal) & UNBLOCKABLE == 0 => {}
                 SIG_DFL | SIG_IGN => match default_of(signal) {
                     Default::Ignore | Default::Continue => {}
+                    Default::Stop if self.traced() => self.ptrace_group_stop(cx, signal),
                     Default::Stop => self.stop_process(signal),
                     Default::Term | Default::Core => {
                         if self.k.options.trace || default_of(signal) == Default::Core {
@@ -399,7 +568,10 @@ impl Task {
         if let Some(call) = interrupted {
             let restart = match handler {
                 None => true,
-                Some((_, action, _)) => action.flags & SA_RESTART != 0 && !matches!(call.sys, Sys::Nanosleep | Sys::ClockNanosleep | Sys::Ppoll | Sys::Poll | Sys::Pselect6 | Sys::Select | Sys::EpollPwait | Sys::EpollPwait2 | Sys::RtSigsuspend),
+                Some((_, action, _)) => {
+                    action.flags & SA_RESTART != 0
+                        && !matches!(call.sys, Sys::Nanosleep | Sys::ClockNanosleep | Sys::Ppoll | Sys::Poll | Sys::Pselect6 | Sys::Select | Sys::EpollPwait | Sys::EpollPwait2 | Sys::RtSigsuspend | Sys::RtSigtimedwait | Sys::Pause)
+                }
             };
             if restart {
                 if let Some(mask) = self.suspend_mask.take() {
@@ -633,8 +805,10 @@ impl Task {
                 // Ignoring a signal drops it if it's pending.
                 if state.signals.ignores(signal) {
                     state.pending &= !bit(signal);
+                    state.infos.remove(&signal);
                     for live in state.threads.values() {
                         live.signals.pending.fetch_and(!bit(signal), Ordering::AcqRel);
+                        lock(&live.signals.infos).remove(&signal);
                     }
                 }
             }
@@ -677,12 +851,120 @@ impl Task {
             return None;
         }
         let signal = ready.trailing_zeros() as i32 + 1;
-        let mut info = Info::user(0);
-        if self.signals.pending.fetch_and(!bit(signal), Ordering::AcqRel) & bit(signal) == 0 {
-            state.pending &= !bit(signal);
-            info = state.infos.remove(&signal).unwrap_or(info);
+        Some(self.dequeue(&mut state, signal).signalfd(signal))
+    }
+
+    /// Takes `signal` off this thread's queue, or else its process's, with what it's about.
+    pub(crate) fn dequeue(&self, state: &mut ProcState, signal: i32) -> Info {
+        let mut info = if self.signals.pending.load(Ordering::Acquire) & bit(signal) != 0 {
+            let mut infos = lock(&self.signals.infos);
+            let info = take(&mut infos, signal);
+            if !infos.contains_key(&signal) {
+                self.signals.pending.fetch_and(!bit(signal), Ordering::AcqRel);
+            }
+            info
+        } else {
+            let info = take(&mut state.infos, signal);
+            if !state.infos.contains_key(&signal) {
+                state.pending &= !bit(signal);
+            }
+            info
+        };
+        crate::timer::delivered(state, &mut info);
+        info
+    }
+
+    /// A signal in `set` that's pending now, taken, with what it's about.
+    fn take_one(&self, set: u64) -> Option<(i32, Info)> {
+        let mut state = lock(&self.process.state);
+        let ready = (self.signals.pending.load(Ordering::Acquire) | state.pending) & set;
+        if ready == 0 {
+            return None;
         }
-        Some(info.signalfd(signal))
+        let signal = ready.trailing_zeros() as i32 + 1;
+        Some((signal, self.dequeue(&mut state, signal)))
+    }
+
+    /// `rt_sigtimedwait`: takes a signal in the set at `set_at` (normally blocked), waiting for one until the timeout
+    /// (none: for ever; zero: not at all). Gives the signal, and its `siginfo` at `info_at`. EAGAIN if none came, EINTR
+    /// if another signal, not blocked, came first.
+    pub(crate) fn rt_sigtimedwait(&mut self, cx: &mut Cx<'_>, set_at: u64, info_at: u64, timeout_at: u64, setsize: u64) -> Result<u64, Errno> {
+        if setsize != 8 {
+            return Err(EINVAL);
+        }
+        let set = self.mem(cx, false, |t| user::read_u64(&t.space(), set_at))? & !UNBLOCKABLE;
+        let deadline = self.timespec_timeout(cx, timeout_at)?.map(|d| std::time::Instant::now() + d);
+        // A signal every thread blocks wakes none; the process's signal watchers say it came.
+        let me: std::sync::Weak<dyn kernels_core::wait::Wake> = Arc::downgrade(&self.waiter) as _;
+        self.process.signal_watchers.add(me.clone());
+        let result = loop {
+            self.waiter.reset();
+            if let Some(found) = self.take_one(set) {
+                break Ok(found);
+            }
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                break Err(EAGAIN);
+            }
+            if self.waiter.wait(deadline) == kernels_core::wait::Woke::Interrupted {
+                // Interrupted for a signal it's waiting for (sent to this thread), or for one to deliver, or to end.
+                if self.ending() || self.deliverable() != 0 {
+                    break Err(EINTR);
+                }
+                self.waiter.clear_interrupt();
+            }
+        };
+        self.process.signal_watchers.remove(&me);
+        let (signal, info) = result?;
+        if info_at != 0 {
+            self.mem(cx, true, |t| user::write(&mut t.space(), info_at, &info.siginfo(signal)))?;
+        }
+        Ok(signal as u64)
+    }
+
+    /// `rt_sigqueueinfo`, and with `tid` `rt_tgsigqueueinfo`: a signal with the sender's own `siginfo`, whose code must
+    /// say it's from a program (negative) unless it's for this process.
+    pub(crate) fn rt_sigqueueinfo(&mut self, cx: &mut Cx<'_>, tgid: i32, tid: Option<i32>, signal: i32, at: u64) -> Result<u64, Errno> {
+        if !(0..=64).contains(&signal) || tgid <= 0 || tid.is_some_and(|t| t <= 0) {
+            return Err(EINVAL);
+        }
+        let info = self.read_siginfo(cx, at)?;
+        let process = self.k.process(tgid).ok_or(ESRCH)?;
+        if tid.is_some_and(|t| !lock(&process.state).threads.contains_key(&t)) {
+            return Err(ESRCH);
+        }
+        self.queue_to(&process, tid, signal, info)
+    }
+
+    /// A `siginfo` a program gives, for a signal it sends: its code, sender and value.
+    pub(crate) fn read_siginfo(&mut self, cx: &mut Cx<'_>, at: u64) -> Result<Info, Errno> {
+        let b = self.mem(cx, false, |t| user::read_vec(&t.space(), at, 32))?;
+        let i32_at = |i: usize| i32::from_le_bytes(b[i..i + 4].try_into().unwrap_or_default());
+        Ok(Info { code: i32_at(8), pid: i32_at(16), uid: i32_at(20) as u32, value: u64::from_le_bytes(b[24..32].try_into().unwrap_or_default()), ..Info::default() })
+    }
+
+    /// Sends a signal with a `siginfo` from the program, checking what it claims: a code of the kernel's (0 or more,
+    /// or `SI_TKILL`) only to itself. EAGAIN if the queue's full.
+    pub(crate) fn queue_to(&mut self, process: &Arc<Process>, tid: Option<i32>, signal: i32, info: Info) -> Result<u64, Errno> {
+        if (info.code >= 0 || info.code == SI_TKILL) && process.pid != self.process.pid {
+            return Err(EPERM);
+        }
+        if lock(&process.state).zombie.is_some() {
+            return Err(ESRCH);
+        }
+        if signal != 0 && !self.k.send(process, tid, signal, info) {
+            return Err(EAGAIN);
+        }
+        Ok(0)
+    }
+
+    /// x86-64's `pause`: waits for a signal that runs a handler or ends the process.
+    pub(crate) fn pause(&mut self) -> Result<u64, Errno> {
+        while self.deliverable() == 0 && !self.ending() {
+            if self.waiter.wait(None) == kernels_core::wait::Woke::Interrupted {
+                break;
+            }
+        }
+        Err(EINTR)
     }
 
     /// Whether a signal in `mask` is pending.
@@ -745,8 +1027,9 @@ impl Task {
         if live.is_empty() {
             return Err(ESRCH);
         }
+        let uid = lock(&self.process.state).creds.uid[0];
         for target in live {
-            self.k.send(&target, None, signal, Info::user(self.process.pid));
+            self.k.send(&target, None, signal, Info { uid, ..Info::user(self.process.pid) });
         }
         Ok(0)
     }

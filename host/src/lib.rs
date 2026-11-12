@@ -134,6 +134,12 @@ pub trait Host: Send + Sync + 'static {
     fn monotonic(&self) -> u64;
     /// Fills `buffer` with random bytes.
     fn random(&self, buffer: &mut [u8]);
+    /// The CPU time the calling thread has used, in nanoseconds. A guest thread runs its program on its own host
+    /// thread, so in a hardware VM this counts the program's time too; in a process sandbox, where the program runs in
+    /// another process, it counts only the kernel's.
+    fn thread_cpu(&self) -> u64 {
+        sys::thread_cpu()
+    }
     /// How many CPUs the host has.
     fn cpus(&self) -> usize;
     /// How much memory the host could give now without paging, in bytes.
@@ -433,6 +439,24 @@ mod tests {
         host.random(&mut a);
         host.random(&mut b);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn a_thread_counts_its_own_cpu_time() {
+        let host = Std::new();
+        let before = host.thread_cpu();
+        let mut x = 0u64;
+        while host.thread_cpu() < before + 20_000_000 {
+            x = std::hint::black_box(x.wrapping_mul(6364136223846793005).wrapping_add(1));
+        }
+        // Another thread's time isn't this one's: one that only sleeps has used almost none.
+        let other = std::thread::spawn(move || {
+            let host = Std::new();
+            let start = host.thread_cpu();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            host.thread_cpu() - start
+        });
+        assert!(other.join().unwrap() < 10_000_000);
     }
 
     /// Linux's checks against the test root, as if it were in the system's bundle.

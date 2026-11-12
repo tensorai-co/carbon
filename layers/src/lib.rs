@@ -89,6 +89,8 @@ pub enum Error {
     Loop,
     /// A name that can't be one: empty, `.`, `..`, or with a `/`.
     BadName,
+    /// A link or a move between a volatile tree and the rest, or another volatile tree.
+    CrossFs,
     /// The store failed, or what's in it (an index, the log, a chunk) is corrupt.
     Io,
 }
@@ -103,6 +105,7 @@ impl core::fmt::Display for Error {
             Error::NotEmpty => "directory not empty",
             Error::Loop => "too many symbolic links",
             Error::BadName => "not a name a file can have",
+            Error::CrossFs => "not in the same tree",
             Error::Io => "the disk's store failed, or what's in it is corrupt",
         })
     }
@@ -125,6 +128,29 @@ pub struct Stat {
     pub generation: u64,
 }
 
+/// A change to the tree, as a kernel watching it is told (inotify, `ReadDirectoryChangesW`): one for each call that
+/// changed something, after it has. Whatever a change says of names is as they were given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Change<'a> {
+    /// `name` made in `dir`.
+    Created { dir: Ino, name: &'a str, ino: Ino, kind: Kind },
+    /// Another name, `name` in `dir`, for a file.
+    Linked { dir: Ino, name: &'a str, ino: Ino },
+    /// `name` taken out of `dir`, and whether that was the file's last name (a file held open is gone all the same:
+    /// nothing can find it).
+    Removed { dir: Ino, name: &'a str, ino: Ino, kind: Kind, gone: bool },
+    /// `from` in `from_dir` moved to `to` in `to_dir`, and the file it replaced there, if any, and whether that's gone.
+    Moved { from_dir: Ino, from: &'a str, to_dir: Ino, to: &'a str, ino: Ino, kind: Kind, replaced: Option<(Ino, bool)> },
+    /// A file's contents (or size) changed.
+    Written { ino: Ino },
+    /// A file's `M` or modification time was set.
+    Changed { ino: Ino },
+}
+
+/// Told of every change, with the tree as it is after it. It runs while the caller has the disk, so it mustn't wait
+/// on anything that waits for the disk.
+pub type Observer<M> = Box<dyn FnMut(&Fs<M>, Change<'_>) + Send>;
+
 /// What to make.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum New {
@@ -145,6 +171,10 @@ struct Node<M> {
     generation: u64,
     links: u32,
     data: Data,
+    /// The volatile tree it's in, by its root: never logged or saved (a kernel's tmpfs).
+    volatile: Option<Ino>,
+    /// Extended attributes, by name. Kept in the log; not yet in a frozen index.
+    xattrs: BTreeMap<String, Vec<u8>>,
 }
 
 /// One chunk of a file.
@@ -192,6 +222,8 @@ pub struct Fs<M> {
     dirty_bytes: u64,
     /// Files a kernel has open, and how many times: one with no links left lives until it's let go.
     held: BTreeMap<Ino, u32>,
+    /// Who's told of changes, if anyone.
+    observer: Option<Observer<M>>,
 }
 
 impl<M> core::fmt::Debug for Fs<M> {
@@ -206,9 +238,85 @@ impl<M: Clone> Fs<M> {
         let mut nodes = BTreeMap::new();
         nodes.insert(
             ROOT,
-            Node { meta: root, modified: 0, generation: 0, links: 2, data: Data::Dir { entries: BTreeMap::new(), parent: ROOT, fold: fold_case } },
+            Node { meta: root, modified: 0, generation: 0, links: 2, data: Data::Dir { entries: BTreeMap::new(), parent: ROOT, fold: fold_case }, volatile: None, xattrs: BTreeMap::new() },
         );
-        Fs { nodes, next: ROOT + 1, store: None, cache: RefCell::new(Vec::new()), save: None, dirty: BTreeMap::new(), dirty_bytes: 0, held: BTreeMap::new() }
+        Fs { nodes, next: ROOT + 1, store: None, cache: RefCell::new(Vec::new()), save: None, dirty: BTreeMap::new(), dirty_bytes: 0, held: BTreeMap::new(), observer: None }
+    }
+
+    /// Tells `observer` of every change from now on (none: no one).
+    pub fn observe(&mut self, observer: Option<Observer<M>>) {
+        self.observer = observer;
+    }
+
+    fn tell(&mut self, change: Change<'_>) {
+        if let Some(mut observer) = self.observer.take() {
+            observer(self, change);
+            self.observer = Some(observer);
+        }
+    }
+
+    fn kind(&self, ino: Ino) -> Kind {
+        self.stat(ino).map(|s| s.kind).unwrap_or(Kind::File)
+    }
+
+    /// The volatile tree `ino` is in, if it's in one.
+    pub fn volatile(&self, ino: Ino) -> Option<Ino> {
+        self.nodes.get(&ino).and_then(|n| n.volatile)
+    }
+
+    /// Whether a change to `ino` is logged: not in a volatile tree.
+    fn logged(&self, ino: Ino) -> bool {
+        self.volatile(ino).is_none()
+    }
+
+    /// Makes a volatile tree: an empty directory, in no other, held until [`Fs::drop_tree`]. What's made in it is in
+    /// memory only: never logged, saved or frozen, and gone when the disk is.
+    pub fn volatile_root(&mut self, meta: M, now: u64) -> Ino {
+        let ino = self.next;
+        self.next += 1;
+        let fold = matches!(self.nodes.get(&ROOT).map(|n| &n.data), Some(Data::Dir { fold: true, .. }));
+        self.nodes.insert(ino, Node { meta, modified: now, generation: 0, links: 2, data: Data::Dir { entries: BTreeMap::new(), parent: ino, fold }, volatile: Some(ino), xattrs: BTreeMap::new() });
+        self.held.insert(ino, 1);
+        ino
+    }
+
+    /// Lets a volatile tree go: everything in it, but for files held open, which go when they're let go.
+    pub fn drop_tree(&mut self, root: Ino) -> Result<()> {
+        if self.volatile(root) != Some(root) {
+            return Err(Error::NotFound);
+        }
+        let mut stack = vec![root];
+        while let Some(ino) = stack.pop() {
+            let Some(node) = self.nodes.get_mut(&ino) else { continue };
+            if let Data::Dir { entries, .. } = &mut node.data {
+                stack.extend(core::mem::take(entries).into_values().map(|(_, child)| child).filter(|child| *child != ino));
+            }
+            node.links = 0;
+            if ino == root || !self.held.contains_key(&ino) {
+                self.nodes.remove(&ino);
+            }
+        }
+        self.held.remove(&root);
+        Ok(())
+    }
+
+    /// How many bytes the files under `dir` hold (as `df` asks a tmpfs).
+    pub fn tree_size(&self, dir: Ino) -> u64 {
+        let mut stack = vec![dir];
+        let mut total = 0;
+        while let Some(ino) = stack.pop() {
+            match self.nodes.get(&ino).map(|n| &n.data) {
+                Some(Data::Dir { entries, .. }) => stack.extend(entries.values().map(|(_, child)| *child).filter(|c| *c != ino)),
+                Some(Data::File(file)) => total += file.size,
+                _ => {}
+            }
+        }
+        total
+    }
+
+    /// Whether nothing can find `ino` any more.
+    fn gone(&self, ino: Ino) -> bool {
+        self.nodes.get(&ino).is_none_or(|n| n.links == 0)
     }
 
     fn node(&self, ino: Ino) -> Result<&Node<M>> {
@@ -246,7 +354,7 @@ impl<M: Clone> Fs<M> {
 
     /// Notes that a file changed, for the next save.
     fn touched(&mut self, ino: Ino, size_before: u64, written: u64) {
-        if self.store.is_none() {
+        if self.store.is_none() || !self.logged(ino) {
             return;
         }
         let low = self.dirty.entry(ino).or_insert(size_before);
@@ -270,7 +378,11 @@ impl<M: Clone> Fs<M> {
 
     pub fn set_meta(&mut self, ino: Ino, meta: M) -> Result<()> {
         self.node_mut(ino)?.meta = meta.clone();
-        self.record(|save| Record::Meta { ino, meta: save(&meta) })
+        if self.logged(ino) {
+            self.record(|save| Record::Meta { ino, meta: save(&meta) })?;
+        }
+        self.tell(Change::Changed { ino });
+        Ok(())
     }
 
     /// The entry `name` in `dir`, without following it if it's a link.
@@ -414,6 +526,7 @@ impl<M: Clone> Fs<M> {
         node.modified = now;
         node.generation += 1;
         self.touched(ino, size_before, data.len() as u64);
+        self.tell(Change::Written { ino });
         self.save_if_much()?;
         Ok(data.len())
     }
@@ -440,7 +553,73 @@ impl<M: Clone> Fs<M> {
         node.modified = now;
         node.generation += 1;
         self.touched(ino, size_before.min(size), 0);
+        self.tell(Change::Written { ino });
         Ok(())
+    }
+
+    /// Zeroes `len` bytes of a file from `offset`, keeping its size: what's past its end is left alone. A chunk zeroed
+    /// whole keeps no bytes (an empty chunk reads as zeroes), so punching a hole in a big file frees what it held.
+    pub fn zero(&mut self, ino: Ino, offset: u64, len: u64, now: u64) -> Result<()> {
+        let size = self.file(ino)?.size;
+        let end = offset.saturating_add(len).min(size);
+        if offset >= end {
+            return Ok(());
+        }
+        for number in (offset / CHUNK) as usize..=((end - 1) / CHUNK) as usize {
+            let start = number as u64 * CHUNK;
+            let (lo, hi) = ((offset.max(start) - start) as usize, (end.min(start + CHUNK) - start) as usize);
+            let existing = self.file(ino)?.chunks.get(number).cloned().unwrap_or(Chunk::Hole);
+            let chunk = if lo == 0 && (hi == CHUNK as usize || start + hi as u64 == size) {
+                match existing {
+                    Chunk::Hole => continue,
+                    _ => Chunk::Bytes(Vec::new(), true),
+                }
+            } else {
+                let mut bytes = self.chunk_bytes(&existing)?;
+                if bytes.len() <= lo {
+                    continue;
+                }
+                let top = hi.min(bytes.len());
+                bytes[lo..top].fill(0);
+                Chunk::Bytes(bytes, true)
+            };
+            let Data::File(file) = &mut self.node_mut(ino)?.data else { return Err(Error::IsDir) };
+            file.chunks[number] = chunk;
+        }
+        let node = self.node_mut(ino)?;
+        node.modified = now;
+        node.generation += 1;
+        self.touched(ino, size, 0);
+        self.tell(Change::Written { ino });
+        Ok(())
+    }
+
+    /// An extended attribute's value, or `None` if the file has no such attribute.
+    pub fn get_xattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.node(ino)?.xattrs.get(name).cloned())
+    }
+
+    /// Every extended attribute's name, in order.
+    pub fn list_xattrs(&self, ino: Ino) -> Result<Vec<String>> {
+        Ok(self.node(ino)?.xattrs.keys().cloned().collect())
+    }
+
+    /// Sets an extended attribute.
+    pub fn set_xattr(&mut self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
+        self.node_mut(ino)?.xattrs.insert(name.to_string(), value.to_vec());
+        if self.logged(ino) {
+            self.record(|_| Record::Xattr { ino, name: name.to_string(), value: Some(value.to_vec()) })?;
+        }
+        Ok(())
+    }
+
+    /// Removes an extended attribute; whether it was there.
+    pub fn remove_xattr(&mut self, ino: Ino, name: &str) -> Result<bool> {
+        let had = self.node_mut(ino)?.xattrs.remove(name).is_some();
+        if had && self.logged(ino) {
+            self.record(|_| Record::Xattr { ino, name: name.to_string(), value: None })?;
+        }
+        Ok(had)
     }
 
     /// A link's target.
@@ -460,7 +639,11 @@ impl<M: Clone> Fs<M> {
             New::Symlink(target) => (2, target.clone()),
         };
         self.create_as(dir, name, ino, new, meta.clone(), now)?;
-        self.record(|save| Record::Create { dir, ino, kind, meta: save(&meta), now, name: name.to_string(), target })?;
+        if self.logged(dir) {
+            self.record(|save| Record::Create { dir, ino, kind, meta: save(&meta), now, name: name.to_string(), target })?;
+        }
+        let kind = self.kind(ino);
+        self.tell(Change::Created { dir, name, ino, kind });
         Ok(ino)
     }
 
@@ -488,7 +671,8 @@ impl<M: Clone> Fs<M> {
             New::Symlink(target) => (Data::Symlink(target), 1),
         };
         let is_dir = matches!(data, Data::Dir { .. });
-        self.nodes.insert(ino, Node { meta, modified: now, generation: 0, links, data });
+        let volatile = self.volatile(dir);
+        self.nodes.insert(ino, Node { meta, modified: now, generation: 0, links, data, volatile, xattrs: BTreeMap::new() });
         let parent = self.node_mut(dir)?;
         if let Data::Dir { entries, .. } = &mut parent.data {
             entries.insert(key(name, fold), (name.to_string(), ino));
@@ -502,8 +686,15 @@ impl<M: Clone> Fs<M> {
 
     /// Adds another name for an existing file (not a directory): a hard link.
     pub fn link(&mut self, dir: Ino, name: &str, ino: Ino, now: u64) -> Result<()> {
+        if self.volatile(dir) != self.volatile(ino) {
+            return Err(Error::CrossFs);
+        }
         self.link_as(dir, name, ino, now)?;
-        self.record(|_| Record::Link { dir, ino, now, name: name.to_string() })
+        if self.logged(dir) {
+            self.record(|_| Record::Link { dir, ino, now, name: name.to_string() })?;
+        }
+        self.tell(Change::Linked { dir, name, ino });
+        Ok(())
     }
 
     fn link_as(&mut self, dir: Ino, name: &str, ino: Ino, now: u64) -> Result<()> {
@@ -528,13 +719,24 @@ impl<M: Clone> Fs<M> {
     /// Sets a file's modification time, in nanoseconds since 1970.
     pub fn set_modified(&mut self, ino: Ino, now: u64) -> Result<()> {
         self.node_mut(ino)?.modified = now;
-        self.record(|_| Record::Modified { ino, now })
+        if self.logged(ino) {
+            self.record(|_| Record::Modified { ino, now })?;
+        }
+        self.tell(Change::Changed { ino });
+        Ok(())
     }
 
     /// Takes `name` out of `dir`. A directory must be empty. The file goes when nothing links to it.
     pub fn remove(&mut self, dir: Ino, name: &str, now: u64) -> Result<()> {
+        let ino = self.lookup(dir, name)?;
+        let kind = self.kind(ino);
         self.remove_as(dir, name, now)?;
-        self.record(|_| Record::Remove { dir, now, name: name.to_string() })
+        if self.logged(dir) {
+            self.record(|_| Record::Remove { dir, now, name: name.to_string() })?;
+        }
+        let gone = self.gone(ino);
+        self.tell(Change::Removed { dir, name, ino, kind, gone });
+        Ok(())
     }
 
     fn remove_as(&mut self, dir: Ino, name: &str, now: u64) -> Result<()> {
@@ -591,8 +793,18 @@ impl<M: Clone> Fs<M> {
 
     /// Moves `from_dir`/`from` to `to_dir`/`to`, replacing a file (not a directory) already there.
     pub fn rename(&mut self, from_dir: Ino, from: &str, to_dir: Ino, to: &str, now: u64) -> Result<()> {
+        let ino = self.lookup(from_dir, from)?;
+        let kind = self.kind(ino);
+        let replaced = self.lookup(to_dir, to).ok().filter(|r| *r != ino);
+        if self.volatile(from_dir) != self.volatile(to_dir) {
+            return Err(Error::CrossFs);
+        }
         if self.rename_as(from_dir, from, to_dir, to, now)? {
-            self.record(|_| Record::Rename { from_dir, to_dir, now, from: from.to_string(), to: to.to_string() })?;
+            if self.logged(from_dir) {
+                self.record(|_| Record::Rename { from_dir, to_dir, now, from: from.to_string(), to: to.to_string() })?;
+            }
+            let replaced = replaced.map(|r| (r, self.gone(r)));
+            self.tell(Change::Moved { from_dir, from, to_dir, to, ino, kind, replaced });
         }
         Ok(())
     }
@@ -715,6 +927,18 @@ impl<M: Clone> Fs<M> {
                 self.node_mut(ino)?.modified = now;
                 Ok(())
             }
+            Record::Xattr { ino, name, value } => {
+                let node = self.node_mut(ino)?;
+                match value {
+                    Some(value) => {
+                        node.xattrs.insert(name, value);
+                    }
+                    None => {
+                        node.xattrs.remove(&name);
+                    }
+                }
+                Ok(())
+            }
             Record::File { ino, cut, size, modified, chunks } => {
                 let node = self.node_mut(ino)?;
                 let Data::File(file) = &mut node.data else { return Err(Error::Io) };
@@ -802,7 +1026,7 @@ impl<M: Persist> Fs<M> {
                     Data::File(file)
                 }
             };
-            fs.nodes.insert(ino, Node { meta: M::load(inode.meta), modified: inode.modified, generation: 0, links: inode.links, data });
+            fs.nodes.insert(ino, Node { meta: M::load(inode.meta), modified: inode.modified, generation: 0, links: inode.links, data, volatile: None, xattrs: BTreeMap::new() });
         }
         Ok(fs)
     }
@@ -862,6 +1086,108 @@ fn key(name: &str, fold: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xattrs_are_kept_and_replayed() {
+        let store = Shared::default();
+        let mut fs = open(None, &store);
+        let f = fs.put("/f", New::File, b"x", 0, 0).unwrap();
+        fs.set_xattr(f, "user.comment", b"hello").unwrap();
+        fs.set_xattr(f, "security.capability", b"\x01\x00").unwrap();
+        fs.set_xattr(f, "user.comment", b"world").unwrap();
+        assert_eq!(fs.get_xattr(f, "user.comment").unwrap().as_deref(), Some(&b"world"[..]));
+        assert_eq!(fs.list_xattrs(f).unwrap(), vec!["security.capability".to_string(), "user.comment".to_string()]);
+        assert!(fs.remove_xattr(f, "security.capability").unwrap());
+        assert!(!fs.remove_xattr(f, "security.capability").unwrap());
+        assert_eq!(fs.get_xattr(f, "security.capability").unwrap(), None);
+        // On a volatile tree: kept in memory, never logged.
+        let tmp = fs.volatile_root(0, 1);
+        let t = fs.create(tmp, "t", New::File, 0, 1).unwrap();
+        fs.set_xattr(t, "user.x", b"1").unwrap();
+        assert_eq!(fs.get_xattr(t, "user.x").unwrap().as_deref(), Some(&b"1"[..]));
+        fs.sync().unwrap();
+        // Reopened from the log: the attribute's latest value is there, the removed one isn't.
+        let again = open(None, &store);
+        let g = again.resolve(ROOT, "/f", true).unwrap();
+        assert_eq!(again.get_xattr(g, "user.comment").unwrap().as_deref(), Some(&b"world"[..]));
+        assert_eq!(again.list_xattrs(g).unwrap(), vec!["user.comment".to_string()]);
+    }
+
+    #[test]
+    fn a_volatile_tree_is_never_logged() {
+        let store = Shared::default();
+        let mut fs = open(None, &store);
+        fs.put("/kept", New::File, b"k", 0, 0).unwrap();
+        fs.sync().unwrap();
+        let tmp = fs.volatile_root(0, 1);
+        let dir = fs.create(tmp, "d", New::Dir, 0, 1).unwrap();
+        let file = fs.create(dir, "f", New::File, 0, 1).unwrap();
+        fs.write(file, 0, &pattern(3 * CHUNK as usize, 3), 2).unwrap();
+        fs.set_meta(file, 9).unwrap();
+        assert_eq!(fs.volatile(file), Some(tmp));
+        // Nothing crosses between it and the rest.
+        assert_eq!(fs.link(ROOT, "f", file, 3), Err(Error::CrossFs));
+        assert_eq!(fs.rename(dir, "f", ROOT, "f", 3), Err(Error::CrossFs));
+        fs.sync().unwrap();
+        // Reopened from its log, only what's outside it is there.
+        let again = open(None, &store);
+        assert_eq!(read_all(&again, "/kept"), b"k");
+        assert_eq!(again.nodes.len(), fs.nodes.len() - 3);
+        // A file held open outlives its tree.
+        fs.hold(file);
+        fs.drop_tree(tmp).unwrap();
+        assert!(fs.stat(dir).is_err() && fs.stat(tmp).is_err());
+        assert_eq!(fs.stat(file).unwrap().links, 0);
+        fs.release(file);
+        assert!(fs.stat(file).is_err());
+        assert_eq!(fs.drop_tree(ROOT), Err(Error::NotFound));
+    }
+
+    #[test]
+    fn an_observer_is_told_of_each_change() {
+        extern crate std;
+        use std::format;
+        use std::sync::{Arc, Mutex};
+        let mut fs = Fs::new(0u32, false);
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        let log = seen.clone();
+        fs.observe(Some(Box::new(move |fs: &Fs<u32>, change: Change<'_>| {
+            // The tree as it is after the change.
+            let after = match change {
+                Change::Created { dir, name, .. } | Change::Linked { dir, name, .. } => fs.lookup(dir, name).is_ok(),
+                Change::Removed { dir, name, .. } => fs.lookup(dir, name).is_err(),
+                _ => true,
+            };
+            log.lock().unwrap().push(format!("{change:?} {after}"));
+        })));
+        let d = fs.create(ROOT, "d", New::Dir, 0, 1).unwrap();
+        let f = fs.create(d, "f", New::File, 0, 1).unwrap();
+        fs.write(f, 0, b"x", 2).unwrap();
+        fs.truncate(f, 0, 3).unwrap();
+        fs.set_meta(f, 7).unwrap();
+        fs.link(ROOT, "g", f, 4).unwrap();
+        let other = fs.create(ROOT, "h", New::File, 0, 5).unwrap();
+        fs.rename(d, "f", ROOT, "h", 6).unwrap();
+        fs.rename(ROOT, "h", ROOT, "g", 6).unwrap();
+        fs.remove(ROOT, "g", 7).unwrap();
+        fs.remove(ROOT, "d", 8).unwrap();
+        let _ = fs.remove(ROOT, "nothing", 9);
+        let seen = seen.lock().unwrap();
+        let want = [
+            format!("Created {{ dir: 1, name: \"d\", ino: {d}, kind: Dir }} true"),
+            format!("Created {{ dir: {d}, name: \"f\", ino: {f}, kind: File }} true"),
+            format!("Written {{ ino: {f} }} true"),
+            format!("Written {{ ino: {f} }} true"),
+            format!("Changed {{ ino: {f} }} true"),
+            format!("Linked {{ dir: 1, name: \"g\", ino: {f} }} true"),
+            format!("Created {{ dir: 1, name: \"h\", ino: {other}, kind: File }} true"),
+            format!("Moved {{ from_dir: {d}, from: \"f\", to_dir: 1, to: \"h\", ino: {f}, kind: File, replaced: Some(({other}, true)) }} true"),
+            // Both names one file: nothing moves, and no one's told.
+            format!("Removed {{ dir: 1, name: \"g\", ino: {f}, kind: File, gone: false }} true"),
+            format!("Removed {{ dir: 1, name: \"d\", ino: {d}, kind: Dir, gone: true }} true"),
+        ];
+        assert_eq!(seen.as_slice(), want.as_slice());
+    }
 
     #[test]
     fn build_and_resolve() {
@@ -1059,6 +1385,28 @@ mod tests {
         assert_eq!(&got[..10], &pattern(150_000, 1)[..10]);
         assert!(got[10..139_999].iter().all(|b| *b == 0));
         assert_eq!(got[139_999], b'z');
+    }
+
+    #[test]
+    fn zeroed_ranges_keep_the_size_and_survive_reopening() {
+        let store = Shared::default();
+        let mut fs = open(None, &store);
+        let data = pattern(3 * CHUNK as usize + 100, 7);
+        let file = fs.put("/f", New::File, &data, 0, 0).unwrap();
+        fs.sync().unwrap();
+        // Part of the first chunk, all of the second, part of the third; then the tail, and past the end.
+        fs.zero(file, 10, 2 * CHUNK + 5 - 10, 1).unwrap();
+        fs.zero(file, 3 * CHUNK + 50, 1 << 20, 2).unwrap();
+        fs.zero(file, 1 << 30, 10, 3).unwrap();
+        fs.sync().unwrap();
+        let fs = open(None, &store);
+        let got = read_all(&fs, "/f");
+        assert_eq!(got.len(), data.len());
+        assert_eq!(&got[..10], &data[..10]);
+        assert!(got[10..2 * CHUNK as usize + 5].iter().all(|b| *b == 0));
+        assert_eq!(&got[2 * CHUNK as usize + 5..3 * CHUNK as usize + 50], &data[2 * CHUNK as usize + 5..3 * CHUNK as usize + 50]);
+        assert!(got[3 * CHUNK as usize + 50..].iter().all(|b| *b == 0));
+        assert_eq!(fs.stat(fs.resolve(ROOT, "/f", true).unwrap()).unwrap().modified, 2);
     }
 
     #[test]

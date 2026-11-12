@@ -23,6 +23,13 @@ kernel (owner and mode to lambda, attributes to atlas) is that kernel's `M`, kep
   they were given.
 - **Open files.** A file held open (`hold`) outlives its name, as programs' nameless temporary files need; the last
   `release` lets it go.
+- **Extended attributes.** Each file keeps a map of extended attributes (`get_xattr`, `set_xattr`, `list_xattrs`,
+  `remove_xattr`), logged like its metadata and replayed on reopen. (Not yet written into a frozen index.)
+- **Volatile trees.** `volatile_root` makes a directory in no other whose tree is never logged, saved or frozen, and
+  `drop_tree` lets it go: a kernel's tmpfs. Nothing links or moves between it and the rest (`CrossFs`).
+- **Watching.** An observer (`observe`) is told of each change as it's made: made, linked, removed (and whether that
+  was the last name), moved (and what it replaced), written, metadata set. lambda's inotify is built on it; atlas's
+  `ReadDirectoryChangesW` could be.
 - A kernel's `M` is saved as four words (`Persist`).
 
 ## Testing
@@ -31,8 +38,9 @@ kernel (owner and mode to lambda, attributes to atlas) is that kernel's `M`, kep
 cargo test -p layers
 ```
 
-Writing and removing, folding case (and keeping it through an index), an open file outliving its name; a disk that
-keeps its files when reopened, what wasn't synced lost cleanly after a crash, holes, files cut then grown, freezing and
+Extended attributes set, replaced, removed and replayed from the log; a volatile tree never reaching the log, nothing crossing out of it, and a file held open outliving it; an observer
+told of each change in order, with the tree as it is after; writing and removing, folding case (and keeping it through an index), an open file outliving its name; a disk that
+keeps its files when reopened, what wasn't synced lost cleanly after a crash, holes, files cut then grown, ranges zeroed in place (`fallocate`'s punched holes), freezing and
 reopening, and a bad index refused.
 
 ## To do

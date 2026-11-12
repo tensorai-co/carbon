@@ -2,7 +2,7 @@
 
 pub(crate) mod trust;
 
-pub use crate::unix::{random, set_raw, terminal_size};
+pub use crate::unix::{random, set_raw, terminal_size, thread_cpu};
 pub use trust::check as check_certificates;
 
 /// `MemAvailable`: what the kernel says it could give without swapping.

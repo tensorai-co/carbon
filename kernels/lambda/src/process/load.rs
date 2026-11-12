@@ -30,19 +30,75 @@ const PIE_BASE: u64 = 0x5555_5555_0000;
 
 impl Task {
     pub(super) fn execve(&mut self, cx: &mut Cx<'_>, a: [u64; 6]) -> Outcome {
+        match self.mem(cx, false, |t| user::read_cstr(&t.space(), a[0], 4096)) {
+            Ok(path) => self.exec_path(cx, String::from_utf8_lossy(&path).into_owned(), a[1], a[2]),
+            Err(e) => Err(e).into(),
+        }
+    }
+
+    /// `execveat`: `execve` of a path from an open directory, or with `AT_EMPTY_PATH` of the file a descriptor is
+    /// open on (`fexecve`). `AT_EXECVE_CHECK` only checks that it could be run.
+    pub(super) fn execveat(&mut self, cx: &mut Cx<'_>, a: [u64; 6]) -> Outcome {
+        self.resolve_exec_at(cx, a[0] as i32, a[1], a[4]).map_or_else(|e| Err(e).into(), |path| match path {
+            Some(path) => self.exec_path(cx, path, a[2], a[3]),
+            None => Outcome::Return(0),
+        })
+    }
+
+    /// The absolute path `execveat` means, or None if `AT_EXECVE_CHECK` found it could be run.
+    fn resolve_exec_at(&mut self, cx: &mut Cx<'_>, dirfd: i32, path_at: u64, flags: u64) -> Result<Option<String>, Errno> {
+        const AT_EXECVE_CHECK: u64 = 0x10000;
+        if flags & !(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW | AT_EXECVE_CHECK) != 0 {
+            return Err(EINVAL);
+        }
+        let path = self.read_path(cx, path_at)?;
+        let (absolute, ino) = if path.is_empty() {
+            if flags & AT_EMPTY_PATH == 0 {
+                return Err(ENOENT);
+            }
+            let open = self.file(dirfd)?;
+            match open.node {
+                crate::fs::Node::File(ino) => (open.path.clone(), ino),
+                crate::fs::Node::Dir(_) => return Err(EACCES),
+                _ => return Err(EACCES),
+            }
+        } else {
+            let (dir, dir_path) = self.start_dir(dirfd)?;
+            let view = self.view();
+            let disk = lock(&self.k.disk);
+            let ino = view.resolve(&disk, dir, &path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
+            if disk.stat(ino)?.kind == layers::Kind::Symlink {
+                return Err(ELOOP);
+            }
+            (exe_path(&dir_path, &path), ino)
+        };
+        if flags & AT_EXECVE_CHECK == 0 {
+            return Ok(Some(absolute));
+        }
+        let disk = lock(&self.k.disk);
+        if disk.stat(ino)?.kind != layers::Kind::File {
+            return Err(EACCES);
+        }
+        let mut magic = [0u8; 4];
+        let n = disk.read(ino, 0, &mut magic)?;
+        if magic[..n].starts_with(b"\x7fELF") || magic[..n].starts_with(b"#!") { Ok(None) } else { Err(ENOEXEC) }
+    }
+
+    /// Runs the program at `path` in this process, with the argument and environment lists at `argv_at` and
+    /// `envp_at`.
+    fn exec_path(&mut self, cx: &mut Cx<'_>, path: String, argv_at: u64, envp_at: u64) -> Outcome {
         let read = self.mem(cx, false, |t| {
             let space = t.space();
             let width = 8;
-            let path = user::read_cstr(&space, a[0], 4096)?;
             let strings = |list: u64| -> Result<Vec<String>, user::Fault> {
                 user::read_ptr_list(&space, list, width, 1 << 16)?
                     .into_iter()
                     .map(|p| Ok(String::from_utf8_lossy(&user::read_cstr(&space, p, user::MOST_STRING)?).into_owned()))
                     .collect()
             };
-            Ok((String::from_utf8_lossy(&path).into_owned(), strings(a[1])?, strings(a[2])?))
+            Ok((strings(argv_at)?, strings(envp_at)?))
         });
-        let (path, argv, env) = match read {
+        let (argv, env) = match read {
             Ok(r) => r,
             Err(e) => return Err(e).into(),
         };
@@ -53,10 +109,22 @@ impl Task {
         }
         match exec_into(&self.k, cx, &mut state, &path, argv, env) {
             Ok(()) => {
+                crate::timer::on_exec(&self.k, &mut state);
+                // Its SysV attachments and AIO contexts went with its old memory.
+                let attached = !std::mem::take(&mut state.shm_attached).is_empty();
+                state.aio.clear();
+                // Its capabilities as execve works them out; its name is its new program's; it's dumpable again.
+                state.creds.exec();
+                state.comm = None;
+                state.security.dumpable = true;
                 self.isa = state.isa;
                 self.clear_tid = 0;
                 self.altstack = None;
                 self.saved_fp.clear();
+                drop(state);
+                if attached {
+                    self.shm_tidy();
+                }
                 Outcome::Keep
             }
             Err(e) => Err(e).into(),
@@ -123,12 +191,12 @@ pub(crate) fn exec_into(k: &Arc<Kernel>, cx: &mut Cx<'_>, state: &mut ProcState,
             let layout = t.space().layout();
             let mut regions: Regions<Area> = Regions::default();
             for kept in &layout.kept {
-                regions.insert(kept.clone(), Area { prot: Prot::NONE, backing: Backing::Reserved, name: String::new() });
+                regions.insert(kept.clone(), Area::new(Prot::NONE, Backing::Reserved, ""));
             }
             let stack_top = page_down(layout.top.min(1 << 47) - (16 << 20));
             let stack_bottom = stack_top - STACK;
             let mmap = MMAP_BOTTOM..stack_bottom - STACK_GAP;
-            regions.insert(stack_bottom..stack_top, Area { prot: Prot::RW, backing: Backing::Anon, name: "[stack]".to_string() });
+            regions.insert(stack_bottom..stack_top, Area::new(Prot::RW, Backing::Anon, "[stack]"));
             t.space().map(stack_top - STACK_MAPPED..stack_top, Prot::RW).zeroed().map_err(|_| ENOMEM)?;
 
             let (lo, hi) = program.span();
@@ -146,7 +214,7 @@ pub(crate) fn exec_into(k: &Arc<Kernel>, cx: &mut Cx<'_>, state: &mut ProcState,
             // The page handlers return to, between mmap's room and the stack.
             let trampoline = mmap.end;
             t.space().map(trampoline..trampoline + PAGE, Prot::RX).with(&crate::signal::trampoline(isa)).map_err(|_| ENOMEM)?;
-            regions.insert(trampoline..trampoline + PAGE, Area { prot: Prot::RX, backing: Backing::Anon, name: "[vdso]".to_string() });
+            regions.insert(trampoline..trampoline + PAGE, Area::new(Prot::RX, Backing::Anon, "[vdso]"));
             let mut interp_base = 0;
             if let Some(interp) = &interp {
                 let (ilo, ihi) = interp.span();
@@ -209,8 +277,9 @@ pub(crate) fn exec_into(k: &Arc<Kernel>, cx: &mut Cx<'_>, state: &mut ProcState,
 
 /// The whole of a file on the disk, found from the process's working directory.
 fn read_file(k: &Kernel, state: &ProcState, path: &str) -> Result<Vec<u8>, Errno> {
+    let view = crate::fs::mount::View { root: state.root.0, mounts: state.ns.mnt.current() };
     let disk = lock(&k.disk);
-    let ino = disk.resolve(state.cwd.0, path, true)?;
+    let ino = view.resolve(&disk, state.cwd.0, path, true)?;
     let meta = disk.meta(ino)?;
     if meta.mode & 0o111 == 0 {
         return Err(EPERM);
@@ -245,7 +314,7 @@ fn map_image(t: &mut Turn<'_>, regions: &mut Regions<Area>, elf: &Elf<'_>, base:
         if prot != Prot::NONE {
             let (from, to) = (page as u64 * PAGE, end as u64 * PAGE);
             t.space().map(lo + from..lo + to, prot).with(&image[from as usize..to as usize]).map_err(|_| ENOMEM)?;
-            regions.insert(lo + from..lo + to, Area { prot, backing: Backing::Anon, name: name.to_string() });
+            regions.insert(lo + from..lo + to, Area::new(prot, Backing::Anon, name));
         }
         page = end;
     }

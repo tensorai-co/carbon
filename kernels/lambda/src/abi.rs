@@ -23,6 +23,7 @@ pub const ENOMEM: Errno = Errno(12);
 pub const EFAULT: Errno = Errno(14);
 pub const EEXIST: Errno = Errno(17);
 pub const EXDEV: Errno = Errno(18);
+pub const EROFS: Errno = Errno(30);
 pub const ENXIO: Errno = Errno(6);
 pub const ENOTDIR: Errno = Errno(20);
 pub const EISDIR: Errno = Errno(21);
@@ -61,6 +62,12 @@ pub const ECONNREFUSED: Errno = Errno(111);
 pub const EHOSTUNREACH: Errno = Errno(113);
 pub const EALREADY: Errno = Errno(114);
 pub const EINPROGRESS: Errno = Errno(115);
+pub const EFBIG: Errno = Errno(27);
+pub const ENOSPC: Errno = Errno(28);
+pub const EBUSY: Errno = Errno(16);
+pub const E2BIG: Errno = Errno(7);
+pub const ESTALE: Errno = Errno(116);
+pub const EOVERFLOW: Errno = Errno(75);
 
 impl From<layers::Error> for Errno {
     fn from(e: layers::Error) -> Errno {
@@ -72,6 +79,7 @@ impl From<layers::Error> for Errno {
             layers::Error::NotEmpty => ENOTEMPTY,
             layers::Error::Loop => ELOOP,
             layers::Error::BadName => EINVAL,
+            layers::Error::CrossFs => EXDEV,
             layers::Error::Io => EIO,
         }
     }
@@ -133,6 +141,7 @@ pub const S_IFREG: u32 = 0o100000;
 pub const S_IFDIR: u32 = 0o040000;
 pub const S_IFLNK: u32 = 0o120000;
 pub const S_IFCHR: u32 = 0o020000;
+pub const S_IFBLK: u32 = 0o060000;
 pub const S_IFIFO: u32 = 0o010000;
 pub const S_IFSOCK: u32 = 0o140000;
 
@@ -162,6 +171,7 @@ pub const CLONE_VM: u64 = 0x100;
 pub const CLONE_FS: u64 = 0x200;
 pub const CLONE_FILES: u64 = 0x400;
 pub const CLONE_SIGHAND: u64 = 0x800;
+pub const CLONE_PIDFD: u64 = 0x1000;
 pub const CLONE_VFORK: u64 = 0x4000;
 pub const CLONE_THREAD: u64 = 0x10000;
 pub const CLONE_SETTLS: u64 = 0x80000;
@@ -181,6 +191,7 @@ pub const FUTEX_WAKE_OP: u64 = 5;
 pub const FUTEX_WAIT_BITSET: u64 = 9;
 pub const FUTEX_WAKE_BITSET: u64 = 10;
 pub const FUTEX_CMD_MASK: u64 = 0x7f;
+pub const FUTEX_PRIVATE_FLAG: u64 = 128;
 
 // Signals.
 pub const SIGKILL: i32 = 9;
@@ -320,10 +331,14 @@ impl Stat {
     }
 }
 
+/// The kernel release and version `uname` gives.
+pub const RELEASE: &str = "6.12.0-carbon";
+pub const VERSION: &str = "#1 SMP Carbon v2";
+
 /// `struct utsname`: six fields of 65 bytes.
-pub fn utsname(machine: &str, nodename: &str) -> Vec<u8> {
+pub fn utsname(machine: &str, nodename: &str, domainname: &str) -> Vec<u8> {
     let mut b = Vec::with_capacity(390);
-    for field in ["Linux", nodename, "6.12.0-carbon", "#1 SMP Carbon v2", machine, "(none)"] {
+    for field in ["Linux", nodename, RELEASE, VERSION, machine, domainname] {
         let mut f = field.as_bytes().to_vec();
         f.resize(65, 0);
         b.extend(f);

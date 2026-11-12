@@ -7,7 +7,7 @@ typedef long i64;
 typedef unsigned int u32;
 
 #if defined(__aarch64__)
-enum { SYS_dup = 23, SYS_fcntl = 25, SYS_flock = 32, SYS_unlinkat = 35, SYS_linkat = 37, SYS_fchmodat = 53,
+enum { SYS_symlinkat = 36, SYS_faccessat = 48, SYS_pipe2 = 59, SYS_readlinkat = 78, SYS_dup = 23, SYS_fcntl = 25, SYS_flock = 32, SYS_unlinkat = 35, SYS_linkat = 37, SYS_fchmodat = 53,
        SYS_fchownat = 54, SYS_openat = 56, SYS_close = 57, SYS_lseek = 62, SYS_read = 63, SYS_write = 64,
        SYS_newfstatat = 79, SYS_utimensat = 88, SYS_exit_group = 94, SYS_close_range = 436 };
 static i64 sys(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
@@ -21,7 +21,7 @@ __asm__(".globl _start\n_start:\n mov x0, sp\n bl cmain\n b .\n");
 #define ST_NLINK(st) (*(u32 *)((char *)(st) + 20))
 #define ST_UID 24
 #else
-enum { SYS_read = 0, SYS_write = 1, SYS_close = 3, SYS_lseek = 8, SYS_dup = 32, SYS_fcntl = 72, SYS_flock = 73,
+enum { SYS_symlinkat = 266, SYS_faccessat = 269, SYS_pipe2 = 293, SYS_readlinkat = 267, SYS_read = 0, SYS_write = 1, SYS_close = 3, SYS_lseek = 8, SYS_dup = 32, SYS_fcntl = 72, SYS_flock = 73,
        SYS_exit_group = 231, SYS_openat = 257, SYS_fchownat = 260, SYS_newfstatat = 262, SYS_unlinkat = 263,
        SYS_linkat = 265, SYS_fchmodat = 268, SYS_utimensat = 280, SYS_close_range = 436 };
 static i64 sys(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
@@ -69,6 +69,18 @@ static i64 make(const char *path, const char *text) {
     int fd = sys(SYS_openat, AT_FDCWD, (i64)path, O_RDWR | O_CREAT | O_TRUNC, 0644, 0, 0);
     sys(SYS_write, fd, (i64)text, len(text), 0, 0, 0);
     return fd;
+}
+
+// `prefix` and `fd`'s digits, in `out`.
+static char *fd_path(char *out, const char *prefix, int fd) {
+    u64 n = 0;
+    while (prefix[n]) { out[n] = prefix[n]; n++; }
+    char digits[12];
+    int d = 0;
+    do { digits[d++] = (char)('0' + fd % 10); fd /= 10; } while (fd);
+    while (d) out[n++] = digits[--d];
+    out[n] = 0;
+    return out;
 }
 
 void cmain(i64 *sp) {
@@ -120,6 +132,33 @@ void cmain(i64 *sp) {
     check(sys(SYS_close_range, first, second, 4, 0, 0, 0) == 0 && sys(SYS_fcntl, first, 1, 0, 0, 0, 0) == 1, "close_range with CLOSE_RANGE_CLOEXEC marks them");
     check(sys(SYS_close_range, first, ~0u, 0, 0, 0, 0) == 0 && sys(SYS_close, second, 0, 0, 0, 0, 0) == -EBADF && sys(SYS_read, fd, (i64)buf, 1, 0, 0, 0) >= 0,
           "close_range closes them, and only them");
+
+    // Paths through the disk's links to what lambda makes: /dev/fd (bash's process substitution), /dev/stdin, and a
+    // link of the program's own into /proc.
+    int p[2];
+    char path[40];
+    sys(SYS_pipe2, (i64)p, 0, 0, 0, 0, 0);
+    sys(SYS_write, p[1], (i64)"through", 7, 0, 0, 0);
+    int via = sys(SYS_openat, AT_FDCWD, (i64)fd_path(path, "/dev/fd/", p[0]), 0, 0, 0, 0);
+    n = sys(SYS_read, via, (i64)buf, sizeof buf, 0, 0, 0);
+    check(via >= 0 && n == 7 && same(buf, "through", 7), "/dev/fd/N opens the pipe that N is");
+    int back = sys(SYS_openat, AT_FDCWD, (i64)fd_path(path, "/dev/fd/", p[1]), 01 | O_CREAT | O_TRUNC, 0644, 0, 0);
+    sys(SYS_write, back, (i64)"back", 4, 0, 0, 0);
+    check(back >= 0 && sys(SYS_read, p[0], (i64)buf, sizeof buf, 0, 0, 0) == 4 && same(buf, "back", 4), "and its write end, with O_CREAT and O_TRUNC, as >(...) opens it");
+    // Two pipes are two files to stat, as diff <(a) <(b) needs them to be.
+    int q[2];
+    u64 st2[32];
+    sys(SYS_pipe2, (i64)q, 0, 0, 0, 0, 0);
+    check(stat_of(fd_path(path, "/dev/fd/", p[0]), st) == 0 && stat_of(fd_path(path, "/dev/fd/", q[0]), st2) == 0 && (st[0] != st2[0] || st[1] != st2[1]) &&
+          stat_of(fd_path(path, "/dev/fd/", p[1]), st2) == 0 && st[1] == st2[1], "two pipes have different inodes; a pipe's two ends, the same");
+    check(stat_of("/dev/stdin", st) == 0 && sys(SYS_faccessat, AT_FDCWD, (i64)"/dev/fd/1", 0, 0, 0, 0) == 0 &&
+          sys(SYS_readlinkat, AT_FDCWD, (i64)"/dev/fd/0", (i64)buf, sizeof buf, 0, 0) > 0, "stat /dev/stdin, access /dev/fd/1, readlink /dev/fd/0");
+    sys(SYS_unlinkat, AT_FDCWD, (i64)"/tmp/me", 0, 0, 0, 0);
+    sys(SYS_symlinkat, (i64)"../proc/self", AT_FDCWD, (i64)"/tmp/me", 0, 0, 0);
+    sys(SYS_write, p[1], (i64)"mine", 4, 0, 0, 0);
+    int mine = sys(SYS_openat, AT_FDCWD, (i64)fd_path(path, "/tmp/me/fd/", p[0]), 0, 0, 0, 0);
+    check(mine >= 0 && sys(SYS_read, mine, (i64)buf, sizeof buf, 0, 0, 0) == 4 && same(buf, "mine", 4), "a link of its own, relative, into /proc/self");
+    check(sys(SYS_openat, AT_FDCWD, (i64)"/dev/fd/900", 0, 0, 0, 0) == -ENOENT && stat_of("/dev/nothing/here", st) == -ENOENT, "a descriptor that isn't open, and a path that isn't there: ENOENT");
 
     say(failures ? "some checks failed\n" : "all passed\n");
     sys(SYS_exit_group, failures, 0, 0, 0, 0, 0);

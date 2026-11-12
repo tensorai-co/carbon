@@ -15,14 +15,19 @@
 //! ```
 
 mod abi;
+mod admin;
 mod fs;
+mod ipc;
 mod mm;
 mod net;
+mod ns;
 mod os;
 mod process;
+mod security;
 mod signal;
 mod sys;
 mod time;
+mod timer;
 mod tty;
 
 use std::collections::BTreeMap;
@@ -153,7 +158,7 @@ pub enum Status {
 
 impl Status {
     /// As `wait4` reports it.
-    fn wait_status(self) -> i32 {
+    pub(crate) fn wait_status(self) -> i32 {
         match self {
             Status::Exited(code) => (code & 0xff) << 8,
             Status::Killed(signal) => signal & 0x7f,
@@ -171,10 +176,16 @@ impl Status {
 
 /// Boots a machine: runs `argv[0]`, a path on `disk`, as process 1, on this thread with the CPU `Exec::open` gave, and
 /// returns how it ended. Other processes still running then are ended with it.
-pub fn boot(exec: Exec, mut cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&str], options: Options) -> Result<Status, String> {
+pub fn boot(mut exec: Exec, mut cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&str], options: Options) -> Result<Status, String> {
     let mut disk = disk;
     os::populate(&mut disk);
+    let mount_ns = fs::mount::MountNs::new(fs::mount::Mounts::boot(&disk));
+    let boot_ns = ns::Namespaces::boot(mount_ns, admin::Names { host: options.hostname.clone(), domain: "(none)".to_string() });
+    let watches = fs::inotify::Registry::default();
+    let fanotify = fs::fanotify::Registry::default();
+    disk.observe(Some(fs::fanotify::observer(watches.clone(), fanotify.clone())));
     let console = (options.console && host.is_terminal()).then(|| Tty::console(host.clone()));
+    let klog = admin::Klog::boot(host.cpus(), exec.memory().size().limit);
     let net = options.network.clone().unwrap_or_else(|| ::net::Network::on_this_host(::net::Config { hostname: options.hostname.clone(), dns: None }));
     let kernel = Arc::new(Kernel {
         console,
@@ -192,6 +203,12 @@ pub fn boot(exec: Exec, mut cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&
         options,
         stdin_watchers: Arc::default(),
         net,
+        timers: Default::default(),
+        watches,
+        fanotify,
+        fifos: Mutex::new(BTreeMap::new()),
+        boot_ns,
+        klog: Mutex::new(klog),
     });
     let watchers = kernel.stdin_watchers.clone();
     kernel.host.watch_input(Arc::new(move || watchers.notify()));
@@ -203,6 +220,7 @@ pub fn boot(exec: Exec, mut cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&
     }
     let result = run_init(&kernel, &mut cpu, argv);
     kernel.done.store(true, Ordering::Release);
+    kernel.timers.stop();
     if kernel.console.is_some() {
         kernel.host.set_raw(false);
     }
@@ -257,6 +275,19 @@ pub(crate) struct Kernel {
     stdin_watchers: Arc<kernels_core::wait::Watchers>,
     /// The machine's network.
     net: ::net::Network,
+    /// The timers its processes' signal timers are kept by.
+    timers: kernels_core::timers::Timers,
+    /// Its inotify watches, by file; the disk's observer reads them too.
+    watches: fs::inotify::Registry,
+    /// Its fanotify groups.
+    fanotify: fs::fanotify::Registry,
+    /// The shared buffers of FIFOs that are open, by inode.
+    fifos: Mutex<BTreeMap<layers::Ino, Weak<fs::Pipe>>>,
+    /// The namespaces process 1 starts in; every other process comes from it, with its own as `clone`, `unshare`
+    /// and `setns` make them.
+    boot_ns: ns::Namespaces,
+    /// The kernel's log, the machine's whatever its namespaces.
+    klog: Mutex<admin::Klog>,
 }
 
 /// Feeds the host's keyboard to the console, sending the signals it asks for, and keeps its size the terminal's.

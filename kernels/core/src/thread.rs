@@ -2,10 +2,11 @@
 //! with each stop through its kernel's [`Guest`]. A thread that blocks (reading a pipe, waiting on a futex, running a
 //! program's callback) blocks its own host thread, and nothing else.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
-use exec::{Cpu, CpuHandle, Exec, Exit, Turn};
+use exec::{Cpu, CpuHandle, Exec, Exit, SpaceId, Turn};
 
 use crate::lock;
 
@@ -16,18 +17,42 @@ pub type SharedExec = Arc<Mutex<Exec>>;
 pub struct Cx<'c> {
     exec: &'c SharedExec,
     cpu: &'c mut Cpu,
+    /// Inside `elsewhere`: the space each turn uses, and the CPU's own to go back to before the turn ends.
+    away: Option<(SpaceId, SpaceId)>,
 }
 
 impl<'c> Cx<'c> {
     pub fn new(exec: &'c SharedExec, cpu: &'c mut Cpu) -> Cx<'c> {
-        Cx { exec, cpu }
+        Cx { exec, cpu, away: None }
     }
 
     /// A turn: exec's lock, held only while `f` runs. Nothing slow may happen in `f`, and it may take no other lock.
     pub fn turn<R>(&mut self, f: impl FnOnce(&mut Turn<'_>) -> R) -> R {
         let mut exec = lock(self.exec);
         let mut turn = exec.enter(self.cpu);
-        f(&mut turn)
+        match self.away {
+            Some((there, home)) => {
+                turn.use_space(there);
+                let result = f(&mut turn);
+                turn.use_space(home);
+                result
+            }
+            None => f(&mut turn),
+        }
+    }
+
+    /// Runs `f` with every turn in `space`, another process's, as a kernel reads or writes another program's memory
+    /// (`ptrace`, `process_vm_readv`). Each turn goes back to the CPU's own space before it ends, so nothing outside
+    /// a turn ever sees the CPU in a space that isn't its own. The caller keeps `space` alive meanwhile.
+    pub fn elsewhere<R>(&mut self, space: SpaceId, f: impl FnOnce(&mut Cx<'_>) -> R) -> R {
+        let home = match self.away {
+            Some((_, home)) => home,
+            None => self.turn(|t| t.space().id()),
+        };
+        let before = self.away.replace((space, home));
+        let result = f(self);
+        self.away = before;
+        result
     }
 
     /// Runs the program until it stops. No lock is held: other CPUs run at the same time.
@@ -45,6 +70,26 @@ impl<'c> Cx<'c> {
     }
 }
 
+/// A guest thread's CPU time, in nanoseconds: running its program (user), and in its kernel dealing with a stop
+/// (system). Its own thread adds to it; any thread may read it.
+#[derive(Debug, Default)]
+pub struct Times {
+    user: AtomicU64,
+    system: AtomicU64,
+}
+
+impl Times {
+    pub fn add(&self, user: u64, system: u64) {
+        self.user.fetch_add(user, Ordering::Relaxed);
+        self.system.fetch_add(system, Ordering::Relaxed);
+    }
+
+    /// User and system time so far.
+    pub fn get(&self) -> (u64, u64) {
+        (self.user.load(Ordering::Relaxed), self.system.load(Ordering::Relaxed))
+    }
+}
+
 /// What a guest thread does next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flow {
@@ -57,10 +102,18 @@ pub enum Flow {
 pub trait Guest {
     /// The CPU stopped: find out why with `cx.turn(|t| t.stop(exit))`, and deal with it.
     fn exit(&mut self, cx: &mut Cx<'_>, exit: Exit) -> Flow;
+
+    /// Before it first runs: anything it must do first (a traced thread stops for its tracer).
+    fn start(&mut self, _cx: &mut Cx<'_>) -> Flow {
+        Flow::Run
+    }
 }
 
 /// Runs a guest thread on this host thread until it ends.
 pub fn run(cx: &mut Cx<'_>, guest: &mut impl Guest) {
+    if guest.start(cx) == Flow::End {
+        return;
+    }
     loop {
         let exit = cx.run();
         if guest.exit(cx, exit) == Flow::End {

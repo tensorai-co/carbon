@@ -185,7 +185,19 @@ On this Mac, through hvf, all of them pass:
 | lambda's `code.c`, both ISAs | code written at run time, as JITs do: a function written to a writable, runnable page and rewritten 1,000 times; a direct call into code that's then rewritten; W^X (written, `mprotect`, run, and again); `munmap`, then new code at the same address; another thread rewriting a function this one keeps calling; 4,096 functions rewritten 16 times while another thread runs its own. On Apple silicon the x86-64 build checks that the translator forgets what it translated; `CARBON_EXEC_CODE_CACHE=65536` makes its code cache move between halves too |
 | lambda's `events.c`, both ISAs | eventfd counts, `EFD_SEMAPHORE`, EAGAIN, and a blocking read woken by another process; timerfd one-shot and interval expiries, `timerfd_gettime`, disarming; epoll level-triggered, edge-triggered and one-shot, `EPOLLOUT`, `EPOLLHUP`, EEXIST/ENOENT/EPERM, a timeout, a wait woken by another process, an edge-triggered timerfd, a closed file leaving, an epoll inside another and polled, `epoll_pwait2`; a signalfd woken in `poll` and `epoll` by another process's `kill`; the signal masks of `ppoll` and `epoll_pwait`; x86-64's `epoll_create`, `epoll_wait` and `eventfd` |
 | lambda's `net.c`, both ISAs | `socketpair` both ways, `FIONREAD` and `MSG_PEEK`, `shutdown` and `POLLRDHUP`, EPIPE and `POLLHUP`; a pipe passed with `SCM_RIGHTS` and read from the other side; seqpacket and `MSG_TRUNC`; a Unix server at a path (a socket file: EADDRINUSE to bind again, ENXIO to open) accepting from another process, with `SO_PEERCRED` and `getsockname`; ECONNREFUSED and ENOENT; Unix datagrams to a path from an abstract name; TCP on 127.0.0.1 listed in `/proc/net/tcp`, an echo from another process after a half-close, `getsockname`/`getpeername`, `TCP_NODELAY`, ECONNREFUSED, a non-blocking accept and connect to the machine's own address with epoll and `SO_ERROR`, a reset; UDP with its sender, `sendmmsg`/`recvmmsg`, `SO_RCVTIMEO`; raw sockets refused; netlink's links and `SIOCGIFINDEX`; `/etc/resolv.conf` and `/etc/hosts`; the machine's DNS server answering its own name |
-| lambda's `files.c`, both ISAs | a hard link and `st_nlink`, the file read by its second name once the first is gone; `chmod` (still a regular file), `chown` with and without -1, `utimensat`'s modification time, all as `stat` sees them; a file removed while open, written and read; `flock`; `F_SETLK` and `F_GETLK`'s `F_UNLCK`; `close_range`, with `CLOSE_RANGE_CLOEXEC` and without |
+| lambda's `files.c`, both ISAs | a hard link and `st_nlink`, the file read by its second name once the first is gone; `chmod` (still a regular file), `chown` with and without -1, `utimensat`'s modification time, all as `stat` sees them; a file removed while open, written and read; `flock`; `F_SETLK` and `F_GETLK`'s `F_UNLCK`; `close_range`, with `CLOSE_RANGE_CLOEXEC` and without; through the disk's links into what lambda makes, `/dev/fd/N` opened for reading and for writing (as bash's `<(…)` and `>(…)` open it), `/dev/stdin` stat'd, `/dev/fd/1` accessed and `/dev/fd/0` read as a link, a relative link of the program's own into `/proc/self`; two pipes with different inodes and a pipe's two ends with one |
+| lambda's `io.c`, both ISAs | `preadv`/`pwritev` at an offset leaving the file's own alone, `preadv2` at -1 moving it, `RWF_APPEND`, `RWF_NOWAIT`'s EAGAIN, unknown flags; ESPIPE for `pread64`, `pwrite64` and `preadv` on a pipe; `sendfile` with and without an offset; `copy_file_range` at both offsets, overlapping within a file refused, 200 KB in pieces; `splice` file to pipe and pipe to file, ESPIPE and `SPLICE_F_NONBLOCK`; 200 KB `sendfile`d into a pipe moving only what fits; `tee` leaving the data in the first pipe; `vmsplice` both ways; `truncate`; `fallocate` growing, with `KEEP_SIZE`, punching a hole and zeroing a range; `sync`, `syncfs`, `sync_file_range`, `readahead`; `ioprio_set` and `ioprio_get`; `fchmodat2`; file handles refused (`EOPNOTSUPP`, `ESTALE`); on x86-64, `utime`, `utimes`, `futimesat` and the old `getdents` |
+| lambda's `procs.c`, both ISAs | `RLIMIT_NOFILE` lowered to 8 and descriptors stopping at 7 (EMFILE, and `dup3` and `F_DUPFD` past it), limits by pid with `prlimit64` and inherited by a child, EINVAL and EPERM; nice values set, inherited and clamped; `SCHED_FIFO` and `SCHED_RR` with their priorities and ranges, `SCHED_RESET_ON_FORK` giving the child `SCHED_OTHER`, `sched_setattr`'s E2BIG with its size written back, `SCHED_DEADLINE`'s parameters and their checks; affinity to CPU 0 and `getcpu` there; `PER_LINUX32`'s `uname`; 300 ms of work counted by `times`, `getrusage` and the CPU-time clocks (by `clock_getcpuclockid` too), a child's 200 ms in `wait4`'s rusage and `RUSAGE_CHILDREN`, TAI 37 s ahead; `waitid` for an exit with and without `WNOWAIT`, a stop, a continue, `WNOHANG`, `P_PGID` and a kill; a thread that ends holding a robust futex leaving it `FUTEX_OWNER_DIED`; `kcmp` on files, memory and file tables; `execveat` by descriptor and from a directory, `AT_EXECVE_CHECK`, `AT_SYMLINK_NOFOLLOW`; `restart_syscall` |
+| lambda's `sigtimers.c`, both ISAs | a real-time signal queued three times taken three times with its values in order, a standard one merged, the lowest first; `rt_tgsigqueueinfo` to a thread; `rt_sigtimedwait` timing out, woken by another process's `sigqueue`, and interrupted by a handled signal; a kernel's `si_code` refused to another process; `pause` (x86-64); `ITIMER_REAL` every 20 ms with `getitimer` and disarming, `alarm` (x86-64), `ITIMER_VIRTUAL` and `ITIMER_PROF` after 50 ms of CPU; POSIX timers' `SI_TIMER` signal with ID and value, overruns while blocked and `timer_getoverrun`, `timer_gettime`, `timer_delete` taking a queued signal back, `TIMER_ABSTIME` on real time, `SIGEV_NONE`, `SIGEV_THREAD_ID`, a CPU-time clock; `clock_settime` and `settimeofday` refused, `adjtimex` read-only; pidfds polled, signalled, waited for (non-blocking too) and copied from, and `CLONE_PIDFD` |
+| lambda's `memory.c`, both ISAs | `MAP_SHARED` anonymous memory and `/dev/zero` shared with a child, pages touched before and after the fork alike, while `MAP_PRIVATE` isn't; a memfd written, read, mapped twice and privately, one mapping's write seen by `pread` and the other, `pwrite` seen by the mapping, a child's write through its inherited mapping; `F_SEAL_SHRINK`, `F_SEAL_WRITE` (writes and writable shared mappings refused), `F_SEAL_SEAL`, a memfd without `MFD_ALLOW_SEALING`; `memfd_secret`; a SysV segment written by a child through a new attachment and the inherited one, `IPC_STAT`'s size, attachments, creator and mode, keys with `IPC_CREAT` and `IPC_EXCL`, `IPC_RMID`, `shmdt`, `IPC_INFO`; `msync`; `mincore` showing the pages touched; `mlock` bringing pages in and `MLOCK_ONFAULT` not; `mseal` refusing `munmap`, `mprotect`, `mmap` over it, `mremap` and `MADV_DONTNEED`; NUMA policy on node 0; no protection keys or shadow stacks; `process_madvise`, `process_mrelease`, `cachestat`, `swapon` |
+| lambda's `ipc.c`, both ISAs | SysV message queues: keys with `IPC_CREAT` and `IPC_EXCL`, receiving by type, the oldest, `MSG_EXCEPT`, the lowest type up to one, E2BIG and `MSG_NOERROR`, ENOMSG, `IPC_STAT`'s counts, limit, sender and mode, a child waiting for a message of its type, and EIDRM when `IPC_RMID` takes the queue from under a waiting receiver; SysV semaphores: `SETVAL`, `GETVAL`, `GETPID`, `SETALL`/`GETALL`, all-or-nothing operations, EAGAIN, EFBIG, ERANGE, `semtimedop` timing out, a waiting child counted by `GETNCNT` and let go, `SEM_UNDO` undone when a process ends, `IPC_STAT`'s size; POSIX message queues: `mq_open`'s EEXIST, ENOENT and EACCES, priorities, EMSGSIZE both ways, `mq_getsetattr`, `O_NONBLOCK` empty and full, a send timing out, `poll`, the status `read` gives, `mq_notify`'s signal with `SI_MESGQ` and its value, EBUSY, a child waiting in `mq_timedreceive`, `mq_unlink`; futex2: `futex_wait`'s EAGAIN, EINVAL and a monotonic deadline, `futex_waitv` across a fork giving which futex woke it, `futex_requeue` moving a waiter |
+| lambda's `watch.c`, both ISAs | inotify on a directory: create, open, two writes merged into one `IN_MODIFY`, close-write, attrib, `IN_MOVED_FROM`/`IN_MOVED_TO` sharing a cookie, delete, `IN_ISDIR` for a directory made and removed; on a file: attrib, access, close-nowrite, move-self, and unlinked, `IN_DELETE_SELF` then `IN_IGNORED`; `IN_ONESHOT`; `inotify_add_watch`'s same watch again, `IN_MASK_CREATE`, ENOENT, `IN_ONLYDIR`; `inotify_rm_watch`; a buffer too small (EINVAL), `FIONREAD`, `poll`, a blocking read in another process woken by a create; x86-64's `inotify_init`. Linux AIO: `io_setup`'s checks, a write and a read with their data, iocb and counts, `PWRITEV`/`PREADV` across a hole, fsync telling an eventfd, a request's own error as its result, EBADF and EINVAL from `io_submit` and a partial submit, a full context's EAGAIN, `io_getevents`' bounds and timeout, `io_pgetevents`, `io_cancel`, a context not inherited, `io_destroy` |
+| lambda's `security.c`, both ISAs | capabilities: `capget`'s full set for root and its version handshake, ESRCH; `capset` dropping `CAP_SETUID` so `setuid` fails, and back; `SECBIT_KEEP_CAPS` through leaving root, then `CAP_SETUID` alone getting root back; ambient raise, is-set, refusal and clear; `PR_CAPBSET_READ`; `/proc`'s Cap lines and `cap_last_cap`. `prctl`'s name cut to 15 bytes. seccomp: actions available, a bad jump, `NEW_LISTENER` and a bad operation refused; a filter's errno, kept by a child, `PR_GET_SECCOMP` and `/proc`'s Seccomp lines; a second filter's SIGSYS with `si_errno`, `SYS_SECCOMP`, the call, its arch and address, the most restrictive answer winning; `SECCOMP_RET_KILL_PROCESS` as SIGSYS; strict mode's SIGKILL; EACCES without privilege until `no_new_privs`. The machine: host and domain names in `uname` and `/proc/sys`; `reboot`'s magic, Ctrl-Alt-Del, suspend refused; the kernel log read, unread and sized; quotas; kexec, modules, accounting, BPF and perf refused; LSM's one module and no attributes; Landlock off; without root, EPERM for names, `reboot`, the log and `vhangup`. On x86-64, `iopl` and `ioperm` |
+| lambda's `mounts.c`, both ISAs | `/proc/self/mounts` and `mountinfo` at boot; `statfs`'s ext4 and proc; a tmpfs with `size=` and `mode=`, on a device of its own, `mounts` showing its options, EXDEV to rename or link out of it, EBUSY to remove its mount point; a bind mount and `..` out of it, remounted read-only (EROFS to write, make or remove; the source still writable; `ST_RDONLY`), unmounted, EINVAL again; `MS_MOVE`; `MS_REC | MS_PRIVATE` and a shared peer group in `mountinfo`; ENODEV for sysfs, EBUSY for /, EINVAL for what isn't a mount; EPERM without root; `chroot` with absolute paths, `..` and an absolute link kept inside, nothing above it, and `getcwd`; `fchroot`; `pivot_root` to a tmpfs and the old root unmounted lazily |
+| lambda's `ns.c`, both ISAs | `/proc/self/ns`: eight links, each `<kind>:[inode]`; a child shares its parent's namespace link; `unshare` of a UTS namespace (its own hostname, a new link, the parent's unchanged); `unshare` of an IPC namespace (the parent's message queue hidden, and still the parent's); a new mount namespace (a child's mount isn't the parent's) and `setns` back into the parent's UTS namespace by an ns fd; `CLONE_NEWPID` EINVAL, `unshare` without root EPERM; `listns`. The new mount API: `fsopen`/`fsconfig`/`fsmount` a tmpfs and `move_mount` it into place, `statfs` says tmpfs, `fspick` and `mount_setattr` make it read-only (EROFS); `open_tree(OPEN_TREE_CLONE)` and `move_mount` bind a directory |
+| lambda's `attrs.c`, both ISAs | extended attributes: set/get/list/remove in `user.`, sizing a get and a list, ENODATA, an unknown namespace EOPNOTSUPP, `XATTR_CREATE`/`XATTR_REPLACE`, kept through a close, `fgetxattr` by descriptor, `l*` on a symlink (EPERM), `getxattrat`; `mknod` a FIFO carrying bytes from a writer in another process, EEXIST, a character device node (EPERM without `CAP_MKNOD`, then its rdev); `openat2` opening and creating, an unknown flag/resolve bit/short struct refused, `RESOLVE_BENEATH` (EXDEV), `RESOLVE_NO_SYMLINKS` (ELOOP), `RESOLVE_IN_ROOT`; `file_getattr` zeros and `file_setattr` of nothing |
+| lambda's `ptrace.c`, both ISAs | `PTRACE_TRACEME` and the child's own SIGSTOP: `GETSIGINFO`, `PEEKDATA`/`POKEDATA`, `process_vm_readv`/`writev` (two ranges to one; EFAULT, EINVAL, ESRCH), `/proc/<pid>/status`'s `TracerPid` and tracing stop; `PTRACE_SYSCALL` with `TRACESYSGOOD`: `GET_SYSCALL_INFO` at entry and exit, orig_rax (x86-64) or x8 and x7 (ARM64), a result changed at the exit, a call skipped at its entry with its result set; signal-delivery stops, one suppressed and one passed on to its handler; `TRACEFORK`'s event, the new process traced from its SIGSTOP and its end heard by its tracer, not its parent; `TRACEEXIT` with the status; `SEIZE` (EPERM again), ESRCH while running, `INTERRUPT`'s `EVENT_STOP`, x86-64's `GETREGS`/`PEEKUSER` (EIO on ARM64), `POKETEXT` to read-only code, `SINGLESTEP` EIO, a seized group stop without siginfo, `LISTEN` until SIGCONT, `DETACH`; `ATTACH` (EPERM to itself, ESRCH to no one) with its SIGSTOP, then `KILL` |
+| lambda's `marks.c`, both ISAs | fanotify: a group (EINVAL for `FAN_REPORT_FID`, EPERM without `CAP_SYS_ADMIN`), a file's mark (EINVAL for an FID-only event), EAGAIN, an open/write/close merged into one event with its version, length, pid and a descriptor `/proc/self/fd` names, which makes no event of its own; `FIONREAD`; an ignore mask; `FAN_EVENT_ON_CHILD`; flushing; a file system's mark; `listmount` in ID order and in reverse, `statmount` of the root (ID, ext4's magic and type, mount point; EINVAL, ENOENT), a tmpfs mounted with its parent; `remap_file_pages` (and EINVAL for prot and private); x86-64's `ustat`, `sysfs`, `modify_ldt`, `uprobe` (ENXIO) and `uretprobe` (SIGILL) |
 | atlas, ARM64 native and x86-64 translated | console handles, `WriteConsoleW`, the command line, `VirtualAlloc` committed on touch, an upcall into the program (`EnumSystemLocalesW`, twice), `MessageBoxW`, and the guest exports: the heap, the last error and critical sections, running inside the program in the embedded ntdll |
 | atlas's `windows.c`, both ISAs | `RegisterClassExW`; `CreateWindowExW` with WM_NCCREATE and WM_CREATE (and its parameter) and WM_SIZE (its client area, inside the frame `AdjustWindowRectEx` says); window text through DefWindowProc's WM_GETTEXT and WM_SETTEXT; `FindWindowW`; `SendMessageW` on the window's thread; window and class longs; subclassing with `CallWindowProcW`; a child window, `EnumChildWindows`, `EnumWindows`; `ShowWindow`, `UpdateWindow`, WM_ERASEBKGND and WM_PAINT; `FillRect`, the class background, a pen's `Rectangle` and `LineTo` read back with `GetPixel`; `MoveWindow` and WM_SIZE; `SendMessageW` and `PostMessageW` from another thread into a `GetMessageW` loop; timers; `PeekMessageW`; WM_CLOSE destroying a window and its child; `PostQuitMessage` |
 | atlas's `desktop.c`, both ISAs | windows made hidden, then shown and activated; WM_ACTIVATE, WM_SETFOCUS and WM_KILLFOCUS; `GetWindowRect` with the frame and `GetClientRect` inside it; `ClientToScreen`, `ScreenToClient`, `WindowFromPoint`, `GetSystemMetrics`; through `SendInput`: a click (WM_LBUTTONDOWN in client coordinates, activating and raising), Shift+A, b and a Unicode `!` typed as WM_CHAR "Ab!" with `GetKeyState` as of each message, the wheel, dragging a title bar (WM_MOVE) and a corner (WM_SIZE), another window's close button; a popup with no frame, closed by Alt+F4; `SetForegroundWindow` |
@@ -214,7 +226,8 @@ answer is the compiler's for the same constants, so it passes on real x86 too.
 
 | Module | What it does |
 | --- | --- |
-| `thread` | A guest thread is a host thread that owns its exec `Cpu`. `Cx::turn` is the only way to take exec's lock, held only while its closure runs; `run` loops a thread's stops through its kernel's `Guest`; `spawn` starts a new one on a host thread of its own. |
+| `thread` | A guest thread is a host thread that owns its exec `Cpu`. `Cx::turn` is the only way to take exec's lock, held only while its closure runs; `Cx::elsewhere` makes each turn in another space (another process's memory, for `ptrace`), going back to the CPU's own before the turn ends; `run` loops a thread's stops through its kernel's `Guest`, after `Guest::start`; `spawn` starts a new one on a host thread of its own. `Times` is a thread's CPU time, user and system, that its own thread adds to and any thread reads. |
+| `timers` | Timers that fire with no thread waiting: one host thread per machine runs each callback when it's due, with nothing locked, so a periodic timer arms its next expiry from its own. lambda's `alarm`, interval timers and POSIX timers use it; atlas's waitable timers and `SetTimer` can. |
 | `wait` | One way to wait (`Waiter`: woken, interrupted or timed out), and `Futexes`, keyed by address, for Linux's futexes and Windows' `WaitOnAddress`. |
 | `mm` | `Regions<R>`: what a space's program was promised, cut and found by address. lambda's `mmap` and atlas's `VirtualAlloc` both use it. |
 | `user` | Copying in and out of program memory, with a bad pointer as a `Fault`. `with_faults` fills a page the program may use (copy-on-write, or not yet touched) the way the program's own touch would, and copies again. |
@@ -282,8 +295,14 @@ kernels/lambda/src/
   sys/            each ISA's numbers mapped to one enum at the edge: arm64.rs, x86_64.rs (i386.rs to come)
   process/        clone, execve, loading ELF, credentials
   signal.rs       delivery, sigreturn, each ISA's signal frame
-  mm.rs           mmap, mprotect, brk, mremap, madvise
-  fs/             the file table over layers: pipes, poll, epoll, eventfd, timerfd, metadata
+  mm/             mmap, mprotect, brk, mremap, madvise; shared memory, memfds and SysV segments; mlock, mseal, NUMA
+  fs/xattr.rs     extended attributes, the twelve calls and the four *xattrat forms
+  security/       capget and capset, seccomp's filters, LSM and Landlock answers
+  admin.rs        host and domain names, reboot, the kernel log, quotas, what a machine may not do
+  ipc/            SysV message queues and semaphores, POSIX message queues
+  ns.rs           mount, UTS and IPC namespaces; unshare, setns, listns, /proc/<pid>/ns
+  fs/             the file table over layers: pipes, poll, epoll, eventfd, timerfd, metadata, inotify, AIO; mounts
+                  and the path walk (mount.rs)
   net/            the socket syscalls over net, netlink, /proc/net
   time.rs tty.rs  clocks and timers; the line discipline, the console and ptys
   os/             what Linux itself provides, made in memory: /dev, /proc
@@ -299,7 +318,9 @@ fix its own quirks (`mmap2`) there the same way.
   `fork_space`; a new thread joins its process before it can run, so one that ends at once is never left listed);
   `wait4` with `WUNTRACED` and `WCONTINUED`; exit and orphans; futexes; sessions and process groups; credentials
   (`creds.rs`: real, effective, saved and filesystem IDs and supplementary groups, with Linux's rules, so a program
-  that drops root, as `apt` does to `_apt`, can't get it back; files' permissions aren't checked against them yet).
+  that drops root, as `apt` does to `_apt`, can't get it back; files' permissions aren't checked against them yet), and
+  capabilities: effective, permitted, inheritable, bounding and ambient sets and securebits, changed as Linux changes
+  them when user IDs change and at `execve`; changing IDs asks `CAP_SETUID` and `CAP_SETGID`.
 - **Sockets** (`net/`): the socket system calls on `net` (`socket`, `socketpair`, `bind`, `listen`, `accept4`,
   `connect`, `send*`, `recv*` including `sendmsg`, `recvmsg`, `sendmmsg` and `recvmmsg`, `shutdown`, `getsockopt`
   and `setsockopt`), with Linux's `sockaddr` layouts for Unix, IPv4, IPv6 and netlink. A socket is a file, so `read`,
@@ -321,8 +342,15 @@ fix its own quirks (`mmap2`) there the same way.
   echo with `ECHOCTL`, `ONLCR`, signal keys) for the console and for pty pairs; `TCGETS`/`TCSETS*`, window sizes,
   foreground groups, controlling terminals, `TIOCGPTN`, `TIOCSPTLCK`, `TIOCGPTPEER`; SIGTTIN for background reads;
   SIGHUP when a session leader leaves.
-- **Memory** (`mm.rs`): `mmap` (anonymous and file-backed through the page cache), `munmap`, `mprotect`, `mremap`,
-  `madvise`, `brk`. Mapping only makes a region; pages are filled when the program faults on them.
+- **Memory** (`mm/`): `mmap` (anonymous and file-backed through the page cache), `munmap`, `mprotect`, `mremap`,
+  `madvise`, `brk`. Mapping only makes a region; pages are filled when the program faults on them. Shared memory
+  (`mm/shared.rs`) is frames lambda owns, made on first touch, that every mapping of it maps: `MAP_SHARED`
+  anonymous memory and `/dev/zero`, memfds (with seals) and SysV segments, shared across fork. `mm/control.rs` has
+  `msync`, `mincore`, the `mlock` family, `mseal`, NUMA on one node, and `process_madvise`.
+- **IPC** (`ipc/`): SysV message queues and semaphores, one table each for the machine, with `SEM_UNDO` undone when
+  a process ends; POSIX message queues by name, each open as a file that `poll` and `epoll` watch and `read` gives
+  the status of, with `mq_notify`'s signal. A process-shared futex in shared memory (and futex2's `futex_waitv`, on
+  `kernels_core::wait`) is keyed by its place in that memory, so processes meet on it.
 - **Files** (`fs/`): a file table per process shared by `dup` and fork, files and directories over `layers`, pipes
   that block, `/dev/null`, `zero`, `random` and `urandom`, `statfs`, `FIONREAD` on pipes. An open file keeps its
   inode (`layers`' `hold`), so one removed while open is read and written until it's closed, as programs' nameless
@@ -336,6 +364,60 @@ fix its own quirks (`mmap2`) there the same way.
   on files is among the watchers of each while it waits, and an epoll's interest in a file is one of that file's
   watchers for as long as it's there. A timer has no thread: a waiter sleeps until its next expiry at the latest, and
   whoever first sees it expired tells its watchers.
+- **Mounts and roots** (`fs/mount.rs`): every path is walked by lambda, component by component: a covered name
+  leads into what's mounted on it, `..` at a mount's root leads out to where it's mounted, and neither `..` nor an
+  absolute link climbs above the process's root (`chroot`, `fchroot`). `mount` binds (with `MS_REC`), moves,
+  remounts (a read-only mount's writes are EROFS), sets propagation, and mounts tmpfs (a volatile tree of `layers`',
+  never logged or saved, sized by `size=` for `statfs`), proc, devpts and mqueue; `umount2`, lazily too;
+  `pivot_root`. `/proc/<pid>/mounts`, `mountinfo` and `/proc/mounts` list them; `statfs` gives each mount's type and
+  flags. The table is a mount namespace's, held by each process: there's one today.
+- **Extended attributes** (`fs/xattr.rs`): the twelve `*xattr` calls and the four `*xattrat` forms, over attributes
+  `layers` keeps with each file. Linux's rules: the `user.`, `trusted.`, `security.` and `system.` namespaces, who may
+  read or change each (`user.` only on files and directories, `trusted.` for `CAP_SYS_ADMIN`), `XATTR_CREATE` and
+  `XATTR_REPLACE`, and the sizing of `get` and `list`.
+- **Special files** (`fs/mod.rs`, `fs/pipe.rs`): `mknod`/`mknodat` make device nodes (with `CAP_MKNOD`) and FIFOs; a
+  FIFO's readers and writers meet on one shared buffer, a reader waiting for a writer and the other way, as Unix does.
+- **`openat2`**: `open_how` taken strictly (unknown flags and resolve bits refused), with `RESOLVE_NO_SYMLINKS`,
+  `RESOLVE_BENEATH`, `RESOLVE_IN_ROOT` and `RESOLVE_NO_XDEV` enforced in the path walk.
+- **Namespaces** (`ns.rs`): each process holds its mount, UTS (host and domain names) and IPC (System V objects and
+  POSIX message queues) namespace, and shares the machine's one PID, network, user, cgroup and time namespace.
+  `clone`'s `CLONE_NEWNS`/`NEWUTS`/`NEWIPC`, `unshare` and `setns` give it its own of the first three; the others'
+  `CLONE_NEW*` is EINVAL, since lambda keeps one of each. Each namespace has an inode of its own, so
+  `/proc/<pid>/ns/<kind>` reads as `<kind>:[inode]`, opens to an fd `setns` takes, and `listns` enumerates them.
+- **The new mount API** (`fs/mount.rs`): `fsopen` and `fsconfig` build a file system (tmpfs, proc, devpts, mqueue),
+  `fsmount` makes it a detached mount, and `move_mount` attaches it; `open_tree` clones a subtree detached; `fspick`
+  and `mount_setattr` change an existing mount (read-only and the rest). All on the same table as `mount`.
+- **Watching files** (`fs/inotify.rs`): inotify instances as files that `read`, `poll` and `epoll` know. `layers`
+  tells an observer, set at boot, of every change to the disk (made, linked, removed, moved, written, metadata set),
+  whatever system call made it; opens, reads and closes are told from `fs`. Each event goes to the watches on the file
+  and on a directory it's in, with its name; for a write or a chmod, which name no directory, the watched directories
+  are looked through for it. Consecutive identical events merge, as on Linux.
+- **Linux AIO** (`fs/aio.rs`): each request is done as it's submitted, as Linux does a buffered file's, and its
+  completion waits for `io_getevents`; an eventfd can be told. A context's ID is memory mapped for it, zeroed, so
+  libaio's ring fast path sees no ring and asks the kernel.
+- **Security** (`security/`): `capget` and `capset`; `prctl`'s bounding and ambient sets, securebits, keep-caps and
+  `no_new_privs`. seccomp: strict mode, and classic-BPF filters checked as Linux checks them and run before each
+  system call on its `seccomp_data` (the number as the program's ISA has it, the audit arch, the address, the
+  arguments); the most restrictive answer of all of them wins: an errno, SIGSYS with its siginfo, or the thread or
+  process killed. The only Linux Security Module is `capability`; Landlock answers as a kernel booted with it off.
+- **The machine** (`admin.rs`): its host and domain names (`uname`, `/proc/sys/kernel`); `reboot` ends it as it
+  ends a container, halt and power-off as SIGINT to its first process, restart as SIGHUP; `syslog` reads the kernel's
+  log, as `dmesg` does; no quotas; kernel modules, kexec, process accounting, BPF, performance counters and x86's I/O
+  ports refused, as in a container.
+- **fanotify** (`fs/fanotify.rs`): classic notification groups, with marks on files, a directory's children or a
+  whole file system (a mount's mark covers its file system), ignore masks and flushing. Open, access, modify and close
+  events come from where inotify's do, each with the process (or thread) that caused it, merged per file and process;
+  a read opens a descriptor on each event's file in the reader, which makes no events itself.
+- **Mount IDs** (`fs/mount.rs`): `statmount` and `listmount` on the same table as `mount`, with Linux's 64-bit IDs.
+- **Tracing** (`process/ptrace.rs`, `process/vm.rs`): `ptrace`, per thread, by a tracer that needn't be the parent
+  (`TRACEME`, `ATTACH`, `SEIZE`). A traced thread stops where Linux's would: a signal about to be delivered (which
+  the tracer may let through, change or drop), each system call's entry and exit, a group stop, `PTRACE_INTERRUPT`,
+  and the fork, vfork, clone, exec and exit events, with new threads and processes traced from their first
+  instruction (`Guest::start`). The tracer hears of each stop, and of its tracees' ends, through `wait4`/`waitid` as
+  of a child's. A thread's registers are only its own CPU's, so a stopped thread leaves a copy for its tracer and
+  takes back what was changed (orig_rax or `NT_ARM_SYSTEM_CALL` to change or skip a call). Another process's memory
+  is read and written in turns in its space (`Cx::elsewhere`), its pages filled as its touch would; a poke to code it
+  can't write goes to a private copy of the page. `process_vm_readv`/`writev` use the same way in.
 - **The OS** (`os/`): `/dev` put on the disk at boot, and `/proc/self/{exe,cwd,fd,maps,status}`, `cpuinfo`,
   `meminfo`, `uptime` made as they're read.
 
@@ -534,10 +616,10 @@ part of it, in more detail. When an item is done it comes off, and this README s
 
 ### lambda
 
-- [ ] Signals: queued real-time signals (today each is pending once), `rt_sigtimedwait`, `setitimer` and `alarm`,
-      SIGTTOU, the FP state in the signal frame itself (it's kept beside it today), and core dumps.
+- [ ] Signals: SIGTTOU, the FP state in the signal frame itself (it's kept beside it today), and core dumps.
 - [ ] `execve` with other threads running (end them first); `vfork` that really shares memory.
-- [ ] Shared file mappings written back; `msync`.
+- [ ] `MAP_SHARED` of a file on the disk written back, and kept in step with `read` and `write` (shared anonymous
+      memory, memfds and SysV segments are shared already); `remap_file_pages`; `userfaultfd`.
 - [ ] `EPOLLEXCLUSIVE` and `EPOLLWAKEUP` are accepted and ignored.
 - [ ] A console on Windows hosts (raw mode is Unix-only for now), and a full-screen editor tried on it.
 - [ ] A vDSO made in memory for each ISA, reading kernels-core's clock page.
@@ -546,11 +628,41 @@ part of it, in more detail. When an item is done it comes off, and this README s
 - [ ] sysfs, and more of `/proc`.
 - [ ] Wayland and X11 servers, as `os/wayland` and `os/x11` answering sockets in the machine.
 - [ ] A PulseAudio server, as `os/pulse` (its native protocol), on `audio`.
+- [ ] Scheduling (nice, policies, affinity, I/O priority) is kept per process, not per thread, and changes nothing on
+      the host; `/proc/<pid>/stat`, `limits` and `sched` don't show it yet. In a process sandbox, CPU time counts only
+      lambda's part, as the program runs in another process.
 - [ ] Locks that hold between processes (`flock`, `fcntl`'s record and OFD locks).
 - [ ] `apt install` on the Linux and Windows hosts, natively on x86-64 (it works on the Mac, in both images).
 - [ ] i386 programs: `sys/i386.rs`, with exec's 32-bit translation.
-- [ ] x86-64 calls not there yet: the old `getdents`, `utime`, `utimes` and `futimesat`, and
-      `MAP_32BIT`; `/proc/cpuinfo` and ptrace's register sets per ISA.
+- [ ] x86-64's `MAP_32BIT`; `/proc/cpuinfo` per ISA.
+- [ ] Tracing: no single-stepping (`PTRACE_SINGLESTEP` and `PTRACE_SYSEMU*` are EIO, as exec has no trap after one
+      instruction), so gdb can set breakpoints but not step over them; no hardware breakpoints or watchpoints;
+      `PTRACE_O_TRACESECCOMP`'s stops (`SECCOMP_RET_TRACE` is still ENOSYS), `PTRACE_EVENT_VFORK_DONE` (a vfork's
+      parent doesn't wait), `PTRACE_PEEKSIGINFO` and the seccomp-filter requests. A traced thread's group stop is its
+      own, not its process's; `PTRACE_O_TRACEEXIT` stops only the thread that called `exit` or `exit_group`, not the
+      others it ends. Yama's `ptrace_scope` is 0: same user, dumpable, or `CAP_SYS_PTRACE`.
+- [ ] Namespaces: `/proc/<pid>/ns` isn't a listable directory, so `lsns` and `ls /proc/self/ns` don't enumerate the
+      links (each link still reads, opens and `setns`), and `listns` is the way to enumerate; the PID, network, user,
+      cgroup and time namespaces can't be separated (lambda keeps one of each); `statmount` and `listmount`, and
+      `open_tree_attr`'s attributes, aren't done. A mount's `nosuid`, `nodev` and `noexec` are shown, not enforced;
+      sysfs, cgroups and overlay mounts are ENODEV. A non-recursive bind shows
+      what's mounted under its source too. Which mount a path is on (for read-only) goes by its path, so a link into a
+      read-only mount from elsewhere isn't caught; `nosuid`, `nodev` and `noexec` are shown, not enforced; unmounting
+      doesn't check for open files. `/proc` and `/dev/pts` are still found by path, wherever they're mounted.
+- [ ] Security: seccomp filters and names are a process's, not each thread's (a filter from one thread holds for all,
+      as with `SECCOMP_FILTER_FLAG_TSYNC`); no user notification (`SECCOMP_RET_USER_NOTIF`, `NEW_LISTENER`); no
+      file capabilities or setuid bits at `execve`; privilege elsewhere (IPC, limits, nice) still asks for effective
+      root, not a capability. Keyrings (`add_key`, `keyctl`). Landlock, enforced. `prctl`'s other options return 0.
+- [ ] Watching files: `IN_DELETE_SELF` comes at the unlink, not an open file's last close; `IN_EXCL_UNLINK` is
+      kept but does nothing; a write to a file in a watched directory looks through that directory for its name.
+      AIO's `IOCB_CMD_POLL`.
+- [ ] IPC: SysV objects' permission bits aren't checked (any process may use any object); `mq_notify`'s
+      `SIGEV_THREAD` (glibc's netlink socket) is EINVAL, and a registration isn't dropped when its descriptor closes;
+      futex2's masks are accepted but every wake wakes, and only 32-bit futexes, without `FUTEX2_NUMA`.
+- [ ] The rest of Linux 7.4's system calls: 8 by name are still ENOSYS: keyrings (`add_key`, `request_key`,
+      `keyctl`), io_uring, `userfaultfd` and `rseq_slice_yield` (with `rseq`). fanotify's FID modes (and so its
+      directory events), pidfds and permission events aren't done. File handles (`name_to_handle_at`) are refused, and
+      `fallocate`'s `COLLAPSE_RANGE` and `INSERT_RANGE` aren't supported.
 
 ### atlas
 

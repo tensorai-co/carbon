@@ -21,6 +21,18 @@ struct MemoryStatusEx {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GlobalMemoryStatusEx(status: *mut MemoryStatusEx) -> i32;
+    fn GetCurrentThread() -> *mut core::ffi::c_void;
+    fn GetThreadTimes(thread: *mut core::ffi::c_void, creation: *mut u64, exit: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
+}
+
+/// The CPU time the calling thread has used, in nanoseconds: its kernel and user time together.
+pub fn thread_cpu() -> u64 {
+    let (mut creation, mut exit, mut kernel, mut user) = (0, 0, 0, 0);
+    // SAFETY: the pseudo-handle for this thread, and four FILETIMEs (each a u64 of 100 ns units) to fill in.
+    if unsafe { GetThreadTimes(GetCurrentThread(), &mut creation, &mut exit, &mut kernel, &mut user) } == 0 {
+        return 0;
+    }
+    (kernel + user) * 100
 }
 
 #[link(name = "bcrypt")]

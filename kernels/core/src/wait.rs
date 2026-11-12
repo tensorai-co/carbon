@@ -160,6 +160,42 @@ impl Futexes {
         Ok(woke)
     }
 
+    /// Waits on every one of `keys` at once (`futex_waitv`), if `still()` says to, as `wait` does. Gives how the wait
+    /// ended and, if a wake ended it, the first of `keys` it was woken by.
+    pub fn wait_any(&self, keys: &[u64], me: &Arc<Waiter>, still: impl FnOnce() -> bool, deadline: Option<Instant>) -> Result<(Woke, Option<usize>), Changed> {
+        {
+            let mut waiting = lock(&self.waiting);
+            if !still() {
+                return Err(Changed);
+            }
+            me.reset();
+            for key in keys {
+                waiting.entry(*key).or_default().push(me.clone());
+            }
+        }
+        let woke = me.wait(deadline);
+        // A wake took this waiter off its key's queue; it's still on the others', which it leaves.
+        let mut waiting = lock(&self.waiting);
+        let mut by = None;
+        for (i, key) in keys.iter().enumerate() {
+            let (still_there, empty) = match waiting.get_mut(key) {
+                Some(queue) => {
+                    let before = queue.len();
+                    queue.retain(|w| !Arc::ptr_eq(w, me));
+                    (before != queue.len(), queue.is_empty())
+                }
+                None => (false, false),
+            };
+            if empty {
+                waiting.remove(key);
+            }
+            if !still_there && by.is_none() {
+                by = Some(i);
+            }
+        }
+        Ok((woke, if woke == Woke::Woken { by } else { None }))
+    }
+
     /// Wakes up to `count` threads waiting on `key`, first come first woken, giving how many.
     pub fn wake(&self, key: u64, count: usize) -> usize {
         let mut waiting = lock(&self.waiting);
@@ -192,6 +228,26 @@ impl Futexes {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn wait_on_several_and_learn_which() {
+        let futexes = Arc::new(Futexes::default());
+        let me = Waiter::new();
+        assert_eq!(futexes.wait_any(&[1, 2], &me, || false, None), Err(Changed));
+        let (f, waiter) = (futexes.clone(), me.clone());
+        let waking = std::thread::spawn(move || {
+            while f.wake(30, 1) == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            drop(waiter);
+        });
+        assert_eq!(futexes.wait_any(&[10, 20, 30], &me, || true, None), Ok((Woke::Woken, Some(2))));
+        waking.join().unwrap();
+        // It left the others' queues: nothing's waiting on 10 or 20.
+        assert_eq!(futexes.wake(10, 1) + futexes.wake(20, 1), 0);
+        let soon = Instant::now() + Duration::from_millis(10);
+        assert_eq!(futexes.wait_any(&[40], &me, || true, Some(soon)), Ok((Woke::TimedOut, None)));
+    }
 
     #[test]
     fn wake_and_time_out() {

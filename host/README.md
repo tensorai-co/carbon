@@ -13,6 +13,9 @@ host's OS itself; it asks a `Host`, so the same kernel runs on any host, and tes
   (`watch_input`), as it waits on anything else. lambda's console feeds it through its tty's line discipline.
 - **Clocks, randomness, CPUs, memory.** The memory the host could give a machine, from Mach's VM statistics (macOS),
   `/proc/meminfo` (Linux) or `GlobalMemoryStatusEx` (Windows); randomness from `getentropy` or `BCryptGenRandom`.
+- **A thread's CPU time** (`thread_cpu`), for the calling thread: `CLOCK_THREAD_CPUTIME_ID` (macOS and Linux) or
+  `GetThreadTimes` (Windows). A guest thread runs its program on its own host thread, so in a hardware VM this is the
+  program's time as well as the kernel's; lambda splits it at each stop into user and system time.
 - **The terminal**: raw mode and window size, for lambda's console (macOS and Linux, in `unix.rs`).
 - **Certificate trust.** Whether the host trusts a chain, for any use, a TLS server (with its name) or a client. It's
   checked offline: nothing is fetched to complete a chain or check revocation. Every failure found is reported at
@@ -25,11 +28,11 @@ host's OS itself; it asks a `Host`, so the same kernel runs on any host, and tes
 The shared part is `src/lib.rs`. What only one host can do is in its folder, with `unix.rs` for what macOS and Linux
 do alike:
 
-| Host | Memory | Randomness | Trust |
-| --- | --- | --- | --- |
-| macOS (`macos/`) | Mach's VM statistics | `getentropy` | Security.framework |
-| Linux (`linux/`) | `/proc/meminfo` | `getentropy` | webpki over the system's CA bundle (`/etc/ssl/certs`) |
-| Windows (`windows/`) | `GlobalMemoryStatusEx` | `BCryptGenRandom` | CryptoAPI's chain engine |
+| Host | Memory | Randomness | Thread CPU time | Trust |
+| --- | --- | --- | --- | --- |
+| macOS (`macos/`) | Mach's VM statistics | `getentropy` | `clock_gettime` (`unix.rs`) | Security.framework |
+| Linux (`linux/`) | `/proc/meminfo` | `getentropy` | `clock_gettime` (`unix.rs`) | webpki over the system's CA bundle (`/etc/ssl/certs`) |
+| Windows (`windows/`) | `GlobalMemoryStatusEx` | `BCryptGenRandom` | `GetThreadTimes` | CryptoAPI's chain engine |
 
 Windows keeps few roots on disk and adds the rest from Microsoft's root program as a chain first needs one. That's its
 store working as designed, so it's allowed.
@@ -42,7 +45,7 @@ cargo test -p host
 
 A real chain (registry-1.docker.io's, at a fixed time) trusted for its names, and refused for another name, time or
 use; test certificates from `tests/certs/make.sh`: an untrusted root, a chain that stops short, every failure at once,
-rubbish. They pass on all three hosts, and Linux's checks also run on every host against test roots.
+rubbish; a thread's CPU time counting its own work and not another's. They pass on all three hosts, and Linux's checks also run on every host against test roots.
 
 ## To do
 

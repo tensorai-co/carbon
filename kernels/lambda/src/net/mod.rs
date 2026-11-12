@@ -306,17 +306,19 @@ impl Task {
     /// A Unix socket's path, made on the disk as a socket file for `bind`.
     fn unix_bind_path(&self, path: &[u8]) -> Result<UnixAddr, Errno> {
         let text = std::str::from_utf8(path).map_err(|_| EINVAL)?;
-        let ((dir, _), umask) = {
+        let ((dir, dir_path), umask) = {
             let state = lock(&self.process.state);
             (state.cwd.clone(), state.umask)
         };
+        self.writable(&crate::process::exe_path(&dir_path, text))?;
+        let view = self.view();
         let mut disk = lock(&self.k.disk);
-        match disk.resolve(dir, text, false) {
+        match view.resolve(&disk, dir, text, false) {
             Ok(_) => return Err(EADDRINUSE),
             Err(layers::Error::NotFound) => {}
             Err(e) => return Err(e.into()),
         }
-        let (parent, name) = disk.resolve_parent(dir, text)?;
+        let (parent, name) = view.resolve_parent(&disk, dir, text)?;
         let ino = disk.create(parent, name, New::File, Meta { mode: S_IFSOCK | (0o777 & !umask), ..Meta::default() }, self.k.now())?;
         Ok(UnixAddr { name: UnixName::Path(path.to_vec()), file: Some(ino) })
     }
@@ -325,8 +327,9 @@ impl Task {
     fn unix_path(&self, path: &[u8]) -> Result<UnixAddr, Errno> {
         let text = std::str::from_utf8(path).map_err(|_| EINVAL)?;
         let dir = lock(&self.process.state).cwd.0;
+        let view = self.view();
         let disk = lock(&self.k.disk);
-        let ino = disk.resolve(dir, text, true)?;
+        let ino = view.resolve(&disk, dir, text, true)?;
         if disk.meta(ino)?.mode & S_IFMT != S_IFSOCK {
             return Err(ECONNREFUSED);
         }
