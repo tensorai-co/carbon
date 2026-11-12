@@ -108,7 +108,8 @@ impl Task {
         let filters = lock(&self.process.state).security.seccomp.clone()?;
         let pc = cx.turn(|t| t.thread().regs().pc());
         let (verdict, log) = seccomp::judge(&filters, self.isa, nr, pc, args);
-        if log && self.k.options.trace {
+        // Traced: what the filter logs, and every call it doesn't simply allow or fail.
+        if (log || !matches!(verdict, Verdict::Allow | Verdict::Return(_))) && self.k.options.trace {
             let what = match &verdict {
                 Verdict::Allow => "logged".to_string(),
                 Verdict::Return(e) => format!("errno {}", e.0),
@@ -125,7 +126,9 @@ impl Task {
             Verdict::Trap(errno) => {
                 let info = Info { code: SYS_SECCOMP, addr: pc, errno: i32::from(errno), syscall: (nr as i32, seccomp::audit_arch(self.isa)), ..Info::default() };
                 self.force_signal(SIGSYS, info);
-                Some(Err(ENOSYS).into())
+                // Not made, and rolled back as Linux does: the handler sees the call's own registers (its first
+                // argument in x0; on x86-64, its number in rax), and a sandbox's handler emulates it from them.
+                Some(Outcome::Keep)
             }
             Verdict::KillThread if lock(&self.process.state).threads.len() > 1 => Some(Outcome::End),
             Verdict::KillThread | Verdict::KillProcess => {

@@ -9,7 +9,7 @@ typedef unsigned int u32;
 #if defined(__aarch64__)
 enum { SYS_symlinkat = 36, SYS_faccessat = 48, SYS_pipe2 = 59, SYS_readlinkat = 78, SYS_dup = 23, SYS_fcntl = 25, SYS_flock = 32, SYS_unlinkat = 35, SYS_linkat = 37, SYS_fchmodat = 53,
        SYS_fchownat = 54, SYS_openat = 56, SYS_close = 57, SYS_lseek = 62, SYS_read = 63, SYS_write = 64,
-       SYS_newfstatat = 79, SYS_utimensat = 88, SYS_exit_group = 94, SYS_close_range = 436 };
+       SYS_newfstatat = 79, SYS_utimensat = 88, SYS_exit_group = 94, SYS_close_range = 436, SYS_getdents64 = 61, SYS_getpid = 172 };
 static i64 sys(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
     register i64 x8 __asm__("x8") = n, x0 __asm__("x0") = a, x1 __asm__("x1") = b, x2 __asm__("x2") = c,
                  x3 __asm__("x3") = d, x4 __asm__("x4") = e, x5 __asm__("x5") = f;
@@ -20,10 +20,11 @@ __asm__(".globl _start\n_start:\n mov x0, sp\n bl cmain\n b .\n");
 #define ST_MODE 16
 #define ST_NLINK(st) (*(u32 *)((char *)(st) + 20))
 #define ST_UID 24
+#define O_DIRECTORY 040000
 #else
 enum { SYS_symlinkat = 266, SYS_faccessat = 269, SYS_pipe2 = 293, SYS_readlinkat = 267, SYS_read = 0, SYS_write = 1, SYS_close = 3, SYS_lseek = 8, SYS_dup = 32, SYS_fcntl = 72, SYS_flock = 73,
        SYS_exit_group = 231, SYS_openat = 257, SYS_fchownat = 260, SYS_newfstatat = 262, SYS_unlinkat = 263,
-       SYS_linkat = 265, SYS_fchmodat = 268, SYS_utimensat = 280, SYS_close_range = 436 };
+       SYS_linkat = 265, SYS_fchmodat = 268, SYS_utimensat = 280, SYS_close_range = 436, SYS_getdents64 = 217, SYS_getpid = 39 };
 static i64 sys(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
     register i64 r10 __asm__("r10") = d, r8 __asm__("r8") = e, r9 __asm__("r9") = f;
     i64 ret;
@@ -34,6 +35,7 @@ __asm__(".globl _start\n_start:\n xor %rbp, %rbp\n mov %rsp, %rdi\n and $-16, %r
 #define ST_MODE 24
 #define ST_NLINK(st) (*(u64 *)((char *)(st) + 16))
 #define ST_UID 28
+#define O_DIRECTORY 0200000
 #endif
 #define ST_GID (ST_UID + 4)
 #define ST_MTIME 88
@@ -159,6 +161,47 @@ void cmain(i64 *sp) {
     int mine = sys(SYS_openat, AT_FDCWD, (i64)fd_path(path, "/tmp/me/fd/", p[0]), 0, 0, 0, 0);
     check(mine >= 0 && sys(SYS_read, mine, (i64)buf, sizeof buf, 0, 0, 0) == 4 && same(buf, "mine", 4), "a link of its own, relative, into /proc/self");
     check(sys(SYS_openat, AT_FDCWD, (i64)"/dev/fd/900", 0, 0, 0, 0) == -ENOENT && stat_of("/dev/nothing/here", st) == -ENOENT, "a descriptor that isn't open, and a path that isn't there: ENOENT");
+
+    // /proc/self/fd and /proc/self/task: directories, listed as Linux lists them (what closefrom and sandboxes read).
+    int marker = sys(SYS_openat, AT_FDCWD, (i64)"/dev/null", 0, 0, 0, 0);
+    int dir = sys(SYS_openat, AT_FDCWD, (i64)"/proc/self/fd", O_DIRECTORY, 0, 0, 0);
+    char dents[4096], name[16];
+    i64 got = dir >= 0 ? sys(SYS_getdents64, dir, (i64)dents, sizeof dents, 0, 0, 0) : -1;
+    int saw0 = 0, saw_marker = 0, links = 1;
+    for (i64 at = 0; at < got; at += *(unsigned short *)(dents + at + 16)) {
+        char *entry = dents + at + 19;
+        if (entry[0] == '.') continue;
+        i64 n = 0;
+        for (char *c = entry; *c; c++) n = n * 10 + (*c - '0');
+        if (dents[at + 18] != 10 /* DT_LNK */) links = 0;
+        if (n == 0) saw0 = 1;
+        if (n == marker) saw_marker = 1;
+    }
+    char *digits = fd_path(name, "", marker);
+    i64 target = dir >= 0 ? sys(SYS_readlinkat, dir, (i64)digits, (i64)buf, sizeof buf, 0, 0) : -1;
+    check(stat_of("/proc/self/fd", st) == 0 && (field(st, ST_MODE) & 0170000) == 0040000 && got > 0 && saw0 && saw_marker && links &&
+          target == 9 && same(buf, "/dev/null", 9), "/proc/self/fd: a directory listing each open descriptor as a link, read relative to it");
+    sys(SYS_close, dir, 0, 0, 0, 0, 0);
+
+    // A device opened is the file it was opened from: fstat says what stat of its path says (st_dev and st_ino, at 0
+    // and 8 on both ISAs), as `cp` and `install` check before copying from it.
+    u64 opened[32];
+    check(stat_of("/dev/null", st) == 0 && sys(SYS_newfstatat, marker, (i64)"", (i64)opened, 0x1000 /* AT_EMPTY_PATH */, 0, 0) == 0 &&
+          st[0] == opened[0] && st[1] == opened[1] && st[1] != 0 && (field(opened, ST_MODE) & 0170000) == 0020000,
+          "fstat of an open /dev/null: the same device and inode as stat of its path, a character device");
+    i64 pid = sys(SYS_getpid, 0, 0, 0, 0, 0, 0);
+    int tasks = sys(SYS_openat, AT_FDCWD, (i64)"/proc/self/task", O_DIRECTORY, 0, 0, 0);
+    got = tasks >= 0 ? sys(SYS_getdents64, tasks, (i64)dents, sizeof dents, 0, 0, 0) : -1;
+    int saw_me = 0;
+    for (i64 at = 0; at < got; at += *(unsigned short *)(dents + at + 16)) {
+        char *entry = dents + at + 19;
+        i64 n = 0;
+        for (char *c = entry; *c >= '0' && *c <= '9'; c++) n = n * 10 + (*c - '0');
+        if (n == pid && dents[at + 18] == 4 /* DT_DIR */) saw_me = 1;
+    }
+    check(saw_me && stat_of("/proc/self/task", st) == 0 && ST_NLINK(st) == 3 && sys(SYS_openat, AT_FDCWD, (i64)"/proc/self/maps", O_DIRECTORY, 0, 0, 0) < 0,
+          "/proc/self/task: its one thread, and 3 links (single-threaded, as sandboxes check); a file isn't a directory");
+    sys(SYS_close, tasks, 0, 0, 0, 0, 0);
 
     say(failures ? "some checks failed\n" : "all passed\n");
     sys(SYS_exit_group, failures, 0, 0, 0, 0, 0);

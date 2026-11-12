@@ -336,6 +336,50 @@ impl View {
         self.walk(disk, start, path, follow, &mut links)
     }
 
+    /// The absolute path `path` names from `cwd` (the process's working directory's path, real already), with every
+    /// link along it followed, the last one too, and `.` and `..` worked out as they're met: `realpath`'s answer, and
+    /// what Linux records as a process's executable (`/proc/self/exe`) and its working directory, so a program run
+    /// through a link finds the files beside its real self.
+    pub fn real_path(&self, disk: &Disk, cwd: &str, path: &str) -> layers::Result<String> {
+        let mut done: Vec<String> = if path.starts_with('/') { Vec::new() } else { cwd.split('/').filter(|p| !p.is_empty()).map(String::from).collect() };
+        let mut rest: std::collections::VecDeque<String> = path.split('/').filter(|p| !p.is_empty()).map(String::from).collect();
+        let mut links = 0;
+        while let Some(part) = rest.pop_front() {
+            match part.as_str() {
+                "." => continue,
+                ".." => {
+                    done.pop();
+                    continue;
+                }
+                _ => {}
+            }
+            let here = format!("/{}/{part}", done.join("/"));
+            let ino = self.resolve(disk, self.root, &here, false)?;
+            if disk.stat(ino)?.kind != Kind::Symlink {
+                done.push(part);
+                continue;
+            }
+            links += 1;
+            if links > MOST_LINKS {
+                return Err(Error::Loop);
+            }
+            // The link's target in its place: from the root if it's absolute, else from the link's directory.
+            let target = disk.read_link(ino)?.to_string();
+            if target.starts_with('/') {
+                done.clear();
+            }
+            for p in target.split('/').filter(|p| !p.is_empty()).rev() {
+                rest.push_front(p.to_string());
+            }
+        }
+        Ok(format!("/{}", done.join("/")))
+    }
+
+    /// How `state`'s process sees paths.
+    pub(crate) fn of(state: &crate::process::ProcState) -> View {
+        View { root: state.root.0, mounts: state.ns.mnt.current() }
+    }
+
     /// Like `resolve`, but stops at the last component's directory, giving it and the last name.
     pub fn resolve_parent<'p>(&self, disk: &Disk, start: Ino, path: &'p str) -> layers::Result<(Ino, &'p str)> {
         let trimmed = path.trim_end_matches('/');
@@ -1284,5 +1328,25 @@ mod tests {
         assert_eq!(jail.resolve_parent(&disk, b, "/new"), Ok((b, "new")));
         assert_eq!(view.mounts.containing("/a/x").path, "/a");
         assert_eq!(view.mounts.containing("/ab").path, "/");
+    }
+
+    #[test]
+    fn real_paths_follow_every_link() {
+        // Firefox's own layout: /usr/bin/firefox-esr -> ../lib/firefox-esr/firefox-esr.
+        let mut disk = Disk::new(Meta::dir(0o755), false);
+        let (dir, file, link) = (Meta::dir(0o755), Meta::file(0o755), Meta::file(0o777));
+        disk.put("/usr/lib/firefox-esr/firefox-esr", layers::New::File, &[], file, dir).unwrap();
+        disk.put("/usr/bin/firefox-esr", layers::New::Symlink("../lib/firefox-esr/firefox-esr".into()), &[], link, dir).unwrap();
+        disk.put("/opt", layers::New::Symlink("/usr/lib".into()), &[], link, dir).unwrap();
+        disk.put("/loop", layers::New::Symlink("/loop".into()), &[], link, dir).unwrap();
+        let view = View { root: ROOT, mounts: Arc::new(Mounts::boot(&disk)) };
+        let real = |cwd: &str, path: &str| view.real_path(&disk, cwd, path);
+        assert_eq!(real("/", "/usr/bin/firefox-esr").as_deref(), Ok("/usr/lib/firefox-esr/firefox-esr"));
+        assert_eq!(real("/usr/bin", "firefox-esr").as_deref(), Ok("/usr/lib/firefox-esr/firefox-esr"));
+        // A link along the way, and `..` taken after it's followed (from where it led, as the kernel walks).
+        assert_eq!(real("/", "/opt/firefox-esr/../firefox-esr/./firefox-esr").as_deref(), Ok("/usr/lib/firefox-esr/firefox-esr"));
+        assert_eq!(real("/", "/opt/.").as_deref(), Ok("/usr/lib"));
+        assert_eq!(real("/", "/usr/bin/nothing"), Err(Error::NotFound));
+        assert_eq!(real("/", "/loop"), Err(Error::Loop));
     }
 }

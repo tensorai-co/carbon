@@ -55,6 +55,8 @@ pub(crate) enum Node {
     Random,
     /// A file made when it was opened, such as `/proc/self/maps`.
     Made(Vec<u8>),
+    /// A directory made when it was opened, such as `/proc/self/fd`: its entries' names and types (`DT_*`).
+    Listing(Vec<(String, u8)>),
     /// A terminal: the console, or a pty's slave side.
     Tty(Arc<Tty>),
     /// A pty's master side.
@@ -238,6 +240,11 @@ impl Files {
         self.fds.remove(&fd).map(|f| f.open)
     }
 
+    /// Its descriptors, lowest first.
+    pub fn numbers(&self) -> Vec<i32> {
+        self.fds.keys().copied().collect()
+    }
+
     pub fn close_on_exec(&mut self) {
         self.fds.retain(|_, f| !f.cloexec);
     }
@@ -285,12 +292,21 @@ fn stat_of_open(disk: &Disk, open: &Open) -> Result<Stat, Errno> {
         Node::Stdin | Node::Stdout | Node::Stderr => Ok(Stat { mode: S_IFIFO | 0o600, nlink: 1, blksize: 4096, ..Stat::default() }),
         // On a device of their own, as Linux's pipefs, each with its own inode.
         Node::Pipe(pipe, _) => Ok(Stat { dev: 0xd, ino: pipe.ino, mode: S_IFIFO | 0o600, nlink: 1, blksize: 4096, ..Stat::default() }),
+        // Opened from its file on the disk: that file's stat. Made otherwise (no file): a device of its own.
+        Node::Null | Node::Zero | Node::Random if let Some(hold) = &open._hold => stat_of(disk, hold.ino),
         Node::Null => Ok(device(1 << 8 | 3)),
         Node::Zero => Ok(device(1 << 8 | 5)),
         Node::Random => Ok(device(1 << 8 | 9)),
         Node::Made(bytes) => {
             let (dev, ino) = os::made_identity(&open.path);
             Ok(Stat { dev, ino, mode: S_IFREG | 0o444, nlink: 1, size: bytes.len() as i64, blksize: 4096, ..Stat::default() })
+        }
+        // Linked from its parent and itself, and from each directory in it: `/proc/self/task`'s count is its threads'
+        // and two, which sandboxes read to see that a process is single-threaded.
+        Node::Listing(entries) => {
+            let (dev, ino) = os::made_identity(&open.path);
+            let dirs = entries.iter().filter(|(_, kind)| *kind == DT_DIR).count();
+            Ok(Stat { dev, ino, mode: S_IFDIR | 0o555, nlink: 2 + dirs as u32, blksize: 4096, ..Stat::default() })
         }
         Node::Signalfd(_) | Node::Eventfd(_) | Node::Timerfd(_) | Node::Epoll(_) | Node::Pidfd(_) | Node::Inotify(_) | Node::Fanotify(_) => Ok(Stat { mode: 0o600, nlink: 1, blksize: 4096, ..Stat::default() }),
         Node::Ns(r) => Ok(Stat { dev: crate::ns::NSFS_DEV, ino: r.id(), mode: S_IFREG | 0o600, nlink: 1, blksize: 4096, ..Stat::default() }),
@@ -323,6 +339,8 @@ impl Task {
         let open = self.file(dirfd)?;
         match open.node {
             Node::Dir(ino) => Ok((ino, open.path.clone())),
+            // A made directory: what's under it is found by its path (`readlinkat(fd, "3")` in `/proc/self/fd`).
+            Node::Listing(_) => Ok((layers::ROOT, open.path.clone())),
             _ => Err(ENOTDIR),
         }
     }
@@ -366,7 +384,7 @@ impl Task {
                 }
                 Ok(buffer)
             }
-            Node::Dir(_) => Err(EISDIR),
+            Node::Dir(_) | Node::Listing(_) => Err(EISDIR),
             Node::Memfd(_, true) => Err(EINVAL),
             Node::Memfd(mem, false) => {
                 let mut offset = lock(&open.offset);
@@ -617,7 +635,7 @@ impl Task {
                 Ok(data.len())
             }
             Node::Signalfd(_) | Node::Timerfd(_) | Node::Epoll(_) | Node::Pidfd(_) | Node::Mqueue(_) | Node::Inotify(_) | Node::Fanotify(_) | Node::Ns(_) | Node::FsContext(_) | Node::MountFd(_) => Err(EINVAL),
-            Node::Stdin | Node::Dir(_) | Node::Pipe(_, false) | Node::Made(_) => Err(EBADF),
+            Node::Stdin | Node::Dir(_) | Node::Listing(_) | Node::Pipe(_, false) | Node::Made(_) => Err(EBADF),
         }
     }
 
@@ -723,6 +741,9 @@ impl Task {
     /// A file lambda makes, opened: a terminal becomes a session leader's controlling one, as it's opened.
     fn opened_made(&self, open: Result<Arc<Open>, Errno>, flags: u32) -> Result<Arc<Open>, Errno> {
         let open = open?;
+        if flags & O_DIRECTORY != 0 && !matches!(open.node, Node::Listing(_) | Node::Dir(_)) {
+            return Err(ENOTDIR);
+        }
         if let Node::Tty(tty) = &open.node
             && flags & O_NOCTTY == 0
         {
@@ -907,9 +928,14 @@ impl Task {
         {
             self.adopt_terminal(tty);
         }
-        // A directory too, so its close is told; the disk never keeps a removed one for it.
+        // A directory too, so its close is told; the disk never keeps a removed one for it. A device's file too, so
+        // `fstat` is the file's own stat, as `stat` of its path is (`cp` and `install` compare the two).
         let hold = match node {
             Node::File(ino) | Node::Dir(ino) => {
+                disk.hold(ino);
+                Some(Hold { k: Arc::downgrade(&self.k), ino, quiet: false })
+            }
+            Node::Null | Node::Zero | Node::Random => {
                 disk.hold(ino);
                 Some(Hold { k: Arc::downgrade(&self.k), ino, quiet: false })
             }
@@ -1016,7 +1042,7 @@ impl Task {
     /// `stat` for a path lambda makes, or None if it isn't one. Followed, `/proc/<pid>/fd/<n>` is the file it's open
     /// on (so two pipes are two files), and ENOENT if nothing is.
     fn made_stat(&self, path: &str, follow: bool) -> Option<Result<Stat, Errno>> {
-        if follow && path.starts_with("/proc/") && path.contains("/fd/") {
+        if (follow && path.starts_with("/proc/") && path.contains("/fd/")) || os::is_listing(path) {
             return os::open(self, path).map(|open| open.and_then(|open| stat_of_open(&lock(&self.k.disk), &open)));
         }
         os::stat(path).map(Ok)
@@ -1037,6 +1063,12 @@ impl Task {
     /// `getdents64`, or with `old` x86-64's `getdents`, whose `linux_dirent` has the type in its last byte.
     pub(crate) fn getdents(&mut self, cx: &mut Cx<'_>, fd: i32, buf: u64, size: u64, old: bool) -> Result<u64, Errno> {
         let open = self.file(fd)?;
+        if let Node::Listing(made) = &open.node {
+            let id = |name: &str| os::made_identity(&format!("{}/{name}", open.path)).1;
+            let mut entries: Vec<(String, Ino, u8)> = vec![(".".into(), id("."), DT_DIR), ("..".into(), id(".."), DT_DIR)];
+            entries.extend(made.iter().map(|(name, kind)| (name.clone(), id(name), *kind)));
+            return self.write_dirents(cx, &open, entries, buf, size, old);
+        }
         let Node::Dir(ino) = open.node else { return Err(ENOTDIR) };
         if open.notifies() {
             self.k.file_event(ino, inotify::IN_ACCESS, &open.path);
@@ -1057,6 +1089,12 @@ impl Task {
                 entries.push((name, child, kind));
             }
         }
+        self.write_dirents(cx, &open, entries, buf, size, old)
+    }
+
+    /// Writes as many of a directory's `entries` as fit in `size` bytes at `buf`, from where its last read left off, as
+    /// `linux_dirent64` (or for `old`, `linux_dirent`).
+    fn write_dirents(&mut self, cx: &mut Cx<'_>, open: &Open, entries: Vec<(String, Ino, u8)>, buf: u64, size: u64, old: bool) -> Result<u64, Errno> {
         let mut offset = lock(&open.offset);
         let mut out = Vec::new();
         let mut index = *offset as usize;
@@ -1200,6 +1238,11 @@ impl Task {
             }
             TIOCSCTTY => {
                 let state = lock(&self.process.state);
+                // Already the session leader's controlling terminal (opening it without O_NOCTTY made it so, as it
+                // does after setsid): nothing to do, as Linux's tiocsctty has it.
+                if state.sid == self.process.pid && state.ctty.as_ref().is_some_and(|c| Arc::ptr_eq(c, tty)) {
+                    return Ok(0);
+                }
                 if state.sid != self.process.pid || state.ctty.is_some() {
                     return Err(EPERM);
                 }
@@ -1597,7 +1640,8 @@ impl Task {
         if disk.stat(ino)?.kind != Kind::Dir {
             return Err(ENOTDIR);
         }
-        let absolute = exe_path(&state.cwd.1, &path);
+        // Its real path, links followed, as `getcwd` gives it.
+        let absolute = view.real_path(&disk, &state.cwd.1, &path).unwrap_or_else(|_| exe_path(&state.cwd.1, &path));
         state.cwd = (ino, absolute);
         Ok(0)
     }

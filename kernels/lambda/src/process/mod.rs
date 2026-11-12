@@ -19,7 +19,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
-use exec::{CpuHandle, Exit, FpRegs, Isa, SpaceId, Stop};
+use exec::{Exit, FpRegs, Isa, SpaceId, Stop};
+use kernels_core::thread::Handle;
 use kernels_core::lock;
 use kernels_core::mm::Regions;
 use kernels_core::thread::{Cx, Flow, Guest, Times};
@@ -124,7 +125,7 @@ pub(crate) enum Report {
 
 /// A running thread, as its process knows it.
 pub(crate) struct Live {
-    pub handle: CpuHandle,
+    pub handle: Handle,
     pub waiter: Arc<Waiter>,
     pub signals: Arc<ThreadSignals>,
     /// Its CPU time so far.
@@ -233,7 +234,7 @@ impl Task {
     }
 
     /// How its process sees it, running on `handle`.
-    pub fn live(&self, handle: CpuHandle) -> Live {
+    pub fn live(&self, handle: Handle) -> Live {
         Live { handle, waiter: self.waiter.clone(), signals: self.signals.clone(), times: self.times.clone(), robust: self.robust.clone(), trace: self.trace.clone() }
     }
 }
@@ -523,7 +524,12 @@ impl Task {
                 Outcome::Keep => "(registers set)".to_string(),
                 Outcome::End => "(thread ends)".to_string(),
             };
-            self.k.host.write(host::Stream::Err, format!("[{}] {:?}({:#x}, {:#x}, {:#x}, {:#x}) = {result}\n", self.tid, call.sys, a[0], a[1], a[2], a[3]).as_bytes());
+            // A thread naming itself (`PR_SET_NAME`) says the name, so a trace tells its threads apart.
+            let name = match (call.sys, a[0]) {
+                (Sys::Prctl, 15) => self.mem(cx, false, |t| kernels_core::user::read_cstr(&t.space(), a[1], 16)).map(|b| format!(" {:?}", String::from_utf8_lossy(&b))).unwrap_or_default(),
+                _ => String::new(),
+            };
+            self.k.host.write(host::Stream::Err, format!("[{}] {:?}({:#x}, {:#x}, {:#x}, {:#x}){name} = {result}\n", self.tid, call.sys, a[0], a[1], a[2], a[3]).as_bytes());
         }
         outcome
     }

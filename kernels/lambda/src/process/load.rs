@@ -179,7 +179,10 @@ pub(crate) fn exec_into(k: &Arc<Kernel>, cx: &mut Cx<'_>, state: &mut ProcState,
         return Err(ENOEXEC);
     }
     let isa = program.isa;
-    let exe = exe_path(&state.cwd.1, &path);
+    // The program's real path, links followed (`/proc/self/exe`, its mappings' names); `AT_EXECFN` is the name it
+    // was run by.
+    let execfn = exe_path(&state.cwd.1, &path);
+    let exe = crate::fs::mount::View::of(state).real_path(&lock(&k.disk), &state.cwd.1, &path).unwrap_or_else(|_| execfn.clone());
     let mut random = [0u8; 16];
     k.host.random(&mut random);
 
@@ -244,7 +247,7 @@ pub(crate) fn exec_into(k: &Arc<Kernel>, cx: &mut Cx<'_>, state: &mut ProcState,
                 (AT_CLKTCK, 100),
                 (AT_SECURE, 0),
             ];
-            let sp = write_stack(t, stack_top, &argv, &env, &auxv, &exe, isa, &random)?;
+            let sp = write_stack(t, stack_top, &argv, &env, &auxv, &execfn, isa, &random)?;
             t.thread().start(entry, sp);
             let brk = page_up(base + hi);
             Ok((regions, mmap, brk, trampoline))

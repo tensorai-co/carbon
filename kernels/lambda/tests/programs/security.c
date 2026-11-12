@@ -228,14 +228,21 @@ void cmain(i64 *sp) {
         sys(SYS_rt_sigaction, SIGSYS, (i64)&act, 0, 8, 0, 0);
         struct sock_filter second[] = {LD_NR, JEQ(SYS_uname, 0, 1), RET(SECCOMP_RET_TRAP | 42), RET(SECCOMP_RET_ALLOW)};
         if (install(second, 4) != 0) bad |= 16;
-        if (sys(SYS_uname, (i64)status_buf, 0, 0, 0, 0, 0) != -ENOSYS || got_signo != SIGSYS || got_errno != 42 || got_code != 1 ||
+        // Rolled back for the handler, as Linux does: a handler that leaves the registers alone returns the call's
+        // first argument on ARM64 and its number on x86-64.
+#if defined(__aarch64__)
+        i64 rolled_back = (i64)status_buf;
+#else
+        i64 rolled_back = SYS_uname;
+#endif
+        if (sys(SYS_uname, (i64)status_buf, 0, 0, 0, 0, 0) != rolled_back || got_signo != SIGSYS || got_errno != 42 || got_code != 1 ||
             got_syscall != SYS_uname || got_arch != ARCH || got_addr == 0)
             bad |= 32;
         if (sys(SYS_getppid, 0, 0, 0, 0, 0, 0) != -EACCES) bad |= 64;
         quit(bad);
     }
     status = reap(child);
-    check(status == 0, "a filter's errno, kept by a child; a second filter's SIGSYS with si_errno, SYS_SECCOMP, the call, its arch and address; the most restrictive wins");
+    check(status == 0, "a filter's errno, kept by a child; a second filter's SIGSYS with si_errno, SYS_SECCOMP, the call, its arch and address, its registers rolled back; the most restrictive wins");
     child = fork();
     if (child == 0) {
         struct sock_filter kill[] = {LD_NR, JEQ(SYS_getuid, 0, 1), RET(SECCOMP_RET_KILL_PROCESS), RET(SECCOMP_RET_ALLOW)};
