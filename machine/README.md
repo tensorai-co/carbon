@@ -21,8 +21,8 @@ a kernel's locks and its run loop have to be designed together.
 4. **Finds the program**: one named without a `/` is found on the image's `PATH`; with none, the image's entrypoint
    and command run, with its environment and `--env` over it.
 5. **Attaches a display, sound, a network and host services**: a headless desktop (atlas), the machine's own `net`
-   network, `host::Std`. Later: the host's windows and speakers, `--net` and `--publish`, and `remote` when `--remote`
-   asks for it.
+   network, `host::Std`, and with `--display host` or `host-windows`, the Mac's screen. Later: the host's speakers,
+   `--net` and `--publish`, and `remote` when `--remote` asks for it.
 6. **Runs it** in the calling process (hvf allows one VM per process, and a machine is one), relaying stdin, stdout
    and the exit code. SIGINT, SIGTERM and SIGHUP go to the first process; a second signal, or ten seconds, ends
    everything (`signals.rs`).
@@ -54,9 +54,9 @@ end through `carbon`.
 
 ## To do
 
-- [ ] **Sound, networks and the host's display**, as [`audio`](../audio/README.md), [`net`](../net/README.md)'s
-      phases 3 and 5, and [`display`](../display/README.md)'s host backends come: `--audio`, `--net`, `--publish`,
-      `--display host`; and `--remote`, attaching a [`remote`](../remote/README.md) listener to the desktop and mixer.
+- [ ] **Sound and networks**, as [`audio`](../audio/README.md) and [`net`](../net/README.md)'s phases 3 and 5 come:
+      `--audio`, `--net`, `--publish`; and `--remote`, attaching a [`remote`](../remote/README.md) listener to the
+      desktop and mixer. The host's display on Linux and Windows comes with [`display`](../display/README.md)'s.
 - [ ] **The image's working directory and user** for its first process (lambda starts it in `/`, as root).
 - [ ] **A worker process per machine**, once one `carbon` process runs several (a daemon, or the SDK): hvf allows one
       VM per process.

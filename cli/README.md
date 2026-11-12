@@ -50,10 +50,6 @@ carbon atlas imports ~/installers/          # a folder of them: which load, and 
 Each module's README has its part; together:
 
 ```sh
-# display: the host's windows, and driving a machine
-carbon run --display host setup.exe
-carbon display click app 300 200 | type app "hello" | key app Return
-
 # audio
 carbon run --audio host … | --audio out.wav …
 

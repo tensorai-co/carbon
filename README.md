@@ -32,8 +32,8 @@ carbon run --platform linux/amd64 debian:13 -- apt-get install -y curl   # x86-6
   x86-64 image installs packages with apt, translated.
 - **A network of its own, over the host's sockets.** Each machine has its own addresses, loopback and DNS, with no
   virtual network card: its connections are the host's, so they go as fast as the host's.
-- **Screens for computer use.** One desktop both kernels' windows go on, headless or (soon) in the host's own windows,
-  with screenshots from the command line, and later clicks, keys, and remote viewers over QUIC.
+- **Screens for computer use.** One desktop both kernels' windows go on, headless or in the host's own windows (on
+  macOS today), with screenshots, clicks and keys from the command line, and later remote viewers over QUIC.
 
 ## Where it runs
 
@@ -172,7 +172,8 @@ cargo build --example run --example run-windows
 A binary that opens a backend on macOS is signed with `carbon.entitlements` (`hypervisor`, `cs.debugger`,
 `get-task-allow`). On Linux, kvm needs the user in the `kvm` group. On Windows, `winkvm.sys` is built with the WDK and
 test signing is on (`exec/windows/driver/README.md`). Each module's README has its own tests; the kernels' test
-programs and how to build them are in [`kernels`](kernels/README.md).
+programs and how to build them are in [lambda's](kernels/lambda/README.md#running-and-testing) and
+[atlas's](kernels/atlas/README.md#running-and-testing) READMEs.
 
 ## Where it stands
 
@@ -180,8 +181,9 @@ programs and how to build them are in [`kernels`](kernels/README.md).
   slot is used again, so a machine can make threads and processes for as long as it runs.
 - **lambda** runs Debian 13, ARM64 natively and x86-64 translated or native: bash with job control on a console,
   ptys, signals, threads, `epoll` and friends, sockets, and `apt-get install` of curl, Python and git, which then
-  work over HTTPS. **atlas** runs Windows programs with its loader and SEH, threads and objects, files, the registry,
-  the environment, and windows on the desktop with input, on both ISAs.
+  work over HTTPS. **atlas** runs Windows programs with its loader and SEH, threads, processes and objects, pipes,
+  sections, asynchronous I/O, files, the registry, security, resources and system information, and windows on the
+  desktop with input, on both ISAs.
 - **`carbon run debian:13 -- bash`** works on all three hosts, from an image pulled over HTTPS (trusting what the host
   trusts), with machines kept by name, stopped, frozen and started again.
 - **net** gives each machine its own network out through the host's sockets: `apt-get update` and `curl https://`
@@ -214,7 +216,7 @@ blocks real work, it moves up. Each item's detail is in the README it links to.
 streaming layers, clearing unused chunks; the image's working directory and user; stopping and screenshots from
 another process on Windows hosts; a worker process per machine.
 
-**3. lambda runs real Linux software** ([kernels](kernels/README.md#lambda-1))
+**3. lambda runs real Linux software** ([lambda](kernels/lambda/README.md#to-do))
 
 1. Processes: `execve` with other threads running, a `vfork` that shares memory, `clone3`, `rseq`, permissions checked
    against credentials.
@@ -225,31 +227,28 @@ another process on Windows hosts; a worker process per machine.
 5. `apt install` on the Linux and Windows hosts, and locks that hold between processes.
 6. A console on Windows hosts, checked with a full-screen editor.
 
-**4. atlas runs real Windows programs and installers** ([kernels](kernels/README.md#atlas-1))
+**4. atlas runs real Windows programs and installers** ([atlas](kernels/atlas/README.md#to-do))
 
-1. `CreateProcess`, with handle inheritance, pipes and objects shared between processes.
-2. The loader, complete: the PEB's lists, `DllMain` on detach, `FreeLibrary`, delay loads, API sets, manifests.
-3. C++ exceptions, vectored handlers, stack overflow with a guard page.
-4. The C runtime's hot half in ntdll, and FLS.
-5. Threads and waits: waitable timers, completion ports, fibers, the thread pool.
-6. Files: mappings and sections, asynchronous I/O, sharing modes, links, other drives.
-7. The registry: change notification, security, the 32-bit view, `RegLoadKey`/`RegSaveKey`.
-8. 32-bit x86, which installers are: exec's 32-bit translation, the i686 ntdll, `SysWOW64`.
-9. Winsock over `net` (with `net`'s phase 4). *Done means:* a Windows program downloads over HTTPS.
-10. `msiexec` in host Rust, and `cmd.exe`, `reg.exe`, `regsvr32.exe`, `rundll32.exe`. *Done means:* a real `.msi`
-    installs.
-11. ANSI (`*A`) versions; then the long tail of exports, as the `missing` stubs name them.
+1. The loader, complete: the PEB's lists, `DllMain` on detach, `FreeLibrary`, delay loads, API sets, manifests.
+2. C++ exceptions, vectored handlers, stack overflow with a guard page.
+3. The C runtime's hot half in ntdll, and FLS.
+4. Threads: fibers and the thread pool.
+5. Files: sharing modes, links, other drives.
+6. The registry: change notification, the 32-bit view, `RegLoadKey`/`RegSaveKey`.
+7. 32-bit x86, which installers are: exec's 32-bit translation, the i686 ntdll, `SysWOW64`.
+8. Winsock over `net` (with `net`'s phase 4). *Done means:* a Windows program downloads over HTTPS.
+9. `msiexec` in host Rust, and `cmd.exe`, `reg.exe`, `regsvr32.exe`, `rundll32.exe`. *Done means:* a real `.msi`
+   installs.
+10. ANSI (`*A`) versions; then the long tail of exports, as the `missing` stubs name them.
 
-**5. The desktop, and programs with windows** ([display](display/README.md#to-do), [kernels](kernels/README.md#atlas-1))
+**5. The desktop, and programs with windows** ([display](display/README.md#to-do), [atlas](kernels/atlas/README.md#2-the-window-kernel))
 
-1. `display/macos`: the desktop on the host, whole in one window or each window in a native one; then Linux and
-   Windows.
-2. `carbon display` commands: `click`, `type`, `key`.
-3. The desktop's rest: minimize and maximize, cursors, `SetCapture`, WM_NCHITTEST, keyboard layouts, the clipboard.
-4. atlas's user interface: menus, the standard controls, dialogs and resources, `MsgWaitForMultipleObjects`.
-5. GDI: bitmaps and memory DCs, DIB sections with shared pages, regions and shapes, real fonts.
-6. lambda's Wayland and X11 servers, so GTK, Qt and Firefox run.
-7. Graphics APIs: OpenGL, Direct3D and DXGI, and how they reach the host's GPU.
+1. The desktop on Linux and Windows hosts' screens, as it is on the Mac's.
+2. The desktop's rest: WM_NCHITTEST and frames a program draws itself, keyboard layouts besides US.
+3. atlas's user interface: menus, the standard controls, dialogs, `MsgWaitForMultipleObjects`.
+4. GDI: bitmaps and memory DCs, DIB sections with shared pages, regions and shapes, real fonts.
+5. lambda's Wayland and X11 servers, so GTK, Qt and Firefox run.
+6. Graphics APIs: OpenGL, Direct3D and DXGI, and how they reach the host's GPU.
 
 **6. Networks** ([net](net/README.md#to-do))
 
@@ -288,8 +287,8 @@ Each blocks the work named; the README linked has the details and a recommendati
 | Syscall User Dispatch on Linux ARM64, or rewriting? | Linux ARM64 | [exec](exec/README.md#open-questions) |
 | `get-task-allow` on macOS, or another way to take the stub's task? | the macOS sandbox | [exec](exec/README.md#open-questions) |
 | How the Windows driver is signed (EV certificate, attestation) | shipping winkvm | [exec](exec/README.md#open-questions) |
-| Graphics APIs: host exports, guest code, or a GPU protocol? | graphics | [kernels](kernels/README.md#open-questions) |
-| How much of the C runtime runs in the program | atlas's C runtime | [kernels](kernels/README.md#open-questions) |
+| Graphics APIs: host exports, guest code, or a GPU protocol? | graphics | [atlas](kernels/atlas/README.md#open-questions) |
+| How much of the C runtime runs in the program | atlas's C runtime | [atlas](kernels/atlas/README.md#open-questions) |
 | QUIC and TLS for remote: `quinn` and `rustls`, or our own? | remote's first picture | [remote](remote/README.md#open-questions) |
 | One remote port per machine or a host gateway; 4433 or 443 by default | remote | [remote](remote/README.md#open-questions) |
 | TLS for atlas's WinHTTP and Schannel: `rustls` in one crate, or our own? | Winsock's HTTPS | [net](net/README.md#open-questions) |
@@ -307,7 +306,7 @@ Each blocks the work named; the README linked has the details and a recommendati
 | Windows' DLLs as files installed on the machine's disk | A second build, an install step, a version handshake between halves of one program | DLLs made in memory from declarations; one embedded guest crate |
 | Trusting that a backend works because its programs finish | A fallback can quietly do the work instead | A conformance suite every backend must pass |
 
-[exec](exec/README.md#why-its-shaped-this-way) and [kernels](kernels/README.md#atlas) have the rest.
+[exec](exec/README.md#why-its-shaped-this-way) and [atlas](kernels/atlas/README.md#how-it-works) have the rest.
 
 ## Developing
 

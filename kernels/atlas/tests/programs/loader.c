@@ -1,4 +1,10 @@
 // ntdll's loader and structured exception handling, for ARM64 and x86-64: no C runtime. tests/programs/build.sh builds it.
+//
+// It checks: an app's own DLL, imported and relocated off a base the program has; its DllMain; a forwarder chain
+// (mylib!heap_alloc → kernel32!HeapAlloc → ntdll!RtlAllocateHeap); LoadLibraryA and GetProcAddress by name and by
+// ordinal; ERROR_MOD_NOT_FOUND and ERROR_PROC_NOT_FOUND; GetModuleFileNameW; static TLS and a TLS callback;
+// __try/__except catching an access violation, from three calls down too; RaiseException with a filter; __finally
+// during an unwind and on a normal exit; EXCEPTION_CONTINUE_EXECUTION; integer divide by zero (x86-64)
 
 typedef void *HANDLE;
 typedef unsigned int DWORD;

@@ -1,4 +1,12 @@
 // Windows, messages and painting on atlas, for ARM64 and x86-64: no C runtime. tests/programs/build.sh builds it.
+//
+// It checks: RegisterClassExW; CreateWindowExW with WM_NCCREATE and WM_CREATE (and its parameter) and WM_SIZE (its
+// client area, inside the frame AdjustWindowRectEx says); window text through DefWindowProc's WM_GETTEXT and
+// WM_SETTEXT; FindWindowW; SendMessageW on the window's thread; window and class longs; subclassing with
+// CallWindowProcW; a child window, EnumChildWindows, EnumWindows; ShowWindow, UpdateWindow, WM_ERASEBKGND and WM_PAINT;
+// FillRect, the class background, a pen's Rectangle and LineTo read back with GetPixel; MoveWindow and WM_SIZE;
+// SendMessageW and PostMessageW from another thread into a GetMessageW loop; timers; PeekMessageW; WM_CLOSE destroying
+// a window and its child; PostQuitMessage
 
 typedef void *HANDLE;
 typedef void *HWND;

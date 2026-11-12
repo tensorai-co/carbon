@@ -1,6 +1,21 @@
 // The desktop on atlas, for ARM64 and x86-64: frames, activation, focus, and input through SendInput, as a user's
 // clicks, typing and drags. No C runtime. tests/programs/build.sh builds it. It ends with a window still open, so
 // the desktop's screenshot has it in its frame.
+//
+// It checks: windows made hidden, then shown and activated; WM_ACTIVATE, WM_SETFOCUS and WM_KILLFOCUS; GetWindowRect
+// with the frame and GetClientRect inside it; ClientToScreen, ScreenToClient, WindowFromPoint, GetSystemMetrics;
+// through SendInput: a click (WM_LBUTTONDOWN in client coordinates, activating and raising), Shift+A, b and a Unicode !
+// typed as WM_CHAR "Ab!" with GetKeyState as of each message, and an é no key types as its WM_CHAR, LoadCursorW,
+// SetCursor and GetCursor, the wheel, dragging a title bar (WM_MOVE) and a corner (WM_SIZE), another window's close
+// button; a popup with no frame that draws its own title bar, moved by WM_NCLBUTTONDOWN with HTCAPTION from its
+// WM_LBUTTONDOWN, maximized and restored by WM_SYSCOMMAND (IsZoomed), closed by Alt+F4; WM_MOUSEHWHEEL; the clipboard:
+// GlobalAlloc's family, copying "héllo" as CF_UNICODETEXT and pasting it as that and as CF_TEXT made from it, the
+// owner, formats and their order, and WM_DESTROYCLIPBOARD when another window takes it; SetCapture taking a click
+// anywhere as A's, then ReleaseCapture; a held key's repeat as WM_KEYDOWN with the previous state; FlashWindow and
+// FlashWindowEx; ClipCursor keeping SetCursorPos inside it, GetClipCursor, and ClipCursor(NULL); DragAcceptFiles
+// setting and clearing WS_EX_ACCEPTFILES; stacking: GetTopWindow, GetWindow and EnumWindows in z-order, SetWindowPos
+// with HWND_BOTTOM and after another window, a topmost window's owned window above it and topmost, both moved to the
+// bottom together, and a WS_EX_NOACTIVATE window clicked without being activated or raised; SetForegroundWindow
 
 typedef void *HANDLE;
 typedef void *HWND;

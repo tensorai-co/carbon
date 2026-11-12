@@ -1,4 +1,11 @@
 // Files and folders on atlas, for ARM64 and x86-64: no C runtime. tests/programs/build.sh builds it.
+//
+// It checks: the current directory; folders made, refused when there, and removed; CREATE_NEW, OPEN_EXISTING,
+// OPEN_ALWAYS and CREATE_ALWAYS with their last errors; reads, seeks, a read at the end, sizes, SetEndOfFile; names in
+// any case; GetFinalPathNameByHandleW in the disk's own case; attributes, and ERROR_FILE_NOT_FOUND against
+// ERROR_PATH_NOT_FOUND; relative paths and GetFullPathNameW; FindFirstFileW/FindNextFileW with wildcards and .; copy,
+// move, replace, delete; ERROR_DIR_NOT_EMPTY; delete-on-close; the temp folder; System32's kernel32.dll read as a PE
+// from memory, not writable, and listed with ntdll; NUL and CONOUT$
 
 typedef void *HANDLE;
 typedef unsigned int DWORD;

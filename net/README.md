@@ -104,7 +104,7 @@ itself and never goes through a machine's network.
 
 What each kernel does on it: lambda's socket system calls, sockets as files in `poll` and `epoll`, netlink, the
 interface ioctls, `/proc/net/*` and its own `/etc/resolv.conf`, `/etc/hosts` and `/etc/hostname` are in the
-[kernels' README](../kernels/README.md). atlas's Winsock is to do (below).
+[lambda's README](../kernels/lambda/README.md#how-it-works). atlas's Winsock is to do (below).
 
 ## The design still to build
 

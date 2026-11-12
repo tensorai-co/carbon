@@ -1,5 +1,9 @@
 // A freestanding Windows test program for atlas: no C runtime, only kernel32 and user32, for ARM64 and x86-64.
 // tests/programs/build.sh builds it.
+//
+// It checks: console handles, WriteConsoleW, the command line, VirtualAlloc committed on touch, an upcall into the
+// program (EnumSystemLocalesW, twice), MessageBoxW, and the guest exports: the heap, the last error and critical
+// sections, running inside the program in the embedded ntdll
 
 typedef void *HANDLE;
 typedef unsigned int DWORD;

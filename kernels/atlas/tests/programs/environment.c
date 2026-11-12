@@ -1,4 +1,10 @@
 // The environment block on atlas, for ARM64 and x86-64: no C runtime. tests/programs/build.sh builds it.
+//
+// It checks: SystemRoot, PROCESSOR_ARCHITECTURE, Path from the registry expanded, USERNAME through the A version,
+// NUMBER_OF_PROCESSORS, TEMP; ERROR_ENVVAR_NOT_FOUND; set and get in another case; sizes when the buffer's short,
+// missing or just enough; replacing; SetEnvironmentVariableA; an empty value; = in a name refused;
+// ExpandEnvironmentStrings (W and A) with unknown names and a short buffer; GetEnvironmentStringsW in order with the
+// new variables; the ANSI block; deleting with NULL
 
 typedef void *HANDLE;
 typedef unsigned int DWORD;

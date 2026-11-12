@@ -1,4 +1,10 @@
 // The registry on atlas, for ARM64 and x86-64: no C runtime. tests/programs/build.sh builds it.
+//
+// It checks: a fresh machine's HKLM (ProductName, a DWORD by RegGetValueW, a type not asked for, REG_EXPAND_SZ
+// expanded); keys made and opened in another case; every value type and the default value; sizes and ERROR_MORE_DATA;
+// RegSetValueExA storing UTF-16; RegQueryInfoKeyW; enumerating values and keys; names keeping their case; deleting
+// values, keys (not with subkeys) and trees; a deleted key's handle; HKEY_CLASSES_ROOT as HKLM\SOFTWARE\Classes;
+// RegFlushKey saving it
 
 typedef void *HANDLE;
 typedef void *HKEY;

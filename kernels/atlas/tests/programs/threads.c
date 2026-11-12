@@ -1,4 +1,10 @@
 // Threads and synchronization on atlas, for ARM64 and x86-64: no C runtime. tests/programs/build.sh builds it.
+//
+// It checks: four threads and a contended critical section with wait-all; GetExitCodeThread; TlsAlloc slots and
+// __declspec(thread), each thread's own; DLL_THREAD_ATTACH; auto- and manual-reset events; a wait that times out;
+// semaphores and their maximum; a mutex owned, waited for, released, not owned, and abandoned; an SRW lock and a
+// condition variable; WaitOnAddress; InitOnceExecuteOnce from four threads; CREATE_SUSPENDED and ResumeThread;
+// QueueUserAPC and an alertable SleepEx; named events; TerminateThread; ExitThread; DuplicateHandle of a pseudo-handle
 
 typedef void *HANDLE;
 typedef unsigned int DWORD;

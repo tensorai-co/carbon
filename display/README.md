@@ -268,13 +268,25 @@ screenshots; with `CARBON_SCREENSHOTS=<folder>`, `run-windows` saves the screen 
       dragging to and from the Mac; in windows mode, popups
       dismissed when another app's clicked, windows on screens besides the main one, the desktop's own move and
       resize handed to the Mac's (`performWindowDragWithEvent:`). Then `display/linux` and `display/windows`.
-- [ ] **`carbon display` commands**: `click`, `type` and `key` beside `screenshot`, against a running machine.
-- [ ] **The desktop, the rest**: minimizing and maximizing; cursor shapes, drawn by the host or a viewer;
-      `SetCapture`; WM_NCHITTEST and frames a program draws itself (today a frameless window shown on the host would
-      still get a host title bar); keyboard layouts besides US; the clipboard, and the host's (Cmd+V).
+- [x] **`carbon display` commands**: `click`, `type` and `key` beside `screenshot`, against a running machine.
+- [ ] **The desktop, the rest**: cursor shapes drawn by a viewer; WM_NCHITTEST and frames a program draws itself
+      (today a frameless window shown on the host would still get a host title bar); keyboard layouts besides US.
 - [ ] **What `remote` needs** (its README has the details): observers, each with every window's damage as a set of
       rectangles and a log of changes, taken once a frame; a window manager outside it (`place`, `close_request`,
       `raise`) for windows mode; cursor shapes set by the kernels; text input; a screen size that changes, for
       `headless=auto`.
+- [ ] **The contract, as the servers ask for it.** Frames and states: a reader of `Presented` with the host's
+      scan-out time; tiled states; a size the window asks for, answered; win32k's menus on the desktop's popups;
+      activation tokens passed on at launch (`XDG_ACTIVATION_TOKEN`, `_NET_STARTUP_ID`, `AllowSetForegroundWindow`),
+      so a second client's first window is made active; docks' struts, a work area, `_NET_RESTACK_WINDOW`, a taskbar
+      for minimized windows; a DIB section's pixels lent in place. Input: serials from the desktop; the scroll's
+      source, and touch; key repeat for a source that doesn't; win32k's scan codes from the keymap; cursors on the
+      headless screen; win32k's IMM messages; raw input and pointer lock. Outputs: several, with windows moved
+      between them; win32k's per-monitor DPI; scaled and translucent buffers composited at full resolution. Data:
+      delayed clipboard rendering and images; a drag icon; OLE drag and drop in win32k; paths between kernels.
+      Observers: each window's app ID and kernel in `carbon display windows`; compositing outside the desktop's lock;
+      locking that scales to a 4K screen.
+- [ ] `--display host` as the default where the host has a screen, once it's decided how an agent's machines stay
+      headless.
 - [ ] Real fonts, shared with atlas's GDI, in place of the one bitmap font.
 - [ ] Not tried yet on a host window: typing, frameless popups, how scrolling feels.

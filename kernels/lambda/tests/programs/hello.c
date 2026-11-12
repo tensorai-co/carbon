@@ -1,6 +1,9 @@
 // A freestanding test program for lambda: no libc, just system calls, for ARM64 and x86-64 alike.
 // Build: clang --target=aarch64-linux-gnu (or x86_64-linux-gnu) -nostdlib -static -ffreestanding -fno-stack-protector
 //        -fuse-ld=lld -O2 hello.c -o hello
+//
+// It checks: argv, getpid, uname, brk and mmap with pages faulted in on touch, files read from and written to the disk,
+// getdents64, clocks, pipes, fork with copy-on-write, a child writing to a pipe, wait4
 
 typedef unsigned long u64;
 typedef long i64;

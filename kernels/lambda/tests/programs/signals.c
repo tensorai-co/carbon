@@ -1,4 +1,8 @@
 // Signals, job control and ptys, for lambda: freestanding, for ARM64 and x86-64 alike. Built like hello.c.
+//
+// It checks: a handler with siginfo and rt_sigreturn, blocked and pending signals, a SIGSEGV handler that moves the
+// program on, SIGTERM to a child, SIGSTOP/SIGCONT/SIGKILL as wait4 reports them, SA_RESTART and EINTR, SIGPIPE and
+// EPIPE, a pty's line editing and echo, ^C on a pty
 
 typedef unsigned long u64;
 typedef long i64;
