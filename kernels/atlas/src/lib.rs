@@ -25,6 +25,9 @@ mod process;
 mod threads;
 mod registry;
 mod sections;
+mod security;
+mod system;
+mod system_info;
 mod upcall;
 mod win32k;
 
@@ -127,7 +130,10 @@ pub fn boot(exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&str]
         sections: Mutex::new(HashMap::new()),
         timers: kernels_core::timers::Timers::default(),
         deferred: Mutex::new(Vec::new()),
+        shared: std::sync::OnceLock::new(),
         named_pipes: Mutex::new(HashMap::new()),
+        file_security: Mutex::new(HashMap::new()),
+        key_security: Mutex::new(HashMap::new()),
         live: (Mutex::new(0), Condvar::new()),
         options,
     });
@@ -141,6 +147,8 @@ pub fn boot(exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&str]
     let exec = kernel.exec.clone();
     let mut cx = Cx::new(&exec, cpu);
     let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+    let _ = kernel.shared.set(system::shared_data(&kernel, &mut cx));
+    system::keep_time(Arc::downgrade(&kernel), std::time::Instant::now());
     let mut task = process::start(&kernel, &mut cx, &argv)?;
     *lock(&kernel.options.stop.0) = Some(Arc::downgrade(&kernel));
     let first = task.process.clone();
@@ -187,8 +195,13 @@ pub(crate) struct Kernel {
     sections: Mutex<HashMap<String, Weak<sections::Section>>>,
     /// Waitable timers' expiries, on a host thread of their own.
     timers: kernels_core::timers::Timers,
+    /// The shared data pages (`KUSER_SHARED_DATA`), one for each ISA.
+    shared: std::sync::OnceLock<system::SharedData>,
     /// I/O finished with no CPU to write its OVERLAPPED with, for the next thread that calls in.
     deferred: Mutex<Vec<ports::Completion>>,
+    /// Descriptors set on files (by full Windows path, lower case) and registry keys (by ID). Others have the default.
+    file_security: Mutex<HashMap<String, security::Descriptor>>,
+    key_security: Mutex<HashMap<u64, security::Descriptor>>,
     /// Named pipes by name (lower case, without `\\.\pipe\`).
     named_pipes: Mutex<HashMap<String, Weak<named_pipes::Server>>>,
     options: Options,

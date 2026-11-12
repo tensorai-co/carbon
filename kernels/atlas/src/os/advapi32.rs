@@ -5,6 +5,7 @@ use kernels_core::lock;
 use kernels_core::thread::Cx;
 use kernels_core::user;
 
+use super::secapi::*;
 use super::{Reply, dll};
 use crate::handles::Handle;
 use crate::process::Task;
@@ -37,10 +38,83 @@ dll! {
     host RegFlushKey(1) => reg_flush_key;
     host RegOpenCurrentUser(2) => reg_open_current_user;
     host GetUserNameW(2) => get_user_name_w;
+    host GetSecurityInfo(8) => get_security_info;
+    host SetSecurityInfo(7) => set_security_info;
+    host GetNamedSecurityInfoW(8) => get_named_security_info_w;
+    host SetNamedSecurityInfoW(7) => set_named_security_info_w;
+    host GetKernelObjectSecurity(5) => get_kernel_object_security;
+    host SetKernelObjectSecurity(3) => set_kernel_object_security;
+    host GetFileSecurityW(5) => get_file_security_w;
+    host SetFileSecurityW(3) => set_file_security_w;
+    host RegGetKeySecurity(4) => reg_get_key_security;
+    host RegSetKeySecurity(3) => reg_set_key_security;
+    host AccessCheck(8) => access_check_call;
+    host MapGenericMask(2) => map_generic_mask;
+    host ImpersonateSelf(1) => impersonate_self;
+    host RevertToSelf(0) => revert_to_self;
+    host SetThreadToken(2) => set_thread_token;
+    host ImpersonateLoggedOnUser(1) => impersonate_logged_on_user;
+    host ImpersonateNamedPipeClient(1) => impersonate_named_pipe_client;
+    host OpenProcessToken(3) => open_process_token;
+    host OpenThreadToken(4) => open_thread_token;
+    host GetTokenInformation(5) => get_token_information;
+    host SetTokenInformation(4) => set_token_information;
+    host AdjustTokenPrivileges(6) => adjust_token_privileges;
+    host PrivilegeCheck(3) => privilege_check;
+    host DuplicateTokenEx(6) => duplicate_token_ex;
+    host DuplicateToken(3) => duplicate_token;
+    host CheckTokenMembership(3) => check_token_membership;
+    host LookupPrivilegeValueW(3) => lookup_privilege_value_w;
+    host LookupPrivilegeValueA(3) => lookup_privilege_value_a;
+    host LookupPrivilegeNameW(4) => lookup_privilege_name_w;
+    host AllocateAndInitializeSid(11) => allocate_and_initialize_sid;
+    host FreeSid(1) => free_sid;
+    host InitializeSid(3) => initialize_sid;
+    host GetSidLengthRequired(1) => get_sid_length_required;
+    host GetSidSubAuthority(2) => get_sid_sub_authority;
+    host GetSidSubAuthorityCount(1) => get_sid_sub_authority_count;
+    host GetSidIdentifierAuthority(1) => get_sid_identifier_authority;
+    host GetLengthSid(1) => get_length_sid;
+    host IsValidSid(1) => is_valid_sid;
+    host EqualSid(2) => equal_sid;
+    host EqualPrefixSid(2) => equal_prefix_sid;
+    host CopySid(3) => copy_sid;
+    host CreateWellKnownSid(4) => create_well_known_sid;
+    host IsWellKnownSid(2) => is_well_known_sid;
+    host ConvertSidToStringSidW(2) => convert_sid_to_string_sid_w;
+    host ConvertStringSidToSidW(2) => convert_string_sid_to_sid_w;
+    host LookupAccountSidW(7) => lookup_account_sid_w;
+    host LookupAccountNameW(7) => lookup_account_name_w;
+    host InitializeSecurityDescriptor(2) => initialize_security_descriptor;
+    host IsValidSecurityDescriptor(1) => is_valid_security_descriptor;
+    host GetSecurityDescriptorLength(1) => get_security_descriptor_length;
+    host GetSecurityDescriptorControl(3) => get_security_descriptor_control;
+    host SetSecurityDescriptorControl(3) => set_security_descriptor_control;
+    host SetSecurityDescriptorOwner(3) => set_security_descriptor_owner;
+    host SetSecurityDescriptorGroup(3) => set_security_descriptor_group;
+    host SetSecurityDescriptorDacl(4) => set_security_descriptor_dacl;
+    host SetSecurityDescriptorSacl(4) => set_security_descriptor_sacl;
+    host GetSecurityDescriptorOwner(3) => get_security_descriptor_owner;
+    host GetSecurityDescriptorGroup(3) => get_security_descriptor_group;
+    host GetSecurityDescriptorDacl(4) => get_security_descriptor_dacl;
+    host GetSecurityDescriptorSacl(4) => get_security_descriptor_sacl;
+    host MakeSelfRelativeSD(3) => make_self_relative_sd;
+    host InitializeAcl(3) => initialize_acl;
+    host IsValidAcl(1) => is_valid_acl;
+    host AddAccessAllowedAce(4) => add_access_allowed_ace;
+    host AddAccessAllowedAceEx(5) => add_access_allowed_ace_ex;
+    host AddAccessDeniedAce(4) => add_access_denied_ace;
+    host AddAccessDeniedAceEx(5) => add_access_denied_ace_ex;
+    host AddMandatoryAce(5) => add_mandatory_ace;
+    host AddAce(5) => add_ace_list;
+    host DeleteAce(2) => delete_ace;
+    host GetAce(3) => get_ace;
+    host GetAclInformation(4) => get_acl_information;
+    host ConvertStringSecurityDescriptorToSecurityDescriptorW(4) => convert_string_security_descriptor_to_security_descriptor_w;
+    host ConvertSecurityDescriptorToStringSecurityDescriptorW(5) => convert_security_descriptor_to_string_security_descriptor_w;
     missing RegNotifyChangeKeyValue;
     missing RegSaveKeyW;
     missing RegLoadKeyW;
-    missing OpenProcessToken;
     missing CryptAcquireContextW;
 }
 
@@ -71,7 +145,7 @@ fn from_ansi(data: &[u8]) -> Vec<u8> {
 
 impl Task {
     /// The registry key a handle stands for: one of the predefined keys, or one this process opened.
-    fn key_of(&self, handle: u64) -> Result<u64, u32> {
+    pub(crate) fn key_of(&self, handle: u64) -> Result<u64, u32> {
         if let Some(root) = Root::from_handle(handle) {
             return Ok(lock(&self.k.registry).root(root));
         }
@@ -135,10 +209,12 @@ impl Task {
     }
 }
 
-fn open_key(task: &mut Task, cx: &mut Cx<'_>, base: u64, subkey: u64, out: u64, wide: bool) -> Reply {
+fn open_key(task: &mut Task, cx: &mut Cx<'_>, base: u64, subkey: u64, out: u64, wide: bool, access: u32) -> Reply {
     let path = task.reg_string(cx, subkey, wide);
     let opened = task.key_of(base).and_then(|base| lock(&task.k.registry).open(base, &path));
     match opened {
+        // A key given a descriptor of its own is opened only as it allows.
+        Ok(id) if !task.key_allows(id, access) => error(5),
         Ok(id) => {
             let handle = task.new_key_handle(id);
             let _ = task.mem(cx, true, |t| user::write_u64(&mut t.space(), out, handle));
@@ -149,19 +225,19 @@ fn open_key(task: &mut Task, cx: &mut Cx<'_>, base: u64, subkey: u64, out: u64, 
 }
 
 pub fn reg_open_key_ex_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    open_key(task, cx, a[0], a[1], a[4], true)
+    open_key(task, cx, a[0], a[1], a[4], true, a[3] as u32)
 }
 
 pub fn reg_open_key_ex_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    open_key(task, cx, a[0], a[1], a[4], false)
+    open_key(task, cx, a[0], a[1], a[4], false, a[3] as u32)
 }
 
 pub fn reg_open_key_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    open_key(task, cx, a[0], a[1], a[2], true)
+    open_key(task, cx, a[0], a[1], a[2], true, crate::security::MAXIMUM_ALLOWED)
 }
 
 pub fn reg_open_current_user(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    open_key(task, cx, 0x8000_0001, 0, a[1], true)
+    open_key(task, cx, 0x8000_0001, 0, a[1], true, a[0] as u32)
 }
 
 #[allow(clippy::too_many_arguments)]

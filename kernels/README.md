@@ -215,6 +215,8 @@ On this Mac, through hvf, all of them pass:
 | atlas's `sections.c`, both ISAs | a section of the page file seen by two views at once, a `FILE_MAP_COPY` view keeping its writes and seeing the section's on pages it hasn't written, a view from 64 KiB in; `VirtualQuery` of a view (its base, the rest of it, `MEM_MAPPED`), a read-only view, private memory committed inside a reservation, the program's image, and freed space; ERROR_INVALID_ADDRESS, ERROR_MAPPED_ALIGNMENT and ERROR_ACCESS_DENIED; a named section written by another process, found again with ERROR_ALREADY_EXISTS, and an inherited one by its value; a file mapping's bytes and zeros after them, written back by `FlushViewOfFile` and by `UnmapViewOfFile`, growing its file, ERROR_FILE_INVALID for an empty file, read-only of a file opened to read; waitable timers: notification and synchronization, 50 ms relative, periodic three times then cancelled, an absolute FILETIME, an APC routine in `SleepEx`, and one opened by name |
 | atlas's `io.c`, both ISAs | a completion port as a work queue for four threads (200 packets, each taken once); WAIT_TIMEOUT with no OVERLAPPED; `GetQueuedCompletionStatusEx` taking three at once, and running an APC when alertable; an overlapped write and read at 8 KiB with its event, the OVERLAPPED's status and count, and `GetOverlappedResult`; a read past the end (ERROR_HANDLE_EOF, `STATUS_END_OF_FILE`); a file on a port: a packet with its key, none for a failed read, no second association, none with `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`; `WriteFileEx` and `ReadFileEx`'s routines in `SleepEx`; `CancelIo` and `CancelIoEx` with nothing under way |
 | atlas's `pipes.c`, both ISAs | a byte pipe: a client before `ConnectNamedPipe` (ERROR_PIPE_CONNECTED), data both ways, each end's process, ERROR_PIPE_BUSY, `WaitNamedPipe` timing out, the client closing (what it wrote, ERROR_BROKEN_PIPE, then ERROR_NO_DATA to connect), `DisconnectNamedPipe`, ERROR_FILE_NOT_FOUND, ERROR_INVALID_NAME, `FILE_FLAG_FIRST_PIPE_INSTANCE` refused; pending I/O: an overlapped `ConnectNamedPipe` completed by a client's `CreateFile`, overlapped reads completed by writes through their event, their port's packet and `ReadFileEx`'s routine, `CancelIoEx` (ERROR_OPERATION_ABORTED, then ERROR_NOT_FOUND), a read ended by the client closing; a message pipe: a message a read, `PeekNamedPipe`'s message left, ERROR_MORE_DATA and the rest, message mode refused on a byte pipe, `TransactNamedPipe` and `CallNamedPipe` against a server thread; another process whose pending read this one's write completes in its memory, and whose exit with its end open ends this one's pending read |
+| atlas's `sysinfo.c`, both ISAs, with and without a manifest | `KUSER_SHARED_DATA` at 0x7ffe0000: Windows 10.0.19045 whatever the manifest, this ISA's architecture, the processor count, all 64 processor features as `IsProcessorFeaturePresent` says, the system time within 100 ms of `GetSystemTimeAsFileTime`, interrupt time and the tick count moving on, `VirtualProtect` and `VirtualFree` refused; `RtlGetVersion` and `RtlGetNtVersionNumbers`; `GetVersionEx(W/A)` and `GetVersion` saying Windows 8 without the manifest and 10 with it, ERROR_INSUFFICIENT_BUFFER for a size that's neither; `VerSetConditionMask`, `VerifyVersionInfo` at least 7, at least 10 (ERROR_OLD_WIN_VERSION without the manifest), 6.3 compared as one number, the build; `GetProductInfo`; `GetSystemInfo` and `GetNativeSystemInfo`; `GlobalMemoryStatusEx` (the wrong length refused); `IsWow64Process(2)`; the processor counts; `GetLogicalProcessorInformation(Ex)`'s size first, then a core a processor, caches, a package and a group; `GetComputerName(Ex)(W/A)`, too small then CARBON; `GetSystemTime` and `GetLocalTime`, SYSTEMTIME and FILETIME both ways, 29 February 2024 and not 2023; UTC's `GetTimeZoneInformation`; US Eastern's daylight saving both ways; `NtQuerySystemInformation`'s basic, processor, performance (both sizes), processor times and `GetSystemTimes`, time of day (whole and in part), debugger, system range (exactly 8 bytes), kernel modules, STATUS_INFO_LENGTH_MISMATCH with the length it wants and STATUS_INVALID_INFO_CLASS; the process list: the idle process first, this one by name with its threads, and a suspended child with this one as its parent; both handle lists: an event's handle, typed, and its duplicate at the same kernel address |
+| atlas's `security.c`, both ISAs | the process's token: TokenUser's size first, then the user (S-1-5-21-0-0-0-1000, CARBON\carbon), elevated with no split token, primary, high integrity, the same through `GetCurrentProcessToken()`'s pseudo-handle; its groups (Administrators enabled and an owner, Everyone) and owner; `CheckTokenMembership` (in Administrators, not SYSTEM, ERROR_NO_IMPERSONATION_TOKEN with a primary token); `OpenThreadToken`'s ERROR_NO_TOKEN; privileges: their names both ways, SeDebugPrivilege held and enabled with the previous state, SeTcbPrivilege's ERROR_NOT_ALL_ASSIGNED, `PrivilegeCheck`; a child's token: its own ID in the same logon session, a copy of this one's privileges that this one's later change doesn't touch; `DuplicateTokenEx`'s impersonation token, its level, its integrity lowered and not raised (ERROR_PRIVILEGE_NOT_HELD); SIDs made, compared, copied (too small, then), well known, as strings both ways (an alias, ERROR_INVALID_SID), by account name (BUILTIN\Administrators, DOMAIN\name in any case, ERROR_NONE_MAPPED); ACLs: ACEs added, counted, found and deleted, ERROR_ALLOTTED_SPACE_EXCEEDED; descriptors: absolute with an owner and DACL, as SDDL, made self-relative (the size first), their parts inside, not settable in place; SDDL to a descriptor and back the same, its label alone, a NULL DACL, an unknown account refused; descriptors kept: a named event's from its SECURITY_ATTRIBUTES (opened to set it denied, to wait allowed), `GetSecurityInfo` (the owner filled in, GA mapped, pointers into it), `SetSecurityInfo` letting it open, the SACL refused without SeSecurityPrivilege and given with it, `GetKernelObjectSecurity`'s size first; `MapGenericMask`, `AccessCheck` (allowed, denied, MAXIMUM_ALLOWED with the owner's rights, generic rights refused, a primary token refused); `ImpersonateSelf`, `OpenThreadToken`, `CheckTokenMembership(NULL)` through it, its token lowered to low integrity (no writing up to an event everyone may write, but waiting on it), `RevertToSelf`, `SetThreadToken` on and off (and not a primary token), `ImpersonateNamedPipeClient`; a new file with a descriptor (opened to write denied, to read allowed, by handle and by name, `SetNamedSecurityInfoW` letting it be written), a folder's default; a key's (`RegSetKeySecurity`, opening to set a value denied, to read allowed, `RegGetKeySecurity`'s size first, by name as CURRENT_USER\\…) |
 
 The x86-64 programs are built as they come, SSE and SSE2 included. Two of lambda's check the translator bit for bit,
 each generated by a Python script beside it (`python3 sse.py > sse.c`), x86-64 only:
@@ -244,8 +246,8 @@ answer is the compiler's for the same constants, so it passes on real x86 too.
 | `frame` | `StackWriter`: building a stack from the top down. |
 | `cache` | The page cache: one frame per page of each file, mapped copy-on-write, given back least recently used first. |
 
-To come: `clock`, monotonic and wall time and the page programs read time from (lambda's `vvar`, atlas's shared user
-data), kept current by a host thread.
+To come: `clock`, monotonic and wall time and the page programs read time from (lambda's `vvar`), kept current by a
+host thread. atlas's shared data page is kept current on `timers` for now (`system.rs`).
 
 ### The run loop
 
@@ -603,6 +605,56 @@ a pipe each way, byte or message.
 
 Overlapped writes go in at once, however full the pipe is.
 
+**System information** (`system.rs`, `os/sysapi.rs`). atlas is one Windows, 10.0.19045 (22H2), and says so the same
+way everywhere: the registry, the PEB, `RtlGetVersion` and the shared data page.
+- **`KUSER_SHARED_DATA`:** a read-only page at 0x7ffe0000 in every process, one for each ISA (an ARM64 program and an
+  x86-64 one see different processors). It has the version, the processor's architecture and features, the
+  processor count, the memory's size, and the clocks: interrupt time, system time and the tick count. The kernel's
+  timer thread brings the clocks up to date 64 times a second, as Windows' clock interrupt does, writing each
+  `KSYSTEM_TIME` in the order its readers expect. `VirtualProtect` and `VirtualFree` refuse it.
+- **The version:** `RtlGetVersion` reads the PEB and tells every program the truth. `GetVersionEx`, `GetVersion`
+  and `VerifyVersionInfo` say Windows 8 (6.2.9200) to a program whose manifest doesn't list Windows 10 in its
+  `supportedOS`, as Windows does. `VerifyVersionInfo` compares the version and service pack as one number, by the
+  condition of the highest part asked for.
+- **The machine:** `GetSystemInfo`, `GlobalMemoryStatus(Ex)`, `IsProcessorFeaturePresent`, `IsWow64Process(2)` (no
+  WOW64 yet), the processor counts (one group), and `GetLogicalProcessorInformation(Ex)` (a core for each
+  processor, two L1 caches each, a shared L2, one package, one NUMA node).
+- **Its name and the time:** `GetComputerName(Ex)` (CARBON, and no DNS domain); SYSTEMTIME and FILETIME both ways.
+  The time zone is UTC, as the host doesn't say which zone it's in. `SystemTimeToTzSpecificLocalTime` and back follow
+  the daylight saving rules of a zone a program gives them.
+- **`NtQuerySystemInformation`** (`system_info.rs`), the classes programs use: basic and processor information (and
+  their emulation twins), performance and each processor's times (with `GetSystemTimes`), the time of day, the
+  process list (an idle process, then every process with its parent, start time, memory, handles and threads), both
+  handle lists (each handle's type, and an object address the same in every process for the same object), the
+  kernel's modules (`ntoskrnl.exe` and `hal.dll`), the system range and the kernel debugger (none). atlas doesn't
+  count the CPU time programs use, so the machine looks idle.
+
+**Security** (`security.rs`, `os/secapi.rs`). There's one user, `carbon` (S-1-5-21-0-0-0-1000, as the registry
+has it), an administrator, elevated, at high integrity, as on a machine with UAC turned off.
+- **Tokens:** each process has a primary token, a copy of its parent's, so a program's changes to its own (privileges
+  enabled, integrity lowered) are its own. `OpenProcessToken`, `GetTokenInformation` (the user, groups, privileges,
+  owner, primary group, default DACL, statistics, elevation, integrity, logon SID and the rest),
+  `SetTokenInformation`, `AdjustTokenPrivileges`, `PrivilegeCheck`, `DuplicateTokenEx`, `CheckTokenMembership`, and
+  the pseudo-handles.
+- **SIDs and accounts:** made, compared and copied; well-known SIDs; strings both ways, with SDDL's aliases; and the
+  machine's accounts and groups by name both ways (`LookupAccountSid`, `LookupAccountName`).
+- **Descriptors and ACLs** are in the program's memory, as on Windows, absolute or self-relative: their parts got and
+  set, ACEs added, found and deleted, and SDDL both ways (`ConvertStringSecurityDescriptorToSecurityDescriptor` and
+  back), with NULL DACLs and mandatory labels.
+- **Kept:** a kernel object or section made with a descriptor in its `SECURITY_ATTRIBUTES` keeps it, as does a new
+  file or folder; any of them, and registry keys, take one from `SetSecurityInfo`, `SetNamedSecurityInfo`,
+  `SetKernelObjectSecurity`, `SetFileSecurity` and `RegSetKeySecurity`, and give theirs to the `Get` forms. Parts left
+  out are filled from the maker's token, and generic rights mapped to the type's own. Files and keys keep theirs in
+  memory, for as long as the machine runs. What has none kept has the default: its maker's token's for objects,
+  Windows' usual ones for files and keys.
+- **Checked:** opening a named object or section, a file, or a key that has a descriptor kept is checked against it,
+  as `AccessCheck` is: each right decided by the first ACE that names it, the owner's implicit `READ_CONTROL` and
+  `WRITE_DAC`, privileges, and the mandatory label (a token below an object's integrity can't write up to it).
+  Changing a descriptor needs `WRITE_DAC` or `WRITE_OWNER` on it, and a SACL SeSecurityPrivilege.
+- **Impersonation:** a thread may act as another token (`ImpersonateSelf`, `SetThreadToken`,
+  `ImpersonateLoggedOnUser`, `ImpersonateNamedPipeClient`) until `RevertToSelf`. Its effective token is the one
+  access is checked with; `OpenThreadToken` and the thread pseudo-handles give it.
+
 **Threads.** Each thread is a guest thread with a CPU, a TEB and a stack of its own (`threads.rs`). It starts in
 ntdll's `AtlasThreadStart`, which waits there if it was made suspended, gives the thread its own static TLS blocks,
 calls each DLL's `DllMain` with `DLL_THREAD_ATTACH`, then runs the thread's routine. `SuspendThread` preempts a
@@ -830,6 +882,12 @@ part of it, in more detail. When an item is done it comes off, and this README s
       Named pipes, the rest: overlapped writes that wait for room, `ImpersonateNamedPipeClient` (with security),
       `GetNamedPipeHandleState`, and `CancelSynchronousIo`. Sharing modes; file times that can be set; `ReplaceFile`, hard and symbolic links, reparse
       points; other drive letters; `GetVolumeInformation` and disk space.
+- [ ] Security, the rest: `SetEntriesInAcl`, inheritance from a folder or parent key, descriptors on processes,
+      threads, pipes and keys made with one, descriptors kept on disk, `NtQueryObject`, restricted tokens, and the
+      `*A` functions.
+- [ ] System information, the rest: CPU time counted per thread and process (`GetProcessTimes`, the process list's
+      times, processor times that aren't all idle); the host's own time zone; `QueryInterruptTime` and
+      `QueryUnbiasedInterruptTime`; `NtQueryObject`, with the type numbers the handle lists use.
 - [ ] The registry: `RegNotifyChangeKeyValue`, security (`RegGetKeySecurity`), the 32-bit view (`WOW6432Node`),
       `RegLoadKey` and `RegSaveKey`, and saving more often than at a flush and the machine's end.
 - [ ] The desktop, the rest: minimizing and maximizing; the cursor's shape; `SetCapture`; the z-order of child

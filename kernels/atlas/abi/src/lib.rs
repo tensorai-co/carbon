@@ -35,6 +35,8 @@ pub mod call {
     pub const WAKE_ADDRESS: u64 = 10;
     /// The first thing a new thread does: a suspended thread waits here until it's resumed.
     pub const THREAD_STARTED: u64 = 11;
+    /// `NtQuerySystemInformation(class, buffer, length, return_length)`: an NTSTATUS.
+    pub const QUERY_SYSTEM_INFORMATION: u64 = 12;
 
     /// An upcall's callback has returned: this is the trap at the return address atlas gave it.
     pub const UPCALL_RETURN: u64 = 0xfff;
@@ -130,6 +132,16 @@ pub mod peb {
     pub const IMAGE_BASE: u64 = 0x10;
     pub const PROCESS_PARAMETERS: u64 = 0x20;
     pub const PROCESS_HEAP: u64 = 0x30;
+    pub const NUMBER_OF_PROCESSORS: u64 = 0xb8;
+    /// The Windows it is: major, minor, build (a u16), service pack (a u16), platform (2, NT).
+    pub const OS_MAJOR_VERSION: u64 = 0x118;
+    pub const OS_MINOR_VERSION: u64 = 0x11c;
+    pub const OS_BUILD_NUMBER: u64 = 0x120;
+    pub const OS_PLATFORM_ID: u64 = 0x124;
+    /// The program's subsystem (2 GUI, 3 console) and its version, from its PE header.
+    pub const IMAGE_SUBSYSTEM: u64 = 0x128;
+    pub const IMAGE_SUBSYSTEM_MAJOR: u64 = 0x12c;
+    pub const IMAGE_SUBSYSTEM_MINOR: u64 = 0x130;
     pub const SIZE: u64 = 0x7c8;
 }
 

@@ -55,11 +55,13 @@ pub struct State {
 pub struct Object {
     pub kind: Kind,
     pub state: Mutex<State>,
+    /// The descriptor it was made with or given since; None for its maker's token's default.
+    pub security: Mutex<Option<crate::security::Descriptor>>,
 }
 
 impl Object {
     pub fn new(kind: Kind, state: State) -> Arc<Object> {
-        Arc::new(Object { kind, state: Mutex::new(state) })
+        Arc::new(Object { kind, state: Mutex::new(state), security: Mutex::new(None) })
     }
 
     /// Whether a wait by thread `tid` would be satisfied now.

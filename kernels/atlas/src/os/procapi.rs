@@ -216,7 +216,7 @@ fn create_process(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Re
         (handles, std_handles)
     };
 
-    let launch = Launch { path, bytes, command_line, environment, cwd: Some(cwd), handles, std_handles, suspended: flags & CREATE_SUSPENDED != 0 };
+    let launch = Launch { path, bytes, command_line, environment, cwd: Some(cwd), handles, std_handles, suspended: flags & CREATE_SUSPENDED != 0, parent: task.process.pid };
     let k = task.k.clone();
     let (made, child) = std::sync::mpsc::channel();
     let started = kernels_core::thread::spawn(task.k.exec.clone(), "atlas process".to_string(), move |cx| {

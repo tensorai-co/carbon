@@ -68,6 +68,10 @@ impl Task {
         let inheritable = self.inheritable_by(cx, attributes);
         match self.k.objects.create(name.as_deref(), kind, state) {
             Ok((object, existed)) => {
+                if !existed && let Some(d) = self.attributes_descriptor(cx, attributes) {
+                    let d = d.filled(&lock(&self.effective_token().state)).mapped(&super::secapi::kind_mapping(&object.kind));
+                    *lock(&object.security) = Some(d);
+                }
                 self.set_last_error(cx, if existed { ERROR_ALREADY_EXISTS } else { 0 });
                 Reply::Value(self.new_handle_with(object, inheritable))
             }
@@ -78,9 +82,14 @@ impl Task {
         }
     }
 
-    fn open_object(&mut self, cx: &mut Cx<'_>, name: u64, kind: fn(&Kind) -> bool) -> Reply {
+    /// Opens a named object, if its descriptor allows `access`.
+    fn open_object(&mut self, cx: &mut Cx<'_>, access: u64, name: u64, kind: fn(&Kind) -> bool, mapping: &crate::security::Mapping) -> Reply {
         let found = self.name(cx, name, true).and_then(|n| self.k.objects.named(&n)).filter(|o| kind(&o.kind));
         match found {
+            Some(object) if !self.allows(&object.security, access as u32, mapping) => {
+                self.set_last_error(cx, 5); // ERROR_ACCESS_DENIED
+                Reply::Value(0)
+            }
             Some(object) => Reply::Value(self.new_handle(object)),
             None => {
                 self.set_last_error(cx, ERROR_FILE_NOT_FOUND);
@@ -101,7 +110,7 @@ impl Task {
         }
     }
 
-    fn thread_of(&self, handle: u64) -> Option<Arc<crate::threads::ThreadControl>> {
+    pub(crate) fn thread_of(&self, handle: u64) -> Option<Arc<crate::threads::ThreadControl>> {
         let object = self.object(handle)?;
         let Kind::Thread(tid) = object.kind else { return None };
         let own = lock(&self.process.state).threads.get(&tid).cloned();
@@ -215,7 +224,7 @@ pub fn create_event_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 }
 
 pub fn open_event_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    task.open_object(cx, a[2], |k| matches!(k, Kind::Event { .. }))
+    task.open_object(cx, a[0], a[2], |k| matches!(k, Kind::Event { .. }), &crate::security::EVENT)
 }
 
 fn change_event(task: &mut Task, cx: &mut Cx<'_>, handle: u64, set: bool) -> Reply {
@@ -259,7 +268,7 @@ pub fn create_mutex_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 }
 
 pub fn open_mutex_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    task.open_object(cx, a[2], |k| *k == Kind::Mutant)
+    task.open_object(cx, a[0], a[2], |k| *k == Kind::Mutant, &crate::security::MUTANT)
 }
 
 pub fn release_mutex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
@@ -434,7 +443,7 @@ pub fn create_waitable_timer_ex_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -
 }
 
 pub fn open_waitable_timer_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    task.open_object(cx, a[2], |k| matches!(k, Kind::Timer { .. }))
+    task.open_object(cx, a[0], a[2], |k| matches!(k, Kind::Timer { .. }), &crate::security::TIMER)
 }
 
 /// Arms a timer's expiry at `when`, for setting number `generation`: it sets the timer, queues its APC, and arms the

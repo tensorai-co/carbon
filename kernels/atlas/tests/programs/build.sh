@@ -28,6 +28,12 @@ for arch in aarch64 x86_64; do
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console sections.c "$out/kernel32-$arch.lib" -o "$out/loader-$arch/sections.exe"
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console io.c "$out/kernel32-$arch.lib" -o "$out/loader-$arch/io.exe"
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console pipes.c "$out/kernel32-$arch.lib" -o "$out/loader-$arch/pipes.exe"
+    $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console sysinfo.c "$out/kernel32-$arch.lib" "$out/ntdll-$arch.lib" -o "$out/loader-$arch/sysinfo.exe"
+    # The same, with a manifest that says it supports Windows 10.
+    "$llvm/llvm-rc" -no-preprocess -fo "$out/sysinfo10-$arch.res" sysinfo10.rc
+    $cc -DWIN10 -Wl,/entry:mainCRTStartup -Wl,/subsystem:console sysinfo.c "$out/kernel32-$arch.lib" "$out/ntdll-$arch.lib" \
+        -Wl,"$out/sysinfo10-$arch.res" -o "$out/loader-$arch/sysinfo10.exe"
+    $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console security.c "$out/kernel32-$arch.lib" "$out/advapi32-$arch.lib" -o "$out/loader-$arch/security.exe"
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console environment.c "$out/kernel32-$arch.lib" -o "$out/loader-$arch/environment.exe"
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:windows desktop.c "$out/kernel32-$arch.lib" "$out/user32-$arch.lib" "$out/shell32-$arch.lib" -o "$out/loader-$arch/desktop.exe"
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:windows windows.c "$out/kernel32-$arch.lib" "$out/user32-$arch.lib" "$out/gdi32-$arch.lib" \

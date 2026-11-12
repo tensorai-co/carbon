@@ -1,0 +1,2 @@
+// sysinfo10.exe's manifest: it supports Windows 10, so GetVersionEx tells it the truth.
+1 24 "sysinfo10.manifest"

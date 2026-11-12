@@ -30,6 +30,8 @@ pub(crate) struct ThreadControl {
     pub apcs: Apcs,
     /// Mutants it may own, to abandon if it ends holding them.
     pub owned: Mutex<Vec<Weak<Object>>>,
+    /// The token it's impersonating, if it is.
+    pub token: Mutex<Option<Arc<crate::security::Token>>>,
 }
 
 impl ThreadControl {
@@ -44,6 +46,7 @@ impl ThreadControl {
             killed: Mutex::new(None),
             apcs: Mutex::new(Default::default()),
             owned: Mutex::new(Vec::new()),
+            token: Mutex::new(None),
         })
     }
 }

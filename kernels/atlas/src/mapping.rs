@@ -168,7 +168,7 @@ impl Task {
             let mut old = None;
             while at < range.end {
                 let Some((r, a)) = state.regions.find(at) else { return status::INVALID_PARAMETER };
-                if matches!(a.kind, AreaKind::Kept | AreaKind::Reserved) {
+                if matches!(a.kind, AreaKind::Kept | AreaKind::Reserved | AreaKind::System) {
                     return status::INVALID_PARAMETER;
                 }
                 // A shared view is no more writable than its section.

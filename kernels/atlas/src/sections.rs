@@ -28,6 +28,8 @@ pub struct Section {
     pub file: Option<Ino>,
     /// Its frames by page, made as they're first wanted.
     frames: Mutex<BTreeMap<u64, Frame>>,
+    /// The descriptor it was made with or given since; None for its maker's token's default.
+    pub security: Mutex<Option<crate::security::Descriptor>>,
 }
 
 impl std::fmt::Debug for Section {
@@ -52,7 +54,7 @@ impl Drop for Section {
 
 impl Section {
     pub fn new(exec: SharedExec, size: u64, writable: bool, executable: bool, file: Option<Ino>) -> Arc<Section> {
-        Arc::new(Section { exec, size, writable, executable, file, frames: Mutex::new(BTreeMap::new()) })
+        Arc::new(Section { exec, size, writable, executable, file, frames: Mutex::new(BTreeMap::new()), security: Mutex::new(None) })
     }
 
     pub fn pages(&self) -> u64 {

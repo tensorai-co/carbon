@@ -105,8 +105,21 @@ fn create_file(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply
             }
         };
     }
+    // A file given a descriptor of its own is opened only as it allows.
+    let full = task.security_path(&name);
+    let kept = full.as_ref().and_then(|p| lock(&task.k.file_security).get(p).cloned());
+    if let Some(d) = kept
+        && crate::security::access_check(&d, &lock(&task.effective_token().state), a[1] as u32, &crate::security::FILE).is_err()
+    {
+        task.set_last_error(cx, 5); // ERROR_ACCESS_DENIED
+        return Reply::Value(INVALID_HANDLE_VALUE);
+    }
     match task.open_file(&name, a[1] as u32, a[4] as u32, a[5] as u32) {
         Ok((file, existed)) => {
+            if !existed && let Some(d) = task.attributes_descriptor(cx, a[3]) {
+                let d = d.filled(&lock(&task.effective_token().state)).mapped(&crate::security::FILE);
+                lock(&task.k.file_security).insert(file.path.to_ascii_lowercase(), d);
+            }
             // CREATE_ALWAYS and OPEN_ALWAYS say whether it was already there.
             let said = if existed && matches!(a[4], 2 | 4) { ERROR_ALREADY_EXISTS } else { 0 };
             task.set_last_error(cx, said);
@@ -551,7 +564,10 @@ fn path_op(task: &mut Task, cx: &mut Cx<'_>, at: u64, wide: bool, op: impl FnOnc
 }
 
 pub fn delete_file_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    path_op(task, cx, a[0], true, Task::delete_file)
+    let path = task.path_arg(cx, a[0], true);
+    let done = path_op(task, cx, a[0], true, Task::delete_file);
+    task.forget_security(path.as_deref(), done);
+    done
 }
 
 pub fn delete_file_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
@@ -559,7 +575,15 @@ pub fn delete_file_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 }
 
 pub fn create_directory_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    path_op(task, cx, a[0], true, Task::create_directory)
+    let done = path_op(task, cx, a[0], true, Task::create_directory);
+    if done == Reply::Value(TRUE)
+        && let Some(d) = task.attributes_descriptor(cx, a[1])
+        && let Some(path) = task.path_arg(cx, a[0], true).and_then(|p| task.security_path(&p))
+    {
+        let d = d.filled(&lock(&task.effective_token().state)).mapped(&crate::security::FILE);
+        lock(&task.k.file_security).insert(path, d);
+    }
+    done
 }
 
 pub fn create_directory_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
@@ -567,7 +591,10 @@ pub fn create_directory_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply 
 }
 
 pub fn remove_directory_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    path_op(task, cx, a[0], true, Task::remove_directory)
+    let path = task.path_arg(cx, a[0], true);
+    let done = path_op(task, cx, a[0], true, Task::remove_directory);
+    task.forget_security(path.as_deref(), done);
+    done
 }
 
 pub fn move_file_ex_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {

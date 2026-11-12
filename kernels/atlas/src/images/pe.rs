@@ -7,6 +7,7 @@ pub const MACHINE_AMD64: u16 = 0x8664;
 pub const MACHINE_ARM64: u16 = 0xaa64;
 
 const DIR_EXPORT: usize = 0;
+const DIR_RESOURCE: usize = 2;
 const DIR_BASERELOC: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +132,38 @@ impl<'a> Pe<'a> {
 
     fn dir(&self, index: usize) -> Option<(u32, u32)> {
         self.dirs.get(index).copied().filter(|(rva, size)| *rva != 0 && *size != 0)
+    }
+
+    /// The subsystem it's for (2 GUI, 3 console), and that subsystem's version.
+    pub fn subsystem(&self) -> (u16, u16, u16) {
+        let opt = u32_at(self.bytes, 0x3c).map(|pe| pe as usize + 24).unwrap_or(0);
+        let at = |o: usize| u16_at(self.bytes, opt + o).unwrap_or(0);
+        (at(68), at(48), at(50))
+    }
+
+    /// A resource's bytes, in the image as laid out: of type `kind` (24 is a manifest), its first name and language.
+    pub fn resource<'i>(&self, image: &'i [u8], kind: u16) -> Option<&'i [u8]> {
+        let (root, _) = self.dir(DIR_RESOURCE)?;
+        let root = root as usize;
+        // A directory's entries: (name or ID, offset from the root, whether that's another directory).
+        let entries = |at: usize| -> Option<Vec<(u32, usize, bool)>> {
+            let count = usize::from(u16_at(image, at + 12).ok()?) + usize::from(u16_at(image, at + 14).ok()?);
+            (0..count.min(4096))
+                .map(|i| {
+                    let e = at + 16 + i * 8;
+                    let (name, offset) = (u32_at(image, e).ok()?, u32_at(image, e + 4).ok()?);
+                    Some((name, root + (offset & 0x7fff_ffff) as usize, offset & 0x8000_0000 != 0))
+                })
+                .collect()
+        };
+        let (_, names, sub) = entries(root)?.into_iter().find(|(name, _, _)| *name == u32::from(kind))?;
+        let (_, languages, sub2) = *entries(names).filter(|_| sub)?.first()?;
+        let (_, leaf, sub3) = *entries(languages).filter(|_| sub2)?.first()?;
+        if sub3 {
+            return None;
+        }
+        let (rva, size) = (u32_at(image, leaf).ok()? as usize, u32_at(image, leaf + 4).ok()? as usize);
+        image.get(rva..rva + size)
     }
 
     /// A data directory's RVA and size (1 imports, 13 delay-load imports, …), if it has one.

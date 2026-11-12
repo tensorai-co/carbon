@@ -67,6 +67,14 @@ pub(crate) struct ProcState {
     pub command_line: (u64, u64),
     /// Set once the process is ending, with its exit code.
     pub exiting: Option<u32>,
+    /// Its manifest says it supports Windows 10: version calls tell it the truth, not Windows 8.
+    pub windows10: bool,
+    /// The process that started it (0 for the first), when (a FILETIME), and its program's Windows path.
+    pub parent: u64,
+    pub created: u64,
+    pub image: String,
+    /// Its primary token: a copy of its parent's, or the user's.
+    pub token: Arc<crate::security::Token>,
 }
 
 /// What the program was promised in a region.
@@ -98,6 +106,8 @@ pub(crate) enum AreaKind {
     Kept,
     /// A view of a section.
     View,
+    /// A page of the system's own, the same in every process: the shared data page.
+    System,
 }
 
 impl Region for Area {
@@ -255,6 +265,11 @@ impl Task {
                 let freed = self.virtual_free(cx, a[0], a[1], a[2] as u32);
                 self.answer(cx, if freed { 0 } else { u64::from(status::INVALID_PARAMETER) })
             }
+            call::QUERY_SYSTEM_INFORMATION => {
+                let a = self.args(cx, 4);
+                let code = self.query_system_information(cx, a[0] as u32, a[1], a[2], a[3]);
+                self.answer(cx, u64::from(code))
+            }
             call::DEBUG_PRINT => {
                 let a = self.args(cx, 2);
                 if let Ok(text) = self.mem(cx, false, |t| user::read_vec(&t.space(), a[0], a[1].min(4096) as usize)) {
@@ -383,7 +398,7 @@ impl Task {
         let mut at = range.start;
         while at < range.end {
             let (r, a) = state.regions.find(at)?;
-            if matches!(a.kind, AreaKind::Kept | AreaKind::Image | AreaKind::View) {
+            if matches!(a.kind, AreaKind::Kept | AreaKind::Image | AreaKind::View | AreaKind::System) {
                 return None;
             }
             at = r.end;
@@ -402,7 +417,7 @@ impl Task {
         const MEM_RELEASE: u32 = 0x8000;
         let mut state = lock(&self.process.state);
         let Some((range, area)) = state.regions.find(addr).map(|(r, a)| (r, a.clone())) else { return false };
-        if matches!(area.kind, AreaKind::Kept | AreaKind::Image | AreaKind::View) {
+        if matches!(area.kind, AreaKind::Kept | AreaKind::Image | AreaKind::View | AreaKind::System) {
             return false;
         }
         let range = match kind {
@@ -521,6 +536,8 @@ pub(crate) struct Launch {
     pub std_handles: [u64; 3],
     /// Made with `CREATE_SUSPENDED`: its first thread waits for `ResumeThread`.
     pub suspended: bool,
+    /// The process starting it, or 0.
+    pub parent: u64,
 }
 
 /// Starts process 1: `argv[0]` from the disk, loaded with its system DLLs, with the host's console as its standard
@@ -536,12 +553,12 @@ pub(crate) fn start(k: &Arc<Kernel>, cx: &mut Cx<'_>, argv: &[String]) -> Result
     let mut handles = Handles::default();
     let std_handles = [handles.add(Handle::Input), handles.add(Handle::Console(host::Stream::Out)), handles.add(Handle::Console(host::Stream::Err))];
     let environment = crate::environment::block(&crate::environment::first(k, isa));
-    launch(k, cx, Launch { path, bytes, command_line: command_line(argv), environment, cwd: None, handles, std_handles, suspended: false })
+    launch(k, cx, Launch { path, bytes, command_line: command_line(argv), environment, cwd: None, handles, std_handles, suspended: false, parent: 0 })
 }
 
 /// Starts a process on this host thread (whose CPU becomes its first thread's), giving that thread's task to run.
 pub(crate) fn launch(k: &Arc<Kernel>, cx: &mut Cx<'_>, launch: Launch) -> Result<Task, String> {
-    let Launch { path, bytes, command_line: line, environment, cwd, handles, std_handles, suspended } = launch;
+    let Launch { path, bytes, command_line: line, environment, cwd, handles, std_handles, suspended, parent } = launch;
     let pe = Pe::parse(&bytes).map_err(|_| format!("{path} isn't a Windows program"))?;
     if pe.is_dll {
         return Err(format!("{path} is a DLL"));
@@ -551,6 +568,13 @@ pub(crate) fn launch(k: &Arc<Kernel>, cx: &mut Cx<'_>, launch: Launch) -> Result
     let windows_path = format!("C:{}", path.replace('/', "\\"));
     let pid = k.new_id();
     let tid = k.new_id();
+    // Whether its manifest says it knows Windows 10: what `GetVersionEx` tells it.
+    // A copy of its parent's token, so a change to either is its own.
+    let token = Arc::new(k.process(parent).map_or_else(crate::security::Token::administrator, |p| {
+        let token = lock(&p.state).token.clone();
+        token.duplicate(1, 0)
+    }));
+    let windows10 = pe.resource(&image, 24).is_some_and(|m| String::from_utf8_lossy(m).to_ascii_lowercase().contains(crate::system::WINDOWS_10_GUID));
 
     let mut regions: Regions<Area> = Regions::default();
     let started = cx
@@ -579,6 +603,15 @@ pub(crate) fn launch(k: &Arc<Kernel>, cx: &mut Cx<'_>, launch: Launch) -> Result
             k.images.use_gate(gate.is_some());
             t.space().map(ATLAS_PAGE..ATLAS_PAGE + PAGE, Prot::RX).with(&images::atlas_page(isa, gate)).map_err(|_| "no memory")?;
             regions.insert(ATLAS_PAGE..ATLAS_PAGE + PAGE, Area::of(Prot::RX, AreaKind::Image));
+
+            // The shared data page, read-only, where Windows has it (where the host leaves that address free).
+            let shared = crate::system::SHARED_DATA;
+            if let Some(frame) = k.shared.get().and_then(|s| s.frame(isa))
+                && regions.is_free(shared..shared + PAGE)
+            {
+                t.space().map(shared..shared + PAGE, Prot::R).frame(frame).map_err(|_| "no memory for the shared data page")?;
+                regions.insert(shared..shared + PAGE, Area::of(Prot::R, AreaKind::System));
+            }
 
             // The PEB, its process parameters and strings, and the TEB, in one committed block.
             let block = regions.free_above(ALLOC, GRANULE * 2, GRANULE).ok_or("no room")?;
@@ -614,6 +647,15 @@ pub(crate) fn launch(k: &Arc<Kernel>, cx: &mut Cx<'_>, launch: Launch) -> Result
             put(ansi_at, &ansi)?;
             put(path_at, &image_path)?;
             put(peb_at + peb::IMAGE_BASE, &base.to_le_bytes())?;
+            put(peb_at + peb::NUMBER_OF_PROCESSORS, &(k.host.cpus() as u32).to_le_bytes())?;
+            put(peb_at + peb::OS_MAJOR_VERSION, &crate::system::MAJOR.to_le_bytes())?;
+            put(peb_at + peb::OS_MINOR_VERSION, &crate::system::MINOR.to_le_bytes())?;
+            put(peb_at + peb::OS_BUILD_NUMBER, &(crate::system::BUILD as u16).to_le_bytes())?;
+            put(peb_at + peb::OS_PLATFORM_ID, &2u32.to_le_bytes())?;
+            let (subsystem, subsystem_major, subsystem_minor) = pe.subsystem();
+            put(peb_at + peb::IMAGE_SUBSYSTEM, &u32::from(subsystem).to_le_bytes())?;
+            put(peb_at + peb::IMAGE_SUBSYSTEM_MAJOR, &u32::from(subsystem_major).to_le_bytes())?;
+            put(peb_at + peb::IMAGE_SUBSYSTEM_MINOR, &u32::from(subsystem_minor).to_le_bytes())?;
             put(peb_at + peb::PROCESS_PARAMETERS, &params_at.to_le_bytes())?;
             put(params_at, &(params::SIZE as u32).to_le_bytes())?;
             for (i, at) in [params::STANDARD_INPUT, params::STANDARD_OUTPUT, params::STANDARD_ERROR].into_iter().enumerate() {
@@ -671,7 +713,7 @@ pub(crate) fn launch(k: &Arc<Kernel>, cx: &mut Cx<'_>, launch: Launch) -> Result
     let mut threads = BTreeMap::new();
     threads.insert(tid, control.clone());
     let cwd = cwd.unwrap_or_else(|| format!("C:\\{}", exe_dir.trim_start_matches('/').replace('/', "\\")));
-    let state = ProcState { space, dispatcher, thread_start, peb, threads, mapped, exe_dir, cwd, regions, handles, std_handles, command_line: command, exiting: None };
+    let state = ProcState { space, dispatcher, thread_start, peb, threads, mapped, exe_dir, cwd, regions, handles, std_handles, command_line: command, exiting: None, windows10, parent, created: crate::files::filetime(k.host.wall()), image: windows_path.clone(), token };
     let object = Object::new(objects_mod::Kind::Process(pid), State::default());
     let process = Arc::new(Process { pid, state: Mutex::new(state), remote: Mutex::new(false), object, ended: (Mutex::new(None), Condvar::new()) });
     k.started(&process);

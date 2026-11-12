@@ -25,11 +25,16 @@ pub enum Handle {
     Section(Arc<crate::sections::Section>),
     /// An I/O completion port.
     Port(Arc<crate::ports::Port>),
+    /// An access token: a process's own (`OpenProcessToken`), or a copy (`DuplicateTokenEx`).
+    Token(Arc<crate::security::Token>),
 }
 
 /// `GetCurrentProcess()` and `GetCurrentThread()`.
 pub const CURRENT_PROCESS: u64 = u64::MAX;
 pub const CURRENT_THREAD: u64 = u64::MAX - 1;
+/// `GetCurrentProcessToken()`, `GetCurrentThreadToken()` and `GetCurrentThreadEffectiveToken()`, for queries.
+pub const CURRENT_PROCESS_TOKEN: u64 = u64::MAX - 3;
+pub const CURRENT_THREAD_EFFECTIVE_TOKEN: u64 = u64::MAX - 5;
 
 #[derive(Default)]
 pub struct Handles {
@@ -67,6 +72,11 @@ impl Handles {
 
     pub fn contains(&self, value: u64) -> bool {
         self.map.contains_key(&value)
+    }
+
+    /// Every handle, with its value, in order.
+    pub fn iter(&self) -> impl Iterator<Item = (u64, &Handle)> {
+        self.map.iter().map(|(v, h)| (*v, h))
     }
 
     /// Whether any handle is one `f` says yes to.

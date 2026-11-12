@@ -117,6 +117,10 @@ fn create_file_mapping(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) 
         }
         Section::new(task.k.exec.clone(), size, writable, executable, Some(ino))
     };
+    if let Some(d) = task.attributes_descriptor(cx, attributes) {
+        let d = d.filled(&lock(&task.effective_token().state)).mapped(&crate::security::SECTION);
+        *lock(&section.security) = Some(d);
+    }
     if let Some(name) = name {
         let mut names = lock(&task.k.sections);
         names.retain(|_, w| w.strong_count() > 0);
@@ -138,6 +142,7 @@ pub fn create_file_mapping_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Rep
 fn open_file_mapping(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
     let found = task.section_name(cx, a[2], wide).and_then(|name| lock(&task.k.sections).get(&name).and_then(Weak::upgrade));
     match found {
+        Some(section) if !task.allows(&section.security, a[0] as u32, &crate::security::SECTION) => task.null(cx, ERROR_ACCESS_DENIED),
         Some(section) => Reply::Value(lock(&task.process.state).handles.add_with(Handle::Section(section), a[1] as u32 != 0)),
         None => task.null(cx, ERROR_FILE_NOT_FOUND),
     }

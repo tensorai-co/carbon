@@ -35,7 +35,7 @@ const PIPE_NOWAIT: u32 = 1;
 
 impl Task {
     /// The named pipe end a handle is, with its file.
-    fn pipe_end(&self, handle: u64) -> Option<Arc<File>> {
+    pub(crate) fn pipe_end(&self, handle: u64) -> Option<Arc<File>> {
         match lock(&self.process.state).handles.get(handle)? {
             Handle::File(file) if matches!(file.node, Node::NamedPipe(_)) => Some(file),
             _ => None,

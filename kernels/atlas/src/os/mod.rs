@@ -9,8 +9,10 @@ pub mod kernel32;
 pub mod memapi;
 pub mod pipeapi;
 pub mod procapi;
+pub mod secapi;
 pub mod shell32;
 pub mod synch;
+pub mod sysapi;
 pub mod user32;
 
 use kernels_core::thread::Cx;
