@@ -73,7 +73,7 @@ Everything is kept in `CARBON_HOME`, or `~/.carbon`. [`cli`](cli/README.md) has 
 | The CPUs and memory | [`exec`](exec/README.md) | Runs a program's machine code in a hardware VM or a process sandbox, and stops it whenever it needs its kernel | Built, on all three hosts |
 | The OS | [`kernels`](kernels/README.md) | lambda (Linux) and atlas (Windows), on a shared `kernels-core`; [obsidian](kernels/obsidian/README.md) (Android) later | Being built |
 | The disk | [`layers`](layers/README.md) | The file system programs see: an image's index, merged, with the machine's own log on top | Built |
-| The screen | [`display`](display/README.md) | The desktop both kernels' windows go on: frames, stacking, focus and input, on a screen in memory or the host's windows | The desktop is built; host windows to do |
+| The screen | [`display`](display/README.md) | The desktop both kernels' windows go on: frames, stacking, focus and input, on a screen in memory or the host's windows | The desktop is built, and shown on macOS, whole or a Mac window for each window |
 | The sound | [`audio`](audio/README.md) | The mixer every program's sound goes into, and the microphone | Not started |
 | The network | [`net`](net/README.md) | Every socket: the machine's addresses, loopback, Unix sockets and DNS, out through the host's sockets | Out works; in, policy and Winsock to do |
 | The host | [`host`](host/README.md) | Standard streams, clocks, randomness, memory, the terminal, certificate trust | Built |
@@ -186,7 +186,8 @@ programs and how to build them are in [`kernels`](kernels/README.md).
   trusts), with machines kept by name, stopped, frozen and started again.
 - **net** gives each machine its own network out through the host's sockets: `apt-get update` and `curl https://`
   work in `debian:13` on all three hosts.
-- **display** has the desktop on a screen in memory. **audio**, **remote** and **sdk** are designed, not started.
+- **display** has the desktop on a screen in memory, and on a Mac's screen: whole in one window (`--display host`), or
+  each window in a Mac window of its own (`--display host-windows`). **audio**, **remote** and **sdk** are designed, not started.
 
 ## The order of work
 
