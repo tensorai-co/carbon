@@ -3,10 +3,19 @@
 //! kernels share, on a screen in memory. Keys are evdev numbers (`keys`). Showing the desktop in the host's own
 //! windows comes later, per host, as `display/macos` and the rest.
 
+pub mod buffer;
+pub mod clock;
+pub mod cursor;
 pub mod desktop;
 pub mod font;
 pub mod keys;
+pub mod keymap;
+pub mod observe;
+pub mod output;
+pub mod positioner;
+pub mod selection;
 
+pub use buffer::{Buffer, Canvas, Format, Pixels};
 pub use desktop::Desktop;
 
 /// A colour as `0x00RRGGBB`.

@@ -123,3 +123,58 @@ pub fn for_char(c: char) -> Option<(u16, bool)> {
         _ => TYPED.iter().find_map(|t| if t.1 == c { Some((t.0, false)) } else if t.2 == c { Some((t.0, true)) } else { None }),
     }
 }
+
+/// A key by its name, as `carbon display key` takes it: a letter or digit, `f1` to `f12`, or a name (`enter`, `esc`,
+/// `tab`, `space`, `backspace`, `delete`, `insert`, `home`, `end`, `pageup`, `pagedown`, the arrows, `ctrl`, `shift`,
+/// `alt`, `meta`, and the punctuation keys by name), whatever its case.
+pub fn by_name(name: &str) -> Option<u16> {
+    let n = name.to_ascii_lowercase();
+    let mut chars = n.chars();
+    if let (Some(c), None) = (chars.next(), chars.next())
+        && c.is_ascii_alphanumeric()
+    {
+        return for_char(c).map(|(code, _)| code);
+    }
+    if let Some(f) = n.strip_prefix('f').and_then(|d| d.parse::<u16>().ok()) {
+        return match f {
+            1..=10 => Some(F1 + f - 1),
+            11 => Some(F11),
+            12 => Some(F12),
+            _ => None,
+        };
+    }
+    Some(match n.as_str() {
+        "enter" | "return" => ENTER,
+        "esc" | "escape" => ESC,
+        "tab" => TAB,
+        "space" => SPACE,
+        "backspace" => BACKSPACE,
+        "delete" | "del" => DELETE,
+        "insert" | "ins" => INSERT,
+        "home" => HOME,
+        "end" => END,
+        "pageup" | "pgup" => PAGE_UP,
+        "pagedown" | "pgdn" => PAGE_DOWN,
+        "up" => UP,
+        "down" => DOWN,
+        "left" => LEFT,
+        "right" => RIGHT,
+        "ctrl" | "control" => LEFT_CTRL,
+        "shift" => LEFT_SHIFT,
+        "alt" | "option" => LEFT_ALT,
+        "meta" | "super" | "win" | "cmd" => LEFT_META,
+        "capslock" => CAPS_LOCK,
+        "minus" => MINUS,
+        "equal" => EQUAL,
+        "comma" => COMMA,
+        "period" | "dot" => DOT,
+        "slash" => SLASH,
+        "backslash" => BACKSLASH,
+        "semicolon" => SEMICOLON,
+        "apostrophe" | "quote" => APOSTROPHE,
+        "grave" | "backtick" => GRAVE,
+        "bracketleft" => LEFT_BRACE,
+        "bracketright" => RIGHT_BRACE,
+        _ => return None,
+    })
+}
