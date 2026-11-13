@@ -327,6 +327,25 @@ impl Network {
         self.0.address
     }
 
+    /// A name's addresses, as the machine's resolver gives them: its own name and `localhost` it answers itself, and
+    /// any other is looked up the host's way. It waits for the answer: kernels call it from a thread that may wait
+    /// (atlas's `getaddrinfo`, which programs call to wait). [`Error::NotFound`] for a name that isn't there. A `--dns`
+    /// server isn't asked here yet: the host's lookup is.
+    pub fn lookup(&self, name: &str) -> Result<Vec<IpAddr>> {
+        let name = name.trim_end_matches('.').to_ascii_lowercase();
+        let hostname = self.0.config.hostname.to_ascii_lowercase();
+        if !hostname.is_empty() && name == hostname {
+            return Ok(vec![IpAddr::V4(self.0.address)]);
+        }
+        if name == "localhost" {
+            return Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)]);
+        }
+        if name.is_empty() {
+            return Err(Error::NotFound);
+        }
+        self.0.host.lookup(&name)
+    }
+
     /// Its gateway and DNS server.
     pub fn gateway(&self) -> Ipv4Addr {
         self.0.gateway

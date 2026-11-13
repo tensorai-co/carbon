@@ -6,9 +6,10 @@ traffic over the host's own sockets. Like `display` and `audio`, it's a shared p
 neither kernel writes networking of its own: lambda's socket system calls and atlas's Winsock are each a thin layer
 over it.
 
-**Phases 1 and 2 are built** (the shared part in memory, and out through each host): lambda's sockets work on it,
-and `apt-get update` and `curl https://` work in `debian:13` on macOS, Linux and Windows. Ports in, policy, atlas's
-Winsock and networks between machines are to do.
+**Phases 1 and 2 are built** (the shared part in memory, and out through each host): lambda's sockets and atlas's
+Winsock work on it; `apt-get update` and `curl https://` work in `debian:13` on macOS, Linux and Windows, and a
+32-bit Windows program downloads and installs its update over HTTPS. Ports in, policy and networks between machines
+are to do.
 
 ```sh
 carbon run debian:13 -- curl https://example.com                      # out through the host, by default
@@ -104,7 +105,10 @@ itself and never goes through a machine's network.
 
 What each kernel does on it: lambda's socket system calls, sockets as files in `poll` and `epoll`, netlink, the
 interface ioctls, `/proc/net/*` and its own `/etc/resolv.conf`, `/etc/hosts` and `/etc/hostname` are in the
-[lambda's README](../kernels/lambda/README.md#how-it-works). atlas's Winsock is to do (below).
+[lambda's README](../kernels/lambda/README.md#how-it-works); atlas's Winsock, its sockets as files, its overlapped I/O
+and `getaddrinfo` (through `Network::lookup`, the resolver's answer without a DNS packet), in
+[atlas's](../kernels/atlas/README.md). A peek at a host connection takes what the host has (64 KiB at least), and a
+read after it gets the rest too, so a kernel that peeks to see what's readable doesn't make each read a byte.
 
 ## The design still to build
 

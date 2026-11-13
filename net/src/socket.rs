@@ -657,17 +657,31 @@ impl Socket {
         match &mut state.conn {
             Conn::Joined(end) => end.recv(len, peek).map(|got| Received { data: got.data, from: None, extra: got.extra, cred: got.cred, full: got.full }),
             Conn::Out { stream, peeked } => {
-                if peeked.is_empty() {
+                if peeked.is_empty() && !peek {
                     let mut buffer = vec![0; len.clamp(1, 1 << 20)];
                     let n = stream.read(&mut buffer)?;
                     buffer.truncate(n);
-                    if !peek {
-                        return Ok(Received { full: n, data: buffer, from: None, extra: None, cred: None });
+                    return Ok(Received { full: n, data: buffer, from: None, extra: None, cred: None });
+                }
+                // A peek takes what the host has (64 KiB of it at least, however little it asks for), so the reads
+                // after it get all of that, not just what was peeked.
+                if peek && peeked.len() < len.max(1) {
+                    let mut buffer = vec![0; len.clamp(64 << 10, 1 << 20)];
+                    match stream.read(&mut buffer) {
+                        Ok(n) => peeked.extend(&buffer[..n]),
+                        Err(e) if peeked.is_empty() => return Err(e),
+                        Err(_) => {}
                     }
-                    *peeked = buffer;
                 }
                 let n = len.min(peeked.len());
-                let data = if peek { peeked[..n].to_vec() } else { peeked.drain(..n).collect() };
+                let mut data: Vec<u8> = if peek { peeked[..n].to_vec() } else { peeked.drain(..n).collect() };
+                // A read past what was peeked has the rest of what the host has too.
+                if !peek && data.len() < len {
+                    let mut more = vec![0; (len - data.len()).min(1 << 20)];
+                    if let Ok(m) = stream.read(&mut more) {
+                        data.extend(&more[..m]);
+                    }
+                }
                 Ok(Received { full: data.len(), data, from: None, extra: None, cred: None })
             }
             Conn::Connecting(_) => Err(Error::WouldBlock),
