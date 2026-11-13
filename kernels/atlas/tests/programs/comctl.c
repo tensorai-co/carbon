@@ -64,6 +64,7 @@ K int __stdcall ImageList_ReplaceIcon(HANDLE, int, HANDLE);
 K int __stdcall ImageList_GetImageCount(HANDLE);
 K int __stdcall ImageList_GetIconSize(HANDLE, int *, int *);
 K int __stdcall ImageList_Remove(HANDLE, int);
+K HANDLE __stdcall CreateCompatibleBitmap(HDC, int, int);
 
 #define WM_NOTIFY 0x4e
 #define WM_INITDIALOG 0x110
@@ -283,7 +284,8 @@ void mainCRTStartup(void) {
     // ---- Image lists ----
     HANDLE images = ImageList_Create(16, 16, 0x20, 4, 4);
     int cx = 0, cy = 0;
-    check(images != 0 && ImageList_AddMasked(images, (HANDLE)1, 0) == 0 && ImageList_AddMasked(images, (HANDLE)1, 0) == 1, "ImageList_Create and ImageList_AddMasked");
+    HANDLE strip = CreateCompatibleBitmap(0, 32, 16);
+    check(images != 0 && ImageList_AddMasked(images, strip, 0) == 0 && ImageList_GetImageCount(images) == 2, "ImageList_Create, and ImageList_AddMasked cutting a bitmap into two");
     check(ImageList_ReplaceIcon(images, -1, (HANDLE)1) == 2 && ImageList_GetImageCount(images) == 3, "ImageList_ReplaceIcon adding one, and the count");
     check(ImageList_GetIconSize(images, &cx, &cy) && cx == 16 && cy == 16, "ImageList_GetIconSize");
     check(ImageList_Remove(images, 0) && ImageList_GetImageCount(images) == 2, "ImageList_Remove");

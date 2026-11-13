@@ -255,7 +255,8 @@ another process on Windows hosts; a worker process per machine.
 3. atlas's user interface: menus, the list box and combo box, comctl32's other controls (the tree view, tabs),
    `MsgWaitForMultipleObjects`. (Dialogs, with buttons, statics and edits, and comctl32's progress bar and list view
    are done.)
-4. GDI: bitmaps and memory DCs, DIB sections with shared pages, regions and shapes, real fonts.
+4. GDI: DIB sections with shared pages, regions and shapes, real fonts. (Bitmaps, memory DCs, `BitBlt` and icons are
+   done.)
 5. lambda's Wayland and X11 servers, so GTK, Qt and Firefox run.
 6. Graphics APIs: OpenGL, Direct3D and DXGI, and how they reach the host's GPU.
 

@@ -85,12 +85,17 @@ dll! {
     host GetSysColor(1) => get_sys_color;
     host GetSysColorBrush(1) => get_sys_color_brush;
     host GetSystemMetrics(1) => get_system_metrics;
-    host LoadCursorW(2) => load_resource;
-    host LoadIconW(2) => load_resource;
-    host LoadCursorA(2) => load_resource;
-    host LoadIconA(2) => load_resource;
-    host LoadBitmapW(2) => load_resource;
-    host LoadImageW(6) => load_resource;
+    host LoadCursorW(2) => load_cursor_w;
+    host LoadIconW(2) => load_icon_w;
+    host LoadCursorA(2) => load_cursor_a;
+    host LoadIconA(2) => load_icon_a;
+    host LoadBitmapW(2) => load_bitmap_w;
+    host LoadBitmapA(2) => load_bitmap_a;
+    host LoadImageW(6) => load_image_w;
+    host LoadImageA(6) => load_image_a;
+    host DrawIconEx(9) => draw_icon_ex;
+    host DrawIcon(4) => draw_icon;
+    host DestroyCursor(1) => destroy_icon;
     host SetCursor(1) => set_cursor;
     host GetCursor(0) => get_cursor;
     host GetFocus(0) => get_focus;
@@ -222,10 +227,76 @@ fn value(result: Result<u64, Reply>) -> Reply {
 
 
 
-/// `LoadCursorW`, `LoadIconW`, `LoadBitmapW` and `LoadImageW(instance, name, type, cx, cy, flags)`: something that
-/// isn't null, until there are resources.
-fn load_resource(_: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
-    Reply::Value(0x0001_0000 | (a[1] & 0xffff))
+/// `LoadImageW(instance, name, type, cx, cy, flags)`: a bitmap, icon or cursor from the module's resources or (with
+/// LR_LOADFROMFILE) a file. The system's own (no module) are handles that say which they are, the cursors among them
+/// drawn as the desktop's shapes. NULL, with ERROR_RESOURCE_NAME_NOT_FOUND, for one that isn't there.
+fn load_image(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    const LR_LOADFROMFILE: u32 = 0x10;
+    let (module, name, kind, width, height, flags) = (a[0], a[1], a[2] as u32, a[3] as i32, a[4] as i32, a[5] as u32);
+    if module == 0 && flags & LR_LOADFROMFILE == 0 {
+        return Reply::Value(0x0001_0000 | (name & 0xffff));
+    }
+    match task.load_picture(cx, module, name, kind, width, height, flags, wide) {
+        Some(loaded) => Reply::Value(task.picture_handle(loaded, kind)),
+        None => {
+            task.set_last_error(cx, 1814);
+            Reply::Value(0)
+        }
+    }
+}
+
+fn load_image_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    load_image(task, cx, a, true)
+}
+
+fn load_image_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    load_image(task, cx, a, false)
+}
+
+/// `LoadIcon`, `LoadCursor` and `LoadBitmap`: `LoadImage` at the default size.
+fn load_kind(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], kind: u32, wide: bool) -> Reply {
+    const LR_DEFAULTSIZE: u64 = 0x40;
+    let flags = if kind == win32k::image::IMAGE_BITMAP { 0 } else { LR_DEFAULTSIZE };
+    load_image(task, cx, &[a[0], a[1], u64::from(kind), 0, 0, flags], wide)
+}
+
+fn load_icon_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    load_kind(task, cx, a, win32k::image::IMAGE_ICON, true)
+}
+
+fn load_icon_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    load_kind(task, cx, a, win32k::image::IMAGE_ICON, false)
+}
+
+fn load_cursor_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    load_kind(task, cx, a, win32k::image::IMAGE_CURSOR, true)
+}
+
+fn load_cursor_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    load_kind(task, cx, a, win32k::image::IMAGE_CURSOR, false)
+}
+
+fn load_bitmap_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    load_kind(task, cx, a, win32k::image::IMAGE_BITMAP, true)
+}
+
+fn load_bitmap_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    load_kind(task, cx, a, win32k::image::IMAGE_BITMAP, false)
+}
+
+/// `DrawIconEx(dc, x, y, icon, cx, cy, step, brush, flags)`: at its own size for 0 (or DI_DEFAULTSIZE's), blended
+/// by its alpha. A system icon (no picture yet) draws nothing.
+fn draw_icon_ex(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let mut w = task.win32k();
+    if !w.gdi.icons.contains_key(&a[3]) {
+        return Reply::Value(u64::from(a[3] >> 16 == 1));
+    }
+    Reply::Value(u64::from(w.draw_icon(a[0], a[1] as i32, a[2] as i32, a[3], a[4] as i32, a[5] as i32)))
+}
+
+/// `DrawIcon(dc, x, y, icon)`: at the default icon size.
+fn draw_icon(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    draw_icon_ex(task, cx, &[a[0], a[1], a[2], a[3], 32, 32, 0, 0, 3])
 }
 
 fn message_box_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
@@ -755,9 +826,12 @@ fn get_class_info_ex_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     class_info(task, cx, a, true, true)
 }
 
-/// `DestroyIcon`: icons aren't objects yet (`LoadIcon`'s and `SHGetFileInfo`'s are placeholders), so there's nothing
-/// to free.
-fn destroy_icon(_: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+/// `DestroyIcon` and `DestroyCursor`: its picture freed. The system's own stay.
+fn destroy_icon(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let mut w = task.win32k();
+    if w.gdi.icons.contains_key(&a[0]) {
+        return Reply::Value(u64::from(w.gdi.delete(a[0])));
+    }
     Reply::Value(u64::from(a[0] != 0))
 }
 
@@ -1416,10 +1490,13 @@ fn set_capture(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
 /// `SetCursor`: what the pointer looks like now, over the window it's in (if it's this machine's), else the active
 /// one's. The cursor before.
 fn set_cursor(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let old = std::mem::replace(&mut task.win32k().cursor, a[0]);
+    let (old, cursor) = {
+        let mut w = task.win32k();
+        (std::mem::replace(&mut w.cursor, a[0]), crate::win32k::cursor_of(a[0], &w.gdi.icons))
+    };
     task.desktop(|d| {
         if let Some(id) = d.hovered().or(d.capture()).or(d.active()) {
-            d.set_cursor(id, crate::win32k::cursor_of(a[0]));
+            d.set_cursor(id, cursor.clone());
         }
     });
     Reply::Value(old)

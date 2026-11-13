@@ -2,7 +2,8 @@
 //! group boxes), statics (text, rectangles, frames and etched lines) and edits (one line, or several). Each paints
 //! itself with win32k's GDI into its top-level window's pixels, in the colours its parent gives with `WM_CTLCOLOR*`,
 //! and tells its parent what happened with `WM_COMMAND` (`BN_CLICKED`, `EN_CHANGE`). Text is drawn in the one font;
-//! a static's wraps at its width. Images (a static's icon or bitmap, a button's) are kept and not drawn yet.
+//! a static's wraps at its width. A static's icon or bitmap (`SS_ICON`, `SS_BITMAP`, from `STM_SETIMAGE` or its
+//! template's resource ID) and a button's (`BS_ICON`, `BS_BITMAP`, from `BM_SETIMAGE`) are drawn.
 
 use kernels_core::thread::Cx;
 use kernels_core::user;
@@ -245,7 +246,8 @@ impl Task {
             win.erase = false;
             let (client, text, style, ex_style) = (win.client(), win.text.clone(), win.style, win.ex_style);
             let c = w.controls.get(&hwnd).cloned().unwrap_or_default();
-            PaintInfo { client, text, style, ex_style, focused: focus == hwnd, enabled, control: c }
+            let picture = w.gdi.bitmaps.get(&c.image).cloned().map(Picture::Bitmap).or_else(|| w.gdi.icons.get(&c.image).cloned().map(Picture::Icon));
+            PaintInfo { picture, client, text, style, ex_style, focused: focus == hwnd, enabled, control: c }
         };
         let hdc = self.get_dc(hwnd);
         // 0: a control that keeps its colours itself, as comctl32's do.
@@ -441,6 +443,24 @@ impl Task {
             return Ok(r);
         }
         match message {
+            WM_CREATE => {
+                // An icon or bitmap static's text names its picture in its module's resources.
+                let (style, text, instance) = self.win32k().windows.get(&hwnd).map(|w| (w.style, w.text.clone(), w.instance)).unwrap_or_default();
+                let kind = match style & 0x1f {
+                    3 => Some(super::image::IMAGE_ICON),
+                    0xe => Some(super::image::IMAGE_BITMAP),
+                    _ => None,
+                };
+                if let Some(kind) = kind.filter(|_| !text.is_empty() && instance != 0) {
+                    let id = crate::resources::Id::named(&text);
+                    let flags = if kind == super::image::IMAGE_ICON { 0x40 } else { 0 };
+                    if let Some(loaded) = self.load_resource_picture(cx, instance, &id, kind, 0, 0, flags) {
+                        let image = self.picture_handle(loaded, kind);
+                        self.control(hwnd, |_, c| c.image = image);
+                    }
+                }
+                Ok(0)
+            }
             WM_GETDLGCODE => Ok(DLGC_STATIC),
             WM_LBUTTONDOWN if self.win32k().windows.get(&hwnd).is_some_and(|w| w.style & SS_NOTIFY != 0) => {
                 self.notify(cx, hwnd, STN_CLICKED)?;
@@ -715,7 +735,38 @@ impl Task {
 }
 
 /// What a control's painting needs to know of it.
+/// A control's picture, as it's drawn.
+#[derive(Clone)]
+pub(super) enum Picture {
+    Bitmap(Surface),
+    Icon(super::image::Image),
+}
+
+impl Picture {
+    fn size(&self) -> (i32, i32) {
+        match self {
+            Picture::Bitmap(s) => (s.width, s.height),
+            Picture::Icon(i) => (i.width, i.height),
+        }
+    }
+
+    /// Draws it with its top left at `(x, y)`.
+    fn draw(&self, s: &mut Surface, x: i32, y: i32, clip: &Rect) {
+        match self {
+            Picture::Bitmap(b) => super::image::copy(s, x, y, b, &b.bounds(), 0xcc_0020, clip),
+            Picture::Icon(i) => super::image::blend(s, i, x, y, clip),
+        }
+    }
+
+    /// Draws it in the middle of `r`.
+    fn draw_centred(&self, s: &mut Surface, r: &Rect, clip: &Rect) {
+        let (w, h) = self.size();
+        self.draw(s, r.left + (r.width() - w) / 2, r.top + (r.height() - h) / 2, clip);
+    }
+}
+
 pub(super) struct PaintInfo {
+    pub picture: Option<Picture>,
     pub client: Rect,
     pub text: String,
     pub style: u32,
@@ -812,7 +863,11 @@ fn paint_button(s: &mut Surface, (dx, dy): (i32, i32), clip: &Rect, colors: &Col
             if default && p.enabled {
                 s.frame(&Rect::new(r.left + 1, r.top + 1, r.right - 1, r.bottom - 1), edge, clip);
             }
-            s.text(r.left + (r.width() - width) / 2, middle, &text, fg, None, clip);
+            // BS_ICON and BS_BITMAP: its picture in place of its text.
+            match &p.picture {
+                Some(picture) if p.style & 0xc0 != 0 => picture.draw_centred(s, &r, clip),
+                _ => s.text(r.left + (r.width() - width) / 2, middle, &text, fg, None, clip),
+            }
             if p.focused {
                 dotted(s, &Rect::new(r.left + 3, r.top + 3, r.right - 3, r.bottom - 3), MARK, clip);
             }
@@ -864,7 +919,20 @@ fn paint_static(s: &mut Surface, (dx, dy): (i32, i32), clip: &Rect, colors: &Col
                 s.text(x, r.top + i as i32 * CELL_HEIGHT, line, fg, colors.text_background, &clip.intersect(&r));
             }
         }
-        // Icons, bitmaps, metafiles, and what its parent draws: its background.
+        // An icon or a bitmap: at its corner, or in its middle (SS_CENTERIMAGE).
+        3 | 0xe => {
+            if let Some(bg) = colors.background {
+                fill(s, bg);
+            }
+            if let Some(picture) = &p.picture {
+                if p.style & 0x200 != 0 {
+                    picture.draw_centred(s, &r, clip);
+                } else {
+                    picture.draw(s, r.left, r.top, clip);
+                }
+            }
+        }
+        // Metafiles, and what its parent draws: its background.
         _ => {
             if let Some(bg) = colors.background {
                 fill(s, bg);

@@ -264,7 +264,7 @@ mod tests {
         assert_eq!(status("kernel32", Some("HeapAlloc"), None, Isa::X86_64, &none), Status::Guest);
         assert_eq!(status("kernel32.dll", Some("CreateFiber"), None, Isa::X86_64, &none), Status::Guest);
         assert_eq!(status("user32.dll", Some("CreateWindowExA"), None, Isa::X86_64, &none), Status::Host);
-        assert_eq!(status("gdi32.dll", Some("BitBlt"), None, Isa::X86_64, &none), Status::Stub);
+        assert_eq!(status("gdi32.dll", Some("CreateDIBSection"), None, Isa::X86_64, &none), Status::Stub);
         assert_eq!(status("kernel32.dll", Some("NoSuchFunction"), None, Isa::X86_64, &none), Status::Undeclared);
         assert_eq!(status("comctl32.dll", Some("InitCommonControlsEx"), None, Isa::X86_64, &none), Status::Host);
         assert_eq!(status("comctl32.dll", None, Some(17), Isa::X86_64, &none), Status::Host);

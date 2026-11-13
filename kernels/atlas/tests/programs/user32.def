@@ -126,3 +126,9 @@ IsWindowEnabled
 GetClassInfoW
 GetClassInfoExW
 SetClassLongPtrW
+LoadBitmapW
+LoadImageW
+LoadIconW
+DrawIconEx
+DrawIcon
+DestroyIcon

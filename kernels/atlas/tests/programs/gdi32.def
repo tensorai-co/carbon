@@ -13,3 +13,9 @@ MoveToEx
 LineTo
 GetPixel
 GetTextExtentPoint32W
+CreateCompatibleBitmap
+CreateCompatibleDC
+DeleteDC
+GetObjectW
+BitBlt
+StretchBlt

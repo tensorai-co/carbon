@@ -1,0 +1,6 @@
+// images.exe's resources: a bitmap, an icon with two images (16 by 16 with alpha, 32 by 32 in 16 colours with a
+// mask) and a cursor, made by hand (see images.c for their pixels). Built with llvm-rc, without the preprocessor.
+LANGUAGE 0, 0
+1 BITMAP "images.bmp"
+2 ICON "images.ico"
+3 CURSOR "images.cur"

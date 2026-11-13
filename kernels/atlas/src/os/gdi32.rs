@@ -31,9 +31,15 @@ dll! {
     host GetTextExtentPoint32W(4) => get_text_extent_point32_w;
     host GetTextExtentPoint32A(4) => get_text_extent_point32_w;
     host GetDeviceCaps(2) => get_device_caps;
-    missing BitBlt;
-    missing CreateCompatibleDC;
-    missing CreateCompatibleBitmap;
+    host BitBlt(9) => bit_blt;
+    host StretchBlt(11) => stretch_blt;
+    host CreateCompatibleDC(1) => create_compatible_dc;
+    host DeleteDC(1) => delete_dc;
+    host CreateCompatibleBitmap(3) => create_compatible_bitmap;
+    host CreateBitmap(5) => create_bitmap;
+    host GetObjectW(3) => get_object;
+    host GetObjectA(3) => get_object;
+    host SetStretchBltMode(2) => set_stretch_blt_mode;
     missing CreateDIBSection;
     missing StretchDIBits;
     // Not written yet: what installers import.
@@ -70,6 +76,94 @@ fn create_pen(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
 /// Any font asked for is the one font.
 fn create_font(task: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
     Reply::Value(task.win32k().gdi.create(Object::Font))
+}
+
+/// `CreateCompatibleDC(dc)`: a memory DC, drawing into the bitmap selected into it.
+fn create_compatible_dc(task: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(task.win32k().gdi.new_memory_dc())
+}
+
+fn delete_dc(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(u64::from(task.win32k().gdi.dcs.remove(&a[0]).is_some()))
+}
+
+/// `CreateCompatibleBitmap(dc, cx, cy)`: a bitmap that size, black.
+fn create_compatible_bitmap(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (w, h) = (a[1] as i32, a[2] as i32);
+    if w <= 0 || h <= 0 || w > 16384 || h > 16384 {
+        return Reply::Value(0);
+    }
+    Reply::Value(task.win32k().gdi.create_bitmap(display::Surface::new(w, h, 0)))
+}
+
+/// `CreateBitmap(cx, cy, planes, bits, &pixels)`: from 32-bit or 24-bit pixels (rows top first, padded to words as
+/// a DDB's are), or 1-bit (set is white); none, black.
+fn create_bitmap(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (w, h, bpp, at) = (a[0] as i32, a[1] as i32, a[3] as u32, a[4]);
+    if w <= 0 || h <= 0 || w > 16384 || h > 16384 {
+        return Reply::Value(0);
+    }
+    let mut s = display::Surface::new(w, h, 0);
+    let stride = ((w as usize * bpp as usize).div_ceil(16)) * 2;
+    if at != 0 && matches!(bpp, 1 | 24 | 32) {
+        let Ok(bits) = task.mem(cx, false, |t| user::read_vec(&t.space(), at, stride * h as usize)) else { return Reply::Value(0) };
+        for y in 0..h as usize {
+            let row = &bits[y * stride..(y + 1) * stride];
+            for x in 0..w as usize {
+                s.pixels[y * w as usize + x] = match bpp {
+                    1 => if row[x / 8] >> (7 - x % 8) & 1 != 0 { 0xff_ffff } else { 0 },
+                    24 => u32::from(row[3 * x + 2]) << 16 | u32::from(row[3 * x + 1]) << 8 | u32::from(row[3 * x]),
+                    _ => u32::from(row[4 * x + 2]) << 16 | u32::from(row[4 * x + 1]) << 8 | u32::from(row[4 * x]),
+                };
+            }
+        }
+    }
+    Reply::Value(task.win32k().gdi.create_bitmap(s))
+}
+
+/// `GetObject(object, size, &out)`: a bitmap's BITMAP (type, width, height, bytes a row, planes, bits a pixel, no
+/// bits of its own here); the size it needs with no buffer. Other objects aren't described yet.
+fn get_object(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let w = task.abi().width as usize;
+    let size = if w == 8 { 32 } else { 24 };
+    let Some((width, height)) = task.win32k().gdi.bitmaps.get(&a[0]).map(|s| (s.width, s.height)) else { return Reply::Value(0) };
+    if a[2] == 0 {
+        return Reply::Value(size as u64);
+    }
+    let mut b = vec![0u8; size];
+    for (o, v) in [(4, width), (8, height), (12, width * 4)] {
+        b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    b[16..18].copy_from_slice(&1u16.to_le_bytes());
+    b[18..20].copy_from_slice(&32u16.to_le_bytes());
+    let n = size.min(a[1] as u32 as usize);
+    if task.mem(cx, true, |t| user::write(&mut t.space(), a[2], &b[..n])).is_err() {
+        return Reply::Value(0);
+    }
+    Reply::Value(n as u64)
+}
+
+/// `BitBlt(dst, x, y, cx, cy, src, sx, sy, rop)`.
+fn bit_blt(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (x, y, w, h) = (a[1] as i32, a[2] as i32, a[3] as i32, a[4] as i32);
+    let (sx, sy) = (a[6] as i32, a[7] as i32);
+    let to = Rect::new(x, y, x + w, y + h);
+    let from = Rect::new(sx, sy, sx + w, sy + h);
+    Reply::Value(u64::from(task.win32k().blit(a[0], to, a[5], from, a[8] as u32)))
+}
+
+/// `StretchBlt(dst, x, y, cx, cy, src, sx, sy, scx, scy, rop)`: scaled, each pixel the nearest.
+fn stretch_blt(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (x, y, w, h) = (a[1] as i32, a[2] as i32, a[3] as i32, a[4] as i32);
+    let (sx, sy, sw, sh) = (a[6] as i32, a[7] as i32, a[8] as i32, a[9] as i32);
+    let to = Rect::new(x, y, x + w, y + h);
+    let from = Rect::new(sx, sy, sx + sw, sy + sh);
+    Reply::Value(u64::from(task.win32k().blit(a[0], to, a[5], from, a[10] as u32)))
+}
+
+/// `SetStretchBltMode`: stretching is always to the nearest pixel; the mode before, BLACKONWHITE.
+fn set_stretch_blt_mode(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(1)
 }
 
 fn select_object(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {

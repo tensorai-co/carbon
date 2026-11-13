@@ -6,7 +6,8 @@
 //! its text in every column, its state (selected, focused), image and `lParam`; it's drawn as a report (rows under a
 //! header, unless `LVS_NOCOLUMNHEADER`), and its other views as one column of the same rows. Its parent hears of
 //! clicks and selection changes through `WM_NOTIFY` (`NM_CLICK`, `NM_DBLCLK`, `NM_RCLICK`, `LVN_ITEMCHANGED`). An
-//! image list counts its images and keeps their size; bitmaps aren't drawn yet, so neither are its images.
+//! image list keeps its images, cut from the bitmaps it's given (transparent where a mask or a colour says) or
+//! icons, and draws them; a list view doesn't draw its items' images yet.
 
 use kernels_core::thread::Cx;
 use kernels_core::user;
@@ -343,7 +344,7 @@ fn paint_list(s: &mut Surface, (dx, dy): (i32, i32), clip: &Rect, _: &Colors, p:
 pub struct ImageList {
     pub width: i32,
     pub height: i32,
-    pub count: i32,
+    pub images: Vec<super::image::Image>,
     pub background: u64,
 }
 
@@ -885,20 +886,76 @@ impl Task {
     pub fn image_list_create(&mut self, width: i32, height: i32) -> u64 {
         let mut w = self.win32k();
         let handle = IMAGE_LISTS + 4 * (w.image_lists.keys().next_back().map_or(0, |h| (h - IMAGE_LISTS) / 4) + 1);
-        w.image_lists.insert(handle, ImageList { width, height, count: 0, background: CLR_NONE });
+        w.image_lists.insert(handle, ImageList { width, height, images: Vec::new(), background: CLR_NONE });
         handle
     }
 
-    /// Adds `n` images: the index of the first, or -1 for a list that isn't there.
+    /// Adds `n` blank images: the index of the first, or -1 for a list that isn't there.
     pub fn image_list_add(&mut self, handle: u64, n: i32) -> u64 {
         match self.win32k().image_lists.get_mut(&handle) {
             Some(l) => {
-                let first = l.count;
-                l.count += n;
-                first as u32 as u64
+                let first = l.images.len();
+                let blank = super::image::Image { width: l.width, height: l.height, pixels: vec![0; (l.width * l.height).max(0) as usize], hotspot: (0, 0) };
+                l.images.extend(std::iter::repeat_n(blank, n.max(0) as usize));
+                first as u64
             }
             None => u64::from(u32::MAX),
         }
+    }
+
+    /// `ImageList_Add` and `AddMasked`: a bitmap cut into images the list's width, transparent where `mask` (a
+    /// bitmap, white for transparent) or the colour `key` says. The first's index, or -1.
+    pub fn image_list_add_bitmap(&mut self, handle: u64, bitmap: u64, mask: Option<u64>, key: Option<Rgb>) -> u64 {
+        let mut w = self.win32k();
+        let w = &mut *w;
+        let Some(strip) = w.gdi.bitmaps.get(&bitmap).map(super::image::Image::from_surface) else { return u64::from(u32::MAX) };
+        let mask = mask.and_then(|m| w.gdi.bitmaps.get(&m)).cloned();
+        let Some(l) = w.image_lists.get_mut(&handle) else { return u64::from(u32::MAX) };
+        let mut strip = strip;
+        for (i, p) in strip.pixels.iter_mut().enumerate() {
+            let (x, y) = (i as i32 % strip.width, i as i32 / strip.width);
+            let masked = mask.as_ref().and_then(|m| m.get(x, y)).is_some_and(|c| c != 0);
+            if masked || key.is_some_and(|k| *p & 0xff_ffff == k) {
+                *p = 0;
+            }
+        }
+        let first = l.images.len();
+        let count = (strip.width / l.width.max(1)).max(1);
+        for i in 0..count {
+            let image = strip.cut(i * l.width, l.width);
+            l.images.push(if image.height != l.height { image.scaled(l.width, l.height) } else { image });
+        }
+        first as u64
+    }
+
+    /// `ImageList_ReplaceIcon(list, index, icon)`: an icon at the list's size, in place of an image, or added for -1.
+    pub fn image_list_replace_icon(&mut self, handle: u64, index: i32, icon: u64) -> u64 {
+        let mut w = self.win32k();
+        let w = &mut *w;
+        let picture = w.gdi.icons.get(&icon).cloned();
+        let Some(l) = w.image_lists.get_mut(&handle) else { return u64::from(u32::MAX) };
+        let image = picture.map_or_else(
+            || super::image::Image { width: l.width, height: l.height, pixels: vec![0; (l.width * l.height).max(0) as usize], hotspot: (0, 0) },
+            |p| p.scaled(l.width, l.height),
+        );
+        if index < 0 {
+            l.images.push(image);
+            return (l.images.len() - 1) as u64;
+        }
+        match l.images.get_mut(index as usize) {
+            Some(slot) => {
+                *slot = image;
+                index as u64
+            }
+            None => u64::from(u32::MAX),
+        }
+    }
+
+    /// `ImageList_Draw(list, index, dc, x, y, style)`: an image, blended by its alpha.
+    pub fn image_list_draw(&mut self, handle: u64, index: i32, hdc: u64, x: i32, y: i32) -> bool {
+        let mut w = self.win32k();
+        let Some(image) = w.image_lists.get(&handle).and_then(|l| l.images.get(usize::try_from(index).ok()?)).cloned() else { return false };
+        w.draw(hdc, |s, (dx, dy), clip, _| super::image::blend(s, &image, x + dx, y + dy, clip))
     }
 }
 

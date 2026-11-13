@@ -391,6 +391,8 @@ impl Task {
             let Some(class) = item_class(&item.class) else { continue };
             let title = match &item.title {
                 Id::Name(s) => s.clone(),
+                // An ordinal names a static's icon or bitmap in the dialog's module.
+                Id::Num(n) if class.eq_ignore_ascii_case("static") => format!("#{n}"),
                 _ => String::new(),
             };
             let style = item.style | WS_CHILD;

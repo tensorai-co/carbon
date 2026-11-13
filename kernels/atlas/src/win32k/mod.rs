@@ -11,6 +11,7 @@ pub mod comctl;
 pub mod controls;
 pub mod dialog;
 pub mod gdi;
+pub mod image;
 pub mod keys;
 mod paint;
 
@@ -224,11 +225,18 @@ pub struct Clipboard {
 /// `OpenClipboard(NULL)`'s opener.
 pub const OPENED_BY_NONE: u64 = u64::MAX;
 
-/// The desktop's cursor for a cursor handle: `LoadCursorW`'s, whose low word is its `IDC_*`; 0 hides it.
-pub fn cursor_of(handle: u64) -> display::cursor::Cursor {
+/// The desktop's cursor for a cursor handle: a system one's (`LoadCursor` with no module, its low word an `IDC_*`) is
+/// its shape; one loaded from a program is its own picture; 0 hides it.
+pub fn cursor_of(handle: u64, icons: &HashMap<u64, image::Image>) -> display::cursor::Cursor {
     use display::cursor::{Cursor, Shape};
     if handle == 0 {
         return Cursor::Hidden;
+    }
+    if let Some(picture) = icons.get(&handle) {
+        return image::cursor_picture(picture);
+    }
+    if handle >> 16 != 1 {
+        return Cursor::Shape(Shape::Default);
     }
     Cursor::Shape(match handle & 0xffff {
         32513 => Shape::Text,
@@ -832,7 +840,8 @@ impl Win32k {
                             let class = self.windows.get(&target).and_then(|w| self.class_by_name(&w.class)).map_or(0, |c| c.cursor);
                             if class != 0 {
                                 self.cursor = class;
-                                dt::lock(&self.display).set_cursor(window, cursor_of(class));
+                                let cursor = cursor_of(class, &self.gdi.icons);
+                                dt::lock(&self.display).set_cursor(window, cursor);
                             }
                         }
                         (target, message, flags, words(cx, cy))
