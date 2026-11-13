@@ -5,10 +5,12 @@ declaration made into a PE in memory, so a machine has no Windows files to insta
 has to run inside the program, ntdll, is a crate (`guest/`) that cargo builds for each ISA and embeds.
 
 **Where it stands.** Programs run on ARM64 natively and x86-64 translated, and 32-bit x86 programs run too (WoW64,
-translated on Apple silicon; phases 1 to 5 of its six, below, are done): 29 of the test programs pass every check as
+translated on Apple silicon; phases 1 to 5 of its six, below, are done): 30 of the test programs pass every check as
 32-bit programs, with x86's own SEH, PE32 images and 32-bit layouts throughout, and a real 32-bit installer starts,
-unpacks its data, runs its start-up script, shows its dialogs, installs its files with its progress shown, and finishes; the program it installs loads with every import there and
-runs its start-up as far as its first socket. They have the loader and SEH, threads and
+unpacks its data, runs its start-up script, shows its dialogs, installs its files with its progress shown, and finishes. The program it installs then starts, downloads its
+240 MB update over HTTPS (Winsock on `net`, its own TLS, crypt32 checking the server's certificates against the
+host's trust), verifies, unpacks and installs it, and starts the full program it updated to, whose own imports are
+next. They have the loader and SEH, threads and
 waits, processes, anonymous and named pipes, sections, asynchronous I/O and completion ports, files, the registry,
 security (tokens, descriptors, access checks, impersonation), resources and version information, the system's
 version and information, and windows on the desktop with input. The loader is Windows' own in all but manifests: the
@@ -19,8 +21,7 @@ are shared as their opens say, with hard and symbolic links and times that can b
 program: work, timers and waits, on pools of their own or the process's. The registry tells watchers of changes, has
 WOW64's 32-bit view, and saves, restores, loads and unloads hives. Code pages convert as Windows' do, every `*A`
 function speaks Windows-1252, and ANSI windows get their messages' text in it. ucrtbase.dll is atlas's own C runtime, in the
-program, so MinGW-built C programs run. Fifteen DLLs declare 1,251 exports between them, 1,193 written and 58 stubs that say so (most of them Winsock's
-sockets and crypt32's certificates, still to come), and ntdll has 332. A DLL's exports can have Windows' own ordinals,
+program, so MinGW-built C programs run. Fifteen DLLs declare 1,260 exports between them, 1,241 written and 19 stubs that say so, and ntdll has 332. A DLL's exports can have Windows' own ordinals,
 gaps and all, which programs import oleaut32's, ws2_32's and some of shell32's by.
 
 ## Layout
@@ -93,6 +94,7 @@ opening comment says what it checks. `crt.exe` (and `crt-mingw.exe`) want the ar
 | atlas's `ansiwin.c`, both ISAs | ANSI windows: a class and window made with the `*A` functions, its `WndProc` given names, text and characters in 1252 however they're sent; a Unicode window driven by the `*A` functions; `GetMessageA` and `DispatchMessageA`; `WndProc`s set by `SetWindowLongPtrA` and `W` |
 | atlas's `ansi.c`, both ISAs | Code pages: `MultiByteToWideChar` and `WideCharToMultiByte` in 1252, 437 and UTF-8; `*A` functions with é in their names, as the `*W` ones see them: files, paths, the registry, the environment, objects, accounts, locales and version information |
 | atlas's `registry.c`, both ISAs | A fresh machine's hives, keys and every value type, enumeration, deletion, and saving; change notification, asynchronous and not; the 32-bit view; hives saved, restored, loaded and unloaded |
+| atlas's `sockets.c`, both ISAs and i686 | Winsock over the machine's loopback: TCP's listen, connect, accept and names; send, recv, MSG_PEEK, FIONREAD; `select` and `WSAPoll`; non-blocking sockets and a connect seen through `select`; SO_RCVTIMEO; options; overlapped `WSARecv` through an event and a completion port, done at once and later, with and without FILE_SKIP_COMPLETION_PORT_ON_SUCCESS; `closesocket` aborting what's under way; shutdown; UDP; `ConnectEx`, `AcceptEx` and `GetAcceptExSockaddrs` from `WSAIoctl`; `getaddrinfo` (numeric, passive, localhost, the machine's own name, AI_NUMERICHOST); `gethostname`, `inet_addr`; ws2_32's old functions by ordinal |
 | atlas's `startup.c`, both ISAs and i686 | What larger programs call as they start: the heap's sizes, reallocation and queries; encoded pointers; `InitOnceBeginInitialize`/`Complete` and `ExecuteOnce`; interlocked lists; `IsDebuggerPresent`, `DebugBreak` to a vectored handler, `UnhandledExceptionFilter`; `IsBadWritePtr`/`ReadPtr`; `CompareString`, `LCMapString` (case and sort keys), `GetStringType`; `GetDateFormat`/`GetTimeFormat`; disk space, drive types, `FindFirstFileEx`; console modes and `SetStdHandle`; `OpenThread`, priorities, affinity, the session; psapi; the monitor, the window station, `MapWindowPoints`, `MsgWaitForMultipleObjects` (a timeout, a message, an object); memory fonts; the event log and `RtlGenRandom`; `CommandLineToArgvW`, `SHGetKnownFolderPath`, `IsUserAnAdmin`; oleaut32's BSTRs and VARIANTs, bcrypt's random bytes and Winsock's start, imported by ordinal |
 | atlas's `installer.c`, both ISAs and i686 | What installers call first: the `lstr*` functions, `CharNext`/`CharPrev`, `MulDiv`, `CompareFileTime`; `wsprintf` with its arguments past the registers, cut at 1024 characters, and `wvsprintf`; temporary and short names, disk space, `SearchPath`; .ini files; the error mode; COM's start, its task allocator and `CoCreateInstance` with no class registered; `SHGetFileInfo` with no flags |
 | atlas's `environment.c`, both ISAs | The environment a logon gives, from the registry: read, expanded, set and deleted |
@@ -706,8 +708,39 @@ ends when a message comes or a timer is due; gdi32's fonts from memory and OpenG
 nothing to draw yet); advapi32's event log sources and `RtlGenRandom`; bcrypt's `BCryptGenRandom`, from the host's
 random bytes; shell32's `CommandLineToArgvW` (Windows' quoting rules), `SHGetKnownFolderPath` (the known folders'
 GUIDs, as their CSIDLs' paths) and `IsUserAnAdmin`; and Winsock's start (`WSAStartup`, `WSACleanup`), byte order,
-last error and `__WSAFDIsSet`, at Windows' ordinals. Sockets, crypt32's certificate store and wsock32's `AcceptEx`
-family are declared, as stubs, so programs that import them load.
+last error and `__WSAFDIsSet`, at Windows' ordinals. Blocks over 1 MiB on the heap have pages of their own, given back
+when they're freed, so a 32-bit program that unpacks big files doesn't run out of address space; and a file on the
+disk reads and writes as much as it's asked for at once (up to 1 GiB), as Windows' do.
+
+**Winsock** (`sockets.rs`, `os/ws2_32.rs`) is a thin layer over the machine's network, [`net`](../../net/README.md). A
+socket is a file, as AFD makes it (`Node::Socket`), so it closes with `CloseHandle`, joins a completion port and takes
+`SetFileCompletionNotificationModes` as any file does. `net` never waits; a blocking call tries, and if it would
+block, waits on its thread's waiter, which a watch on the socket wakes as its readiness changes. `FIONBIO` makes it
+WSAEWOULDBLOCK instead; SO_RCVTIMEO and SO_SNDTIMEO end the wait with WSAETIMEDOUT. An overlapped call (`WSARecv`,
+`WSASend`, their `From`/`To` forms, `ConnectEx`, `AcceptEx`) is tried at once, and if it would wait, queued on its
+socket for the process's network thread: made the first time something's queued (started at ws2_32's
+`AtlasNetPump`), it wakes with any of its sockets' readiness, finishes what it can, and writes the results into the
+program's buffers and OVERLAPPED, as only a thread of the process can, then sets the event, posts the port's packet
+or queues the routine. One done at once is told the same way, but for the port with
+FILE_SKIP_COMPLETION_PORT_ON_SUCCESS; one that fails at once is told only by its return. `closesocket` ends what's
+under way with WSA_OPERATION_ABORTED. `select` and `WSAPoll` wait on any number of sockets; since `net` says a host
+socket is readable until a read finds nothing, a socket said readable is checked with a byte peeked. `WSAIoctl`
+gives the extension functions (`ConnectEx`, `AcceptEx`, `GetAcceptExSockaddrs`, `DisconnectEx`: exports of
+ws2_32's, here, rather than mswsock's), the base handle, the address list and keep-alives. `getaddrinfo` and
+`GetAddrInfoW` ask the machine's resolver (`Network::lookup`: its own name and `localhost` it answers, the rest the
+host's way), with services by number or by name, each answer in one block from the heap. `net`'s errors are WSA
+codes; a socket's are NTSTATUS in its OVERLAPPED, as `0xE000xxxx` with the WSA code, which `ports::error` reads back.
+Not yet: `WSAEventSelect`, `WSAAsyncSelect`, `gethostbyname` and the other old lookups, IPv6-only sockets'
+options, `TransmitFile`, Unix sockets, and the `iphlpapi` and `dnsapi` calls.
+
+**Certificates** (`os/crypt32.rs`): contexts are in the program's memory as CryptoAPI gives them, CERT_CONTEXT with
+its DER and a CERT_INFO read from it (version, serial, algorithms, issuer and subject, validity, the public key; not
+the extensions yet). Stores are atlas's own, in memory (a system store opens empty: the host's roots aren't
+listed). `CertGetCertificateChain` asks the host whether it trusts the certificate with whatever the stores hold
+(`Host::check_certificates`: Security.framework on macOS, CryptoAPI on Windows, webpki on Linux), for the usage the
+chain parameters ask (server or client authentication), and gives a chain context of the certificates it could link
+from the leaf, its CERT_TRUST_STATUS the host's verdict. `CertVerifyCertificateChainPolicy`, which checks names, is
+to come.
 
 **Shell links** (`os/com.rs`): `CLSID_ShellLink`'s objects, with `IShellLinkW`, `IShellLinkA` and `IPersistFile`. One
 keeps a target, arguments, working folder, description, relative path, icon and its index, show command and hot key,
@@ -960,7 +993,7 @@ First `cmd.exe` (variables, `if`, `for`, `goto`, `call`, pipes, redirection, `.b
      `carbon run` knows a 32-bit `.exe` (platform `windows/386`), and gives it x86's memory ordering.
   6. [ ] **Every test program for i686**, passing; then real installers. Every test program but `sysinfo.c` (whose
      checks are 64-bit offsets; `wow64.c` checks the same calls at 32 bits) builds for i686 and passes every check:
-     29 programs, 1,019 checks, with the loader's own DLLs, thread-local variables (`__tls_array`), `__try` through
+     30 programs, 1,076 checks, with the loader's own DLLs, thread-local variables (`__tls_array`), `__try` through
      `_except_handler3` (now in the i686 ntdll, with `_local_unwind2`), and the C runtime. `build.sh` makes each
      program's import libraries from what its object imports, `__imp_` or not. `installer.c` checks what installers
      call first, on all three ISAs: `wsprintf` is C-variadic, so each ISA's is a few lines of the guest's assembly

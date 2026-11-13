@@ -16,6 +16,7 @@ layers.workspace = true
 host.workspace = true
 atlas-abi.workspace = true
 display.workspace = true
+net.workspace = true
 
 [dev-dependencies]
 layers.workspace = true

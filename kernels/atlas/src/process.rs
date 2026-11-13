@@ -48,6 +48,8 @@ pub(crate) struct Process {
     pub object: Arc<Object>,
     /// Its exit code, once its last thread has ended.
     pub ended: (Mutex<Option<u32>>, Condvar),
+    /// Its sockets' overlapped I/O still under way, and the thread that finishes it (`sockets`).
+    pub net: Mutex<crate::sockets::Pump>,
 }
 
 pub(crate) struct ProcState {
@@ -836,7 +838,7 @@ pub(crate) fn launch(k: &Arc<Kernel>, cx: &mut Cx<'_>, launch: Launch) -> Result
     let cwd = cwd.unwrap_or_else(|| format!("C:\\{}", exe_dir.trim_start_matches('/').replace('/', "\\")));
     let state = ProcState { space, dispatcher, thread_start, peb, threads, mapped, exe_dir, cwd, regions, handles, std_handles, command_line: command, exiting: None, windows10, parent, created: crate::files::filetime(k.host.wall()), image: windows_path.clone(), token, error_mode: 0, com: BTreeMap::new() };
     let object = Object::new(objects_mod::Kind::Process(pid), State::default());
-    let process = Arc::new(Process { pid, isa, state: Mutex::new(state), remote: Mutex::new(false), object, ended: (Mutex::new(None), Condvar::new()) });
+    let process = Arc::new(Process { pid, isa, state: Mutex::new(state), remote: Mutex::new(false), object, ended: (Mutex::new(None), Condvar::new()), net: Mutex::default() });
     k.started(&process);
     Ok(Task { k: k.clone(), process, tid, waiter, isa, depth: 0, nested: 0, control, ending: None })
 }

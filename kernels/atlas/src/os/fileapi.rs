@@ -194,7 +194,8 @@ impl Task {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn transfer(task: &mut Task, cx: &mut Cx<'_>, handle: u64, buffer: u64, len: u32, done_out: u64, ov: u64, write: bool, notify: Notify) -> Reply {
     let Some(file) = task.file_handle(handle) else { return task.fail(cx, ERROR_INVALID_HANDLE) };
-    let len = (len as usize).min(1 << 24);
+    // A file on the disk takes it all at once, as Windows' do (up to 1 GiB here); a pipe or device, 16 MiB at a time.
+    let len = (len as usize).min(if matches!(file.node, Node::File(_)) { 1 << 30 } else { 1 << 24 });
     let (offset, event) = match overlapped(task, cx, ov) {
         Some((offset, event)) => (Some(offset), if matches!(notify, Notify::Plain) { event } else { 0 }),
         None => (None, 0),

@@ -242,7 +242,8 @@ another process on Windows hosts; a worker process per machine.
 6. The registry: Windows' own hive format, for hives from a real Windows. (Change notification, the 32-bit view, and
    saving, restoring, loading and unloading hives are done.)
 7. 32-bit x86, which installers are: exec's 32-bit translation, the i686 ntdll, `SysWOW64`.
-8. Winsock over `net` (with `net`'s phase 4). *Done means:* a Windows program downloads over HTTPS.
+8. Winsock over `net` (with `net`'s phase 4). *Done means:* a Windows program downloads over HTTPS. (Done: a 32-bit
+   program downloads, checks and installs its 240 MB update.)
 9. `msiexec` in host Rust, and `cmd.exe`, `reg.exe`, `regsvr32.exe`, `rundll32.exe`. *Done means:* a real `.msi`
    installs.
 10. The long tail of exports, as the `missing` stubs and `carbon atlas imports` name them. (Code pages, the `*A`

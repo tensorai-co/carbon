@@ -104,6 +104,8 @@ pub enum Node {
     Pipe(crate::pipes::End),
     /// One end of a named pipe: a server's instance, or a client's connection to one.
     NamedPipe(crate::named_pipes::PipeEnd),
+    /// A Winsock socket, which is a file of AFD's on Windows.
+    Socket(Arc<crate::sockets::Sock>),
 }
 
 pub struct File {
@@ -575,8 +577,12 @@ impl Task {
         let start = at.unwrap_or(*position);
         let data = match &file.node {
             Node::File(ino) => {
-                let mut buffer = vec![0; len];
-                let n = lock(&self.k.disk).read(*ino, start, &mut buffer).map_err(layers_error)?;
+                let disk = lock(&self.k.disk);
+                // No more room than there's file to read.
+                let left = disk.stat(*ino).map_or(len as u64, |st| st.size.saturating_sub(start));
+                let mut buffer = vec![0; len.min(left as usize)];
+                let n = disk.read(*ino, start, &mut buffer).map_err(layers_error)?;
+                drop(disk);
                 buffer.truncate(n);
                 buffer
             }
@@ -588,7 +594,8 @@ impl Task {
                 buffer.truncate(n);
                 return Ok(buffer);
             }
-            Node::Dir(_) | Node::Console(_) | Node::Pipe(_) | Node::NamedPipe(_) => return Err(ERROR_ACCESS_DENIED),
+            // A socket's read goes through Winsock.
+            Node::Dir(_) | Node::Console(_) | Node::Pipe(_) | Node::NamedPipe(_) | Node::Socket(_) => return Err(ERROR_ACCESS_DENIED),
         };
         *position = start + data.len() as u64;
         Ok(data)

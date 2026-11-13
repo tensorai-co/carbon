@@ -1,5 +1,7 @@
-//! The process heap: size classes of powers of two, each with a free list, carved from chunks of memory atlas commits.
-//! Every allocation has a 16-byte header: its class, then the size asked for (`HeapSize`'s answer).
+//! The process heap: size classes of powers of two, each with a free list, carved from chunks of memory atlas commits;
+//! and above 1 MiB, as Windows' heap does, pages of their own, given back when the block's freed, so big blocks don't
+//! use up a 32-bit process's address space. Every allocation has a 16-byte header: its class (`BIG` for one with
+//! pages of its own), then the size asked for (`HeapSize`'s answer).
 
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
@@ -10,6 +12,11 @@ const HEADER: usize = 16;
 const CLASSES: usize = 40;
 const SMALLEST: usize = 5; // 32 bytes, header included
 const CHUNK: usize = 1 << 20;
+/// Blocks this big (header included) or bigger have pages of their own.
+const LARGE: usize = 1 << 20;
+/// A big block's class.
+const BIG: usize = usize::MAX;
+const PAGE: usize = 4096;
 
 struct State {
     free: [*mut u8; CLASSES],
@@ -48,6 +55,9 @@ fn class_of(size: usize) -> Option<usize> {
 }
 
 pub fn allocate(size: usize, zero: bool) -> *mut u8 {
+    if size.checked_add(HEADER).is_some_and(|t| t >= LARGE) {
+        return allocate_big(size);
+    }
     let Some(class) = class_of(size) else { return core::ptr::null_mut() };
     let block = with(|s| {
         let head = s.free[class];
@@ -85,6 +95,21 @@ pub fn allocate(size: usize, zero: bool) -> *mut u8 {
     }
 }
 
+/// A block of pages of its own, which come zeroed.
+fn allocate_big(size: usize) -> *mut u8 {
+    let Some(total) = size.checked_add(HEADER + PAGE - 1).map(|t| t & !(PAGE - 1)) else { return core::ptr::null_mut() };
+    let block = crate::sys::allocate(total);
+    if block.is_null() {
+        return block;
+    }
+    // SAFETY: fresh pages, `total` long.
+    unsafe {
+        block.cast::<usize>().write(BIG);
+        block.cast::<usize>().add(1).write(size);
+        block.add(HEADER)
+    }
+}
+
 /// How many bytes a block from `allocate` has room for.
 pub fn usable(ptr: *mut u8) -> usize {
     if ptr.is_null() {
@@ -92,6 +117,9 @@ pub fn usable(ptr: *mut u8) -> usize {
     }
     // SAFETY: `ptr` came from `allocate`, so its header is just before it.
     let class = unsafe { ptr.sub(HEADER).cast::<usize>().read() };
+    if class == BIG {
+        return ((size(ptr) + HEADER + PAGE - 1) & !(PAGE - 1)) - HEADER;
+    }
     if class >= CLASSES { 0 } else { (1 << class) - HEADER }
 }
 
@@ -147,6 +175,11 @@ pub fn free(ptr: *mut u8) {
     // SAFETY: `ptr` came from `allocate`, so its header is just before it.
     let block = unsafe { ptr.sub(HEADER) };
     let class = unsafe { block.cast::<usize>().read() };
+    if class == BIG {
+        const MEM_RELEASE: u64 = 0x8000;
+        crate::sys::call4(atlas_abi::call::FREE_VIRTUAL_MEMORY, block as usize as u64, 0, MEM_RELEASE, 0);
+        return;
+    }
     if class >= CLASSES {
         return;
     }

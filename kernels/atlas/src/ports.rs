@@ -210,16 +210,32 @@ impl Kernel {
     }
 
     fn notify(&self, c: &Completion) {
-        let n = c.data.len() as u64;
-        if let Some(event) = &c.op.event {
+        self.tell(&c.op, c.data.len() as u64, c.error);
+    }
+
+    /// Tells whoever an I/O's done for: its event, its port's packet, its routine's APC.
+    fn tell(&self, op: &Op, n: u64, error: u32) {
+        if let Some(event) = &op.event {
             self.objects.signal(event, |s| s.set = true);
         }
-        if let Some((port, key)) = &c.op.port {
-            port.post(Packet { bytes: n as u32, key: *key, overlapped: c.op.overlapped, status: status(c.error) });
+        if let Some((port, key)) = &op.port {
+            port.post(Packet { bytes: n as u32, key: *key, overlapped: op.overlapped, status: status(error) });
         }
-        if let (Some(routine), Some(thread)) = (c.op.routine, c.op.thread.upgrade()) {
-            lock(&thread.apcs).push_back((routine, vec![u64::from(c.error), n, c.op.overlapped]));
+        if let (Some(routine), Some(thread)) = (op.routine, op.thread.upgrade()) {
+            lock(&thread.apcs).push_back((routine, vec![u64::from(error), n, op.overlapped]));
             thread.waiter.wake();
         }
+    }
+
+    /// Finishes an I/O whose results go in several places (a socket's buffers, the address it came from): `writes`
+    /// into the asking process, then its OVERLAPPED with `n` bytes and `error`, then whoever it's done for.
+    pub(crate) fn finish(&self, cx: &mut kernels_core::thread::Cx<'_>, op: &Op, writes: &[(u64, &[u8])], n: u64, error: u32) {
+        if let Some(process) = op.process.upgrade() {
+            let fields = crate::abi::Abi::of(process.isa).overlapped_result(status(error), n);
+            let mut all = writes.to_vec();
+            all.push((op.overlapped, &fields));
+            write_remote(self, cx, &process, &all);
+        }
+        self.tell(op, n, error);
     }
 }

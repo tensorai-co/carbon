@@ -468,7 +468,7 @@ fn put_sized(task: &mut Task, cx: &mut Cx<'_>, buffer: u64, length: u64, data: &
 
 // --- The machine's name ---
 
-fn computer_name() -> &'static str {
+pub(crate) fn computer_name() -> &'static str {
     crate::registry::variable("computername").unwrap_or("CARBON")
 }
 

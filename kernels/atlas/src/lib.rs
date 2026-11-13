@@ -28,6 +28,7 @@ mod threads;
 mod registry;
 mod resources;
 mod sections;
+mod sockets;
 mod security;
 mod system;
 mod system_info;
@@ -141,6 +142,7 @@ pub fn boot(exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&str]
         file_security: Mutex::new(HashMap::new()),
         key_security: Mutex::new(HashMap::new()),
         live: (Mutex::new(0), Condvar::new()),
+        net: ::net::Network::on_this_host(::net::Config { hostname: os::sysapi::computer_name().to_string(), dns: None }),
         options,
     });
     // Input on the desktop wakes the threads that have windows, to take it as messages.
@@ -208,6 +210,8 @@ pub(crate) struct Kernel {
     /// Descriptors set on files (by full Windows path, lower case) and registry keys (by ID). Others have the default.
     file_security: Mutex<HashMap<String, security::Descriptor>>,
     key_security: Mutex<HashMap<u64, security::Descriptor>>,
+    /// The machine's network, which every socket is on.
+    net: ::net::Network,
     /// The console's code page: the OEM one, unless a program sets another.
     console_cp: std::sync::atomic::AtomicU32,
     /// `RegNotifyChangeKeyValue`'s watches, each set once as a change it asks for comes.
