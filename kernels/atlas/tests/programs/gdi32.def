@@ -19,3 +19,5 @@ DeleteDC
 GetObjectW
 BitBlt
 StretchBlt
+AddFontMemResourceEx
+RemoveFontMemResourceEx

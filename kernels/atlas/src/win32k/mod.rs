@@ -1784,6 +1784,12 @@ impl Task {
         id
     }
 
+    /// When this thread's next timer is due, if it has one.
+    pub fn next_timer(&mut self) -> Option<Instant> {
+        let tid = self.tid;
+        self.win32k().queues.get(&tid).and_then(|q| q.timers.iter().map(|t| t.next).min())
+    }
+
     pub fn kill_timer(&mut self, hwnd: u64, id: u64) -> bool {
         let tid = self.tid;
         let mut w = self.win32k();

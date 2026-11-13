@@ -513,6 +513,35 @@ pub extern "system" fn AtlasSetUnhandledExceptionFilter(filter: usize) -> usize 
     UNHANDLED_FILTER.swap(filter, Ordering::AcqRel)
 }
 
+/// `UnhandledExceptionFilter(&pointers)`, which programs call themselves from their outermost handler (as the C
+/// runtime's stack-cookie check does): the program's filter if it set one, and otherwise, with no debugger to hand it
+/// to, EXCEPTION_EXECUTE_HANDLER, so the caller ends the process.
+#[unsafe(no_mangle)]
+pub extern "system" fn AtlasUnhandledExceptionFilter(pointers: *mut Pointers) -> i32 {
+    const EXECUTE_HANDLER: i32 = 1;
+    let filter = UNHANDLED_FILTER.load(Ordering::Acquire);
+    if filter != 0 {
+        // SAFETY: the program's filter.
+        let filter: extern "system" fn(*mut Pointers) -> i32 = unsafe { core::mem::transmute(filter) };
+        let verdict = filter(pointers);
+        // Anything but EXCEPTION_CONTINUE_SEARCH (0).
+        if verdict != 0 {
+            return verdict;
+        }
+    }
+    // SAFETY: the program's EXCEPTION_POINTERS, if any.
+    if let Some(record) = unsafe { pointers.as_ref() }.and_then(|p| unsafe { p.record.as_ref() }) {
+        Message::new().text(b"atlas-guest: unhandled exception ").hex(u64::from(record.code)).text(b" at ").hex(record.address as u64).text(b"\n").print();
+    }
+    EXECUTE_HANDLER
+}
+
+/// `DebugBreak()`: a breakpoint exception, as `int3` makes; with no debugger, the program's handlers see it.
+#[unsafe(no_mangle)]
+pub extern "system" fn AtlasDebugBreak() {
+    raise_simple(0x8000_0003, 0);
+}
+
 /// `RtlLookupFunctionEntry`: the `.pdata` entry for `pc`, and its image's base.
 #[cfg(not(target_arch = "x86"))]
 #[unsafe(no_mangle)]

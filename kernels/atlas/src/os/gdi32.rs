@@ -43,6 +43,14 @@ dll! {
     missing CreateDIBSection;
     missing StretchDIBits;
     // Not written yet: what installers import.
+    // Fonts a program brings in memory, information contexts, and OpenGL's pixel formats.
+    host AddFontMemResourceEx(4) => add_font_mem_resource_ex;
+    host RemoveFontMemResourceEx(1) => remove_font_mem_resource_ex;
+    host CreateICW(4) => create_compatible_dc;
+    host CreateICA(4) => create_compatible_dc;
+    host ChoosePixelFormat(2) => choose_pixel_format;
+    host SetPixelFormat(3) => set_pixel_format;
+    host SwapBuffers(1) => swap_buffers;
 }
 
 const CLR_INVALID: u64 = 0xffff_ffff;
@@ -259,4 +267,34 @@ fn get_device_caps(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
         88 | 90 => u64::from(dpi),  // LOGPIXELSX, LOGPIXELSY
         _ => 0,
     })
+}
+
+/// `AddFontMemResourceEx(data, size, reserved, &count)`: a handle for the fonts, and how many there are (one, as
+/// atlas draws text in its own font whichever is chosen).
+fn add_font_mem_resource_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0x5f00);
+    if a[0] == 0 || a[1] == 0 || a[3] == 0 || task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[3], 1)).is_err() {
+        return Reply::Value(0);
+    }
+    Reply::Value(NEXT.fetch_add(4, Ordering::Relaxed))
+}
+
+fn remove_font_mem_resource_ex(_: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(u64::from(a[0] != 0))
+}
+
+/// `ChoosePixelFormat(dc, &descriptor)`: format 1, the one there is.
+fn choose_pixel_format(_: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(u64::from(a[1] != 0))
+}
+
+/// `SetPixelFormat(dc, format, &descriptor)`: format 1 is taken; there's no OpenGL to draw with it yet.
+fn set_pixel_format(_: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(u64::from(a[1] as u32 == 1))
+}
+
+/// `SwapBuffers(dc)`: nothing drawn behind to show.
+fn swap_buffers(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(1)
 }

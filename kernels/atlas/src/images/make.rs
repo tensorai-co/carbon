@@ -64,9 +64,9 @@ pub fn stub(isa: Isa, nr: u64, pop: u16, gate: bool) -> Vec<u8> {
     code
 }
 
-/// A DLL's image: `name` (as `KERNEL32.dll`), at `base`, with `exports` in ordinal order from 1.
-/// Its exports' ordinals start at `first_ordinal`.
-pub fn dll(isa: Isa, name: &str, base: u64, first_ordinal: u16, exports: &[(&str, Body)], gate: bool) -> Vec<u8> {
+/// A DLL's image: `name` (as `KERNEL32.dll`), at `base`, with `exports`, each at its ordinal: the export address
+/// table runs from the lowest to the highest, with nothing where there's no export (as Windows' own DLLs have gaps).
+pub fn dll(isa: Isa, name: &str, base: u64, ordinals: &[u16], exports: &[(&str, Body)], gate: bool) -> Vec<u8> {
     // .text: one stub per trapping export, in order.
     let mut text = Vec::new();
     let mut functions = Vec::new();
@@ -88,8 +88,10 @@ pub fn dll(isa: Isa, name: &str, base: u64, first_ordinal: u16, exports: &[(&str
     let n = exports.len();
     let mut sorted: Vec<usize> = (0..n).collect();
     sorted.sort_by(|&a, &b| exports[a].0.cmp(exports[b].0));
+    let first_ordinal = ordinals.iter().copied().min().unwrap_or(1);
+    let slots = ordinals.iter().copied().max().map_or(0, |last| usize::from(last - first_ordinal) + 1);
     let functions_at = 40;
-    let names_at = functions_at + 4 * n;
+    let names_at = functions_at + 4 * slots;
     let ordinals_at = names_at + 4 * n;
     let mut strings_at = ordinals_at + 2 * n;
     let mut strings = Vec::new();
@@ -114,17 +116,21 @@ pub fn dll(isa: Isa, name: &str, base: u64, first_ordinal: u16, exports: &[(&str
     // The directory: Characteristics, TimeDateStamp, Major and MinorVersion, Name, Base, NumberOfFunctions,
     // NumberOfNames, and the three tables' RVAs.
     let mut edata = Vec::new();
-    for v in [0u32, 0, 0, name_rva, u32::from(first_ordinal), n as u32, n as u32, (edata_rva + functions_at) as u32, (edata_rva + names_at) as u32, (edata_rva + ordinals_at) as u32] {
+    for v in [0u32, 0, 0, name_rva, u32::from(first_ordinal), slots as u32, n as u32, (edata_rva + functions_at) as u32, (edata_rva + names_at) as u32, (edata_rva + ordinals_at) as u32] {
         edata.extend(v.to_le_bytes());
     }
-    for rva in &function_rvas {
+    let mut table = vec![0u32; slots];
+    for (i, rva) in function_rvas.iter().enumerate() {
+        table[usize::from(ordinals[i] - first_ordinal)] = *rva;
+    }
+    for rva in &table {
         edata.extend(rva.to_le_bytes());
     }
     for &i in &sorted {
         edata.extend(name_rvas[i].to_le_bytes());
     }
     for &i in &sorted {
-        edata.extend((i as u16).to_le_bytes());
+        edata.extend((ordinals[i] - first_ordinal).to_le_bytes());
     }
     edata.extend(&strings);
     let edata_size = edata.len();
@@ -205,7 +211,8 @@ mod tests {
     fn made_images_read_back() {
         let exports = [("WriteFile", Body::Trap { nr: 0x1001, pop: 20 }), ("HeapAlloc", Body::Forward("ntdll.RtlAllocateHeap".into())), ("ExitProcess", Body::Trap { nr: 0x1002, pop: 4 })];
         for (isa, base) in [(Isa::Arm64, 0x7ff0_0000_0000), (Isa::X86_64, 0x7ff0_0000_0000), (Isa::X86_32, 0x7040_0000)] {
-            let image = dll(isa, "KERNEL32.dll", base, 1, &exports, false);
+            // Ordinals with a gap: 1, then 115 and 116.
+            let image = dll(isa, "KERNEL32.dll", base, &[1, 115, 116], &exports, false);
             let pe = Pe::parse(&image).unwrap();
             assert_eq!((pe.isa, pe.image_base, pe.is_dll), (isa, base, true));
             let laid = pe.layout().unwrap();
@@ -214,6 +221,8 @@ mod tests {
             assert_eq!(&laid[rva as usize..rva as usize + 4], &stub(isa, 0x1002, 4, false)[..4]);
             assert_eq!(pe.export(&laid, &Wanted::Name("HeapAlloc".into())).unwrap(), Some(Found::Forward("ntdll.RtlAllocateHeap".into())));
             assert_eq!(pe.export(&laid, &Wanted::Ordinal(1)).unwrap(), pe.export(&laid, &Wanted::Name("WriteFile".into())).unwrap());
+            assert_eq!(pe.export(&laid, &Wanted::Ordinal(116)).unwrap(), pe.export(&laid, &Wanted::Name("ExitProcess".into())).unwrap());
+            assert_eq!(pe.export(&laid, &Wanted::Ordinal(50)).unwrap(), None);
             assert_eq!(pe.export(&laid, &Wanted::Name("Nope".into())).unwrap(), None);
             // Its version information, where its resource directory says.
             let (root, _) = pe.directory(2).unwrap();

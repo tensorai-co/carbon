@@ -1,0 +1,5 @@
+LIBRARY PSAPI.DLL
+EXPORTS
+GetModuleFileNameExW
+GetModuleInformation
+GetProcessMemoryInfo

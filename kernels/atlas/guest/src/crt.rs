@@ -72,22 +72,16 @@ pub extern "C" fn AtlasCrtRealloc(p: *mut u8, size: usize) -> *mut u8 {
         crate::heap::free(p);
         return core::ptr::null_mut();
     }
-    let have = crate::heap::usable(p);
-    if size <= have {
-        return p;
-    }
-    let q = AtlasCrtMalloc(size);
-    if !q.is_null() {
-        // SAFETY: both blocks are this big at least.
-        unsafe { core::ptr::copy_nonoverlapping(p, q, have) };
-        crate::heap::free(p);
+    let q = crate::heap::reallocate(p, size, false, false);
+    if q.is_null() {
+        set_errno(ENOMEM);
     }
     q
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn AtlasCrtMsize(p: *mut u8) -> usize {
-    crate::heap::usable(p)
+    crate::heap::size(p)
 }
 
 /// `_set_new_mode`: whether `malloc` calls the new handler; there's none, so it's only kept.

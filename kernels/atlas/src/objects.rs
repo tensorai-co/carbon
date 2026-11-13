@@ -21,6 +21,8 @@ pub const WAIT_ABANDONED_0: u32 = 0x80;
 pub const WAIT_IO_COMPLETION: u32 = 0xc0;
 pub const WAIT_TIMEOUT: u32 = 0x102;
 pub const WAIT_FAILED: u32 = 0xffff_ffff;
+/// What [`Task::wait_or_wake`] gives when the thread was woken for something else (a message, for one).
+pub const WOKEN: u32 = 0xffff_fffe;
 pub const INFINITE: u32 = 0xffff_ffff;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +140,12 @@ impl Task {
     /// Waits for one (`all` false) or all of `objects`, up to `timeout_ms`; alertable waits run queued APCs and
     /// return. Gives a `WAIT_*` value, or the reply that the thread or process is ending.
     pub fn wait_for(&mut self, cx: &mut Cx<'_>, objects: &[Arc<Object>], all: bool, timeout_ms: u32, alertable: bool) -> Result<u32, Reply> {
+        self.wait_or_wake(cx, objects, all, timeout_ms, alertable, false)
+    }
+
+    /// The same wait, which with `woken` also ends (with [`WOKEN`]) when anything wakes the thread: what else it
+    /// waits for, as `MsgWaitForMultipleObjects` waits for messages too, is the caller's to check.
+    pub fn wait_or_wake(&mut self, cx: &mut Cx<'_>, objects: &[Arc<Object>], all: bool, timeout_ms: u32, alertable: bool, woken: bool) -> Result<u32, Reply> {
         let deadline = (timeout_ms != INFINITE).then(|| Instant::now() + Duration::from_millis(u64::from(timeout_ms)));
         let tid = self.tid;
         let objects_lock = &self.k.objects;
@@ -182,8 +190,12 @@ impl Task {
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 break Ok(WAIT_TIMEOUT);
             }
-            if self.waiter.wait(deadline) == Woke::Interrupted && self.ending() {
+            let woke = self.waiter.wait(deadline);
+            if woke == Woke::Interrupted && self.ending() {
                 break Err(Reply::Ended);
+            }
+            if woken && deadline.is_none_or(|d| Instant::now() < d) {
+                break Ok(WOKEN);
             }
         };
         {

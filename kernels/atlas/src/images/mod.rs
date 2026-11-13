@@ -114,7 +114,7 @@ fn make_dll(isa: Isa, dll: usize, gate: bool) -> Vec<u8> {
             (e.name, body)
         })
         .collect();
-    make::dll(isa, d.name, layout(isa).dll_base(dll), d.first_ordinal, &exports, gate)
+    make::dll(isa, d.name, layout(isa).dll_base(dll), &d.ordinals(), &exports, gate)
 }
 
 /// Makes the arguments atlas reads from the stack slots x86 passed.
@@ -133,6 +133,8 @@ pub fn x86_wide(name: &str) -> Option<(usize, Join)> {
         "VerSetConditionMask" => (4, |s| vec![s[0] & LOW | (s[1] & LOW) << 32, s[2], s[3]]),
         // (POINT): x and y, as one 64-bit value has them.
         "WindowFromPoint" => (2, |s| vec![s[0] & LOW | (s[1] & LOW) << 32]),
+        // (POINT, flags)
+        "MonitorFromPoint" => (3, |s| vec![s[0] & LOW | (s[1] & LOW) << 32, s[2]]),
         _ => return None,
     };
     Some(joined)

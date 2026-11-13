@@ -201,6 +201,10 @@ impl<'a> Pe<'a> {
         };
         let Some(index) = index.filter(|i| *i < functions) else { return Ok(None) };
         let target = u32_at(image, function_table as usize + index as usize * 4)?;
+        // An ordinal with nothing there: the gaps a DLL's table can have.
+        if target == 0 {
+            return Ok(None);
+        }
         Ok(Some(if target >= rva && target < rva + size { Found::Forward(cstr(image, target as usize)?) } else { Found::Rva(target) }))
     }
 

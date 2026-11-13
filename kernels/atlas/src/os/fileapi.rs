@@ -1022,6 +1022,56 @@ pub fn get_disk_free_space_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Rep
     Reply::Value(TRUE)
 }
 
+/// `GetDiskFreeSpaceExW(folder, &free to the caller, &total, &free)` and `A`: the same disk, in bytes.
+pub fn get_disk_free_space_ex_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (total, free) = (128u64 << 30, 96u64 << 30);
+    for (at, v) in [(a[1], free), (a[2], total), (a[3], free)] {
+        if at != 0 && task.mem(cx, true, |t| user::write(&mut t.space(), at, &v.to_le_bytes())).is_err() {
+            return task.fail(cx, 998);
+        }
+    }
+    Reply::Value(TRUE)
+}
+
+/// `GetDriveTypeW(root)` and `A`: C: (or none, the current drive's) is DRIVE_FIXED (3); other drive letters have
+/// nothing there, DRIVE_NO_ROOT_DIR (1).
+fn get_drive_type(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let root = if a[0] == 0 { String::new() } else { task.path_arg(cx, a[0], wide).unwrap_or_default() };
+    let fixed = match root.as_bytes() {
+        [] => true,
+        [d, b':', rest @ ..] => d.eq_ignore_ascii_case(&b'c') && matches!(rest, [] | [b'\\' | b'/']),
+        [b'\\' | b'/', ..] => true,
+        _ => false,
+    };
+    Reply::Value(if fixed { 3 } else { 1 })
+}
+
+pub fn get_drive_type_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    get_drive_type(task, cx, a, true)
+}
+
+pub fn get_drive_type_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    get_drive_type(task, cx, a, false)
+}
+
+/// `FindFirstFileExW(pattern, info level, &data, search op, filter, flags)` and `A`: as `FindFirstFile`; the basic
+/// info level has no short names, which atlas's finds never have anyway, and limiting to folders is only advice.
+pub fn find_first_file_ex_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[1] > 1 || a[3] > 2 || a[4] != 0 {
+        task.set_last_error(cx, ERROR_INVALID_PARAMETER);
+        return Reply::Value(INVALID_HANDLE_VALUE);
+    }
+    find_first(task, cx, &[a[0], a[2]], true)
+}
+
+pub fn find_first_file_ex_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[1] > 1 || a[3] > 2 || a[4] != 0 {
+        task.set_last_error(cx, ERROR_INVALID_PARAMETER);
+        return Reply::Value(INVALID_HANDLE_VALUE);
+    }
+    find_first(task, cx, &[a[0], a[2]], false)
+}
+
 /// `SearchPathW(path, file, extension, size, &buffer, &file part)`: the first folder of `path` (or of the program's
 /// folder, the current one, System32 and Windows) with the file, `extension` added if its name has none. Its full
 /// name's length, or the size it needs; 0 with ERROR_FILE_NOT_FOUND.

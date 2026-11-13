@@ -153,3 +153,11 @@ LoadMenuW
 SetMenu
 GetMenu
 TrackPopupMenu
+MonitorFromWindow
+MonitorFromPoint
+GetMonitorInfoW
+GetProcessWindowStation
+GetUserObjectInformationW
+MapWindowPoints
+MsgWaitForMultipleObjects
+PostThreadMessageW

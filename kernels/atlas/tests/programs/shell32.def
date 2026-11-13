@@ -15,3 +15,6 @@ SHFileOperationW
 ShellExecuteW
 ShellExecuteExW
 SHBrowseForFolderW
+CommandLineToArgvW
+SHGetKnownFolderPath
+IsUserAnAdmin @680 NONAME

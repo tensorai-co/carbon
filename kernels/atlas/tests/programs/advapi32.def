@@ -86,3 +86,7 @@ GetUserNameA
 ConvertSidToStringSidA
 ConvertStringSidToSidA
 LookupAccountSidA
+RegisterEventSourceW
+ReportEventW
+DeregisterEventSource
+SystemFunction036

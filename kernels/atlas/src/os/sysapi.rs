@@ -706,3 +706,277 @@ mod tests {
         assert_eq!(zone.to_utc(at([2024, 7, 0, 1, 12, 0, 0, 0])), at([2024, 7, 0, 1, 16, 0, 0, 0]));
     }
 }
+
+// --- Dates and times as text, as English (United States) writes them ---
+
+const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+const DAYS: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const DATE_SHORTDATE: u32 = 0x1;
+const DATE_LONGDATE: u32 = 0x2;
+const DATE_YEARMONTH: u32 = 0x8;
+const TIME_NOMINUTESORSECONDS: u32 = 0x1;
+const TIME_NOSECONDS: u32 = 0x2;
+const TIME_NOTIMEMARKER: u32 = 0x4;
+const TIME_FORCE24HOURFORMAT: u32 = 0x8;
+/// LOCALE_NOUSEROVERRIDE and LOCALE_USE_CP_ACP, which say nothing about the format.
+const LOCALE_FLAGS: u32 = 0xc000_0000;
+const ERROR_INVALID_FLAGS: u32 = 1004;
+
+/// `st` written by a picture: runs of d, M, y, g, h, H, m, s and t are its fields, text in single quotes ('' is a
+/// quote) is as it is, and anything else is itself.
+fn picture(st: [u16; 8], pic: &str) -> String {
+    let [year, month, weekday, day, hour, minute, second, _] = st.map(u32::from);
+    let p: Vec<char> = pic.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < p.len() {
+        let c = p[i];
+        if c == '\'' {
+            i += 1;
+            while i < p.len() {
+                if p[i] == '\'' {
+                    if p.get(i + 1) == Some(&'\'') {
+                        out.push('\'');
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                out.push(p[i]);
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        let n = p[i..].iter().take_while(|&&d| d == c).count();
+        i += n;
+        let hour12 = if hour % 12 == 0 { 12 } else { hour % 12 };
+        let field = match (c, n) {
+            ('d', 1) => day.to_string(),
+            ('d', 2) => format!("{day:02}"),
+            ('d', 3) => DAYS[weekday as usize % 7][..3].to_string(),
+            ('d', _) => DAYS[weekday as usize % 7].to_string(),
+            ('M', 1) => month.to_string(),
+            ('M', 2) => format!("{month:02}"),
+            ('M', 3) => MONTHS[(month as usize + 11) % 12][..3].to_string(),
+            ('M', _) => MONTHS[(month as usize + 11) % 12].to_string(),
+            ('y', 1) => (year % 100).to_string(),
+            ('y', 2) => format!("{:02}", year % 100),
+            ('y', _) => year.to_string(),
+            ('g', _) => "A.D.".to_string(),
+            ('h', 1) => hour12.to_string(),
+            ('h', _) => format!("{hour12:02}"),
+            ('H', 1) => hour.to_string(),
+            ('H', _) => format!("{hour:02}"),
+            ('m', 1) => minute.to_string(),
+            ('m', _) => format!("{minute:02}"),
+            ('s', 1) => second.to_string(),
+            ('s', _) => format!("{second:02}"),
+            ('t', 1) => (if hour < 12 { "A" } else { "P" }).to_string(),
+            ('t', _) => (if hour < 12 { "AM" } else { "PM" }).to_string(),
+            _ => std::iter::repeat_n(c, n).collect(),
+        };
+        out.push_str(&field);
+    }
+    out
+}
+
+/// The time to write: the program's SYSTEMTIME (its day of the week worked out again, as Windows does), or now.
+fn time_to_write(task: &mut Task, cx: &mut Cx<'_>, at: u64) -> Result<[u16; 8], u64> {
+    if at == 0 {
+        return Ok(system::system_time(crate::files::filetime(task.k.host.wall())));
+    }
+    let st = read_systemtime(task, cx, at)?;
+    match system::file_time(st) {
+        Some(ft) => Ok(system::system_time(ft)),
+        None => {
+            task.set_last_error(cx, ERROR_INVALID_PARAMETER);
+            Err(0)
+        }
+    }
+}
+
+/// Gives back formatted text as `GetDateFormat` and `GetTimeFormat` do: its length with the NUL, or with no room,
+/// the room it needs; 0 with ERROR_INSUFFICIENT_BUFFER if it doesn't fit.
+fn give_text(task: &mut Task, cx: &mut Cx<'_>, out: u64, room: u64, text: &str, wide: bool) -> Result<u64, u64> {
+    let mut bytes: Vec<u8> = if wide { text.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect() } else { crate::ansi::bytes(text).iter().copied().chain([0]).collect() };
+    let count = (bytes.len() / if wide { 2 } else { 1 }) as u64;
+    if room == 0 {
+        return Ok(count);
+    }
+    if room < count {
+        task.set_last_error(cx, ERROR_INSUFFICIENT_BUFFER);
+        return Err(0);
+    }
+    if wide {
+        bytes.truncate(count as usize * 2);
+    }
+    task.put(cx, out, &bytes).map_err(|_| 0u64)?;
+    Ok(count)
+}
+
+/// `GetDateFormatW(locale, flags, &date, picture, out, room)` and `A`: the picture given, or the locale's short date
+/// (`M/d/yyyy`), long date or year and month.
+fn get_date_format(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Result<u64, u64> {
+    let flags = a[1] as u32 & !LOCALE_FLAGS;
+    let st = time_to_write(task, cx, a[2])?;
+    let pic = if a[3] != 0 {
+        if flags != 0 {
+            task.set_last_error(cx, ERROR_INVALID_FLAGS);
+            return Err(0);
+        }
+        task.text_arg(cx, a[3], wide)
+    } else if flags & DATE_LONGDATE != 0 {
+        "dddd, MMMM d, yyyy".into()
+    } else if flags & DATE_YEARMONTH != 0 {
+        "MMMM yyyy".into()
+    } else if flags & !DATE_SHORTDATE & 0xff == 0 {
+        "M/d/yyyy".into()
+    } else {
+        task.set_last_error(cx, ERROR_INVALID_FLAGS);
+        return Err(0);
+    };
+    give_text(task, cx, a[4], a[5] & 0xffff_ffff, &picture(st, &pic), wide)
+}
+
+pub fn get_date_format_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    reply(get_date_format(task, cx, a, true))
+}
+
+pub fn get_date_format_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    reply(get_date_format(task, cx, a, false))
+}
+
+/// `GetDateFormatEx(locale name, flags, &date, picture, out, room, calendar)`.
+pub fn get_date_format_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    reply(get_date_format(task, cx, a, true))
+}
+
+/// Takes a picture's fields of some letters out, with the separators before them (or after, for the first).
+fn without(pic: &str, letters: &[char]) -> String {
+    let p: Vec<char> = pic.chars().collect();
+    let mut keep = vec![true; p.len()];
+    let mut i = 0;
+    while i < p.len() {
+        if letters.contains(&p[i]) {
+            let start = i;
+            while i < p.len() && p[i] == p[start] {
+                i += 1;
+            }
+            // The separator before it, back to the field before; else the one after.
+            let mut s = start;
+            while s > 0 && !p[s - 1].is_alphabetic() {
+                s -= 1;
+            }
+            let (from, to) = if s > 0 { (s, i) } else { (start, i + p[i..].iter().take_while(|c| !c.is_alphabetic()).count()) };
+            keep[from..to].iter_mut().for_each(|k| *k = false);
+            i = to.max(i);
+        } else {
+            i += 1;
+        }
+    }
+    p.iter().zip(keep).filter(|(_, k)| *k).map(|(c, _)| c).collect()
+}
+
+/// `GetTimeFormatW(locale, flags, &time, picture, out, room)` and `A`: the picture given or `h:mm:ss tt`, without
+/// minutes and seconds, seconds or the AM/PM marker, or in 24 hours, as the flags say.
+fn get_time_format(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Result<u64, u64> {
+    let flags = a[1] as u32 & !LOCALE_FLAGS;
+    let st = time_to_write(task, cx, a[2])?;
+    let mut pic = if a[3] != 0 { task.text_arg(cx, a[3], wide) } else { "h:mm:ss tt".into() };
+    if flags & TIME_NOMINUTESORSECONDS != 0 {
+        pic = without(&pic, &['m', 's']);
+    } else if flags & TIME_NOSECONDS != 0 {
+        pic = without(&pic, &['s']);
+    }
+    if flags & TIME_NOTIMEMARKER != 0 {
+        pic = without(&pic, &['t']);
+    }
+    if flags & TIME_FORCE24HOURFORMAT != 0 {
+        pic = pic.replace('h', "H");
+    }
+    give_text(task, cx, a[4], a[5] & 0xffff_ffff, &picture(st, &pic), wide)
+}
+
+pub fn get_time_format_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    reply(get_time_format(task, cx, a, true))
+}
+
+pub fn get_time_format_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    reply(get_time_format(task, cx, a, false))
+}
+
+/// `GetTimeFormatEx(locale name, flags, &time, picture, out, room)`.
+pub fn get_time_format_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    reply(get_time_format(task, cx, a, true))
+}
+
+// --- Which processors a process or thread may run on, and the session it's in ---
+
+/// The mask of every processor, as wide as the program's pointers.
+fn all_processors(task: &Task) -> u64 {
+    let bits = task.cpus().min(task.abi().width as u32 * 8);
+    if bits >= 64 { u64::MAX } else { (1 << bits) - 1 }
+}
+
+/// `GetProcessAffinityMask(process, &process mask, &system mask)`: every processor, both.
+pub fn get_process_affinity_mask(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let mask = all_processors(task);
+    for at in [a[1], a[2]] {
+        if at == 0 || task.write_ptr(cx, at, mask).is_err() {
+            task.set_last_error(cx, ERROR_NOACCESS);
+            return Reply::Value(FALSE);
+        }
+    }
+    Reply::Value(TRUE)
+}
+
+/// `SetProcessAffinityMask(process, mask)`: any mask within the processors there are; atlas's threads run where the
+/// host puts them, so it's only checked.
+pub fn set_process_affinity_mask(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[1] == 0 || a[1] & !all_processors(task) != 0 {
+        task.set_last_error(cx, ERROR_INVALID_PARAMETER);
+        return Reply::Value(FALSE);
+    }
+    Reply::Value(TRUE)
+}
+
+/// `SetThreadAffinityMask(thread, mask)`: the mask it had (every processor), or 0 for one with none there is.
+pub fn set_thread_affinity_mask(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let all = all_processors(task);
+    if a[1] & all == 0 {
+        task.set_last_error(cx, ERROR_INVALID_PARAMETER);
+        return Reply::Value(0);
+    }
+    Reply::Value(all)
+}
+
+/// `ProcessIdToSessionId(pid, &session)`: every process is in session 1, the interactive user's.
+pub fn process_id_to_session_id(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let pid = a[0] as u32 as u64;
+    if pid != task.process.pid && task.k.process(pid).is_none() {
+        task.set_last_error(cx, ERROR_INVALID_PARAMETER);
+        return Reply::Value(FALSE);
+    }
+    reply(task.put(cx, a[1], &1u32.to_le_bytes()).map(|()| TRUE))
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    #[test]
+    fn pictures() {
+        // Friday 13 November 2026, 14:05:09.
+        let st = [2026, 11, 5, 13, 14, 5, 9, 0];
+        assert_eq!(picture(st, "M/d/yyyy"), "11/13/2026");
+        assert_eq!(picture(st, "dddd, MMMM d, yyyy"), "Friday, November 13, 2026");
+        assert_eq!(picture(st, "ddd dd MMM yy"), "Fri 13 Nov 26");
+        assert_eq!(picture(st, "h:mm:ss tt"), "2:05:09 PM");
+        assert_eq!(picture(st, "HH'h'mm 'o''clock'"), "14h05 o'clock");
+        assert_eq!(without("h:mm:ss tt", &['s']), "h:mm tt");
+        assert_eq!(without("h:mm:ss tt", &['m', 's']), "h tt");
+        assert_eq!(without("h:mm:ss tt", &['t']), "h:mm:ss");
+        assert_eq!(without("tt h:mm", &['t']), "h:mm");
+    }
+}

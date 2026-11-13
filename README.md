@@ -252,9 +252,9 @@ another process on Windows hosts; a worker process per machine.
 
 1. The desktop on Linux and Windows hosts' screens, as it is on the Mac's.
 2. The desktop's rest: WM_NCHITTEST and frames a program draws itself, keyboard layouts besides US.
-3. atlas's user interface: menu bars, the list box and combo box, comctl32's other controls (the tree view, tabs),
-   `MsgWaitForMultipleObjects`. (Dialogs, with buttons, statics and edits, popup menus, and comctl32's progress bar
-   and list view are done.)
+3. atlas's user interface: menu bars, the list box and combo box, comctl32's other controls (the tree view, tabs).
+   (Dialogs, with buttons, statics and edits, popup menus, comctl32's progress bar and list view, and
+   `MsgWaitForMultipleObjects` are done.)
 4. GDI: DIB sections with shared pages, regions and shapes, real fonts. (Bitmaps, memory DCs, `BitBlt` and icons are
    done.)
 5. lambda's Wayland and X11 servers, so GTK, Qt and Firefox run.

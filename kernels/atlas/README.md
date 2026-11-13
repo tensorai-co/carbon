@@ -5,9 +5,10 @@ declaration made into a PE in memory, so a machine has no Windows files to insta
 has to run inside the program, ntdll, is a crate (`guest/`) that cargo builds for each ISA and embeds.
 
 **Where it stands.** Programs run on ARM64 natively and x86-64 translated, and 32-bit x86 programs run too (WoW64,
-translated on Apple silicon; phases 1 to 5 of its six, below, are done): 28 of the test programs pass every check as
+translated on Apple silicon; phases 1 to 5 of its six, below, are done): 29 of the test programs pass every check as
 32-bit programs, with x86's own SEH, PE32 images and 32-bit layouts throughout, and a real 32-bit installer starts,
-unpacks its data, runs its start-up script, shows its dialogs, installs its files with its progress shown, and finishes. They have the loader and SEH, threads and
+unpacks its data, runs its start-up script, shows its dialogs, installs its files with its progress shown, and finishes; the program it installs loads with every import there and
+runs its start-up as far as its first socket. They have the loader and SEH, threads and
 waits, processes, anonymous and named pipes, sections, asynchronous I/O and completion ports, files, the registry,
 security (tokens, descriptors, access checks, impersonation), resources and version information, the system's
 version and information, and windows on the desktop with input. The loader is Windows' own in all but manifests: the
@@ -18,7 +19,9 @@ are shared as their opens say, with hard and symbolic links and times that can b
 program: work, timers and waits, on pools of their own or the process's. The registry tells watchers of changes, has
 WOW64's 32-bit view, and saves, restores, loads and unloads hives. Code pages convert as Windows' do, every `*A`
 function speaks Windows-1252, and ANSI windows get their messages' text in it. ucrtbase.dll is atlas's own C runtime, in the
-program, so MinGW-built C programs run. Nine DLLs declare 1,085 exports between them, 1,074 written and 11 stubs that say so, and ntdll has 300.
+program, so MinGW-built C programs run. Fifteen DLLs declare 1,251 exports between them, 1,193 written and 58 stubs that say so (most of them Winsock's
+sockets and crypt32's certificates, still to come), and ntdll has 332. A DLL's exports can have Windows' own ordinals,
+gaps and all, which programs import oleaut32's, ws2_32's and some of shell32's by.
 
 ## Layout
 
@@ -90,6 +93,7 @@ opening comment says what it checks. `crt.exe` (and `crt-mingw.exe`) want the ar
 | atlas's `ansiwin.c`, both ISAs | ANSI windows: a class and window made with the `*A` functions, its `WndProc` given names, text and characters in 1252 however they're sent; a Unicode window driven by the `*A` functions; `GetMessageA` and `DispatchMessageA`; `WndProc`s set by `SetWindowLongPtrA` and `W` |
 | atlas's `ansi.c`, both ISAs | Code pages: `MultiByteToWideChar` and `WideCharToMultiByte` in 1252, 437 and UTF-8; `*A` functions with é in their names, as the `*W` ones see them: files, paths, the registry, the environment, objects, accounts, locales and version information |
 | atlas's `registry.c`, both ISAs | A fresh machine's hives, keys and every value type, enumeration, deletion, and saving; change notification, asynchronous and not; the 32-bit view; hives saved, restored, loaded and unloaded |
+| atlas's `startup.c`, both ISAs and i686 | What larger programs call as they start: the heap's sizes, reallocation and queries; encoded pointers; `InitOnceBeginInitialize`/`Complete` and `ExecuteOnce`; interlocked lists; `IsDebuggerPresent`, `DebugBreak` to a vectored handler, `UnhandledExceptionFilter`; `IsBadWritePtr`/`ReadPtr`; `CompareString`, `LCMapString` (case and sort keys), `GetStringType`; `GetDateFormat`/`GetTimeFormat`; disk space, drive types, `FindFirstFileEx`; console modes and `SetStdHandle`; `OpenThread`, priorities, affinity, the session; psapi; the monitor, the window station, `MapWindowPoints`, `MsgWaitForMultipleObjects` (a timeout, a message, an object); memory fonts; the event log and `RtlGenRandom`; `CommandLineToArgvW`, `SHGetKnownFolderPath`, `IsUserAnAdmin`; oleaut32's BSTRs and VARIANTs, bcrypt's random bytes and Winsock's start, imported by ordinal |
 | atlas's `installer.c`, both ISAs and i686 | What installers call first: the `lstr*` functions, `CharNext`/`CharPrev`, `MulDiv`, `CompareFileTime`; `wsprintf` with its arguments past the registers, cut at 1024 characters, and `wvsprintf`; temporary and short names, disk space, `SearchPath`; .ini files; the error mode; COM's start, its task allocator and `CoCreateInstance` with no class registered; `SHGetFileInfo` with no flags |
 | atlas's `environment.c`, both ISAs | The environment a logon gives, from the registry: read, expanded, set and deleted |
 | atlas's `links.c`, both ISAs | Sharing modes, opens refused and allowed; deleting and moving open files; a deleted file still read where it's open; hard links; symbolic links to files and folders, as attributes, listings and `RemoveDirectory` see them; file times set and read back |
@@ -680,6 +684,31 @@ chooses it, and a press outside dismisses them all. It gives the item's ID (`TPM
 for it. Items are drawn with their text, accelerator, check or radio dot, a submenu's arrow, and greyed when they're
 disabled.
 
+**What larger programs call as they start**, found by scanning a real client program's imports (`carbon atlas
+imports`) and written so it loads and starts. In the guest: `HeapReAlloc` (in place when the block has room, else
+moved; zeroing what it grows by; `HEAP_REALLOC_IN_PLACE_ONLY`), `HeapSize` (the size asked for, kept in each block's
+header), `HeapValidate`, `HeapLock`, `HeapWalk` (no blocks listed), `GetProcessHeaps` and the heap's information;
+`EncodePointer` and `DecodePointer` (XOR with a per-process secret, then a rotation); `InitOnceBeginInitialize` and
+`InitOnceComplete` (the state in the INIT_ONCE's low two bits and the context above them, as Windows keeps it, which
+`InitOnceExecuteOnce` now shares); interlocked singly linked lists; `IsDebuggerPresent` (the PEB's byte), `DebugBreak`
+(a breakpoint exception) and `UnhandledExceptionFilter` (the program's filter, else `EXCEPTION_EXECUTE_HANDLER`); and
+oleaut32's BSTRs and `VariantInit`, `VariantClear` and `VariantCopy` (a BSTR freed or copied, an interface released or
+added to). In the host: `CompareString` (word sort passing over hyphens and apostrophes, case second and lowercase
+first, `NORM_IGNORECASE`, `NORM_IGNORESYMBOLS`, `SORT_DIGITSASNUMBERS`), `LCMapString` (case one character for one,
+byte reversal, and sort keys in the same order) and `GetStringType`'s three classes; `GetDateFormat` and
+`GetTimeFormat`, in English (United States), with pictures and their flags; `GetDiskFreeSpaceEx`, `GetDriveType`,
+`FindFirstFileEx`; the console's modes, `ReadConsole`, `SetStdHandle`; `OpenThread`, thread priorities, affinity
+masks and the session; psapi's module paths, module information and memory counters (as kernel32's `K32` functions
+too); `IsBadWritePtr` and `IsBadReadPtr` from the process's regions; `OutputDebugString` into the trace; user32's one
+monitor (`MonitorFrom*`, `GetMonitorInfo`, `EnumDisplayMonitors`), the window station and desktop
+(`GetUserObjectInformation`), `MapWindowPoints`, `RedrawWindow`, and `MsgWaitForMultipleObjects(Ex)`, a wait that also
+ends when a message comes or a timer is due; gdi32's fonts from memory and OpenGL's pixel formats (accepted, with
+nothing to draw yet); advapi32's event log sources and `RtlGenRandom`; bcrypt's `BCryptGenRandom`, from the host's
+random bytes; shell32's `CommandLineToArgvW` (Windows' quoting rules), `SHGetKnownFolderPath` (the known folders'
+GUIDs, as their CSIDLs' paths) and `IsUserAnAdmin`; and Winsock's start (`WSAStartup`, `WSACleanup`), byte order,
+last error and `__WSAFDIsSet`, at Windows' ordinals. Sockets, crypt32's certificate store and wsock32's `AcceptEx`
+family are declared, as stubs, so programs that import them load.
+
 **Shell links** (`os/com.rs`): `CLSID_ShellLink`'s objects, with `IShellLinkW`, `IShellLinkA` and `IPersistFile`. One
 keeps a target, arguments, working folder, description, relative path, icon and its index, show command and hot key,
 and gives the target as a path, a WIN32_FIND_DATA and an item ID list. `IPersistFile` saves it as a `.lnk` file in
@@ -796,8 +825,8 @@ By layer, bottom up. Items are host Rust unless marked **[guest]** (ntdll), or a
   views, editing labels, sorting, `LVN_GETDISPINFO`'s callback items, owner data);
   scroll bars and carets; icons' rest (`GetIconInfo`, `CreateIconIndirect`, `CopyImage`, PNG images, the system's own
   icons drawn, a window's icon in its frame); hooks
-  (`SetWindowsHookEx`); window stations and desktops as objects; `MsgWaitForMultipleObjects`, one wait for messages
-  and objects, so no GUI program polls; windows across processes (`SendMessage`, `EnumWindows`, `WindowFromPoint`);
+  (`SetWindowsHookEx`); window stations and desktops as objects (there's one of each, by fixed handles, for now);
+  `MsgWaitForMultipleObjects`' wake mask, told apart by kind of message; windows across processes (`SendMessage`, `EnumWindows`, `WindowFromPoint`);
   per-monitor DPI awareness; IME, with imm32.
 - **NtGdi:** bitmaps' rest (`CreateDIBSection` on shared pages, `StretchDIBits`, `SetDIBitsToDevice`, `GetDIBits`,
   `AlphaBlend`, `TransparentBlt`, monochrome bitmaps' colours); regions; ellipses, polygons and paths; mapping modes; real fonts with metrics and the
@@ -833,13 +862,14 @@ BITS, audio **[audio]**, WMI's common classes); and **the event log**.
 
 ### 5. The Win32 core
 
-- **kernel32:** process lists (toolhelp) and `psapi`; the console in full (input records, modes, screen buffers,
-  cursor and colours, code pages, `AllocConsole`, virtual terminal sequences); strings and NLS
-  (code pages beyond 1252, 437 and UTF-8, the double-byte ones too; `CompareString`, `LCMapString`,
-  `GetLocaleInfoEx`, number and date formats); resources' rest (`UpdateResource`, `LOAD_LIBRARY_AS_DATAFILE`,
+- **kernel32:** process lists (toolhelp) and psapi's enumerations (`EnumProcesses`, `EnumProcessModules`); the
+  console in full (input records, screen buffers, cursor and colours, code pages, `AllocConsole`, virtual terminal
+  sequences); strings and NLS (code pages beyond 1252, 437 and UTF-8, the double-byte ones too; sorting as Windows'
+  tables do, accented letters with their plain ones; `GetLocaleInfoEx`, number formats, other locales' dates); resources' rest (`UpdateResource`, `LOAD_LIBRARY_AS_DATAFILE`,
   message tables for `FormatMessage`); job objects; `SetThreadExecutionState`;
   the long tail, as the import scanner and the `missing` stubs say.
-- **advapi32:** services; the event log; CryptoAPI's legacy face over bcrypt; ETW registration that succeeds.
+- **advapi32:** services; the event log kept and read (its sources are taken and their reports let go, for now);
+  CryptoAPI's legacy face over bcrypt; ETW registration that succeeds.
 - **user32 and gdi32:** ANSI windows' rest: `GetWindowLongPtrA`'s and `GetClassLongPtrA`'s `WndProc` for a Unicode
   window (and the W ones' for an ANSI one) as a handle `CallWindowProc` converts through, as Windows gives, and
   controls' messages with text (`EM_REPLACESEL` from an ANSI caller, `LB_*`, `CB_*`); menu, icon, cursor and
@@ -930,7 +960,7 @@ First `cmd.exe` (variables, `if`, `for`, `goto`, `call`, pipes, redirection, `.b
      `carbon run` knows a 32-bit `.exe` (platform `windows/386`), and gives it x86's memory ordering.
   6. [ ] **Every test program for i686**, passing; then real installers. Every test program but `sysinfo.c` (whose
      checks are 64-bit offsets; `wow64.c` checks the same calls at 32 bits) builds for i686 and passes every check:
-     28 programs, 937 checks, with the loader's own DLLs, thread-local variables (`__tls_array`), `__try` through
+     29 programs, 1,019 checks, with the loader's own DLLs, thread-local variables (`__tls_array`), `__try` through
      `_except_handler3` (now in the i686 ntdll, with `_local_unwind2`), and the C runtime. `build.sh` makes each
      program's import libraries from what its object imports, `__imp_` or not. `installer.c` checks what installers
      call first, on all three ISAs: `wsprintf` is C-variadic, so each ISA's is a few lines of the guest's assembly
@@ -958,7 +988,7 @@ Installers, winget and large desktop apps go past the layers' first items, in ro
 2. **What ordinary programs use:** menus; real fonts and the rest of GDI, with `DrawTextExW`, `ScrollWindowEx` and
    Uniscribe; real icons and cursors; services; restricted tokens, job objects with limits, and desktops and window
    stations (a browser engine's sandbox); `msi.dll` with compound files written.
-3. **What's faked underneath:** `MsgWaitForMultipleObjects`; change notification; junctions; `MoveFileEx` until reboot; transactions; windows across processes and `SetWindowsHookExW`;
+3. **What's faked underneath:** change notification; junctions; `MoveFileEx` until reboot; transactions; windows across processes and `SetWindowsHookExW`;
    the environment from the registry so what an installer sets reaches new processes; process
    times, `GetProcessMemoryInfo`, and local time zones.
 4. **Packaging:** MSIX, app containers and package identity; WinRT activation.

@@ -35,6 +35,9 @@ dll! {
     host ShellExecuteExW(1) => shell_execute_ex_w;
     host SHBrowseForFolderW(1) => sh_browse_for_folder_w;
     host SHBrowseForFolderA(1) => sh_browse_for_folder_a;
+    host CommandLineToArgvW(2) => command_line_to_argv_w;
+    host SHGetKnownFolderPath(4) => sh_get_known_folder_path;
+    host IsUserAnAdmin(0) @ 680 => is_user_an_admin;
 }
 
 /// `DragAcceptFiles`: whether a window takes files dropped on it (its `WS_EX_ACCEPTFILES`).
@@ -439,4 +442,219 @@ fn sh_get_file_info_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 
 fn sh_get_file_info_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     file_info(task, cx, a, false)
+}
+
+// ---- Command lines, known folders, and whether the user is an administrator ----
+
+/// A command line split as `CommandLineToArgvW` splits it. The program's name, first, ends at its closing quote or
+/// at a space or tab, and takes no escapes. Then: spaces and tabs between arguments; quotes group; 2n backslashes
+/// before a quote are n, and the quote is one; 2n + 1 are n and a literal quote; "" inside quotes is a literal quote;
+/// backslashes before anything else are themselves.
+pub(crate) fn split_command_line(line: &[u16]) -> Vec<Vec<u16>> {
+    let (quote, backslash, space, tab) = (u16::from(b'"'), u16::from(b'\\'), u16::from(b' '), u16::from(b'\t'));
+    let blank = |c: u16| c == space || c == tab;
+    let mut args = Vec::new();
+    let mut i = 0;
+    let mut first = Vec::new();
+    if line.first() == Some(&quote) {
+        i = 1;
+        while i < line.len() && line[i] != quote {
+            first.push(line[i]);
+            i += 1;
+        }
+        i += 1;
+    } else {
+        while i < line.len() && !blank(line[i]) {
+            first.push(line[i]);
+            i += 1;
+        }
+    }
+    args.push(first);
+    while i < line.len() && blank(line[i]) {
+        i += 1;
+    }
+    if i >= line.len() {
+        return args;
+    }
+    let mut arg = Vec::new();
+    let mut quoted = false;
+    while i < line.len() {
+        let c = line[i];
+        if blank(c) && !quoted {
+            args.push(std::mem::take(&mut arg));
+            while i < line.len() && blank(line[i]) {
+                i += 1;
+            }
+            if i >= line.len() {
+                return args;
+            }
+            continue;
+        }
+        if c == backslash {
+            let n = line[i..].iter().take_while(|&&c| c == backslash).count();
+            i += n;
+            if line.get(i) == Some(&quote) {
+                arg.extend(std::iter::repeat_n(backslash, n / 2));
+                if n % 2 == 1 {
+                    arg.push(quote);
+                    i += 1;
+                }
+            } else {
+                arg.extend(std::iter::repeat_n(backslash, n));
+            }
+            continue;
+        }
+        if c == quote {
+            if quoted && line.get(i + 1) == Some(&quote) {
+                arg.push(quote);
+                i += 2;
+                continue;
+            }
+            quoted = !quoted;
+            i += 1;
+            continue;
+        }
+        arg.push(c);
+        i += 1;
+    }
+    args.push(arg);
+    args
+}
+
+/// `CommandLineToArgvW(line, &count)`: the arguments, in one block `LocalFree` frees: their pointers (a null after the
+/// last), then their text. An empty line gives the program's path alone.
+fn command_line_to_argv_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[1] == 0 {
+        task.set_last_error(cx, 87);
+        return Reply::Value(0);
+    }
+    let line: Vec<u16> = task.wstr(cx, a[0]).encode_utf16().collect();
+    let args = if line.is_empty() { vec![kernels_core::lock(&task.process.state).image.encode_utf16().collect()] } else { split_command_line(&line) };
+    let abi = task.abi();
+    let w = abi.width;
+    let table = (args.len() as u64 + 1) * w;
+    let text: usize = args.iter().map(|s| (s.len() + 1) * 2).sum();
+    let base = super::kernel32::global_new(task, cx, &vec![0; table as usize + text]);
+    if base == 0 {
+        task.set_last_error(cx, 8);
+        return Reply::Value(0);
+    }
+    let mut block = Vec::with_capacity(table as usize + text);
+    let mut at = base + table;
+    for s in &args {
+        block.extend(abi.ptr(at));
+        at += (s.len() as u64 + 1) * 2;
+    }
+    block.extend(abi.ptr(0));
+    for s in &args {
+        block.extend(s.iter().chain([&0]).flat_map(|u| u.to_le_bytes()));
+    }
+    let wrote = task.mem(cx, true, |t| {
+        user::write(&mut t.space(), base, &block)?;
+        user::write_u32(&mut t.space(), a[1], args.len() as u32)
+    });
+    if wrote.is_err() {
+        task.set_last_error(cx, 998);
+        return Reply::Value(0);
+    }
+    Reply::Value(base)
+}
+
+/// A known folder's path, by its GUID: the CSIDL folder it is, or one of the few with none.
+fn known_folder(task: &mut Task, guid: &str) -> Option<String> {
+    let csidl = match guid {
+        "B4BFCC3A-DB2C-424C-B029-7FE99A87C641" => 0x10,
+        "FDD39AD0-238F-46AF-ADB4-6C85480369C7" => 0x05,
+        "1777F761-68AD-4D8A-87BD-30B759FA33DD" => 0x06,
+        "B97D20BB-F46A-4C97-BA10-5E3608430854" => 0x07,
+        "AE50C081-EBD2-438A-8655-8A092E34987A" => 0x08,
+        "8983036C-27C0-404B-8F08-102D10DCFD74" => 0x09,
+        "625B53C3-AB48-4EC1-BA1F-A1EF4146FC19" => 0x0b,
+        "A77F5D77-2E2B-44C3-A6A2-ABA601054A51" => 0x02,
+        "4BD8D571-6D19-48D3-BE97-422220080E43" => 0x0d,
+        "18989B1D-99B5-455B-841C-AB7C74E4DDFC" => 0x0e,
+        "FD228CB7-AE11-4AE3-864C-16F3910AB8FE" => 0x14,
+        "A63293E8-664E-48DB-A079-DF759E0509F7" => 0x15,
+        "A4115719-D62E-491D-AA7C-E74B8BE3B067" => 0x16,
+        "0139D44E-6AFE-49F2-8690-3DAFCAE6FFB8" => 0x17,
+        "C4AA340D-F20F-4863-AFEF-F87EF2E6BA25" => 0x19,
+        "3EB685DB-65F9-4CF6-A03A-E3EF65729F3D" => 0x1a,
+        "F1B32785-6FBA-4FCF-9D55-7B8E7F157091" => 0x1c,
+        "352481E8-33BE-4251-BA85-6007CAEDCF9D" => 0x20,
+        "2B0F765D-C0E9-4171-908E-08A611B84FF6" => 0x21,
+        "D9DC8A3B-B784-432E-A781-5A1130A75963" => 0x22,
+        "62AB5D82-FDC1-4DC3-A9DD-070D1D495D97" => 0x23,
+        "F38BF404-1D43-42F2-9305-67DE0B28FC23" => 0x24,
+        "1AC14E77-02E7-4E5D-B744-2EB1AE5198B7" => 0x25,
+        "905E63B6-C1BF-494E-B29C-65B732D3D21A" => 0x26,
+        "33E28130-4E1E-4676-835A-98395C3BC3BB" => 0x27,
+        "5E6C858F-0E22-4760-9AFE-EA3317B67173" => 0x28,
+        "D65231B0-B2F1-4857-A4CE-A8E7C6EA7D27" => 0x29,
+        "7C5A40EF-A0FB-4BFC-874A-C0F2E0B9FA8E" => 0x2a,
+        "F7F1ED05-9F6D-47A2-AAAE-29D317C6F066" => 0x2b,
+        "DE974D24-D9C6-4D3E-BF91-F4455120B917" => 0x2c,
+        // LocalLow, Downloads, the users' folder and Public have no CSIDL.
+        "A520A1A4-1780-4FF6-BD18-167343C5AF16" => return Some(make(task, "C:\\Users\\carbon\\AppData\\LocalLow")),
+        "374DE290-123F-4565-9164-39C4925E467B" => return Some(make(task, "C:\\Users\\carbon\\Downloads")),
+        "0762D272-C50A-4BB0-A382-697DCD729B80" => return Some(make(task, "C:\\Users")),
+        "DFDF76A2-C82A-4D63-906A-5644AC457385" => return Some(make(task, "C:\\Users\\Public")),
+        _ => return None,
+    };
+    folder_path(task, csidl)
+}
+
+fn make(task: &mut Task, path: &str) -> String {
+    task.make_folders(path);
+    path.to_string()
+}
+
+/// `SHGetKnownFolderPath(&folder id, flags, token, &path)`: S_OK and the path in a block from `CoTaskMemAlloc`;
+/// HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) and a null path for a folder atlas doesn't know.
+fn sh_get_known_folder_path(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Ok(g) = task.mem(cx, false, |t| user::read_vec(&t.space(), a[0], 16)) else { return Reply::Value(E_INVALIDARG) };
+    let guid = format!(
+        "{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{}",
+        u32::from_le_bytes([g[0], g[1], g[2], g[3]]),
+        u16::from_le_bytes([g[4], g[5]]),
+        u16::from_le_bytes([g[6], g[7]]),
+        g[8],
+        g[9],
+        g[10..16].iter().map(|b| format!("{b:02X}")).collect::<String>()
+    );
+    let Some(path) = known_folder(task, &guid) else {
+        let _ = task.write_ptr(cx, a[3], 0);
+        return Reply::Value(0x8007_0002);
+    };
+    let text: Vec<u8> = path.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+    let at = match task.task_alloc(cx, &text) {
+        Ok(at) => at,
+        Err(reply) => return reply,
+    };
+    if at == 0 || task.write_ptr(cx, a[3], at).is_err() {
+        return Reply::Value(0x8007_000e);
+    }
+    Reply::Value(S_OK)
+}
+
+/// `IsUserAnAdmin()`, shell32's #680: the user is, elevated.
+fn is_user_an_admin(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_command_line;
+
+    fn split(s: &str) -> Vec<String> {
+        split_command_line(&s.encode_utf16().collect::<Vec<_>>()).iter().map(|a| String::from_utf16_lossy(a)).collect()
+    }
+
+    #[test]
+    fn command_lines_split_as_windows_splits_them() {
+        assert_eq!(split(r#""C:\Program Files\app.exe" -a "b c" d"#), ["C:\\Program Files\\app.exe", "-a", "b c", "d"]);
+        assert_eq!(split(r#"app.exe a\\\"b "c\\" d\e"#), ["app.exe", r#"a\"b"#, r"c\", r"d\e"]);
+        assert_eq!(split(r#"app.exe "a ""quoted"" word" """#), ["app.exe", r#"a "quoted" word"#, ""]);
+        assert_eq!(split("app.exe   "), ["app.exe"]);
+        assert_eq!(split(r"C:\dir\app.exe"), [r"C:\dir\app.exe"]);
+    }
 }

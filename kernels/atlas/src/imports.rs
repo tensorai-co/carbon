@@ -127,7 +127,7 @@ pub fn status(dll: &str, name: Option<&str>, ordinal: Option<u16>, isa: Isa, pro
     let d = DLLS[index];
     let found = match (name, ordinal) {
         (Some(name), _) => d.exports.iter().find(|e| e.name == name),
-        (None, Some(ordinal)) => ordinal.checked_sub(d.first_ordinal).and_then(|i| d.exports.get(usize::from(i))),
+        (None, Some(ordinal)) => d.by_ordinal(ordinal),
         (None, None) => None,
     };
     match found.map(|e| e.kind) {

@@ -313,24 +313,180 @@ pub extern "system" fn AtlasSleepConditionVariableCS(cv: &AtomicUsize, cs: *mut 
     sleep_on(cv, timeout_ms, release, reacquire)
 }
 
-// ---- One-time initialization: 0 not yet, 1 running, 2 done ----
+// ---- One-time initialization: the low two bits 0 not yet, 1 running, 2 done; the rest, when done, the context ----
 
+const ONCE_CHECK_ONLY: u32 = 1;
+const ONCE_INIT_FAILED: u32 = 4;
+const ONCE_STATE: usize = 3;
+
+/// The INIT_ONCE's low half, which its state is in, for waiting on.
+fn once_low(once: &AtomicUsize) -> &AtomicU32 {
+    // SAFETY: an INIT_ONCE is pointer-sized and aligned; its first four bytes are its low half on every ISA here.
+    unsafe { &*(once as *const AtomicUsize).cast::<AtomicU32>() }
+}
+
+/// `InitOnceBeginInitialize(once, flags, &pending, &context)`: TRUE with `pending` set if this caller is to do it (the
+/// others wait), or TRUE with the context given if it's been done. INIT_ONCE_CHECK_ONLY only asks.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasInitOnceExecuteOnce(once: &AtomicU32, function: extern "system" fn(*const AtomicU32, usize, *mut usize) -> i32, parameter: usize, context: *mut usize) -> i32 {
-    loop {
-        match once.compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire) {
-            Ok(_) => {
-                let ok = function(once, parameter, context);
-                once.store(if ok != 0 { 2 } else { 0 }, Ordering::Release);
-                wake_address(once as *const AtomicU32 as u64, true);
-                return ok;
+pub extern "system" fn AtlasInitOnceBeginInitialize(once: &AtomicUsize, flags: u32, pending: *mut i32, context: *mut usize) -> i32 {
+    let done = |value: usize| {
+        // SAFETY: the program's BOOL and pointer, where given.
+        unsafe {
+            if !pending.is_null() {
+                pending.write(0);
             }
-            Err(2) => return 1,
-            Err(_) => {
-                wait_while_u32(once, 1, INFINITE);
+            if !context.is_null() {
+                context.write(value & !ONCE_STATE);
+            }
+        }
+        1
+    };
+    loop {
+        let value = once.load(Ordering::Acquire);
+        match value & ONCE_STATE {
+            2 => return done(value),
+            _ if flags & ONCE_CHECK_ONLY != 0 => {
+                // SAFETY: as above.
+                unsafe {
+                    if !pending.is_null() {
+                        pending.write(1);
+                    }
+                }
+                crate::RtlSetLastWin32Error(31); // ERROR_GEN_FAILURE, as STATUS_UNSUCCESSFUL is
+                return 0;
+            }
+            0 => {
+                if once.compare_exchange(value, 1, Ordering::Acquire, Ordering::Acquire).is_ok() {
+                    // SAFETY: as above.
+                    unsafe {
+                        if !pending.is_null() {
+                            pending.write(1);
+                        }
+                    }
+                    return 1;
+                }
+            }
+            _ => {
+                wait_while_u32(once_low(once), value as u32, INFINITE);
             }
         }
     }
+}
+
+/// `InitOnceComplete(once, flags, context)`: done, with `context` kept (its low two bits must be clear), or with
+/// INIT_ONCE_INIT_FAILED back to not done; whoever waits wakes.
+#[unsafe(no_mangle)]
+pub extern "system" fn AtlasInitOnceComplete(once: &AtomicUsize, flags: u32, context: usize) -> i32 {
+    if context & ONCE_STATE != 0 || once.load(Ordering::Acquire) & ONCE_STATE != 1 {
+        crate::RtlSetLastWin32Error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    once.store(if flags & ONCE_INIT_FAILED != 0 { 0 } else { context | 2 }, Ordering::Release);
+    wake_address(once as *const AtomicUsize as u64, true);
+    1
+}
+
+/// `InitOnceExecuteOnce(once, function, parameter, &context)`: `function` runs once, whoever else calls waiting for
+/// it; if it fails, the next caller tries again.
+#[unsafe(no_mangle)]
+pub extern "system" fn AtlasInitOnceExecuteOnce(once: &AtomicUsize, function: extern "system" fn(*const AtomicUsize, usize, *mut usize) -> i32, parameter: usize, context: *mut usize) -> i32 {
+    let mut pending = 0;
+    let mut value = 0usize;
+    if AtlasInitOnceBeginInitialize(once, 0, &mut pending, &mut value) == 0 {
+        return 0;
+    }
+    if pending != 0 {
+        let ok = function(once, parameter, &mut value);
+        AtlasInitOnceComplete(once, if ok != 0 { 0 } else { ONCE_INIT_FAILED }, if ok != 0 { value & !ONCE_STATE } else { 0 });
+        if ok == 0 {
+            return 0;
+        }
+    }
+    if !context.is_null() {
+        // SAFETY: the program's pointer.
+        unsafe { context.write(value) };
+    }
+    1
+}
+
+// ---- Singly linked lists, interlocked: the header's first word is the top entry, then a 16-bit depth and a 16-bit
+// sequence. Pushes and pops take a lock of their own, so there's no ABA to guard against. ----
+
+static SLISTS: AtomicUsize = AtomicUsize::new(0);
+
+fn with_slists<R>(f: impl FnOnce() -> R) -> R {
+    while SLISTS.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+    let r = f();
+    SLISTS.store(0, Ordering::Release);
+    r
+}
+
+#[repr(C)]
+pub struct SListHeader {
+    next: *mut *mut u8,
+    depth: u16,
+    sequence: u16,
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn AtlasInitializeSListHead(head: *mut SListHeader) {
+    // SAFETY: the program's header: 8 bytes on x86, 16 elsewhere; all of it is cleared.
+    unsafe { core::ptr::write_bytes(head.cast::<u8>(), 0, 2 * PTR as usize) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn AtlasInterlockedPushEntrySList(head: *mut SListHeader, entry: *mut *mut u8) -> *mut *mut u8 {
+    with_slists(|| {
+        // SAFETY: the program's header and entry, whose first word is its link.
+        unsafe {
+            let h = &mut *head;
+            let top = h.next;
+            entry.write(top.cast());
+            h.next = entry;
+            h.depth = h.depth.wrapping_add(1);
+            h.sequence = h.sequence.wrapping_add(1);
+            top
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn AtlasInterlockedPopEntrySList(head: *mut SListHeader) -> *mut *mut u8 {
+    with_slists(|| {
+        // SAFETY: the program's header, and the entries on it.
+        unsafe {
+            let h = &mut *head;
+            let top = h.next;
+            if !top.is_null() {
+                h.next = top.read().cast();
+                h.depth = h.depth.wrapping_sub(1);
+                h.sequence = h.sequence.wrapping_add(1);
+            }
+            top
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn AtlasInterlockedFlushSList(head: *mut SListHeader) -> *mut *mut u8 {
+    with_slists(|| {
+        // SAFETY: the program's header.
+        unsafe {
+            let h = &mut *head;
+            let top = h.next;
+            h.next = core::ptr::null_mut();
+            h.depth = 0;
+            top
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn AtlasQueryDepthSList(head: *mut SListHeader) -> u16 {
+    // SAFETY: the program's header.
+    with_slists(|| unsafe { (*head).depth })
 }
 
 // ---- TLS and FLS slots: 64 of each, given out from a bitmap ----

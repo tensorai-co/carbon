@@ -371,3 +371,163 @@ pub fn get_startup_info(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let _ = task.mem(cx, true, |t| user::write(&mut t.space(), a[0], &info));
     Reply::Value(0)
 }
+
+// --- Threads by ID, and their priorities ---
+
+/// `OpenThread(access, inherit, tid)`: a handle to any process's thread that hasn't ended.
+pub fn open_thread(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let tid = a[2] as u32 as u64;
+    let own = lock(&task.process.state).threads.get(&tid).cloned();
+    match own.or_else(|| task.k.thread(tid)) {
+        Some(thread) => Reply::Value(lock(&task.process.state).handles.add_with(Handle::Object(thread.object.clone()), a[1] as u32 != 0)),
+        None => {
+            task.set_last_error(cx, ERROR_INVALID_PARAMETER);
+            Reply::Value(0)
+        }
+    }
+}
+
+/// `SetThreadPriority(thread, priority)`: any of Windows' levels, for a thread; the host schedules atlas's threads
+/// alike, so it's only checked.
+pub fn set_thread_priority(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if task.thread_of(a[0]).is_none() {
+        return task.fail(cx, ERROR_INVALID_HANDLE);
+    }
+    let priority = a[1] as u32 as i32;
+    // THREAD_PRIORITY_IDLE (-15) to TIME_CRITICAL (15), and THREAD_MODE_BACKGROUND_BEGIN and END.
+    if !(matches!(priority, -2..=2 | -15 | 15 | 0x10000 | 0x20000)) {
+        return task.fail(cx, ERROR_INVALID_PARAMETER);
+    }
+    Reply::Value(TRUE)
+}
+
+/// `GetThreadPriority(thread)`: THREAD_PRIORITY_NORMAL, or THREAD_PRIORITY_ERROR_RETURN for what isn't a thread.
+pub fn get_thread_priority(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if task.thread_of(a[0]).is_none() {
+        task.set_last_error(cx, ERROR_INVALID_HANDLE);
+        return Reply::Value(0x7fff_ffff);
+    }
+    Reply::Value(0)
+}
+
+// --- psapi: a process's modules and memory, as kernel32's K32* functions (psapi.dll's are the same) ---
+
+const ERROR_ACCESS_DENIED: u32 = 5;
+
+/// A module of a process: its base (0 is its program's) and Windows path.
+fn module_of(process: &Process, module: u64) -> Option<(u64, String)> {
+    let state = lock(&process.state);
+    if module == 0 {
+        return Some((0, state.image.clone()));
+    }
+    state.mapped.values().find(|(base, _)| *base == module).cloned()
+}
+
+/// `K32GetModuleFileNameExW(process, module, out, room)` and `A`: the module's full path, cut to fit (with its NUL);
+/// its length without the NUL.
+fn get_module_file_name_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let Some(process) = task.process_of(a[0]) else { return task.fail(cx, ERROR_INVALID_HANDLE) };
+    let room = a[3] as u32 as usize;
+    let Some((_, path)) = module_of(&process, a[1]).or_else(|| (a[1] == task.exe_base(cx) && Arc::ptr_eq(&process, &task.process)).then(|| (0, lock(&process.state).image.clone()))) else {
+        return task.fail(cx, ERROR_INVALID_HANDLE);
+    };
+    if room == 0 {
+        return task.fail(cx, ERROR_INSUFFICIENT_BUFFER);
+    }
+    let (bytes, count) = if wide {
+        let mut units: Vec<u16> = path.encode_utf16().collect();
+        units.truncate(room - 1);
+        let n = units.len();
+        (units.iter().chain([&0]).flat_map(|u| u.to_le_bytes()).collect::<Vec<u8>>(), n)
+    } else {
+        let mut b = crate::ansi::bytes(&path).to_vec();
+        b.truncate(room - 1);
+        let n = b.len();
+        b.push(0);
+        (b, n)
+    };
+    if task.mem(cx, true, |t| user::write(&mut t.space(), a[2], &bytes)).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(count as u64)
+}
+
+const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+
+pub fn get_module_file_name_ex_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    get_module_file_name_ex(task, cx, a, true)
+}
+
+pub fn get_module_file_name_ex_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    get_module_file_name_ex(task, cx, a, false)
+}
+
+impl Task {
+    /// Where this process's program is, from its PEB.
+    fn exe_base(&mut self, cx: &mut Cx<'_>) -> u64 {
+        let abi = self.abi();
+        let peb = lock(&self.process.state).peb;
+        self.mem(cx, false, |t| user::read_ptr(&t.space(), peb + abi.peb.image_base, abi.width)).unwrap_or(0)
+    }
+}
+
+/// `K32GetModuleInformation(process, module, &info, size)`: MODULEINFO's base, size of image and entry point, read
+/// from the module's headers. Only this process's: another's memory isn't read from here.
+pub fn get_module_information(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(process) = task.process_of(a[0]) else { return task.fail(cx, ERROR_INVALID_HANDLE) };
+    if !Arc::ptr_eq(&process, &task.process) {
+        return task.fail(cx, ERROR_ACCESS_DENIED);
+    }
+    let abi = task.abi();
+    let size = 2 * abi.width + if abi.width == 8 { 8 } else { 4 };
+    if a[3] < size {
+        return task.fail(cx, ERROR_INSUFFICIENT_BUFFER);
+    }
+    let base = if a[1] == 0 { task.exe_base(cx) } else { a[1] };
+    if base != task.exe_base(cx) && module_of(&process, base).is_none() {
+        return task.fail(cx, ERROR_INVALID_HANDLE);
+    }
+    let headers = task.mem(cx, false, |t| {
+        let lfanew = u64::from(user::read_u32(&t.space(), base + 0x3c)?);
+        Ok((user::read_u32(&t.space(), base + lfanew + 0x28)?, user::read_u32(&t.space(), base + lfanew + 0x50)?))
+    });
+    let Ok((entry, image_size)) = headers else { return task.fail(cx, ERROR_INVALID_HANDLE) };
+    let mut info = abi.ptr(base);
+    info.extend(image_size.to_le_bytes());
+    if abi.width == 8 {
+        info.extend([0; 4]);
+    }
+    info.extend(abi.ptr(if entry == 0 { 0 } else { base + u64::from(entry) }));
+    if task.mem(cx, true, |t| user::write(&mut t.space(), a[2], &info)).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(TRUE)
+}
+
+/// `K32GetProcessMemoryInfo(process, &counters, size)`: PROCESS_MEMORY_COUNTERS(_EX), its working set and
+/// commit both what the process has committed now (there's no paging to tell them apart), peaks the same.
+pub fn get_process_memory_info(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(process) = task.process_of(a[0]) else { return task.fail(cx, ERROR_INVALID_HANDLE) };
+    let abi = task.abi();
+    let w = abi.width;
+    let (plain, ex) = (8 + 8 * w, 8 + 9 * w);
+    let size = a[2] as u32 as u64;
+    if size < plain {
+        return task.fail(cx, ERROR_INSUFFICIENT_BUFFER);
+    }
+    let committed: u64 = {
+        let state = lock(&process.state);
+        state.regions.iter().filter(|(_, area)| !matches!(area.kind, crate::process::AreaKind::Reserved | crate::process::AreaKind::Kept)).map(|(r, _)| r.end - r.start).sum()
+    };
+    let size = if size >= ex { ex } else { plain };
+    let mut b = (size as u32).to_le_bytes().to_vec();
+    b.extend(((committed / 4096) as u32).to_le_bytes());
+    // Peak and current working set, the pool quotas (none), then the pagefile's, peak, and private bytes.
+    for v in [committed, committed, 0, 0, 0, 0, committed, committed, committed].iter().take(((size - 8) / w) as usize) {
+        b.extend(abi.ptr(*v));
+    }
+    if task.mem(cx, true, |t| user::write(&mut t.space(), a[1], &b)).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(TRUE)
+}

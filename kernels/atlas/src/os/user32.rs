@@ -247,6 +247,22 @@ dll! {
     guest wsprintfW => AtlasWsprintfW;
     guest wvsprintfA => AtlasWvsprintfA;
     guest wvsprintfW => AtlasWvsprintfW;
+    // Monitors, the window station, and waiting for messages and objects at once.
+    host AllowSetForegroundWindow(1) => allow_set_foreground_window;
+    host MonitorFromPoint(2) => monitor_from;
+    host MonitorFromWindow(2) => monitor_from;
+    host MonitorFromRect(2) => monitor_from;
+    host GetMonitorInfoW(2) => get_monitor_info_w;
+    host GetMonitorInfoA(2) => get_monitor_info_a;
+    host EnumDisplayMonitors(4) => enum_display_monitors;
+    host GetProcessWindowStation(0) => get_process_window_station;
+    host GetThreadDesktop(1) => get_thread_desktop;
+    host GetUserObjectInformationW(5) => get_user_object_information_w;
+    host GetUserObjectInformationA(5) => get_user_object_information_a;
+    host MapWindowPoints(4) => map_window_points;
+    host RedrawWindow(4) => redraw_window;
+    host MsgWaitForMultipleObjects(5) => msg_wait_for_multiple_objects;
+    host MsgWaitForMultipleObjectsEx(5) => msg_wait_for_multiple_objects_ex;
 }
 
 const TRUE: u64 = 1;
@@ -2006,4 +2022,232 @@ fn register_clipboard_format(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: 
         return Reply::Value(0);
     }
     Reply::Value(u64::from(register_format(task, &name)))
+}
+
+// ---- Monitors: the desktop is one, the primary ----
+
+/// The one monitor's handle.
+const MONITOR: u64 = 0x0001_0001;
+
+/// `MonitorFromPoint(point, flags)`, `MonitorFromWindow(window, flags)` and `MonitorFromRect(&rect, flags)`: the one
+/// monitor, whatever the flags say to do when it's off every monitor.
+fn monitor_from(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(MONITOR)
+}
+
+/// `GetMonitorInfoW(monitor, &info)` and `A`: MONITORINFO (40 bytes) or MONITORINFOEX (with the device's name): the
+/// desktop's size, all of it work area, and MONITORINFOF_PRIMARY.
+fn get_monitor_info(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let Ok(size) = task.mem(cx, false, |t| user::read_u32(&t.space(), a[1])) else { return Reply::Value(FALSE) };
+    let ex = if wide { 104 } else { 72 };
+    if a[0] != MONITOR || (size != 40 && size != ex) {
+        task.set_last_error(cx, 87);
+        return Reply::Value(FALSE);
+    }
+    let (w, h) = task.desktop(|d| d.size());
+    let mut b = size.to_le_bytes().to_vec();
+    for _ in 0..2 {
+        for v in [0, 0, w, h] {
+            b.extend(v.to_le_bytes());
+        }
+    }
+    b.extend(1u32.to_le_bytes());
+    if size == ex {
+        let name = "\\\\.\\DISPLAY1";
+        let mut device: Vec<u8> = if wide { name.encode_utf16().flat_map(u16::to_le_bytes).collect() } else { name.as_bytes().to_vec() };
+        device.resize(if wide { 64 } else { 32 }, 0);
+        b.extend(device);
+    }
+    Reply::Value(u64::from(task.mem(cx, true, |t| user::write(&mut t.space(), a[1], &b)).is_ok()))
+}
+
+fn get_monitor_info_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    get_monitor_info(task, cx, a, true)
+}
+
+fn get_monitor_info_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    get_monitor_info(task, cx, a, false)
+}
+
+/// `EnumDisplayMonitors(dc, &clip, callback, data)`: the callback, once, for the one monitor, with its rectangle.
+fn enum_display_monitors(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (w, h) = task.desktop(|d| d.size());
+    let rect: Vec<u8> = [0, 0, w, h].iter().flat_map(|v| v.to_le_bytes()).collect();
+    match task.upcall_data(cx, a[2], &rect, |at| vec![MONITOR, a[0], at, a[3]]) {
+        Ok(_) => Reply::Value(TRUE),
+        Err(reply) => reply,
+    }
+}
+
+// ---- The window station and desktop: WinSta0 and its Default ----
+
+const WINDOW_STATION: u64 = 0x7f00;
+const THREAD_DESKTOP: u64 = 0x7f04;
+
+fn allow_set_foreground_window(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(TRUE)
+}
+
+fn get_process_window_station(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(WINDOW_STATION)
+}
+
+fn get_thread_desktop(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(THREAD_DESKTOP)
+}
+
+/// `GetUserObjectInformationW(object, index, out, room, &needed)` and `A`: of the window station or desktop,
+/// UOI_FLAGS (visible, for the window station), UOI_NAME, UOI_TYPE, UOI_USER_SID (none) or UOI_IO (it takes input).
+fn get_user_object_information(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let station = match a[0] {
+        WINDOW_STATION => true,
+        THREAD_DESKTOP => false,
+        _ => {
+            task.set_last_error(cx, 6);
+            return Reply::Value(FALSE);
+        }
+    };
+    let text = |s: &str| -> Vec<u8> { if wide { s.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect() } else { s.bytes().chain([0]).collect() } };
+    let data: Vec<u8> = match a[1] as u32 {
+        1 => [0u32, 0, u32::from(station)].iter().flat_map(|v| v.to_le_bytes()).collect(),
+        2 => text(if station { "WinSta0" } else { "Default" }),
+        3 => text(if station { "WindowStation" } else { "Desktop" }),
+        4 => Vec::new(),
+        6 => 1u32.to_le_bytes().to_vec(),
+        _ => {
+            task.set_last_error(cx, 87);
+            return Reply::Value(FALSE);
+        }
+    };
+    if a[4] != 0 {
+        let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[4], data.len() as u32));
+    }
+    if (a[3] as u32 as usize) < data.len() {
+        task.set_last_error(cx, 122);
+        return Reply::Value(FALSE);
+    }
+    Reply::Value(u64::from(data.is_empty() || task.mem(cx, true, |t| user::write(&mut t.space(), a[2], &data)).is_ok()))
+}
+
+fn get_user_object_information_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    get_user_object_information(task, cx, a, true)
+}
+
+fn get_user_object_information_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    get_user_object_information(task, cx, a, false)
+}
+
+// ---- Coordinates and repainting ----
+
+/// `MapWindowPoints(from, to, &points, count)`: points in `from`'s client area (or the screen's, for 0) moved to
+/// `to`'s. What was added, x in the low word and y in the high; 0 with ERROR_INVALID_WINDOW_HANDLE for a window that
+/// isn't one.
+fn map_window_points(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let origin = |task: &mut Task, hwnd: u64| if hwnd == 0 || hwnd == DESKTOP { Some((0, 0)) } else { task.win32k().screen_origin(hwnd) };
+    let (Some(from), Some(to)) = (origin(task, a[0]), origin(task, a[1])) else {
+        task.set_last_error(cx, 1400);
+        return Reply::Value(0);
+    };
+    let (dx, dy) = (from.0 - to.0, from.1 - to.1);
+    let count = (a[3] as u32).min(1 << 20) as usize;
+    let Ok(mut b) = task.mem(cx, false, |t| user::read_vec(&t.space(), a[2], count * 8)) else {
+        task.set_last_error(cx, 998);
+        return Reply::Value(0);
+    };
+    for p in b.as_chunks_mut::<8>().0 {
+        let x = i32::from_le_bytes(p[0..4].try_into().unwrap_or_default()) + dx;
+        let y = i32::from_le_bytes(p[4..8].try_into().unwrap_or_default()) + dy;
+        p[0..4].copy_from_slice(&x.to_le_bytes());
+        p[4..8].copy_from_slice(&y.to_le_bytes());
+    }
+    if task.mem(cx, true, |t| user::write(&mut t.space(), a[2], &b)).is_err() {
+        task.set_last_error(cx, 998);
+        return Reply::Value(0);
+    }
+    Reply::Value(u64::from(dx as u16) | u64::from(dy as u16) << 16)
+}
+
+/// `RedrawWindow(window, &rect, region, flags)`: RDW_INVALIDATE (with RDW_ERASE) or RDW_VALIDATE the rectangle (all of
+/// the window for none, or for a region, which atlas doesn't keep the shape of), then with RDW_UPDATENOW or
+/// RDW_ERASENOW, paints it now. The desktop's own window has nothing to redraw.
+fn redraw_window(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    const RDW_INVALIDATE: u32 = 0x1;
+    const RDW_ERASE: u32 = 0x4;
+    const RDW_VALIDATE: u32 = 0x8;
+    const RDW_UPDATENOW: u32 = 0x100;
+    const RDW_ERASENOW: u32 = 0x200;
+    let (hwnd, flags) = (a[0], a[3] as u32);
+    if hwnd == 0 || hwnd == DESKTOP {
+        return Reply::Value(TRUE);
+    }
+    if !task.win32k().windows.contains_key(&hwnd) {
+        task.set_last_error(cx, 1400);
+        return Reply::Value(FALSE);
+    }
+    let rect = if a[2] != 0 { None } else { task.read_rect(cx, a[1]) };
+    if flags & RDW_INVALIDATE != 0 {
+        task.invalidate(hwnd, rect, flags & RDW_ERASE != 0);
+    } else if flags & RDW_VALIDATE != 0 {
+        validate_rect(task, cx, &[hwnd, 0]);
+    }
+    if flags & (RDW_UPDATENOW | RDW_ERASENOW) != 0 {
+        return match update_window(task, cx, &[hwnd]) {
+            Reply::Value(_) => Reply::Value(TRUE),
+            other => other,
+        };
+    }
+    Reply::Value(TRUE)
+}
+
+// ---- Waiting for objects and messages at once ----
+
+/// `MsgWaitForMultipleObjectsEx(count, handles, timeout, wake mask, flags)`'s work: WAIT_OBJECT_0 + i for an object
+/// signalled (or all of them, with MWMO_WAITALL), WAIT_OBJECT_0 + count for a message in the queue (of any kind:
+/// the wake mask isn't told apart), WAIT_IO_COMPLETION for an APC with MWMO_ALERTABLE, or WAIT_TIMEOUT.
+fn msg_wait(task: &mut Task, cx: &mut Cx<'_>, count: u64, handles: u64, all: bool, timeout: u32, alertable: bool) -> Reply {
+    use std::time::{Duration, Instant};
+    const WAIT_FAILED: u64 = 0xffff_ffff;
+    let count = count as u32 as usize;
+    if count > 63 {
+        task.set_last_error(cx, 87);
+        return Reply::Value(WAIT_FAILED);
+    }
+    let width = task.abi().width;
+    let Ok(values) = task.mem(cx, false, |t| (0..count as u64).map(|i| user::read_ptr(&t.space(), handles + i * width, width)).collect::<Result<Vec<_>, _>>()) else {
+        task.set_last_error(cx, 998);
+        return Reply::Value(WAIT_FAILED);
+    };
+    let Some(objects) = values.iter().map(|&h| task.object(h)).collect::<Option<Vec<_>>>() else {
+        task.set_last_error(cx, 6);
+        return Reply::Value(WAIT_FAILED);
+    };
+    let deadline = (timeout != u32::MAX).then(|| Instant::now() + Duration::from_millis(u64::from(timeout)));
+    loop {
+        match task.next_message(cx, Filter { hwnd: 0, min: 0, max: 0 }, false, false) {
+            Ok(Some(_)) => return Reply::Value(count as u64),
+            Ok(None) => {}
+            Err(reply) => return reply,
+        }
+        let now = Instant::now();
+        // Until the deadline, or the next timer, whichever's first.
+        let until = [deadline, task.next_timer()].into_iter().flatten().min();
+        let ms = until.map_or(u32::MAX, |u| u.saturating_duration_since(now).as_millis().min(u128::from(u32::MAX - 1)) as u32);
+        match task.wait_or_wake(cx, &objects, all, ms, alertable, true) {
+            Ok(crate::objects::WOKEN) => {}
+            Ok(crate::objects::WAIT_TIMEOUT) if deadline.is_none_or(|d| Instant::now() < d) => {}
+            Ok(code) => return Reply::Value(u64::from(code)),
+            Err(reply) => return reply,
+        }
+    }
+}
+
+/// `MsgWaitForMultipleObjects(count, handles, wait all, timeout, wake mask)`.
+fn msg_wait_for_multiple_objects(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    msg_wait(task, cx, a[0], a[1], a[2] as u32 != 0, a[3] as u32, false)
+}
+
+/// `MsgWaitForMultipleObjectsEx(count, handles, timeout, wake mask, flags)`: MWMO_WAITALL (1), MWMO_ALERTABLE (2).
+fn msg_wait_for_multiple_objects_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let flags = a[4] as u32;
+    msg_wait(task, cx, a[0], a[1], flags & 1 != 0, a[2] as u32, flags & 2 != 0)
 }

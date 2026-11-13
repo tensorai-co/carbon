@@ -7,7 +7,7 @@ out="${1:-.}"
 llvm="${LLVM:-/opt/homebrew/opt/llvm/bin}"
 for arch in aarch64 x86_64; do
     machine=$([ $arch = aarch64 ] && echo arm64 || echo i386:x86-64)
-    for dll in kernel32 user32 ntdll advapi32 gdi32 shell32 version ucrtbase ole32 comctl32; do
+    for dll in kernel32 user32 ntdll advapi32 gdi32 shell32 version ucrtbase ole32 comctl32 psapi oleaut32 bcrypt ws2_32; do
         "$llvm/llvm-dlltool" -m "$machine" -d $dll.def -l "$out/$dll-$arch.lib"
     done
     # Unwind tables for every function, as MSVC makes them: SEH walks the stack by them.
@@ -64,6 +64,9 @@ for arch in aarch64 x86_64; do
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console installer.c "$out/kernel32-$arch.lib" "$out/user32-$arch.lib" "$out/ole32-$arch.lib" \
         "$out/shell32-$arch.lib" -o "$out/loader-$arch/installer.exe"
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console environment.c "$out/kernel32-$arch.lib" -o "$out/loader-$arch/environment.exe"
+    $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console startup.c "$out/kernel32-$arch.lib" "$out/user32-$arch.lib" "$out/gdi32-$arch.lib" \
+        "$out/advapi32-$arch.lib" "$out/shell32-$arch.lib" "$out/ole32-$arch.lib" "$out/psapi-$arch.lib" "$out/oleaut32-$arch.lib" \
+        "$out/bcrypt-$arch.lib" "$out/ws2_32-$arch.lib" -o "$out/loader-$arch/startup.exe"
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:windows desktop.c "$out/kernel32-$arch.lib" "$out/user32-$arch.lib" "$out/shell32-$arch.lib" -o "$out/loader-$arch/desktop.exe"
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:windows windows.c "$out/kernel32-$arch.lib" "$out/user32-$arch.lib" "$out/gdi32-$arch.lib" \
         -o "$out/loader-$arch/windows.exe"
@@ -78,7 +81,7 @@ fi
 # `_except_handler3`), and each goes in an import library for the system DLL whose .def has it, decorated, with `-k`
 # so the DLL's own name is the plain one, as on Windows. The test DLLs' own import libraries come from linking them.
 cc32="$llvm/clang --target=i686-pc-windows-msvc -nostdlib -ffreestanding -fno-builtin -fno-stack-protector -O2 -fuse-ld=lld"
-system_dlls="kernel32 user32 ntdll advapi32 gdi32 shell32 version ucrtbase ole32 comctl32"
+system_dlls="kernel32 user32 ntdll advapi32 gdi32 shell32 version ucrtbase ole32 comctl32 psapi oleaut32 bcrypt ws2_32"
 # The system import libraries an object needs: i686_imports object folder, printing the libraries.
 i686_imports() {
     obj=$1
@@ -87,7 +90,8 @@ i686_imports() {
         imp=${sym#__imp_}
         imp=${imp#_}
         for dll in $system_dlls; do
-            line=$(grep -E "^${imp%@*}( DATA)?\$" "$dll.def" | head -1)
+            # Its line: the name, and DATA, or an ordinal it's imported by (NONAME).
+            line=$(grep -E "^${imp%@*}( DATA| @[0-9]+( NONAME)?)?\$" "$dll.def" | head -1)
             if [ -n "$line" ]; then
                 [ -f "$tmp/$dll.def" ] || head -2 "$dll.def" > "$tmp/$dll.def"
                 grep -qx "$imp${line#${imp%@*}}" "$tmp/$dll.def" || echo "$imp${line#${imp%@*}}" >> "$tmp/$dll.def"
@@ -126,7 +130,7 @@ i686dll() {
     rm -rf "$tmp"
 }
 mkdir -p "$out/loader-i686"
-for prog in shell comctl installer wow64 files io pipes process sections registry links environment security pool windows desktop ansiwin exceptions fibers crt ansi hello; do
+for prog in startup shell comctl installer wow64 files io pipes process sections registry links environment security pool windows desktop ansiwin exceptions fibers crt ansi hello; do
     i686 $prog.c "$out/loader-i686/$prog.exe" || echo "i686: $prog.c doesn't build"
 done
 # The loader's DLLs, as the 64-bit ones are made.

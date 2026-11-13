@@ -420,6 +420,71 @@ dll! {
     guest lstrcmp => AtlasLstrcmpA;
     guest lstrcmpi => AtlasLstrcmpiA;
     guest lstrcpyn => AtlasLstrcpynA;
+    // What larger programs call as they start: heaps, encoded pointers, one-time initialization, lists, the
+    // debugger, locale-aware text, disks, the console, threads, processors and psapi's K32 functions.
+    guest HeapReAlloc => RtlReAllocateHeap;
+    guest HeapSize => RtlSizeHeap;
+    guest HeapValidate => RtlValidateHeap;
+    guest HeapLock => RtlLockHeap;
+    guest HeapUnlock => RtlUnlockHeap;
+    guest HeapWalk => AtlasHeapWalk;
+    guest GetProcessHeaps => AtlasGetProcessHeaps;
+    guest HeapQueryInformation => AtlasHeapQueryInformation;
+    guest HeapSetInformation => AtlasHeapSetInformation;
+    guest EncodePointer => RtlEncodePointer;
+    guest DecodePointer => RtlDecodePointer;
+    guest InitOnceBeginInitialize => AtlasInitOnceBeginInitialize;
+    guest InitOnceComplete => AtlasInitOnceComplete;
+    guest InitializeSListHead => AtlasInitializeSListHead;
+    guest InterlockedPushEntrySList => AtlasInterlockedPushEntrySList;
+    guest InterlockedPopEntrySList => AtlasInterlockedPopEntrySList;
+    guest InterlockedFlushSList => AtlasInterlockedFlushSList;
+    guest QueryDepthSList => AtlasQueryDepthSList;
+    guest IsDebuggerPresent => AtlasIsDebuggerPresent;
+    guest DebugBreak => AtlasDebugBreak;
+    guest UnhandledExceptionFilter => AtlasUnhandledExceptionFilter;
+    host IsBadWritePtr(2) => is_bad_write_ptr;
+    host IsBadReadPtr(2) => is_bad_read_ptr;
+    host OutputDebugStringA(1) => output_debug_string_a;
+    host OutputDebugStringW(1) => output_debug_string_w;
+    host CompareStringW(6) => compare_string_w;
+    host CompareStringA(6) => compare_string_a;
+    host CompareStringEx(9) => compare_string_ex;
+    host LCMapStringW(6) => lc_map_string_w;
+    host LCMapStringEx(9) => lc_map_string_ex;
+    host GetStringTypeW(4) => get_string_type_w;
+    host GetStringTypeExW(5) => get_string_type_ex_w;
+    host GetDateFormatW(6) => get_date_format_w;
+    host GetDateFormatA(6) => get_date_format_a;
+    host GetDateFormatEx(7) => get_date_format_ex;
+    host GetTimeFormatW(6) => get_time_format_w;
+    host GetTimeFormatA(6) => get_time_format_a;
+    host GetTimeFormatEx(6) => get_time_format_ex;
+    host GetDiskFreeSpaceA(5) => get_disk_free_space_w;
+    host GetDiskFreeSpaceExW(4) => get_disk_free_space_ex_w;
+    host GetDiskFreeSpaceExA(4) => get_disk_free_space_ex_w;
+    host GetDriveTypeW(1) => get_drive_type_w;
+    host GetDriveTypeA(1) => get_drive_type_a;
+    host FindFirstFileExW(6) => find_first_file_ex_w;
+    host FindFirstFileExA(6) => find_first_file_ex_a;
+    host DeviceIoControl(8) => device_io_control;
+    host GetConsoleMode(2) => get_console_mode;
+    host SetConsoleMode(2) => set_console_mode;
+    host ReadConsoleA(5) => read_console_a;
+    host ReadConsoleW(5) => read_console_w;
+    host SetConsoleCtrlHandler(2) => set_console_ctrl_handler;
+    host SetStdHandle(2) => set_std_handle;
+    host OpenThread(3) => open_thread;
+    host SetThreadPriority(2) => set_thread_priority;
+    host GetThreadPriority(1) => get_thread_priority;
+    host GetProcessAffinityMask(3) => get_process_affinity_mask;
+    host SetProcessAffinityMask(2) => set_process_affinity_mask;
+    host SetThreadAffinityMask(2) => set_thread_affinity_mask;
+    host ProcessIdToSessionId(2) => process_id_to_session_id;
+    host K32GetModuleFileNameExW(4) => get_module_file_name_ex_w;
+    host K32GetModuleFileNameExA(4) => get_module_file_name_ex_a;
+    host K32GetModuleInformation(4) => get_module_information;
+    host K32GetProcessMemoryInfo(3) => get_process_memory_info;
 }
 
 const TRUE: u64 = 1;
@@ -598,4 +663,108 @@ fn enum_system_locales(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) 
         }
     }
     Reply::Value(TRUE)
+}
+
+// --- The console's modes, reading it, and the standard handles ---
+
+/// Whether a handle is the console's: its input, or output to it.
+fn is_console(task: &Task, handle: u64) -> Option<bool> {
+    match lock(&task.process.state).handles.get(handle)? {
+        Handle::Input => Some(true),
+        Handle::Console(_) => Some(false),
+        _ => None,
+    }
+}
+
+/// `GetConsoleMode(handle, &mode)`: the input's processed, line and echo input with insert and quick edit; output's
+/// processed output with wrapping at the line's end. A handle that isn't the console's is ERROR_INVALID_HANDLE, which
+/// is how programs tell a console from a file or pipe.
+fn get_console_mode(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(input) = is_console(task, a[0]) else { return task.fail(cx, 6) };
+    let mode: u32 = if input { 0x1f7 } else { 0x3 };
+    if task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[1], mode)).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(TRUE)
+}
+
+/// `SetConsoleMode(handle, mode)`: taken for the console's handles; the host's terminal keeps its own modes.
+fn set_console_mode(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if is_console(task, a[0]).is_none() {
+        return task.fail(cx, 6);
+    }
+    Reply::Value(TRUE)
+}
+
+/// `ReadConsoleA(input, buffer, count, &read, control)`: as `ReadFile` reads it.
+fn read_console_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if is_console(task, a[0]) != Some(true) {
+        return task.fail(cx, 6);
+    }
+    read_file(task, cx, &[a[0], a[1], a[2], a[3], 0])
+}
+
+/// `ReadConsoleW(input, buffer, count, &read, control)`: bytes read as `ReadFile` does, then made UTF-16 from the
+/// console's code page, in the same buffer (which has room: a byte becomes at most one unit).
+fn read_console_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if is_console(task, a[0]) != Some(true) || a[3] == 0 {
+        return task.fail(cx, if a[3] == 0 { 87 } else { 6 });
+    }
+    let r = read_file(task, cx, &[a[0], a[1], a[2], a[3], 0]);
+    if r != Reply::Value(TRUE) {
+        return r;
+    }
+    let Ok(n) = task.mem(cx, false, |t| user::read_u32(&t.space(), a[3])) else { return task.fail(cx, 998) };
+    let Ok(bytes) = task.mem(cx, false, |t| user::read_vec(&t.space(), a[1], n as usize)) else { return task.fail(cx, 998) };
+    let cp = task.k.console_cp.load(std::sync::atomic::Ordering::Relaxed);
+    let units = crate::ansi::decode(cp, &bytes, false).unwrap_or_default();
+    let out: Vec<u8> = units.iter().take(a[2] as u32 as usize).flat_map(|u| u.to_le_bytes()).collect();
+    let wrote = task.mem(cx, true, |t| {
+        user::write(&mut t.space(), a[1], &out)?;
+        user::write_u32(&mut t.space(), a[3], (out.len() / 2) as u32)
+    });
+    if wrote.is_err() { task.fail(cx, 998) } else { Reply::Value(TRUE) }
+}
+
+/// `SetConsoleCtrlHandler(handler, add)`: kept nowhere, as the host's terminal sends atlas no Ctrl+C to pass on.
+fn set_console_ctrl_handler(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(TRUE)
+}
+
+/// `SetStdHandle(which, handle)`: what `GetStdHandle` gives from now on.
+fn set_std_handle(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let slot = match a[0] as u32 as i32 {
+        -10 => 0,
+        -11 => 1,
+        -12 => 2,
+        _ => return task.fail(cx, 6),
+    };
+    lock(&task.process.state).std_handles[slot] = a[1];
+    Reply::Value(TRUE)
+}
+
+/// `DeviceIoControl(device, code, in, in size, out, out size, &returned, overlapped)`: no device atlas has takes
+/// controls, so ERROR_INVALID_FUNCTION, as a file's handle gives for codes its file system doesn't know.
+fn device_io_control(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if lock(&task.process.state).handles.get(a[0]).is_none() {
+        return task.fail(cx, 6);
+    }
+    task.fail(cx, 1)
+}
+
+/// `OutputDebugStringA(text)` and `W`: with no debugger, it goes to atlas's trace when tracing is on.
+fn output_debug_string(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    if task.k.options.trace {
+        let text = task.text_arg(cx, a[0], wide);
+        task.k.host.write(host::Stream::Err, format!("[{}] debug output: {}\n", task.tid, text.trim_end()).as_bytes());
+    }
+    Reply::Value(0)
+}
+
+fn output_debug_string_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    output_debug_string(task, cx, a, false)
+}
+
+fn output_debug_string_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    output_debug_string(task, cx, a, true)
 }

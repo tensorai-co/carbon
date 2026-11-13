@@ -145,6 +145,13 @@ dll! {
     host RegRestoreKeyW(3) => reg_restore_key_w;
     host RegRestoreKeyA(3) => reg_restore_key_a;
     missing CryptAcquireContextW;
+    // The event log, which nothing reads here, and random bytes.
+    host RegisterEventSourceW(2) => register_event_source;
+    host RegisterEventSourceA(2) => register_event_source;
+    host DeregisterEventSource(1) => deregister_event_source;
+    host ReportEventW(9) => report_event;
+    host ReportEventA(9) => report_event;
+    host SystemFunction036(2) => system_function036;
 }
 
 const SUCCESS: u64 = 0;
@@ -786,4 +793,38 @@ fn get_user_name(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Rep
     }
     let _ = task.mem(cx, true, |t| user::write(&mut t.space(), a[0], &bytes));
     Reply::Value(1)
+}
+
+// --- The event log: sources are taken and what they report is let go, as there's no Event Viewer to read it ---
+
+const EVENT_SOURCE: u64 = 0x7e00;
+
+fn register_event_source(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(EVENT_SOURCE)
+}
+
+fn deregister_event_source(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[0] != EVENT_SOURCE {
+        task.set_last_error(cx, 6);
+        return Reply::Value(0);
+    }
+    Reply::Value(1)
+}
+
+fn report_event(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    deregister_event_source(task, cx, a)
+}
+
+/// `SystemFunction036(buffer, length)`, `RtlGenRandom`: the host's random bytes.
+fn system_function036(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(u64::from(task.random_into(cx, a[0], a[1] as u32 as usize)))
+}
+
+impl Task {
+    /// Fills `len` bytes at `at` with the host's random bytes; false if they can't be written there.
+    pub(crate) fn random_into(&mut self, cx: &mut Cx<'_>, at: u64, len: usize) -> bool {
+        let mut bytes = vec![0u8; len];
+        self.k.host.random(&mut bytes);
+        len == 0 || self.mem(cx, true, |t| user::write(&mut t.space(), at, &bytes)).is_ok()
+    }
 }

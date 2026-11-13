@@ -2,8 +2,10 @@
 //! each DLL's image from its declaration (`images`), and nothing is ever a file of its own.
 
 pub mod advapi32;
+pub mod bcrypt;
 pub mod com;
 pub mod comctl32;
+pub mod crypt32;
 pub mod fileapi;
 pub mod gdi32;
 pub mod ioapi;
@@ -12,8 +14,10 @@ pub mod memapi;
 pub mod menuapi;
 pub mod nlsapi;
 pub mod ole32;
+pub mod oleaut32;
 pub mod pipeapi;
 pub mod procapi;
+pub mod psapi;
 pub mod resapi;
 pub mod secapi;
 pub mod shell32;
@@ -23,6 +27,8 @@ pub mod sysapi;
 pub mod ucrtbase;
 pub mod user32;
 pub mod version;
+pub mod ws2_32;
+pub mod wsock32;
 
 use kernels_core::thread::Cx;
 
@@ -57,6 +63,9 @@ pub enum Kind {
 pub struct Export {
     pub name: &'static str,
     pub kind: Kind,
+    /// Its ordinal, where it isn't the one after the export before it's (programs import some by Windows' own
+    /// numbers, which have gaps: ws2_32's `socket` is #23, `WSAStartup` #115).
+    pub ordinal: Option<u16>,
 }
 
 pub struct Dll {
@@ -68,35 +77,58 @@ pub struct Dll {
     pub first_ordinal: u16,
 }
 
+impl Dll {
+    /// Each export's ordinal: its own, or the one after the export before it's (the first's `first_ordinal`).
+    pub fn ordinals(&self) -> Vec<u16> {
+        let mut next = self.first_ordinal;
+        self.exports
+            .iter()
+            .map(|e| {
+                let o = e.ordinal.unwrap_or(next);
+                next = o + 1;
+                o
+            })
+            .collect()
+    }
+
+    /// The export with an ordinal.
+    pub fn by_ordinal(&self, ordinal: u16) -> Option<&Export> {
+        self.ordinals().iter().position(|&o| o == ordinal).map(|i| &self.exports[i])
+    }
+}
+
 /// Declares a DLL: each export is `host Name(args) => function`, `guest Name => NtdllName` (or just `guest Name`), or
-/// `missing Name`. `"NAME.dll" @ 17;` numbers its exports from 17.
+/// `missing Name`, numbered on from the one before; `@ 23` after its name gives it an ordinal of its own (the next
+/// follow on from there). `"NAME.dll" @ 17;` numbers its exports from 17.
 macro_rules! dll {
-    ($file:literal $(@ $first:literal)?; $($kind:ident $name:ident $(($args:literal))? $(=> $target:ident)?;)*) => {
+    ($file:literal $(@ $first:literal)?; $($kind:ident $name:ident $(($args:literal))? $(@ $ord:literal)? $(=> $target:ident)?;)*) => {
         pub static DLL: $crate::os::Dll = $crate::os::Dll {
             name: $file,
-            exports: &[$(dll!(@export $kind $name $(($args))? $(=> $target)?)),*],
+            exports: &[$(dll!(@export $kind $name $(($args))? [$($ord)?] $(=> $target)?)),*],
             first_ordinal: dll!(@first $($first)?),
         };
     };
     (@first) => { 1 };
     (@first $first:literal) => { $first };
-    (@export host $name:ident ($args:literal) => $run:ident) => {
-        $crate::os::Export { name: stringify!($name), kind: $crate::os::Kind::Host { args: $args, run: $run } }
+    (@ord) => { None };
+    (@ord $ord:literal) => { Some($ord) };
+    (@export host $name:ident ($args:literal) [$($ord:literal)?] => $run:ident) => {
+        $crate::os::Export { name: stringify!($name), kind: $crate::os::Kind::Host { args: $args, run: $run }, ordinal: dll!(@ord $($ord)?) }
     };
-    (@export guest $name:ident => $target:ident) => {
-        $crate::os::Export { name: stringify!($name), kind: $crate::os::Kind::Guest(stringify!($target)) }
+    (@export guest $name:ident [$($ord:literal)?] => $target:ident) => {
+        $crate::os::Export { name: stringify!($name), kind: $crate::os::Kind::Guest(stringify!($target)), ordinal: dll!(@ord $($ord)?) }
     };
-    (@export guest $name:ident) => {
-        $crate::os::Export { name: stringify!($name), kind: $crate::os::Kind::Guest(stringify!($name)) }
+    (@export guest $name:ident [$($ord:literal)?]) => {
+        $crate::os::Export { name: stringify!($name), kind: $crate::os::Kind::Guest(stringify!($name)), ordinal: dll!(@ord $($ord)?) }
     };
-    (@export missing $name:ident) => {
-        $crate::os::Export { name: stringify!($name), kind: $crate::os::Kind::Missing }
+    (@export missing $name:ident [$($ord:literal)?]) => {
+        $crate::os::Export { name: stringify!($name), kind: $crate::os::Kind::Missing, ordinal: dll!(@ord $($ord)?) }
     };
 }
 pub(crate) use dll;
 
 /// Every system DLL atlas has.
-pub static DLLS: &[&Dll] = &[&kernel32::DLL, &user32::DLL, &advapi32::DLL, &gdi32::DLL, &shell32::DLL, &version::DLL, &ucrtbase::DLL, &comctl32::DLL, &ole32::DLL];
+pub static DLLS: &[&Dll] = &[&kernel32::DLL, &user32::DLL, &advapi32::DLL, &gdi32::DLL, &shell32::DLL, &version::DLL, &ucrtbase::DLL, &comctl32::DLL, &ole32::DLL, &psapi::DLL, &oleaut32::DLL, &bcrypt::DLL, &crypt32::DLL, &ws2_32::DLL, &wsock32::DLL];
 
 /// The DLL called `name` (`kernel32`, `KERNEL32.DLL`, …), by its index in [`DLLS`].
 pub fn find(name: &str) -> Option<usize> {

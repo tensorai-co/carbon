@@ -1,5 +1,5 @@
 //! The process heap: size classes of powers of two, each with a free list, carved from chunks of memory atlas commits.
-//! Every allocation has a 16-byte header with its class.
+//! Every allocation has a 16-byte header: its class, then the size asked for (`HeapSize`'s answer).
 
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
@@ -76,6 +76,7 @@ pub fn allocate(size: usize, zero: bool) -> *mut u8 {
     // SAFETY: a block of 1 << class bytes, ours alone now.
     unsafe {
         block.cast::<usize>().write(class);
+        block.cast::<usize>().add(1).write(size);
         let ptr = block.add(HEADER);
         if zero {
             core::ptr::write_bytes(ptr, 0, (1 << class) - HEADER);
@@ -92,6 +93,51 @@ pub fn usable(ptr: *mut u8) -> usize {
     // SAFETY: `ptr` came from `allocate`, so its header is just before it.
     let class = unsafe { ptr.sub(HEADER).cast::<usize>().read() };
     if class >= CLASSES { 0 } else { (1 << class) - HEADER }
+}
+
+/// The size a block was asked for, or last resized to.
+pub fn size(ptr: *mut u8) -> usize {
+    if ptr.is_null() {
+        return usize::MAX;
+    }
+    // SAFETY: `ptr` came from `allocate`, so its header is just before it.
+    unsafe { ptr.sub(HEADER).cast::<usize>().add(1).read() }
+}
+
+/// Resizes a block where it is, if it has the room: zeroing what it grows by, with `zero`.
+pub fn resize_in_place(ptr: *mut u8, new: usize, zero: bool) -> bool {
+    if ptr.is_null() || new > usable(ptr) {
+        return false;
+    }
+    let old = size(ptr);
+    // SAFETY: the block has room for `new` bytes, and its header is just before it.
+    unsafe {
+        if zero && new > old {
+            core::ptr::write_bytes(ptr.add(old), 0, new - old);
+        }
+        ptr.sub(HEADER).cast::<usize>().add(1).write(new);
+    }
+    true
+}
+
+/// `HeapReAlloc`'s work: in place if it fits, else (unless `in_place_only`) moved to a new block.
+pub fn reallocate(ptr: *mut u8, new: usize, zero: bool, in_place_only: bool) -> *mut u8 {
+    if ptr.is_null() {
+        return core::ptr::null_mut();
+    }
+    if resize_in_place(ptr, new, zero) {
+        return ptr;
+    }
+    if in_place_only {
+        return core::ptr::null_mut();
+    }
+    let moved = allocate(new, zero);
+    if !moved.is_null() {
+        // SAFETY: both blocks have room for the smaller size.
+        unsafe { core::ptr::copy_nonoverlapping(ptr, moved, size(ptr).min(new)) };
+        free(ptr);
+    }
+    moved
 }
 
 pub fn free(ptr: *mut u8) {

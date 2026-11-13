@@ -302,3 +302,37 @@ pub fn get_system_time_as_file_time(task: &mut Task, cx: &mut Cx<'_>, a: &[u64])
     let _ = task.mem(cx, true, |t| user::write_u64(&mut t.space(), a[0], now));
     Reply::Value(0)
 }
+
+/// Whether every page of `size` bytes at `at` is committed and gives `write` (or read) access, guard pages not.
+fn accessible(task: &Task, at: u64, size: u64, write: bool) -> bool {
+    if size == 0 {
+        return true;
+    }
+    let Some(end) = at.checked_add(size) else { return false };
+    let state = lock(&task.process.state);
+    let mut page = at & !(PAGE - 1);
+    while page < end {
+        let Some((range, area)) = state.regions.find(page) else { return false };
+        if matches!(area.kind, AreaKind::Reserved | AreaKind::Kept) || area.guard {
+            return false;
+        }
+        // PAGE_READWRITE, PAGE_WRITECOPY and their EXECUTE_ forms write; all but PAGE_NOACCESS and PAGE_EXECUTE read.
+        let p = prot_to_page(area.prot) & 0xff;
+        let ok = if write { matches!(p, 0x04 | 0x08 | 0x40 | 0x80) } else { !matches!(p, 0x00 | 0x01 | 0x10) };
+        if !ok {
+            return false;
+        }
+        page = range.end.max(page + PAGE);
+    }
+    true
+}
+
+/// `IsBadWritePtr(at, size)`: TRUE unless all of it may be written.
+pub fn is_bad_write_ptr(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(u64::from(!accessible(task, a[0], a[1], true)))
+}
+
+/// `IsBadReadPtr(at, size)`: TRUE unless all of it may be read.
+pub fn is_bad_read_ptr(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(u64::from(!accessible(task, a[0], a[1], false)))
+}
