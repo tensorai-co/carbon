@@ -19,8 +19,13 @@ pub use self::{ldr32 as ldr, params32 as params, peb32 as peb, record32 as recor
 /// address the same way.
 pub mod call {
     /// atlas's own page of code in every process, below the system DLLs: what threads and upcalls return to, and
-    /// x86-64's trampoline into atlas.
-    pub const ATLAS_PAGE: u64 = 0x6ff0_0000_0000 - 0x1_0000;
+    /// x86-64's trampoline into atlas. A 32-bit process has it below 2 GiB, as WoW64 has its system DLLs.
+    pub const ATLAS_PAGE64: u64 = 0x6ff0_0000_0000 - 0x1_0000;
+    pub const ATLAS_PAGE32: u64 = 0x7000_0000 - 0x1_0000;
+    #[cfg(target_pointer_width = "64")]
+    pub const ATLAS_PAGE: u64 = ATLAS_PAGE64;
+    #[cfg(target_pointer_width = "32")]
+    pub const ATLAS_PAGE: u64 = ATLAS_PAGE32;
     /// x86-64's way into atlas for code that can't know the backend (ntdll): `call` here, with the number in `eax` and
     /// the arguments as for `syscall`. It's `syscall; ret`, or, where programs reach their kernel through a gate (the
     /// Windows sandbox), a jump to the gate, which returns to the caller.

@@ -22,7 +22,7 @@ use kernels_core::user;
 
 use crate::handles::Handle;
 use crate::objects::Kind;
-use crate::process::{ALLOC, AreaKind, GRANULE, Task};
+use crate::process::{AreaKind, GRANULE, Task};
 use crate::system;
 
 const INFO_LENGTH_MISMATCH: u32 = 0xc000_0004;
@@ -127,7 +127,7 @@ impl Task {
         o.u32(20, pages as u32);
         o.u32(24, GRANULE as u32);
         o.u64(32, GRANULE);
-        o.u64(40, ALLOC.end - GRANULE - 1);
+        o.u64(40, self.layout().alloc.end - GRANULE - 1);
         o.u64(48, u64::MAX >> (64 - cpus));
         o.u8(56, cpus as u8);
         o.0

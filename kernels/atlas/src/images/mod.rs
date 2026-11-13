@@ -15,14 +15,47 @@ use kernels_core::lock;
 use crate::os::{DLLS, Kind, number};
 use make::Body;
 
-/// Where system DLLs go: each in a slot of its own, below the top of every ISA's space.
-pub const SYSTEM_BASE: u64 = 0x6ff0_0000_0000;
-const SLOT: u64 = 0x100_0000;
-/// The page of stubs every process has: where its first thread returns to, and where upcalls return to.
-pub const ATLAS_PAGE: u64 = atlas_abi::call::ATLAS_PAGE;
-pub const THREAD_RETURN_AT: u64 = ATLAS_PAGE;
-pub const UPCALL_RETURN_AT: u64 = ATLAS_PAGE + 32;
-const _: () = assert!(ATLAS_PAGE == SYSTEM_BASE - 0x1_0000);
+/// Where things go in a process of one ISA: the program's allocations, atlas's page of stubs, and the system DLLs above
+/// it, each in a slot of its own. A 32-bit process has them all below 2 GiB, as WoW64 has: the program's from 64 KiB,
+/// then atlas's page and the system DLLs from 0x70000000, under the shared data page at 0x7ffe0000.
+#[derive(Debug, Clone)]
+pub struct Layout {
+    /// Where `VirtualAlloc`, stacks and images find room, bottom up as on Windows.
+    pub alloc: std::ops::Range<u64>,
+    /// The page of stubs every process has: where its first thread returns to, and where upcalls return to.
+    pub atlas_page: u64,
+    pub system_base: u64,
+    slot: u64,
+}
+
+impl Layout {
+    pub fn thread_return(&self) -> u64 {
+        self.atlas_page
+    }
+
+    pub fn upcall_return(&self) -> u64 {
+        self.atlas_page + 32
+    }
+
+    /// Where system DLL `dll` goes.
+    pub fn dll_base(&self, dll: usize) -> u64 {
+        self.system_base + dll as u64 * self.slot
+    }
+}
+
+pub fn layout(isa: Isa) -> Layout {
+    match isa {
+        // The 64-bit ISAs' allocations start above 4 GiB, which the macOS sandbox keeps empty.
+        Isa::Arm64 | Isa::X86_64 => {
+            let system_base = 0x6ff0_0000_0000;
+            Layout { alloc: 0x1_0000_0000..system_base - (1 << 30), atlas_page: atlas_abi::call::ATLAS_PAGE64, system_base, slot: 0x100_0000 }
+        }
+        Isa::X86_32 => {
+            let system_base = 0x7000_0000;
+            Layout { alloc: 0x1_0000..0x6000_0000, atlas_page: atlas_abi::call::ATLAS_PAGE32, system_base, slot: 0x40_0000 }
+        }
+    }
+}
 
 /// `atlas-guest`'s image for `isa`, as `build.rs` built it, or None where it couldn't be built. Without it, guest
 /// exports trap like missing ones and say so.
@@ -36,11 +69,6 @@ pub fn guest(isa: Isa) -> Option<&'static [u8]> {
         Isa::X86_32 => X86,
     };
     (!image.is_empty()).then_some(image)
-}
-
-/// Where system DLL `dll` goes.
-pub fn base(dll: usize) -> u64 {
-    SYSTEM_BASE + dll as u64 * SLOT
 }
 
 /// Images made so far, by ISA and DLL.
@@ -75,22 +103,36 @@ fn make_dll(isa: Isa, dll: usize, gate: bool) -> Vec<u8> {
         .map(|(i, e)| {
             let body = match e.kind {
                 Kind::Guest(target) if guest(isa).is_some() => Body::Forward(format!("ntdll.{target}")),
-                _ => Body::Trap(number(dll, i)),
+                // x86's stubs pop a stdcall function's arguments: four bytes each, as atlas reads them. The C
+                // runtime's, and the functions that take a variable number, are cdecl: their caller pops.
+                Kind::Host { args, .. } if !cdecl(d.name, e.name) => Body::Trap { nr: number(dll, i), pop: 4 * args as u16 },
+                _ => Body::Trap { nr: number(dll, i), pop: 0 },
             };
             (e.name, body)
         })
         .collect();
-    make::dll(isa, d.name, base(dll), &exports, gate)
+    make::dll(isa, d.name, layout(isa).dll_base(dll), &exports, gate)
+}
+
+/// Whether an export is cdecl on x86: the C runtime's, and those with a variable number of arguments.
+pub fn cdecl(dll: &str, name: &str) -> bool {
+    dll.eq_ignore_ascii_case("ucrtbase.dll") || dll.eq_ignore_ascii_case("msvcrt.dll") || matches!(name, "wsprintfA" | "wsprintfW" | "DbgPrint" | "DbgPrintEx")
 }
 
 /// The atlas page's code: two stubs, 32 bytes apart, that come into atlas with the program's return value kept (in
-/// `x0`, or moved to `r10`, since x86's stub needs `eax` for the number); then, at `TRAP_AT`, x86-64's trampoline into
-/// atlas: `syscall; ret`, or a jump to the backend's `gate`.
+/// `x0`, or moved to `r10`, or on x86 to `edx`, since x86's stub needs `eax` for the number); then, at `TRAP_AT`,
+/// x86-64's trampoline into atlas: `syscall; ret`, or a jump to the backend's `gate`.
 pub fn atlas_page(isa: Isa, gate: Option<u64>) -> Vec<u8> {
     let mut page = Vec::new();
     for nr in [THREAD_RETURN, UPCALL_RETURN] {
         let mut stub = Vec::new();
         match isa {
+            // mov edx, eax; mov eax, nr; int 0x2e; int3
+            Isa::X86_32 => {
+                stub.extend([0x89, 0xc2, 0xb8]);
+                stub.extend((nr as u32).to_le_bytes());
+                stub.extend([0xcd, 0x2e, 0xcc]);
+            }
             Isa::Arm64 => {
                 // movz x8, #nr; svc #0; brk #0
                 for word in [0xd280_0008 | (nr as u32) << 5, 0xd400_0001, 0xd420_0000] {
@@ -114,8 +156,8 @@ pub fn atlas_page(isa: Isa, gate: Option<u64>) -> Vec<u8> {
         stub.resize(32, if isa == Isa::Arm64 { 0 } else { 0xcc });
         page.extend(stub);
     }
-    if isa != Isa::Arm64 {
-        page.resize((atlas_abi::call::TRAP_AT - ATLAS_PAGE) as usize, 0xcc);
+    if isa == Isa::X86_64 {
+        page.resize((atlas_abi::call::TRAP_AT - atlas_abi::call::ATLAS_PAGE64) as usize, 0xcc);
         match gate {
             // mov r11, gate; jmp r11: the caller's return address stays, for the gate to return to.
             Some(gate) => {

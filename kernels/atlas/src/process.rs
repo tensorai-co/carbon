@@ -6,8 +6,8 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex};
 
-use atlas_abi::{call, params, peb, status, teb};
-use exec::isa::x86::{R10, RCX};
+use atlas_abi::{call, status};
+use exec::isa::x86::{R10, RCX, RDX};
 use exec::{FpRegs, Isa, PAGE, Prot, Regs, SpaceId, Stop, Turn};
 use kernels_core::call::Convention;
 use kernels_core::lock;
@@ -17,17 +17,16 @@ use kernels_core::user::{self, Fault};
 use kernels_core::wait::Waiter;
 
 use crate::Kernel;
+use crate::abi::{self, Abi};
 use crate::handles::{Handle, Handles};
 use crate::exceptions::Raised;
 use crate::images::pe::{Found, Pe, Wanted};
-use crate::images::{self, ATLAS_PAGE, THREAD_RETURN_AT};
+use crate::images::{self, Layout};
 use crate::mapping::{map_image, map_ntdll, module_name, place};
 use crate::objects::{self as objects_mod, Object, State};
 use crate::os::{self, Kind, Reply};
 use crate::threads::ThreadControl;
 
-/// Where `VirtualAlloc` finds room, bottom up as on Windows: above the macOS sandbox's empty bottom 4 GiB.
-pub(crate) const ALLOC: std::ops::Range<u64> = 0x1_0000_0000..images::SYSTEM_BASE - (1 << 30);
 /// Windows' allocation granularity.
 pub(crate) const GRANULE: u64 = 0x1_0000;
 const STACK: u64 = 1 << 20;
@@ -159,6 +158,22 @@ impl Guest for Task {
 }
 
 impl Task {
+    /// Where things are in this process's structures, by its ISA.
+    pub fn abi(&self) -> Abi {
+        Abi::of(self.isa)
+    }
+
+    /// Where things go in this process's space: `layout().alloc` is where `VirtualAlloc` finds room.
+    pub fn layout(&self) -> Layout {
+        images::layout(self.isa)
+    }
+
+    /// Writes a pointer-sized value: a pointer, a handle or a SIZE_T, as this process's ISA has them.
+    pub fn write_ptr(&mut self, cx: &mut Cx<'_>, addr: u64, value: u64) -> Result<(), Fault> {
+        let bytes = self.abi().ptr(value);
+        self.mem(cx, true, |t| user::write(&mut t.space(), addr, &bytes))
+    }
+
     /// The calling convention of this thread's ISA.
     pub fn convention(&self) -> Convention {
         match self.isa {
@@ -354,8 +369,10 @@ impl Task {
         }
     }
 
-    /// Sets the call's result, and carries on.
+    /// Sets the call's result, and carries on. A 32-bit program gets 32 bits of it: -1 is 0xffffffff, as it'd have
+    /// it, and the top half of its registers stays clear.
     fn answer(&mut self, cx: &mut Cx<'_>, value: u64) -> Flow {
+        let value = if self.isa == Isa::X86_32 { value & 0xffff_ffff } else { value };
         cx.turn(|t| t.thread().set_return(value));
         if self.ending() { Flow::End } else { Flow::Run }
     }
@@ -365,7 +382,8 @@ impl Task {
     fn wait_address(&mut self, cx: &mut Cx<'_>, addr: u64, compare: u64, size: u64, timeout_ms: u64) -> Result<u32, Reply> {
         let size = size.clamp(1, 8) as usize;
         let Ok(expected) = self.mem(cx, false, |t| user::read_vec(&t.space(), compare, size)) else { return Ok(status::ACCESS_VIOLATION) };
-        let deadline = (timeout_ms != u64::from(u32::MAX)).then(|| std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms));
+        // INFINITE is u32::MAX, however the argument was widened.
+        let deadline = (timeout_ms as u32 != u32::MAX).then(|| std::time::Instant::now() + std::time::Duration::from_millis(u64::from(timeout_ms as u32)));
         let waiter = self.waiter.clone();
         let k = self.k.clone();
         let still = || self.mem(cx, false, |t| user::read_vec(&t.space(), addr, size)).is_ok_and(|now| now == expected);
@@ -377,27 +395,36 @@ impl Task {
         }
     }
 
-    /// What a function returned to one of the atlas page's stubs: `x0`, or `rax` (moved to `r10`).
+    /// What a function returned to one of the atlas page's stubs: `x0`, or `rax` (moved to `r10`), or on x86 `eax`
+    /// (moved to `edx`).
     pub fn return_value(&mut self, cx: &mut Cx<'_>) -> u64 {
+        let isa = self.isa;
         match cx.turn(|t| t.thread().regs()) {
             Regs::Arm64(r) => r.x[0],
+            Regs::X86(r) if isa == Isa::X86_32 => r.gpr[RDX] & 0xffff_ffff,
             Regs::X86(r) => r.gpr[R10],
         }
     }
 
     /// The first `count` arguments of the call that trapped, by this ISA's convention. x86-64's stubs keep the first
-    /// in `r10`, as Windows' own do, since `syscall` takes `rcx`.
+    /// in `r10`, as Windows' own do, since `syscall` takes `rcx`. x86's are on the stack, 32 bits each: -1 to -16
+    /// are widened as negative numbers, as WoW64 widens a handle, so the pseudo-handles (`GetCurrentProcess()`'s -1)
+    /// and INVALID_HANDLE_VALUE are what they are for a 64-bit program; everything else is widened with zeros.
     fn args(&mut self, cx: &mut Cx<'_>, count: usize) -> Vec<u64> {
         let mut regs = cx.turn(|t| t.thread().regs());
-        if let Regs::X86(r) = &mut regs {
+        if let Regs::X86(r) = &mut regs
+            && self.isa == Isa::X86_64
+        {
             r.gpr[RCX] = r.gpr[R10];
         }
         let convention = self.convention();
         let width = convention.width();
+        let x32 = self.isa == Isa::X86_32;
         (0..count)
             .map(|i| {
                 let mut stack = |addr: u64| self.mem(cx, false, |t| user::read_ptr(&t.space(), addr, width)).ok();
-                convention.arg(&regs, i, &mut stack).unwrap_or(0)
+                let v = convention.arg(&regs, i, &mut stack).unwrap_or(0);
+                if x32 && v >= 0xffff_fff0 { v | 0xffff_ffff_0000_0000 } else { v }
             })
             .collect()
     }
@@ -419,8 +446,10 @@ impl Task {
             }
             (page..page + PAGE, area.prot)
         };
-        let teb_at = self.control.teb;
-        let stack = self.mem(cx, false, |t| Ok((user::read_u64(&t.space(), teb_at + teb::DEALLOCATION_STACK)?, user::read_u64(&t.space(), teb_at + teb::STACK_BASE)?))).ok();
+        let (teb_at, abi) = (self.control.teb, self.abi());
+        let stack = self
+            .mem(cx, false, |t| Ok((user::read_ptr(&t.space(), teb_at + abi.teb.deallocation_stack, abi.width)?, user::read_ptr(&t.space(), teb_at + abi.teb.stack_base, abi.width)?)))
+            .ok();
         let (range, code) = match stack {
             Some((bottom, top)) if bottom != 0 && addr >= bottom && addr < top => (bottom..range.end, status::STACK_OVERFLOW),
             _ => (range, status::GUARD_PAGE_VIOLATION),
@@ -429,7 +458,7 @@ impl Task {
         cx.turn(|t| t.space().protect(range.clone(), prot));
         if code == status::STACK_OVERFLOW {
             // As Windows has it, the stack's limit is the lowest page it may use now.
-            let _ = self.mem(cx, true, |t| user::write_u64(&mut t.space(), teb_at + teb::STACK_LIMIT, range.start));
+            let _ = self.write_ptr(cx, teb_at + abi.teb.stack_limit, range.start);
         }
         Some(code)
     }
@@ -447,6 +476,7 @@ impl Task {
         if size == 0 {
             return None;
         }
+        let alloc = self.layout().alloc;
         let mut state = lock(&self.process.state);
         let commit = kind & MEM_COMMIT != 0;
         let guard = commit && protect & PAGE_GUARD != 0;
@@ -454,7 +484,7 @@ impl Task {
         if addr == 0 || kind & MEM_RESERVE != 0 {
             let size = size.next_multiple_of(GRANULE);
             let base = if addr == 0 {
-                state.regions.free_above(ALLOC, size, GRANULE)?
+                state.regions.free_above(alloc, size, GRANULE)?
             } else {
                 let base = addr & !(GRANULE - 1);
                 if !state.regions.is_free(base..base + size) {
@@ -650,6 +680,8 @@ pub(crate) fn launch(k: &Arc<Kernel>, cx: &mut Cx<'_>, launch: Launch) -> Result
     let windows10 = pe.resource(&image, 24).is_some_and(|m| String::from_utf8_lossy(m).to_ascii_lowercase().contains(crate::system::WINDOWS_10_GUID));
 
     let mut regions: Regions<Area> = Regions::default();
+    let (abi, places) = (Abi::of(isa), images::layout(isa));
+    let alloc = places.alloc.clone();
     let started = cx
         .turn(|t| -> Result<_, String> {
             let space = t.new_space(isa).map_err(|e| format!("exec can't run {isa:?} programs here: {e:?}"))?;
@@ -674,8 +706,9 @@ pub(crate) fn launch(k: &Arc<Kernel>, cx: &mut Cx<'_>, launch: Launch) -> Result
             // Where programs reach atlas through a gate rather than `syscall`, the stubs atlas makes do too.
             let gate = t.space().layout().gate;
             k.images.use_gate(gate.is_some());
-            t.space().map(ATLAS_PAGE..ATLAS_PAGE + PAGE, Prot::RX).with(&images::atlas_page(isa, gate)).map_err(|_| "no memory")?;
-            regions.insert(ATLAS_PAGE..ATLAS_PAGE + PAGE, Area::of(Prot::RX, AreaKind::Image));
+            let atlas_page = places.atlas_page;
+            t.space().map(atlas_page..atlas_page + PAGE, Prot::RX).with(&images::atlas_page(isa, gate)).map_err(|_| "no memory")?;
+            regions.insert(atlas_page..atlas_page + PAGE, Area::of(Prot::RX, AreaKind::Image));
 
             // The shared data page, read-only, where Windows has it (where the host leaves that address free).
             let shared = crate::system::SHARED_DATA;
@@ -687,7 +720,7 @@ pub(crate) fn launch(k: &Arc<Kernel>, cx: &mut Cx<'_>, launch: Launch) -> Result
             }
 
             // The PEB, its process parameters and strings, and the TEB, in one committed block.
-            let block = regions.free_above(ALLOC, GRANULE * 2, GRANULE).ok_or("no room")?;
+            let block = regions.free_above(alloc.clone(), GRANULE * 2, GRANULE).ok_or("no room")?;
             regions.insert(block..block + GRANULE * 2, Area::of(Prot::RW, AreaKind::Committed));
             t.space().map(block..block + GRANULE * 2, Prot::RW).zeroed().map_err(|_| "no memory")?;
             let (peb_at, params_at, mut teb_at, strings_at) = (block, block + 0x1000, block + 0x2000, block + 0x4000);
@@ -707,57 +740,46 @@ pub(crate) fn launch(k: &Arc<Kernel>, cx: &mut Cx<'_>, launch: Launch) -> Result
             if env_at + environment.len() as u64 > block + GRANULE * 2 {
                 return Err("the environment is too big".to_string());
             }
-            let unicode_string = |len: usize, at: u64| -> Vec<u8> {
-                let mut s = ((len - 2) as u16).to_le_bytes().to_vec();
-                s.extend((len as u16).to_le_bytes());
-                s.extend([0; 4]);
-                s.extend(at.to_le_bytes());
-                s
-            };
+            let (peb, params) = (abi.peb, abi.params);
             let mut memory = t.space();
             let mut put = |at: u64, bytes: &[u8]| user::write(&mut memory, at, bytes).map_err(|_| "writing the PEB".to_string());
             put(wide_at, &wide)?;
             put(ansi_at, &ansi)?;
             put(path_at, &image_path)?;
-            put(peb_at + peb::IMAGE_BASE, &base.to_le_bytes())?;
-            put(peb_at + peb::NUMBER_OF_PROCESSORS, &(k.host.cpus() as u32).to_le_bytes())?;
-            put(peb_at + peb::OS_MAJOR_VERSION, &crate::system::MAJOR.to_le_bytes())?;
-            put(peb_at + peb::OS_MINOR_VERSION, &crate::system::MINOR.to_le_bytes())?;
-            put(peb_at + peb::OS_BUILD_NUMBER, &(crate::system::BUILD as u16).to_le_bytes())?;
-            put(peb_at + peb::OS_PLATFORM_ID, &2u32.to_le_bytes())?;
+            put(peb_at + peb.image_base, &abi.ptr(base))?;
+            put(peb_at + peb.number_of_processors, &(k.host.cpus() as u32).to_le_bytes())?;
+            put(peb_at + peb.os_major_version, &crate::system::MAJOR.to_le_bytes())?;
+            put(peb_at + peb.os_minor_version, &crate::system::MINOR.to_le_bytes())?;
+            put(peb_at + peb.os_build_number, &(crate::system::BUILD as u16).to_le_bytes())?;
+            put(peb_at + peb.os_platform_id, &2u32.to_le_bytes())?;
             let (subsystem, subsystem_major, subsystem_minor) = pe.subsystem();
-            put(peb_at + peb::IMAGE_SUBSYSTEM, &u32::from(subsystem).to_le_bytes())?;
-            put(peb_at + peb::IMAGE_SUBSYSTEM_MAJOR, &u32::from(subsystem_major).to_le_bytes())?;
-            put(peb_at + peb::IMAGE_SUBSYSTEM_MINOR, &u32::from(subsystem_minor).to_le_bytes())?;
-            put(peb_at + peb::PROCESS_PARAMETERS, &params_at.to_le_bytes())?;
-            put(params_at, &(params::SIZE as u32).to_le_bytes())?;
-            for (i, at) in [params::STANDARD_INPUT, params::STANDARD_OUTPUT, params::STANDARD_ERROR].into_iter().enumerate() {
-                put(params_at + at, &std_handles[i].to_le_bytes())?;
+            put(peb_at + peb.image_subsystem, &u32::from(subsystem).to_le_bytes())?;
+            put(peb_at + peb.image_subsystem_major, &u32::from(subsystem_major).to_le_bytes())?;
+            put(peb_at + peb.image_subsystem_minor, &u32::from(subsystem_minor).to_le_bytes())?;
+            put(peb_at + peb.process_parameters, &abi.ptr(params_at))?;
+            put(params_at, &(params.size as u32).to_le_bytes())?;
+            for (i, at) in [params.standard_input, params.standard_output, params.standard_error].into_iter().enumerate() {
+                put(params_at + at, &abi.ptr(std_handles[i]))?;
             }
-            put(params_at + params::IMAGE_PATH_NAME, &unicode_string(image_path.len(), path_at))?;
-            put(params_at + params::COMMAND_LINE, &unicode_string(wide.len(), wide_at))?;
+            put(params_at + params.image_path_name, &abi.unicode_string(image_path.len(), path_at))?;
+            put(params_at + params.command_line, &abi.unicode_string(wide.len(), wide_at))?;
             put(env_at, &environment)?;
-            put(params_at + params::ENVIRONMENT, &env_at.to_le_bytes())?;
-            put(params_at + params::ENVIRONMENT_SIZE, &(environment.len() as u64).to_le_bytes())?;
+            put(params_at + params.environment, &abi.ptr(env_at))?;
+            put(params_at + params.environment_size, &abi.ptr(environment.len() as u64))?;
 
             // The stack.
-            let stack = regions.free_above(ALLOC, STACK, GRANULE).ok_or("no room for the stack")?;
+            let stack = regions.free_above(alloc.clone(), STACK, GRANULE).ok_or("no room for the stack")?;
             let stack_top = stack + STACK;
             regions.insert(stack..stack_top, Area::of(Prot::RW, AreaKind::Committed));
             regions.update(stack..stack + STACK_GUARD, |a| a.guard = true);
             t.space().map(stack_top - STACK_MAPPED..stack_top, Prot::RW).zeroed().map_err(|_| "no memory")?;
             let mut memory = t.space();
-            let mut put = |at: u64, bytes: &[u8]| user::write(&mut memory, at, bytes).map_err(|_| "writing the TEB".to_string());
-            put(teb_at + teb::STACK_BASE, &stack_top.to_le_bytes())?;
-            put(teb_at + teb::STACK_LIMIT, &(stack_top - STACK_MAPPED).to_le_bytes())?;
-            put(teb_at + teb::DEALLOCATION_STACK, &stack.to_le_bytes())?;
-            put(teb_at + teb::SELF, &teb_at.to_le_bytes())?;
-            put(teb_at + teb::CLIENT_ID, &pid.to_le_bytes())?;
-            put(teb_at + teb::CLIENT_ID + 8, &tid.to_le_bytes())?;
-            put(teb_at + teb::PEB, &peb_at.to_le_bytes())?;
+            for (at, bytes) in abi.teb_fields(teb_at, stack_top, stack_top - STACK_MAPPED, stack, pid, tid, peb_at) {
+                user::write(&mut memory, teb_at + at, &bytes).map_err(|_| "writing the TEB".to_string())?;
+            }
 
             // The first thread: ntdll's process start, which never returns, with the TEB where Windows keeps it (x18
-            // on ARM64, gs on x86-64).
+            // on ARM64, gs on x86-64, fs on x86).
             let entry = process_start;
             t.thread().start(entry, stack_top);
             windows_fp(t, isa);
@@ -767,12 +789,9 @@ pub(crate) fn launch(k: &Arc<Kernel>, cx: &mut Cx<'_>, launch: Launch) -> Result
                 Isa::X86_64 => Convention::Win64,
                 Isa::X86_32 => Convention::Stdcall,
             };
-            let (sp, frame) = convention.prepare(&mut regs, entry, &[peb_at, ntdll], THREAD_RETURN_AT);
+            let (sp, frame) = convention.prepare(&mut regs, entry, &[peb_at, ntdll], places.thread_return());
             user::write(&mut t.space(), sp, &frame).map_err(|_| "writing the first frame")?;
-            match &mut regs {
-                Regs::Arm64(r) => r.x[18] = teb_at,
-                Regs::X86(r) => r.gs_base = teb_at,
-            }
+            abi::set_teb(&mut regs, isa, teb_at);
             t.thread().set_regs(&regs);
             Ok((space, base, (ansi_at, wide_at), ntdll, (dispatcher, thread_start), (peb_at, teb_at)))
         })

@@ -9,6 +9,7 @@
 //! Each export is `host` (host Rust), `guest` (forwarded to `atlas-guest`'s ntdll) or `missing` (a stub that names
 //! itself, so the next thing to write is obvious). Host code can call the program back with an upcall.
 
+mod abi;
 pub mod ansi;
 mod environment;
 mod exceptions;

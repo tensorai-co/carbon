@@ -7,7 +7,6 @@
 
 use std::sync::Arc;
 
-use atlas_abi::{params, peb};
 use exec::Isa;
 use kernels_core::thread::Cx;
 use kernels_core::{lock, user};
@@ -103,9 +102,10 @@ impl Task {
     /// The program's environment as it is now (ntdll keeps it, and its changes, in the process parameters).
     fn environment_now(&mut self, cx: &mut Cx<'_>) -> Vec<u8> {
         let peb_at = lock(&self.process.state).peb;
+        let abi = self.abi();
         let at = self.mem(cx, false, |t| {
-            let params_at = user::read_u64(&t.space(), peb_at + peb::PROCESS_PARAMETERS)?;
-            user::read_u64(&t.space(), params_at + params::ENVIRONMENT)
+            let params_at = user::read_ptr(&t.space(), peb_at + abi.peb.process_parameters, abi.width)?;
+            user::read_ptr(&t.space(), params_at + abi.params.environment, abi.width)
         });
         at.ok().and_then(|at| self.wide_block(cx, at)).unwrap_or_else(|| vec![0, 0])
     }

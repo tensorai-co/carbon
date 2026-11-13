@@ -57,3 +57,34 @@ done
 if command -v x86_64-w64-mingw32-gcc >/dev/null; then
     x86_64-w64-mingw32-gcc -O2 crt.c -o "$out/loader-x86_64/crt-mingw.exe"
 fi
+
+# 32-bit x86 (WoW64). x86's imports are stdcall names, `_Name@N`, whose N (the bytes of arguments) the .def files
+# don't say: each program's object says which it imports, and each goes in an import library for the DLL whose .def
+# has it, decorated, with `-k` so the DLL's own name is the plain one, as on Windows.
+i686() {
+    src=$1
+    exe=$2
+    tmp=$(mktemp -d)
+    cc32="$llvm/clang --target=i686-pc-windows-msvc -nostdlib -ffreestanding -fno-builtin -fno-stack-protector -O2 -fuse-ld=lld"
+    $cc32 -c "$src" -o "$tmp/prog.o"
+    for imp in $("$llvm/llvm-nm" -u "$tmp/prog.o" | awk '{print $2}' | sed -n 's/^__imp__//p'); do
+        for def in *.def; do
+            if grep -qx "${imp%@*}" "$def"; then
+                [ -f "$tmp/$def" ] || head -2 "$def" > "$tmp/$def"
+                echo "$imp" >> "$tmp/$def"
+                break
+            fi
+        done
+    done
+    libs=""
+    for def in "$tmp"/*.def; do
+        [ -e "$def" ] || continue
+        "$llvm/llvm-dlltool" -m i386 -k -d "$def" -l "${def%.def}.lib"
+        libs="$libs ${def%.def}.lib"
+    done
+    # shellcheck disable=SC2086
+    $cc32 "$tmp/prog.o" $libs -Wl,/entry:mainCRTStartup -Wl,/subsystem:console -o "$exe"
+    rm -rf "$tmp"
+}
+mkdir -p "$out/loader-i686"
+i686 wow64.c "$out/loader-i686/wow64.exe"

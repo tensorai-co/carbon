@@ -47,7 +47,7 @@ impl Task {
 
     /// The program's last error, in its TEB.
     pub fn set_last_error(&mut self, cx: &mut Cx<'_>, error: u32) {
-        let at = self.control.teb + atlas_abi::teb::LAST_ERROR;
+        let at = self.control.teb + self.abi().teb.last_error;
         let _ = self.mem(cx, true, |t| user::write_u32(&mut t.space(), at, error));
     }
 

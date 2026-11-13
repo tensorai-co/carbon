@@ -12,15 +12,16 @@ use kernels_core::user;
 use crate::images::pe::Pe;
 use crate::images::{self};
 use crate::os;
-use crate::process::{ALLOC, Area, AreaKind, GRANULE, Task, disk_path};
+use crate::process::{Area, AreaKind, GRANULE, Task, disk_path};
 
 /// Where an image goes: its preferred base if that's free, else the lowest room. Relocates `image` there.
 pub(crate) fn place(regions: &Regions<Area>, pe: &Pe<'_>, image: &mut [u8]) -> Result<u64, String> {
     let size = u64::from(pe.size_of_image).next_multiple_of(GRANULE);
-    let base = if pe.image_base >= ALLOC.start && pe.image_base + size < ALLOC.end && regions.is_free(pe.image_base..pe.image_base + size) {
+    let alloc = images::layout(pe.isa).alloc;
+    let base = if pe.image_base >= alloc.start && pe.image_base + size < alloc.end && regions.is_free(pe.image_base..pe.image_base + size) {
         pe.image_base
     } else {
-        regions.free_above(ALLOC, size, GRANULE).ok_or("no room for an image")?
+        regions.free_above(alloc, size, GRANULE).ok_or("no room for an image")?
     };
     if base != pe.image_base {
         pe.relocate(image, base).map_err(|_| "an image that can't be moved, and its base isn't free")?;
@@ -107,8 +108,10 @@ impl Task {
             }
         };
         let path16: Vec<u8> = path.encode_utf16().take(259).chain([0]).flat_map(u16::to_le_bytes).collect();
+        // The loader's base is pointer-sized.
+        let base_bytes = self.abi().ptr(base);
         let wrote = self.mem(cx, true, |t| {
-            user::write_u64(&mut t.space(), base_out, base)?;
+            user::write(&mut t.space(), base_out, &base_bytes)?;
             user::write(&mut t.space(), path_out, &path16)
         });
         if wrote.is_err() { status::ACCESS_VIOLATION } else { status::SUCCESS }
@@ -122,7 +125,7 @@ impl Task {
         // atlas's own: made for this ISA, always from System32, whatever the program brings.
         if let Some(dll) = os::find(name) {
             let image = self.k.images.get(isa, dll);
-            let base = images::base(dll);
+            let base = images::layout(isa).dll_base(dll);
             let path = format!("C:\\Windows\\System32\\{}", os::DLLS[dll].name);
             let mut state = lock(&self.process.state);
             let state = &mut *state;
@@ -166,7 +169,7 @@ impl Task {
     /// `UNMAP_IMAGE`: a DLL the loader has unloaded. Only one it mapped by name, from the disk: atlas's own and
     /// ntdll stay, as do the program and anything that isn't an image.
     pub(crate) fn unmap_image(&mut self, cx: &mut Cx<'_>, base: u64, size: u64) -> u32 {
-        if base >= images::SYSTEM_BASE || !base.is_multiple_of(GRANULE) || size == 0 {
+        if base >= self.layout().system_base || !base.is_multiple_of(GRANULE) || size == 0 {
             return status::INVALID_PARAMETER;
         }
         let range = base..(base + size).next_multiple_of(GRANULE);

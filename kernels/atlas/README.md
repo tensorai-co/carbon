@@ -87,6 +87,7 @@ On this Mac, through hvf, every test program passes. Each one's opening comment 
 | atlas's `sections.c`, both ISAs | Sections and file mappings, `VirtualQuery`, and waitable timers |
 | atlas's `io.c`, both ISAs | Completion ports and overlapped I/O: events, packets, `ReadFileEx` routines |
 | atlas's `pipes.c`, both ISAs | Named pipes, byte and message, pending I/O, and a pipe between two processes |
+| atlas's `wow64.c`, 32-bit x86 | WoW64: the TEB through fs and the PEB; GetSystemInfo's 32-bit layout; memory below 2 GiB; the heap, the last error, TLS and critical sections; GetProcAddress; a thread; an upcall; fibers; RaiseException to a vectored handler; a frame of its own on the fs:[0] chain unwound by RtlUnwind; an access violation from atlas |
 | atlas's `sysinfo.c`, both ISAs, with and without a manifest | `KUSER_SHARED_DATA`, the version as a program is told it, the machine, time and time zones, `NtQuerySystemInformation` |
 | atlas's `security.c`, both ISAs | Tokens and privileges, SIDs, ACLs, descriptors and SDDL, descriptors kept and checked, `AccessCheck`, impersonation |
 | atlas's `resources.c`, both ISAs, with `resources.rc` | Finding, loading and enumerating resources, string tables, and version information |
@@ -761,20 +762,31 @@ First `cmd.exe` (variables, `if`, `for`, `goto`, `call`, pipes, redirection, `.b
      `RtlUnwind` as stubs that capture their caller's registers. `_alldiv`, `_aulldiv`, `_allrem` and `_aullrem` wrap
      compiler_builtins'. Still to do there: a nested exception's own registration (`ExceptionNestedException` is
      taken as handlers return it, not detected), and `_except_handler3`/`4` for the C runtime (phase 6).
-  3. [ ] **32-bit processes**: PE32 images parsed, mapped and relocated (`IMAGE_REL_BASED_HIGHLOW`); a 32-bit
-     layout below 2 GiB (or 4 GiB for a large-address-aware program), with atlas's page, ntdll and the system DLLs
-     in it; the TEB32, PEB32, `RTL_USER_PROCESS_PARAMETERS32` and loader entries with 32-bit pointers, `fs` at the
-     TEB; atlas's address constants per ISA.
-  4. [ ] **System DLLs for i686**: `images/make.rs` makes PE32 images whose host stubs are
+  3. [x] **32-bit processes**, run on hvf: `wow64.c` passes. `images::layout(isa)` says where things go: a 32-bit
+     process's allocations from 64 KiB to 1.5 GiB, atlas's page at 0x6fff0000 and the system DLLs from 0x70000000,
+     all below 2 GiB, as WoW64 has them. `abi.rs` gives each process its own ISA's TEB, PEB, process parameters and
+     exception record offsets and pointer width, which start-up, threads (`fs` at a TEB whose SEH chain starts at
+     -1), `MAP_IMAGE`, `GetSystemInfo`'s 36-byte SYSTEM_INFO and exceptions use: x86's are an EXCEPTION_RECORD32 and
+     a 0x2cc-byte CONTEXT, with FloatSave and ExtendedRegisters both, handed to the dispatcher stdcall's way, and
+     `NtContinue` takes what the CONTEXT's flags say it has. A 32-bit call's arguments are read off its stack; -1 to
+     -16 are widened as negative numbers, as WoW64 widens a handle, so pseudo-handles and INVALID_HANDLE_VALUE are
+     what 64-bit code expects, and its result is cut to 32 bits. PE32 images were already read and relocated.
+  4. [ ] **System DLLs for i686**, half done: `images/make.rs` makes PE32 images whose host stubs are
      `mov eax, nr; int 0x2e; ret 4*n`, popping the arguments stdcall's way (the `(n)` in each `host` declaration), and
-     `ret` alone for the cdecl ones (`wsprintfA`, ucrtbase's); host exports read their arguments with
-     `Convention::Stdcall`; upcalls push theirs.
+     `ret` alone for the cdecl ones (ucrtbase's, `wsprintf`, `DbgPrint`); upcalls push theirs. Still to do: every host
+     export that reads or writes a structure with a pointer, handle or SIZE_T in it (about 40 `read_u64`/`write_u64`s
+     and the structures built with `to_le_bytes`, `OVERLAPPED`, `STARTUPINFO`, `MSG`, `WNDCLASS` and the rest), by
+     the process's `Abi`; the few functions that take a 64-bit value by value, two stack slots on x86
+     (`SetFilePointerEx`'s LARGE_INTEGER); and checking each `(n)` is the true count, since a wrong one pops the
+     wrong amount.
   5. [ ] **WoW64 as programs see it**: `SysWOW64` for 32-bit processes, with `System32` redirected to it
      (`Wow64DisableWow64FsRedirection` and `Sysnative`); the registry's 32-bit view by default; `IsWow64Process(2)`,
      `GetNativeSystemInfo`, `PROCESSOR_ARCHITECTURE` and `PROCESSOR_ARCHITEW6432`; 32-bit and 64-bit processes
      starting each other.
-  6. [ ] **Every test program for i686** (`build.sh`'s third arch), passing; then an NSIS installer built from source,
-     then Steam's.
+  6. [ ] **Every test program for i686**, passing; then an NSIS installer built from source, then Steam's. `build.sh`
+     builds i686 programs with import libraries made from what each object imports (x86's `_Name@N` names); so far
+     `wow64.c`. The others declare SIZE_T as `unsigned long long`, which is two stack slots on x86, and need
+     declaring by size before they're built for it.
 - **ANSI and code pages:** each `*A` function still to come is the `*W` with 1252 strings, as those there are.
 - **Manifests:** side-by-side assemblies and activation contexts decide which comctl32 a program gets.
 - **API sets:** `ext-ms-*` sets, and the `api-ms-win-*` the map doesn't know yet, as programs ask.

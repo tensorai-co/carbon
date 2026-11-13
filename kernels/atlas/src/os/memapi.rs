@@ -12,7 +12,7 @@ use super::Reply;
 use crate::files::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, Node};
 use crate::handles::Handle;
 use crate::mapping::prot_to_page;
-use crate::process::{ALLOC, Area, AreaKind, GRANULE, Task};
+use crate::process::{Area, AreaKind, GRANULE, Task};
 use crate::sections::{Section, View};
 
 const TRUE: u64 = 1;
@@ -182,9 +182,10 @@ pub fn map_view_of_file_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply
         (true, true) => Prot::RWX,
     };
     let size = bytes.next_multiple_of(PAGE);
+    let alloc = task.layout().alloc;
     let mut state = lock(&task.process.state);
     let base = match a[5] {
-        0 => state.regions.free_above(ALLOC, size.next_multiple_of(GRANULE), GRANULE),
+        0 => state.regions.free_above(alloc, size.next_multiple_of(GRANULE), GRANULE),
         at if at.is_multiple_of(GRANULE) && state.regions.is_free(at..at + size) => Some(at),
         _ => None,
     };
@@ -245,7 +246,7 @@ pub fn virtual_query(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
         match state.regions.find(page) {
             None => {
                 // Free up to whatever comes next.
-                let next = state.regions.iter().map(|(r, _)| r.start).filter(|&s| s > page).min().unwrap_or(crate::images::SYSTEM_BASE);
+                let next = state.regions.iter().map(|(r, _)| r.start).filter(|&s| s > page).min().unwrap_or(task.layout().system_base);
                 (page, 0, 0, next.saturating_sub(page), MEM_FREE, 0, 0)
             }
             Some((range, area)) => {

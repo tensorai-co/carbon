@@ -27,7 +27,8 @@ impl Task {
             return handle & !3;
         }
         let peb = kernels_core::lock(&self.process.state).peb;
-        self.mem(cx, false, |t| user::read_u64(&t.space(), peb + atlas_abi::peb::IMAGE_BASE)).unwrap_or(0)
+        let abi = self.abi();
+        self.mem(cx, false, |t| user::read_ptr(&t.space(), peb + abi.peb.image_base, abi.width)).unwrap_or(0)
     }
 
     fn read_module(&mut self, cx: &mut Cx<'_>, at: u64, len: usize) -> Option<Vec<u8>> {

@@ -1,10 +1,11 @@
 //! Making a system DLL's image in memory, from its declaration: PE headers, a `.text` of trap stubs for its host and
 //! missing exports, and an export table whose guest exports forward to `ntdll`. File and memory layouts are the same
-//! (both aligned to a page), so the bytes are the file `System32` shows and the image a process maps.
+//! (both aligned to a page), so the bytes are the file `System32` shows and the image a process maps. It's PE32+ for
+//! the 64-bit ISAs and PE32 for x86, whose stubs pop a stdcall function's arguments as they return.
 
 use exec::Isa;
 
-use super::pe::{MACHINE_AMD64, MACHINE_ARM64};
+use super::pe::{MACHINE_AMD64, MACHINE_ARM64, MACHINE_I386};
 
 const PAGE: usize = 0x1000;
 /// Each stub's room in `.text`.
@@ -13,17 +14,31 @@ pub const STUB: usize = 32;
 /// What one export becomes.
 #[derive(Debug, Clone)]
 pub enum Body {
-    /// A stub that traps into atlas with this number.
-    Trap(u64),
+    /// A stub that traps into atlas with this number; on x86 it pops `pop` bytes of arguments as it returns.
+    Trap { nr: u64, pop: u16 },
     /// A forwarder: `dll.name`.
     Forward(String),
 }
 
-/// A stub that traps into atlas with call number `nr`, then returns to its caller with the result.
-/// With `gate`, an x86-64 stub comes in through atlas's trampoline (`TRAP_AT`) rather than `syscall`.
-pub fn stub(isa: Isa, nr: u64, gate: bool) -> Vec<u8> {
+/// A stub that traps into atlas with call number `nr`, then returns to its caller with the result, popping `pop`
+/// bytes of arguments on x86. With `gate`, an x86-64 stub comes in through atlas's trampoline (`TRAP_AT`) rather than
+/// `syscall`.
+pub fn stub(isa: Isa, nr: u64, pop: u16, gate: bool) -> Vec<u8> {
     let mut code = Vec::with_capacity(STUB);
     match isa {
+        // mov eax, nr; int 0x2e; then ret pop, or ret
+        Isa::X86_32 => {
+            code.push(0xb8);
+            code.extend((nr as u32).to_le_bytes());
+            code.extend([0xcd, 0x2e]);
+            if pop != 0 {
+                code.push(0xc2);
+                code.extend(pop.to_le_bytes());
+            } else {
+                code.push(0xc3);
+            }
+            code.resize(STUB, 0xcc);
+        }
         Isa::Arm64 => {
             // movz x8, #nr; svc #0; ret
             for word in [0xd280_0008 | (nr as u32 & 0xffff) << 5, 0xd400_0001, 0xd65f_03c0] {
@@ -57,9 +72,9 @@ pub fn dll(isa: Isa, name: &str, base: u64, exports: &[(&str, Body)], gate: bool
     let text_rva = PAGE;
     for (_, body) in exports {
         functions.push(match body {
-            Body::Trap(nr) => {
+            Body::Trap { nr, pop } => {
                 let rva = text_rva + text.len();
-                text.extend(stub(isa, *nr, gate));
+                text.extend(stub(isa, *nr, *pop, gate));
                 Some(rva as u32)
             }
             Body::Forward(_) => None,
@@ -92,7 +107,7 @@ pub fn dll(isa: Isa, name: &str, base: u64, exports: &[(&str, Body)], gate: bool
         .map(|((_, body), rva)| match (rva, body) {
             (Some(rva), _) => *rva,
             (None, Body::Forward(to)) => add_string(to, &mut strings),
-            (None, Body::Trap(_)) => 0,
+            (None, Body::Trap { .. }) => 0,
         })
         .collect();
     // The directory: Characteristics, TimeDateStamp, Major and MinorVersion, Name, Base, NumberOfFunctions,
@@ -127,16 +142,28 @@ pub fn dll(isa: Isa, name: &str, base: u64, exports: &[(&str, Body)], gate: bool
     put(&mut image, 0x3c, &0x40u32.to_le_bytes());
     put(&mut image, 0x40, b"PE\0\0");
     let coff = 0x44;
-    let machine = if isa == Isa::Arm64 { MACHINE_ARM64 } else { MACHINE_AMD64 };
+    let pe32 = isa == Isa::X86_32;
+    let machine = match isa {
+        Isa::Arm64 => MACHINE_ARM64,
+        Isa::X86_64 => MACHINE_AMD64,
+        Isa::X86_32 => MACHINE_I386,
+    };
+    // PE32's optional header is 16 bytes shorter: a 4-byte image base, stack and heap sizes, and BaseOfData.
+    let optional_size: u16 = if pe32 { 224 } else { 240 };
     put(&mut image, coff, &machine.to_le_bytes());
     put(&mut image, coff + 2, &3u16.to_le_bytes());
-    put(&mut image, coff + 16, &240u16.to_le_bytes());
-    put(&mut image, coff + 18, &0x2022u16.to_le_bytes()); // an executable, large-address-aware DLL
+    put(&mut image, coff + 16, &optional_size.to_le_bytes());
+    // An executable DLL: large-address-aware (64-bit), or for a 32-bit machine.
+    put(&mut image, coff + 18, &(if pe32 { 0x2102u16 } else { 0x2022u16 }).to_le_bytes());
     let opt = coff + 20;
-    put(&mut image, opt, &0x20bu16.to_le_bytes());
+    put(&mut image, opt, &(if pe32 { 0x10bu16 } else { 0x20bu16 }).to_le_bytes());
     put(&mut image, opt + 4, &(text_size as u32).to_le_bytes());
     put(&mut image, opt + 20, &(text_rva as u32).to_le_bytes());
-    put(&mut image, opt + 24, &base.to_le_bytes());
+    if pe32 {
+        put(&mut image, opt + 28, &(base as u32).to_le_bytes());
+    } else {
+        put(&mut image, opt + 24, &base.to_le_bytes());
+    }
     put(&mut image, opt + 32, &(PAGE as u32).to_le_bytes());
     put(&mut image, opt + 36, &(PAGE as u32).to_le_bytes());
     put(&mut image, opt + 40, &10u16.to_le_bytes());
@@ -144,13 +171,15 @@ pub fn dll(isa: Isa, name: &str, base: u64, exports: &[(&str, Body)], gate: bool
     put(&mut image, opt + 56, &(size_of_image as u32).to_le_bytes());
     put(&mut image, opt + 60, &(PAGE as u32).to_le_bytes());
     put(&mut image, opt + 68, &3u16.to_le_bytes()); // console
-    put(&mut image, opt + 70, &0x160u16.to_le_bytes());
-    put(&mut image, opt + 108, &16u32.to_le_bytes());
-    put(&mut image, opt + 112, &(edata_rva as u32).to_le_bytes());
-    put(&mut image, opt + 116, &(edata_size as u32).to_le_bytes());
-    put(&mut image, opt + 128, &(rsrc_rva as u32).to_le_bytes());
-    put(&mut image, opt + 132, &(rsrc.len() as u32).to_le_bytes());
-    let table = opt + 240;
+    // Dynamic base, NX compatible, and on PE32+ high-entropy addresses.
+    put(&mut image, opt + 70, &(if pe32 { 0x140u16 } else { 0x160u16 }).to_le_bytes());
+    let dirs = if pe32 { opt + 92 } else { opt + 108 };
+    put(&mut image, dirs, &16u32.to_le_bytes());
+    put(&mut image, dirs + 4, &(edata_rva as u32).to_le_bytes());
+    put(&mut image, dirs + 8, &(edata_size as u32).to_le_bytes());
+    put(&mut image, dirs + 20, &(rsrc_rva as u32).to_le_bytes());
+    put(&mut image, dirs + 24, &(rsrc.len() as u32).to_le_bytes());
+    let table = opt + usize::from(optional_size);
     for (i, (name, rva, size, flags)) in [(b".text\0\0\0", text_rva, text_size, 0x6000_0020u32), (b".edata\0\0", edata_rva, edata_size, 0x4000_0040), (b".rsrc\0\0\0", rsrc_rva, rsrc.len(), 0x4000_0040)].into_iter().enumerate() {
         let at = table + i * 40;
         put(&mut image, at, name);
@@ -173,15 +202,15 @@ mod tests {
 
     #[test]
     fn made_images_read_back() {
-        let exports = [("WriteFile", Body::Trap(0x1001)), ("HeapAlloc", Body::Forward("ntdll.RtlAllocateHeap".into())), ("ExitProcess", Body::Trap(0x1002))];
-        for isa in [Isa::Arm64, Isa::X86_64] {
-            let image = dll(isa, "KERNEL32.dll", 0x7ff0_0000_0000, &exports, false);
+        let exports = [("WriteFile", Body::Trap { nr: 0x1001, pop: 20 }), ("HeapAlloc", Body::Forward("ntdll.RtlAllocateHeap".into())), ("ExitProcess", Body::Trap { nr: 0x1002, pop: 4 })];
+        for (isa, base) in [(Isa::Arm64, 0x7ff0_0000_0000), (Isa::X86_64, 0x7ff0_0000_0000), (Isa::X86_32, 0x7040_0000)] {
+            let image = dll(isa, "KERNEL32.dll", base, &exports, false);
             let pe = Pe::parse(&image).unwrap();
-            assert_eq!((pe.isa, pe.image_base, pe.is_dll), (isa, 0x7ff0_0000_0000, true));
+            assert_eq!((pe.isa, pe.image_base, pe.is_dll), (isa, base, true));
             let laid = pe.layout().unwrap();
             assert_eq!(laid, image);
             let Some(Found::Rva(rva)) = pe.export(&laid, &Wanted::Name("ExitProcess".into())).unwrap() else { panic!() };
-            assert_eq!(&laid[rva as usize..rva as usize + 4], &stub(isa, 0x1002, false)[..4]);
+            assert_eq!(&laid[rva as usize..rva as usize + 4], &stub(isa, 0x1002, 4, false)[..4]);
             assert_eq!(pe.export(&laid, &Wanted::Name("HeapAlloc".into())).unwrap(), Some(Found::Forward("ntdll.RtlAllocateHeap".into())));
             assert_eq!(pe.export(&laid, &Wanted::Ordinal(1)).unwrap(), pe.export(&laid, &Wanted::Name("WriteFile".into())).unwrap());
             assert_eq!(pe.export(&laid, &Wanted::Name("Nope".into())).unwrap(), None);

@@ -8,7 +8,6 @@ use exec::Stop;
 use kernels_core::thread::{Cx, Flow};
 use kernels_core::user;
 
-use crate::images::UPCALL_RETURN_AT;
 use crate::os::Reply;
 use crate::process::Task;
 
@@ -64,7 +63,7 @@ impl Task {
         }
         let list = args(sp);
         regs.set_sp(sp);
-        let (frame_at, frame) = self.convention().prepare(&mut regs, target, &list, UPCALL_RETURN_AT);
+        let (frame_at, frame) = self.convention().prepare(&mut regs, target, &list, self.layout().upcall_return());
         self.mem(cx, true, |t| user::write(&mut t.space(), frame_at, &frame)).map_err(|_| Reply::ExitProcess(status::ACCESS_VIOLATION))?;
         cx.turn(|t| t.thread().set_regs(&regs));
 

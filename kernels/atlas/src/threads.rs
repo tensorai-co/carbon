@@ -4,17 +4,15 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use atlas_abi::teb;
-use exec::{Prot, Regs};
+use exec::Prot;
 use kernels_core::thread::Handle;
 use kernels_core::lock;
 use kernels_core::thread::{self, Cx};
 use kernels_core::user;
 use kernels_core::wait::{Waiter, Woke};
 
-use crate::images::THREAD_RETURN_AT;
 use crate::objects::{Apcs, Kind, Object, State};
-use crate::process::{ALLOC, Area, AreaKind, GRANULE, Process, Task};
+use crate::process::{Area, AreaKind, GRANULE, Process, Task};
 
 /// What a process knows of each of its threads, and what other threads use to reach it.
 pub(crate) struct ThreadControl {
@@ -62,11 +60,12 @@ impl Task {
     pub fn create_thread(&mut self, cx: &mut Cx<'_>, stack_size: u64, start: u64, parameter: u64, flags: u32) -> Result<(Arc<Object>, u64), u32> {
         let tid = self.k.new_id();
         let size = stack_size.max(STACK).next_multiple_of(GRANULE);
+        let (alloc, abi, thread_return) = (self.layout().alloc, self.abi(), self.layout().thread_return());
         let (teb_at, stack, peb, thread_start) = {
             let mut state = lock(&self.process.state);
-            let teb_at = state.regions.free_above(ALLOC, GRANULE, GRANULE).ok_or(atlas_abi::status::NO_MEMORY)?;
+            let teb_at = state.regions.free_above(alloc.clone(), GRANULE, GRANULE).ok_or(atlas_abi::status::NO_MEMORY)?;
             state.regions.insert(teb_at..teb_at + GRANULE, Area::of(Prot::RW, AreaKind::Committed));
-            let stack = state.regions.free_above(ALLOC, size, GRANULE).ok_or(atlas_abi::status::NO_MEMORY)?;
+            let stack = state.regions.free_above(alloc, size, GRANULE).ok_or(atlas_abi::status::NO_MEMORY)?;
             state.regions.insert(stack..stack + size, Area::of(Prot::RW, AreaKind::Committed));
             state.regions.update(stack..stack + crate::process::STACK_GUARD, |a| a.guard = true);
             (teb_at, stack, state.peb, state.thread_start)
@@ -78,8 +77,8 @@ impl Task {
             t.space().map(teb_at..teb_at + GRANULE, Prot::RW).zeroed().map_err(nomem)?;
             t.space().map(top - STACK_MAPPED..top, Prot::RW).zeroed().map_err(nomem)?;
             let mut memory = t.space();
-            for (at, value) in [(teb::STACK_BASE, top), (teb::STACK_LIMIT, top - STACK_MAPPED), (teb::DEALLOCATION_STACK, stack), (teb::SELF, teb_at), (teb::CLIENT_ID, pid), (teb::CLIENT_ID + 8, tid), (teb::PEB, peb)] {
-                user::write_u64(&mut memory, teb_at + at, value).map_err(|_| atlas_abi::status::NO_MEMORY)?;
+            for (at, bytes) in abi.teb_fields(teb_at, top, top - STACK_MAPPED, stack, pid, tid, peb) {
+                user::write(&mut memory, teb_at + at, &bytes).map_err(|_| atlas_abi::status::NO_MEMORY)?;
             }
             Ok(())
         })?;
@@ -94,12 +93,9 @@ impl Task {
                 t.thread().start(thread_start, top);
                 crate::process::windows_fp(t, isa);
                 let mut regs = t.thread().regs();
-                let (sp, frame) = convention.prepare(&mut regs, thread_start, &[start, parameter], THREAD_RETURN_AT);
+                let (sp, frame) = convention.prepare(&mut regs, thread_start, &[start, parameter], thread_return);
                 user::write(&mut t.space(), sp, &frame).map_err(|_| "no stack for a new thread".to_string())?;
-                match &mut regs {
-                    Regs::Arm64(r) => r.x[18] = teb_at,
-                    Regs::X86(r) => r.gs_base = teb_at,
-                }
+                crate::abi::set_teb(&mut regs, isa, teb_at);
                 t.thread().set_regs(&regs);
                 Ok::<(), String>(())
             })?;

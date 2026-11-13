@@ -26,6 +26,7 @@ GetProcAddress
 GetModuleHandleA
 GetModuleFileNameW
 RaiseException
+RtlUnwind
 CreateThread
 ExitThread
 GetExitCodeThread

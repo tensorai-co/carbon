@@ -8,7 +8,7 @@ use kernels_core::thread::Cx;
 use kernels_core::user;
 
 use super::Reply;
-use crate::process::{ALLOC, GRANULE, Task};
+use crate::process::{GRANULE, Task};
 use crate::system;
 
 const TRUE: u64 = 1;
@@ -187,21 +187,29 @@ pub fn get_product_info(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 
 // --- The machine ---
 
-/// `GetSystemInfo(&info)` and `GetNativeSystemInfo`: the same here, as every program runs as its own ISA.
+/// `GetSystemInfo(&info)` and `GetNativeSystemInfo`: the same here, as every program runs as its own ISA. SYSTEM_INFO's
+/// two addresses and its processor mask are pointer-sized, so a 32-bit program's is 36 bytes, not 48.
 pub fn get_system_info(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let cpus = task.cpus();
-    let mut b = [0u8; 48];
-    b[0..2].copy_from_slice(&system::architecture(task.isa).to_le_bytes());
-    b[4..8].copy_from_slice(&4096u32.to_le_bytes());
-    b[8..16].copy_from_slice(&GRANULE.to_le_bytes());
-    b[16..24].copy_from_slice(&(ALLOC.end - GRANULE - 1).to_le_bytes());
-    b[24..32].copy_from_slice(&(u64::MAX >> (64 - cpus)).to_le_bytes());
-    b[32..36].copy_from_slice(&cpus.to_le_bytes());
-    // PROCESSOR_AMD_X8664, family 6; ARM64 has no processor type.
-    let (kind, level) = if task.isa == exec::Isa::Arm64 { (0u32, 8u16) } else { (8664, 6) };
-    b[36..40].copy_from_slice(&kind.to_le_bytes());
-    b[40..44].copy_from_slice(&(GRANULE as u32).to_le_bytes());
-    b[44..46].copy_from_slice(&level.to_le_bytes());
+    let abi = task.abi();
+    let mut b = Vec::with_capacity(48);
+    b.extend(system::architecture(task.isa).to_le_bytes());
+    b.extend([0, 0]);
+    b.extend(4096u32.to_le_bytes());
+    b.extend(abi.ptr(GRANULE));
+    b.extend(abi.ptr(task.layout().alloc.end - GRANULE - 1));
+    b.extend(abi.ptr(u64::MAX >> (64 - cpus.min(abi.width as u32 * 8))));
+    b.extend(cpus.to_le_bytes());
+    // PROCESSOR_AMD_X8664 or PROCESSOR_INTEL_PENTIUM, family 6; ARM64 has no processor type.
+    let (kind, level) = match task.isa {
+        exec::Isa::Arm64 => (0u32, 8u16),
+        exec::Isa::X86_64 => (8664, 6),
+        exec::Isa::X86_32 => (586, 6),
+    };
+    b.extend(kind.to_le_bytes());
+    b.extend((GRANULE as u32).to_le_bytes());
+    b.extend(level.to_le_bytes());
+    b.extend([0, 0]);
     let _ = task.put(cx, a[0], &b);
     Reply::Value(0)
 }
@@ -220,7 +228,7 @@ pub fn global_memory_status_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> R
             return Err(FALSE);
         }
         let (total, free) = physical(cx);
-        let virt = ALLOC.end - GRANULE;
+        let virt = task.layout().alloc.end - GRANULE;
         let load = ((total - free) * 100).checked_div(total).unwrap_or(0) as u32;
         let mut b = Vec::with_capacity(64);
         b.extend(64u32.to_le_bytes());
@@ -237,7 +245,7 @@ pub fn global_memory_status_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> R
 /// `GlobalMemoryStatus(&status)`: the older `MEMORYSTATUS`, which has no result.
 pub fn global_memory_status(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let (total, free) = physical(cx);
-    let virt = ALLOC.end - GRANULE;
+    let virt = task.layout().alloc.end - GRANULE;
     let load = ((total - free) * 100).checked_div(total).unwrap_or(0) as u32;
     let mut b = Vec::with_capacity(56);
     b.extend(56u32.to_le_bytes());
