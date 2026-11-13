@@ -32,6 +32,12 @@ pub(crate) struct ThreadControl {
     pub token: Mutex<Option<Arc<crate::security::Token>>>,
     /// `Wow64DisableWow64FsRedirection`: a 32-bit thread's System32 is System32, not SysWOW64, until it reverts.
     pub fs_redirection_off: std::sync::atomic::AtomicBool,
+    /// Its registers, while another thread may look at them: from when it calls into atlas until it goes back to the
+    /// program. Parked while suspended, its floating-point registers too; inside a call, those aren't read (it's
+    /// costly on a VM), so `GetThreadContext` gives a new thread's.
+    pub seen: Mutex<Option<(exec::Regs, Option<exec::FpRegs>)>>,
+    /// Wakes those waiting for `seen`.
+    pub seen_changed: std::sync::Condvar,
 }
 
 impl ThreadControl {
@@ -48,6 +54,8 @@ impl ThreadControl {
             owned: Mutex::new(Vec::new()),
             token: Mutex::new(None),
             fs_redirection_off: std::sync::atomic::AtomicBool::new(false),
+            seen: Mutex::new(None),
+            seen_changed: std::sync::Condvar::new(),
         })
     }
 }
@@ -117,8 +125,13 @@ impl Task {
         }
     }
 
-    /// Waits here while suspended. False if it's to end instead.
-    pub fn park_while_suspended(&mut self) -> bool {
+    /// Waits here while suspended, its registers where `GetThreadContext` can read them. False if it's to end instead.
+    pub fn park_while_suspended(&mut self, cx: &mut Cx<'_>) -> bool {
+        if self.control.suspend.load(Ordering::Acquire) != 0 {
+            let state = cx.turn(|t| (t.thread().regs(), t.thread().fp()));
+            *lock(&self.control.seen) = Some((state.0, Some(state.1)));
+            self.control.seen_changed.notify_all();
+        }
         loop {
             self.waiter.reset();
             if self.ending() {
@@ -170,6 +183,9 @@ impl Task {
             });
         }
         self.k.exited(&self.control.object, code);
+        if self.k.options.trace {
+            self.k.host.write(host::Stream::Err, format!("[{}] the thread ends, {code:#x}\n", self.tid).as_bytes());
+        }
         let last = {
             let mut state = lock(&self.process.state);
             state.threads.remove(&self.tid);
@@ -194,10 +210,14 @@ impl Task {
             cx.turn(|t| t.destroy_space(space));
             drop(gone);
             self.k.exited(&self.process.object, code);
+            if self.k.options.trace {
+                self.k.host.write(host::Stream::Err, format!("[{}] process {} ends, {code:#x}\n", self.tid, self.process.pid).as_bytes());
+            }
             let (ended, done) = &self.process.ended;
             *lock(ended) = Some(code);
             done.notify_all();
             self.k.ended(self.process.pid);
+            self.win32k().stations.forget(self.process.pid);
         }
     }
 }

@@ -155,9 +155,11 @@ impl Guest for Task {
     fn exit(&mut self, cx: &mut Cx<'_>, exit: exec::Exit) -> Flow {
         let stop = cx.turn(|t| t.stop(exit));
         let mut flow = self.handle(cx, stop);
-        if flow == Flow::Run && !self.park_while_suspended() {
+        if flow == Flow::Run && !self.park_while_suspended(cx) {
             flow = Flow::End;
         }
+        // Back to the program: its registers are its CPU's again.
+        lock(&self.control.seen).take();
         if flow == Flow::End {
             self.finish_thread(cx);
         }
@@ -191,9 +193,24 @@ impl Task {
         }
     }
 
+    /// Which module `addr` is in, and how far in: the mapped image with the nearest base below it.
+    pub fn where_is(&self, addr: u64) -> String {
+        let state = lock(&self.process.state);
+        match state.mapped.iter().filter(|(_, (base, _))| *base <= addr).max_by_key(|(_, (base, _))| *base) {
+            Some((name, (base, _))) => format!("{name}+{:#x}", addr - base),
+            None => "no module".to_string(),
+        }
+    }
+
     /// Deals with one stop. Also used while an upcall runs the program.
     pub fn handle(&mut self, cx: &mut Cx<'_>, stop: Option<Stop>) -> Flow {
         if self.ending() {
+            // Traced, a thread stopped from outside says where it was: a quiet thread's only trace.
+            if self.k.options.trace && matches!(stop, None | Some(Stop::Preempted)) {
+                let pc = cx.turn(|t| t.thread().regs().pc());
+                let shown = self.where_is(pc);
+                self.k.host.write(host::Stream::Err, format!("[{}] ended at {pc:#x} ({shown})\n", self.tid).as_bytes());
+            }
             return Flow::End;
         }
         match stop {
@@ -264,7 +281,15 @@ impl Task {
                 let a = self.args(cx, 4);
                 match self.wait_address(cx, a[0], a[1], a[2], a[3]) {
                     Ok(code) => self.answer(cx, u64::from(code)),
-                    Err(reply) => self.reply(cx, reply),
+                    Err(reply) => {
+                        // Traced, a guest wait the machine's end cut short says what it waited on, and from where.
+                        if trace {
+                            let pc = cx.turn(|t| t.thread().regs().pc());
+                            let shown = self.where_is(pc);
+                            self.k.host.write(host::Stream::Err, format!("[{}] waiting on {:#x} at {pc:#x} ({shown}): ended\n", self.tid, a[0]).as_bytes());
+                        }
+                        self.reply(cx, reply)
+                    }
                 }
             }
             call::WAKE_ADDRESS => {
@@ -437,6 +462,14 @@ impl Task {
     /// and INVALID_HANDLE_VALUE are what they are for a 64-bit program; everything else is widened with zeros.
     fn args(&mut self, cx: &mut Cx<'_>, count: usize) -> Vec<u64> {
         let mut regs = cx.turn(|t| t.thread().regs());
+        // In a call into atlas, where another thread may read its registers (a suspended thread blocked in one).
+        {
+            let mut seen = lock(&self.control.seen);
+            if seen.is_none() {
+                *seen = Some((regs, None));
+                self.control.seen_changed.notify_all();
+            }
+        }
         if let Regs::X86(r) = &mut regs
             && self.isa == Isa::X86_64
         {

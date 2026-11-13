@@ -395,7 +395,7 @@ fn type_of(handle: &Handle) -> (u8, u32) {
         },
         Handle::Port(_) => (36, 0x1f_0003),
         Handle::Token(_) => (5, 0xf_01ff),
-        Handle::Console(_) | Handle::Input | Handle::File(_) | Handle::Find(_) => (37, 0x12_019f),
+        Handle::Console(_) | Handle::Input | Handle::File(_) | Handle::Find(_) | Handle::Snapshot(_) => (37, 0x12_019f),
         Handle::Section(_) => (42, 0xf_001f),
         Handle::Key(_) => (44, 0xf_003f),
     }
@@ -410,6 +410,7 @@ fn object_address(handle: &Handle) -> u64 {
         Handle::Section(s) => Arc::as_ptr(s) as u64,
         Handle::Port(p) => Arc::as_ptr(p) as u64,
         Handle::Token(t) => Arc::as_ptr(t) as u64,
+        Handle::Snapshot(s) => Arc::as_ptr(s) as u64,
         Handle::Key(id) => 0x10_0000 + id * 0x40,
         Handle::Console(host::Stream::Out) => 0x1000,
         Handle::Console(_) => 0x1040,

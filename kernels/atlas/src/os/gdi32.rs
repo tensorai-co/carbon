@@ -51,6 +51,94 @@ dll! {
     host ChoosePixelFormat(2) => choose_pixel_format;
     host SetPixelFormat(3) => set_pixel_format;
     host SwapBuffers(1) => swap_buffers;
+    // Not written yet: what larger programs import.
+    missing AddFontResourceA;
+    missing AddFontResourceExA;
+    host CombineRgn(4) => combine_rgn;
+    host CreateDCW(4) => create_dc_w;
+    host CreateFontA(14) => create_font;
+    host CreateFontIndirectA(1) => create_font;
+    host CreateRectRgn(4) => create_rect_rgn;
+    missing DescribePixelFormat;
+    host EnumFontFamiliesExA(5) => enum_font_families_ex_a;
+    host EnumFontFamiliesExW(5) => enum_font_families_ex_w;
+    missing ExtTextOutA;
+    missing ExtTextOutW;
+    host GdiFlush(0) => one;
+    missing GetBitmapBits;
+    missing GetCharABCWidthsW;
+    host GetClipBox(2) => get_clip_box;
+    host GetCurrentObject(2) => get_current_object;
+    missing GetDIBits;
+    host GetDeviceGammaRamp(2) => nothing;
+    missing GetFontData;
+    host GetICMProfileW(3) => nothing;
+    host GetPixelFormat(1) => one;
+    host GetTextMetricsA(2) => get_text_metrics_a;
+    host GetTextMetricsW(2) => get_text_metrics_w;
+    host GetViewportOrgEx(2) => get_viewport_org_ex;
+    missing Polyline;
+    missing RemoveFontResourceA;
+    host SelectClipRgn(2) => select_clip_rgn;
+    host SetBrushOrgEx(4) => set_origin;
+    missing SetDCBrushColor;
+    missing SetDIBitsToDevice;
+    host SetDeviceGammaRamp(2) => nothing;
+    host SetMapMode(2) => set_map_mode;
+    host SetRectRgn(5) => set_rect_rgn;
+    host SetTextAlign(2) => nothing;
+    host SetViewportOrgEx(4) => set_origin;
+    missing BeginPath;
+    missing CancelDC;
+    missing CloseEnhMetaFile;
+    missing CloseFigure;
+    missing CreateEnhMetaFileW;
+    missing CreateRectRgnIndirect;
+    missing DeleteEnhMetaFile;
+    missing EndDoc;
+    missing EndPage;
+    missing EndPath;
+    missing EnumEnhMetaFile;
+    missing EqualRgn;
+    missing ExtCreatePen;
+    missing ExtEscape;
+    missing FillPath;
+    missing GdiAlphaBlend;
+    missing GdiComment;
+    missing GetCharWidthW;
+    missing GetClipRgn;
+    missing GetEnhMetaFileBits;
+    missing GetEnhMetaFileHeader;
+    missing GetObjectType;
+    missing GetOutlineTextMetricsW;
+    missing GetRegionData;
+    missing GetRgnBox;
+    missing GetTextFaceA;
+    missing GetWorldTransform;
+    missing IntersectClipRect;
+    missing ModifyWorldTransform;
+    missing PlayEnhMetaFile;
+    missing PlayEnhMetaFileRecord;
+    missing PolyBezierTo;
+    missing PtInRegion;
+    missing RestoreDC;
+    missing SaveDC;
+    missing SelectClipPath;
+    missing SetAbortProc;
+    missing SetArcDirection;
+    missing SetDCPenColor;
+    missing SetDIBits;
+    missing SetEnhMetaFileBits;
+    missing SetGraphicsMode;
+    missing SetMiterLimit;
+    missing SetPolyFillMode;
+    missing SetROP2;
+    missing SetWorldTransform;
+    missing StartDocW;
+    missing StartPage;
+    missing StrokeAndFillPath;
+    missing StrokePath;
+    missing WidenPath;
 }
 
 const CLR_INVALID: u64 = 0xffff_ffff;
@@ -297,4 +385,214 @@ fn set_pixel_format(_: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
 /// `SwapBuffers(dc)`: nothing drawn behind to show.
 fn swap_buffers(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
     Reply::Value(1)
+}
+
+/// `GetCurrentObject(dc, type)`: the pen (OBJ_PEN, 1), brush (2), font (6) or bitmap (7) the DC has selected.
+fn get_current_object(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let w = task.win32k();
+    let Some(dc) = w.gdi.dcs.get(&a[0]) else { return Reply::Value(0) };
+    Reply::Value(match a[1] as u32 {
+        1 => dc.pen,
+        2 => dc.brush,
+        6 => dc.font,
+        7 => dc.bitmap,
+        _ => 0,
+    })
+}
+
+/// `GetClipBox(dc, &rect)`: where it may draw; SIMPLEREGION (2).
+fn get_clip_box(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(clip) = task.win32k().gdi.dcs.get(&a[0]).map(|dc| dc.clip) else { return Reply::Value(0) };
+    if !task.write_rect(cx, a[1], &clip) {
+        return Reply::Value(0);
+    }
+    Reply::Value(2)
+}
+
+/// A point's two LONGs written where asked (0, 0: the origin, which is all there is with MM_TEXT).
+fn put_origin(task: &mut Task, cx: &mut Cx<'_>, at: u64) -> Reply {
+    if at != 0 {
+        let _ = task.mem(cx, true, |t| user::write(&mut t.space(), at, &[0u8; 8]));
+    }
+    Reply::Value(1)
+}
+
+/// `GetViewportOrgEx(dc, &point)`, `SetViewportOrgEx(dc, x, y, &old)` and `SetBrushOrgEx(dc, x, y, &old)`: the
+/// origin stays where it is.
+fn get_viewport_org_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    put_origin(task, cx, a[1])
+}
+
+fn set_origin(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    put_origin(task, cx, a[3])
+}
+
+/// `SetMapMode(dc, mode)`: MM_TEXT (1), what it was and stays.
+fn set_map_mode(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(1)
+}
+
+/// What takes its arguments and does nothing more: `GdiFlush` (drawing isn't batched), `SetTextAlign` (TA_TOP |
+/// TA_LEFT, the alignment there was), `GetPixelFormat` (format 1).
+fn one(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(1)
+}
+
+fn nothing(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(0)
+}
+
+/// `CreateDCW(driver, device, port, &mode)`: a DC for the display, as a memory DC.
+fn create_dc_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    create_compatible_dc(task, cx, a)
+}
+
+// ---- Regions, as rectangles ----
+
+const NULLREGION: u64 = 1;
+const SIMPLEREGION: u64 = 2;
+
+fn region_kind(r: &Rect) -> u64 {
+    if r.right <= r.left || r.bottom <= r.top { NULLREGION } else { SIMPLEREGION }
+}
+
+fn rect_args(a: &[u64]) -> Rect {
+    Rect { left: a[0] as u32 as i32, top: a[1] as u32 as i32, right: a[2] as u32 as i32, bottom: a[3] as u32 as i32 }
+}
+
+/// `CreateRectRgn(left, top, right, bottom)`.
+fn create_rect_rgn(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(task.win32k().gdi.create(Object::Region(rect_args(a))))
+}
+
+/// `SetRectRgn(region, left, top, right, bottom)`.
+fn set_rect_rgn(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(u64::from(task.win32k().gdi.set_region(a[0], rect_args(&a[1..]))))
+}
+
+/// `CombineRgn(destination, a, b, mode)`: RGN_AND (1) their overlap; RGN_OR (2) and RGN_XOR (3) the rectangle
+/// around both; RGN_DIFF (4) and RGN_COPY (5) the first. What kind the result is: NULLREGION, SIMPLEREGION or ERROR.
+fn combine_rgn(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let mut w = task.win32k();
+    let Some(x) = w.gdi.region(a[1]) else { return Reply::Value(0) };
+    let y = w.gdi.region(a[2]).unwrap_or_default();
+    let r = match a[3] as u32 {
+        1 => Rect { left: x.left.max(y.left), top: x.top.max(y.top), right: x.right.min(y.right), bottom: x.bottom.min(y.bottom) },
+        2 | 3 if region_kind(&x) == NULLREGION => y,
+        2 | 3 if region_kind(&y) == NULLREGION => x,
+        2 | 3 => Rect { left: x.left.min(y.left), top: x.top.min(y.top), right: x.right.max(y.right), bottom: x.bottom.max(y.bottom) },
+        4 | 5 => x,
+        _ => return Reply::Value(0),
+    };
+    if !w.gdi.set_region(a[0], r) {
+        return Reply::Value(0);
+    }
+    Reply::Value(region_kind(&r))
+}
+
+/// `SelectClipRgn(dc, region)`: where it may draw, the region's rectangle in its window's client area (none: all of
+/// it).
+fn select_clip_rgn(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let mut w = task.win32k();
+    let region = w.gdi.region(a[1]);
+    let Some(hwnd) = w.gdi.dcs.get(&a[0]).map(|dc| dc.hwnd) else { return Reply::Value(0) };
+    let whole = w.windows.get(&hwnd).map(|win| win.client()).unwrap_or(Rect { left: 0, top: 0, right: i32::MAX / 2, bottom: i32::MAX / 2 });
+    let clip = region.unwrap_or(whole);
+    if let Some(dc) = w.gdi.dcs.get_mut(&a[0]) {
+        dc.clip = clip;
+    }
+    Reply::Value(region_kind(&clip))
+}
+
+// ---- Fonts listed ----
+
+/// The font families listed: atlas draws text in one font, under any of these names.
+const FAMILIES: [&str; 4] = ["Segoe UI", "Arial", "Tahoma", "Courier New"];
+
+/// Text in a fixed field of `chars` characters.
+fn face(s: &str, chars: usize, wide: bool) -> Vec<u8> {
+    let mut b: Vec<u8> = if wide { s.encode_utf16().flat_map(u16::to_le_bytes).collect() } else { s.as_bytes().to_vec() };
+    b.resize(if wide { chars * 2 } else { chars }, 0);
+    b
+}
+
+/// ENUMLOGFONTEX and NEWTEXTMETRICEX for a family, as one block: the first at 0, the second where the second value
+/// says.
+fn font_entry(family: &str, wide: bool) -> (Vec<u8>, usize) {
+    let mut b = Vec::new();
+    // LOGFONT: height, width, escapement, orientation, weight; italic, underline, strike-out, charset, out precision,
+    // clip precision, quality, pitch and family; the face.
+    for v in [-16i32, 0, 0, 0, 400] {
+        b.extend(v.to_le_bytes());
+    }
+    b.extend([0u8, 0, 0, 0, 3, 2, 1, 0x22]);
+    b.extend(face(family, 32, wide));
+    // The full name, the style, the script.
+    b.extend(face(family, 64, wide));
+    b.extend(face("Regular", 32, wide));
+    b.extend(face("Western", 32, wide));
+    let metrics_at = b.len();
+    // TEXTMETRIC: height, ascent, descent, internal and external leading, average and widest character, weight,
+    // overhang, aspect; first, last, default and break characters; italic, underlined, struck out, pitch and family,
+    // charset.
+    for v in [16i32, 13, 3, 3, 0, 7, 14, 400, 0, 96, 96] {
+        b.extend(v.to_le_bytes());
+    }
+    if wide {
+        for c in [0x20u16, 0xfffc, 0x1f, 0x20] {
+            b.extend(c.to_le_bytes());
+        }
+    } else {
+        b.extend([0x20u8, 0xff, 0x1f, 0x20]);
+    }
+    b.extend([0u8, 0, 0, 0x27, 0]);
+    b.resize(b.len().next_multiple_of(4), 0);
+    // NTM_REGULAR, the em square, cell height, average width; then FONTSIGNATURE, Latin 1 in its code pages.
+    for v in [0x40u32, 2048, 2400, 1000, 0, 0, 0, 0, 1, 0] {
+        b.extend(v.to_le_bytes());
+    }
+    (b, metrics_at)
+}
+
+/// `EnumFontFamiliesExW(dc, &logfont, callback, data, flags)` and `A`: the callback for each family (the one named,
+/// if the LOGFONT names one), as TrueType, until it returns 0. Its last return.
+fn enum_font_families_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let name_at = a[1] + 28;
+    let wanted = if wide { task.wstr(cx, name_at) } else { task.text_arg(cx, name_at, false) };
+    let mut last = 1;
+    for family in FAMILIES.iter().filter(|f| wanted.is_empty() || f.eq_ignore_ascii_case(&wanted)) {
+        let (block, metrics_at) = font_entry(family, wide);
+        match task.upcall_data(cx, a[2], &block, |at| vec![at, at + metrics_at as u64, 4, a[3]]) {
+            Ok(0) => return Reply::Value(0),
+            Ok(v) => last = v,
+            Err(reply) => return reply,
+        }
+    }
+    Reply::Value(last)
+}
+
+fn enum_font_families_ex_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    enum_font_families_ex(task, cx, a, true)
+}
+
+fn enum_font_families_ex_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    enum_font_families_ex(task, cx, a, false)
+}
+
+/// `GetTextMetricsW(dc, &metrics)` and `A`: atlas's one font's TEXTMETRIC, whatever's selected.
+fn get_text_metrics(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    if !task.win32k().gdi.dcs.contains_key(&a[0]) {
+        return Reply::Value(0);
+    }
+    let (block, at) = font_entry(FAMILIES[0], wide);
+    let size = if wide { 60 } else { 56 };
+    Reply::Value(u64::from(task.mem(cx, true, |t| user::write(&mut t.space(), a[1], &block[at..at + size])).is_ok()))
+}
+
+fn get_text_metrics_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    get_text_metrics(task, cx, a, true)
+}
+
+fn get_text_metrics_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    get_text_metrics(task, cx, a, false)
 }

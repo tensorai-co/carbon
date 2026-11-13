@@ -23,7 +23,7 @@ const ERROR_NEGATIVE_SEEK: u32 = 131;
 
 impl Task {
     /// A path the program passed, as UTF-16 or ANSI.
-    fn path_arg(&mut self, cx: &mut Cx<'_>, at: u64, wide: bool) -> Option<String> {
+    pub(crate) fn path_arg(&mut self, cx: &mut Cx<'_>, at: u64, wide: bool) -> Option<String> {
         if at == 0 {
             return None;
         }
@@ -742,6 +742,48 @@ fn copy_file(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
     }
 }
 
+/// `CopyFileExW(from, to, progress routine, its data, &cancel, flags)` and `A`: as `CopyFile`, with
+/// COPY_FILE_FAIL_IF_EXISTS (1); the copy is one step, so there's no progress to tell.
+fn copy_file_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    copy_file(task, cx, &[a[0], a[1], a[5] & 1], wide)
+}
+
+pub fn copy_file_ex_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    copy_file_ex(task, cx, a, true)
+}
+
+pub fn copy_file_ex_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    copy_file_ex(task, cx, a, false)
+}
+
+/// `ReplaceFileW(replaced, replacement, backup, flags, exclude, reserved)` and `A`: the file that's there kept as
+/// `backup` (if one's named), then the replacement moved in over it.
+fn replace_file(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    const ERROR_UNABLE_TO_MOVE_REPLACEMENT: u32 = 1176;
+    let (Some(replaced), Some(replacement)) = (task.path_arg(cx, a[0], wide), task.path_arg(cx, a[1], wide)) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
+    if let Err(e) = task.path_info(&replaced) {
+        return task.fail(cx, e);
+    }
+    if a[2] != 0 {
+        let Some(backup) = task.path_arg(cx, a[2], wide) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
+        if let Err(e) = task.copy_file(&replaced, &backup, false) {
+            return task.fail(cx, e);
+        }
+    }
+    match task.move_file(&replacement, &replaced, true) {
+        Ok(()) => Reply::Value(TRUE),
+        Err(_) => task.fail(cx, ERROR_UNABLE_TO_MOVE_REPLACEMENT),
+    }
+}
+
+pub fn replace_file_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    replace_file(task, cx, a, true)
+}
+
+pub fn replace_file_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    replace_file(task, cx, a, false)
+}
+
 /// WIN32_FIND_DATAW (592 bytes), or WIN32_FIND_DATAA (320).
 fn find_data(found: &Found, wide: bool) -> Vec<u8> {
     let mut b = vec![0u8; if wide { 592 } else { 320 }];
@@ -1265,4 +1307,14 @@ pub fn write_private_profile_string_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64
         }
     }
     if task.ini_write(&path, &ini) { Reply::Value(TRUE) } else { task.fail(cx, 5) }
+}
+
+/// `DeleteFileTransactedW(path, transaction)`: as `DeleteFileW`, now: transactions aren't kept.
+pub fn delete_file_transacted_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    delete_file_w(task, cx, &a[..1])
+}
+
+/// `MoveFileTransactedW(from, to, progress, its data, flags, transaction)`: as `MoveFileExW`, now.
+pub fn move_file_transacted_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    move_file_ex_w(task, cx, &[a[0], a[1], a[4]])
 }

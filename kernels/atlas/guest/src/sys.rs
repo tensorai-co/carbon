@@ -20,7 +20,7 @@ pub fn call4(nr: u64, a: u64, b: u64, c: u64, d: u64) -> u64 {
     }
     #[cfg(target_arch = "x86")]
     {
-        result = stack_call(nr, &[a as u32, b as u32, c as u32, d as u32, 0, 0, 0, 0]);
+        result = stack_call(nr, &[a as u32, b as u32, c as u32, d as u32, 0, 0, 0, 0, 0, 0, 0, 0]);
     }
     result
 }
@@ -28,11 +28,15 @@ pub fn call4(nr: u64, a: u64, b: u64, c: u64, d: u64) -> u64 {
 /// x86's way in: the eight arguments pushed, last first, then a dummy return address, then `int 0x2e`.
 #[cfg(target_arch = "x86")]
 #[inline(always)]
-fn stack_call(nr: u64, args: &[u32; 8]) -> u64 {
+fn stack_call(nr: u64, args: &[u32; MOST_ARGS]) -> u64 {
     let result: u32;
     // SAFETY: a trap into atlas, which changes only eax; the stack is put back as it was.
     unsafe {
         core::arch::asm!(
+            "push dword ptr [{p} + 44]",
+            "push dword ptr [{p} + 40]",
+            "push dword ptr [{p} + 36]",
+            "push dword ptr [{p} + 32]",
             "push dword ptr [{p} + 28]",
             "push dword ptr [{p} + 24]",
             "push dword ptr [{p} + 20]",
@@ -43,7 +47,7 @@ fn stack_call(nr: u64, args: &[u32; 8]) -> u64 {
             "push dword ptr [{p}]",
             "push 0",
             "int 0x2e",
-            "add esp, 36",
+            "add esp, 52",
             p = in(reg) args.as_ptr(),
             inlateout("eax") nr as u32 => result,
             lateout("ecx") _, lateout("edx") _,
@@ -52,43 +56,66 @@ fn stack_call(nr: u64, args: &[u32; 8]) -> u64 {
     u64::from(result)
 }
 
-/// A call with up to eight arguments: past the fourth they go where a Windows call has them, in `x4` to `x7` on
-/// ARM64 and on the stack, past the home space, on x86-64. How ntdll calls a host export that takes more than four.
+/// The most arguments `call_n` passes, as many as the widest host export ntdll calls takes.
+pub const MOST_ARGS: usize = 12;
+
+/// A call with up to twelve arguments, where a Windows call has them: `x0` to `x7` then the stack on ARM64; four
+/// registers then the stack past the home space on x86-64; all on the stack on x86. How ntdll calls a host export that
+/// takes more than four.
 #[inline(always)]
-#[allow(clippy::too_many_arguments)]
-pub fn call8(nr: u64, a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, h: u64) -> u64 {
+pub fn call_n(nr: u64, args: &[u64; MOST_ARGS]) -> u64 {
     let result: u64;
-    // SAFETY: a trap into atlas, as `call4`; on x86-64, the stack is put back as it was.
-    #[cfg(not(target_arch = "x86"))]
+    // SAFETY: a trap into atlas, as `call4`; the stack is put back as it was.
+    #[cfg(target_arch = "aarch64")]
     unsafe {
-        #[cfg(target_arch = "aarch64")]
-        core::arch::asm!("svc #0", in("x8") nr, inlateout("x0") a => result, in("x1") b, in("x2") c, in("x3") d, in("x4") e, in("x5") f, in("x6") g, in("x7") h, options(nostack));
-        #[cfg(target_arch = "x86_64")]
-        {
-            let rest = [e, f, g, h];
-            core::arch::asm!(
-                "sub rsp, 0x48",
-                "mov rax, [{rest}]",
-                "mov [rsp + 0x20], rax",
-                "mov rax, [{rest} + 8]",
-                "mov [rsp + 0x28], rax",
-                "mov rax, [{rest} + 16]",
-                "mov [rsp + 0x30], rax",
-                "mov rax, [{rest} + 24]",
-                "mov [rsp + 0x38], rax",
-                "mov rax, {nr}",
-                "call r11",
-                "add rsp, 0x48",
-                rest = in(reg) rest.as_ptr(),
-                nr = in(reg) nr,
-                out("rax") result, in("r10") a, in("rdx") b, in("r8") c, in("r9") d,
-                inlateout("r11") call::TRAP_AT => _, lateout("rcx") _,
-            );
-        }
+        let rest = [args[8], args[9], args[10], args[11]];
+        core::arch::asm!(
+            "sub sp, sp, #0x20",
+            "ldp x9, x10, [{rest}]",
+            "stp x9, x10, [sp]",
+            "ldp x9, x10, [{rest}, #16]",
+            "stp x9, x10, [sp, #16]",
+            "svc #0",
+            "add sp, sp, #0x20",
+            rest = in(reg) rest.as_ptr(),
+            in("x8") nr, inlateout("x0") args[0] => result, in("x1") args[1], in("x2") args[2], in("x3") args[3],
+            in("x4") args[4], in("x5") args[5], in("x6") args[6], in("x7") args[7],
+            out("x9") _, out("x10") _,
+        );
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let rest = &args[4..];
+        core::arch::asm!(
+            "sub rsp, 0x68",
+            "mov rax, [{rest}]",
+            "mov [rsp + 0x20], rax",
+            "mov rax, [{rest} + 8]",
+            "mov [rsp + 0x28], rax",
+            "mov rax, [{rest} + 16]",
+            "mov [rsp + 0x30], rax",
+            "mov rax, [{rest} + 24]",
+            "mov [rsp + 0x38], rax",
+            "mov rax, [{rest} + 32]",
+            "mov [rsp + 0x40], rax",
+            "mov rax, [{rest} + 40]",
+            "mov [rsp + 0x48], rax",
+            "mov rax, [{rest} + 48]",
+            "mov [rsp + 0x50], rax",
+            "mov rax, [{rest} + 56]",
+            "mov [rsp + 0x58], rax",
+            "mov rax, {nr}",
+            "call r11",
+            "add rsp, 0x68",
+            rest = in(reg) rest.as_ptr(),
+            nr = in(reg) nr,
+            out("rax") result, in("r10") args[0], in("rdx") args[1], in("r8") args[2], in("r9") args[3],
+            inlateout("r11") call::TRAP_AT => _, lateout("rcx") _,
+        );
     }
     #[cfg(target_arch = "x86")]
     {
-        result = stack_call(nr, &[a as u32, b as u32, c as u32, d as u32, e as u32, f as u32, g as u32, h as u32]);
+        result = stack_call(nr, &args.map(|a| a as u32));
     }
     result
 }
@@ -121,8 +148,12 @@ macro_rules! host {
     };
     (@call $n:ident $(, $arg:ident)*) => { $crate::sys::host!(@pad $n, [$($arg),*]) };
     (@pad $n:ident, [$($arg:ident),*]) => {{
-        let a: [u64; 8] = { let mut a = [0u64; 8]; let given = [$($arg),*]; let mut i = 0; while i < given.len() { a[i] = given[i]; i += 1; } a };
-        $crate::sys::call8($n, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7])
+        const GIVEN: usize = <[&str]>::len(&[$(stringify!($arg)),*]);
+        const { assert!(GIVEN <= $crate::sys::MOST_ARGS, "more arguments than call_n passes") };
+        let given: [u64; GIVEN] = [$($arg),*];
+        let mut a = [0u64; $crate::sys::MOST_ARGS];
+        a[..GIVEN].copy_from_slice(&given);
+        $crate::sys::call_n($n, &a)
     }};
 }
 pub(crate) use host;

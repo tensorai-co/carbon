@@ -545,3 +545,48 @@ pub fn cancel_waitable_timer(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Rep
     task.k.objects.signal(&timer, |s| s.count += 1);
     Reply::Value(TRUE)
 }
+
+/// `CreateEventExW(attributes, name, flags, access)`: CREATE_EVENT_MANUAL_RESET (1) and CREATE_EVENT_INITIAL_SET (2).
+pub fn create_event_ex_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let flags = a[2] as u32;
+    create_event(task, cx, &[a[0], u64::from(flags & 1 != 0), u64::from(flags & 2 != 0), a[1]], true)
+}
+
+/// `CreateSemaphoreExW(attributes, initial, most, name, flags, access)`.
+pub fn create_semaphore_ex_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    create_semaphore(task, cx, &[a[0], a[1], a[2], a[3]], true)
+}
+
+/// `GetThreadContext(thread, &context)`: the calling thread's registers as they are, or another's as it stopped:
+/// suspended (it's waited for, a moment, to stop), or inside a call into atlas. Every part of the CONTEXT is written;
+/// a thread caught inside a call gives its floating-point registers as a new thread's.
+pub fn get_thread_context(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(thread) = task.thread_of(a[0]) else {
+        task.set_last_error(cx, ERROR_INVALID_HANDLE);
+        return Reply::Value(FALSE);
+    };
+    let state = if thread.tid == task.tid {
+        Some(cx.turn(|t| (t.thread().regs(), t.thread().fp())))
+    } else {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut seen = lock(&thread.seen);
+        while seen.is_none() && std::time::Instant::now() < deadline {
+            seen = thread.seen_changed.wait_timeout(seen, std::time::Duration::from_millis(50)).map(|(g, _)| g).unwrap_or_else(|e| e.into_inner().0);
+        }
+        (*seen).map(|(regs, fp)| {
+            let isa = if matches!(regs, exec::Regs::Arm64(_)) { exec::Isa::Arm64 } else { exec::Isa::X86_64 };
+            (regs, fp.unwrap_or_else(|| exec::FpRegs::new(isa)))
+        })
+    };
+    let Some((regs, fp)) = state else {
+        // It's running and never stopped where it could be seen.
+        task.set_last_error(cx, 31);
+        return Reply::Value(FALSE);
+    };
+    let bytes = if task.isa == exec::Isa::X86_32 { crate::exceptions::encode_x86(&regs, &fp) } else { crate::exceptions::encode(&regs, &fp) };
+    if task.mem(cx, true, |t| user::write(&mut t.space(), a[1], &bytes)).is_err() {
+        task.set_last_error(cx, 998);
+        return Reply::Value(FALSE);
+    }
+    Reply::Value(TRUE)
+}

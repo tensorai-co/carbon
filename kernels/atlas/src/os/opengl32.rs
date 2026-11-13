@@ -1,0 +1,68 @@
+//! opengl32.dll: declared so the programs that import it load; each export says it isn't written yet when called.
+
+use super::dll;
+
+dll! {
+    "OPENGL32.dll";
+    missing glBegin;
+    missing glBindTexture;
+    missing glBlendFunc;
+    missing glClear;
+    missing glColor4fv;
+    missing glColor4ub;
+    missing glColorMask;
+    missing glDeleteTextures;
+    missing glDepthMask;
+    missing glDepthRange;
+    missing glDisable;
+    missing glDisableClientState;
+    missing glDrawArrays;
+    missing glDrawElements;
+    missing glEnable;
+    missing glEnd;
+    missing glGenTextures;
+    missing glGetBooleanv;
+    missing glGetDoublev;
+    missing glGetError;
+    missing glGetFloatv;
+    missing glGetIntegerv;
+    missing glGetString;
+    missing glIsEnabled;
+    missing glIsTexture;
+    missing glLineWidth;
+    missing glLoadIdentity;
+    missing glLoadMatrixf;
+    missing glMatrixMode;
+    missing glOrtho;
+    missing glPixelStorei;
+    missing glPixelZoom;
+    missing glPolygonMode;
+    missing glPopAttrib;
+    missing glPopClientAttrib;
+    missing glPushAttrib;
+    missing glPushClientAttrib;
+    missing glReadPixels;
+    missing glRenderMode;
+    missing glScalef;
+    missing glScissor;
+    missing glShadeModel;
+    missing glTexCoord2d;
+    missing glTexCoord2f;
+    missing glTexCoord2i;
+    missing glTexEnvf;
+    missing glTexImage2D;
+    missing glTexParameterf;
+    missing glTexParameteri;
+    missing glTexSubImage2D;
+    missing glTranslatef;
+    missing glVertex2f;
+    missing glVertex3f;
+    missing glViewport;
+    missing wglCreateContext;
+    missing wglDeleteContext;
+    missing wglGetCurrentContext;
+    missing wglGetCurrentDC;
+    missing wglGetProcAddress;
+    missing wglMakeCurrent;
+    missing wglShareLists;
+}

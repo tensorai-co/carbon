@@ -129,6 +129,11 @@ fn find(name: &Name) -> Option<u64> {
 }
 
 /// The module `addr` is in: its base and size.
+/// The module an address is in: its name, and the address's offset in it.
+pub fn whose(addr: u64) -> Option<(Name, u64)> {
+    with(|t| t.modules[..t.count].iter().find(|m| addr >= m.base && addr < m.base + m.size).map(|m| (m.name, addr - m.base)))
+}
+
 pub fn containing(addr: u64) -> Option<(u64, u64)> {
     with(|t| t.modules[..t.count].iter().find(|m| addr >= m.base && addr < m.base + m.size).map(|m| (m.base, m.size)))
 }
@@ -443,7 +448,16 @@ fn resolve_imports(image: Image, why: Why, static_load: bool, depth: usize) -> R
                             Wanted::Name(n) => n,
                             Wanted::Ordinal(_) => b"(an ordinal)",
                         };
-                        result = Err(if static_load { fail(b"no export", shown, status::ENTRYPOINT_NOT_FOUND) } else { status::ENTRYPOINT_NOT_FOUND });
+                        if static_load {
+                            // What's missing, from which DLL, for which module.
+                            let mut m = Message::new();
+                            m.text(b"atlas-guest: no export ").text(shown).text(b" in ").text(dll);
+                            if let Some((importer, _)) = whose(image.0) {
+                                m.text(b", for ").text(importer.as_bytes());
+                            }
+                            m.text(b"\n").print();
+                        }
+                        result = Err(status::ENTRYPOINT_NOT_FOUND);
                         break;
                     }
                 }
@@ -693,14 +707,17 @@ pub extern "system" fn RtlExitUserProcess(code: u32) -> ! {
     sys::terminate(code)
 }
 
-/// Runs each module that isn't yet, in the order their imports were resolved (so dependencies first): its TLS
-/// callbacks, then `DllMain`. Each goes on the PEB's initialization order list as it starts. False if a `DllMain`
-/// failed.
-fn attach_all() -> bool {
+/// Runs each module that isn't yet, of those given an order from `first` on (what one load brought in), in the order
+/// their imports were resolved (so dependencies first): its TLS callbacks, then `DllMain`. Each goes on the PEB's
+/// initialization order list as it starts. False if a `DllMain` failed.
+///
+/// A `DllMain` that loads a library (as C runtimes' do) starts only what that load brought in: a module the outer
+/// load is still to start waits for it, as on Windows, rather than starting before the DLLs it depends on are done.
+fn attach_all(first: u32) -> bool {
     loop {
         let next = with(|t| {
             let ldr_at = t.ldr;
-            let m = t.modules[..t.count].iter_mut().filter(|m| !m.ready && m.order != 0).min_by_key(|m| m.order)?;
+            let m = t.modules[..t.count].iter_mut().filter(|m| !m.ready && m.order >= first.max(1)).min_by_key(|m| m.order)?;
             m.ready = true;
             if m.entry != 0 && ldr_at != 0 {
                 // SAFETY: an entry the loader made, and the PEB_LDR_DATA.
@@ -773,7 +790,7 @@ pub extern "system" fn AtlasProcessStart(peb_at: usize, ntdll: usize) -> ! {
         sys::terminate(e);
     }
     set_up_tls(Image(exe));
-    if !attach_all() {
+    if !attach_all(0) {
         sys::terminate(status::DLL_INIT_FAILED);
     }
     run_tls_callbacks(Image(exe), DLL_PROCESS_ATTACH);
@@ -942,8 +959,9 @@ unsafe fn read_name(at: u64, wide: bool, limit: usize, out: &mut [u8; 260]) -> u
 
 /// Loads a DLL for the program, and starts it: its base, or the status.
 fn load_dynamic(name: &[u8]) -> Result<u64, u32> {
+    let first = with(|t| t.next_order);
     let base = load(name, Why::Dynamic, 0)?;
-    if attach_all() {
+    if attach_all(first) {
         Ok(base)
     } else {
         // Windows tells a DLL whose DllMain failed that it's detaching, and unloads it.
@@ -1114,6 +1132,28 @@ pub extern "system" fn AtlasGetModuleHandleExA(flags: u32, name: usize, out: *mu
 pub extern "system" fn AtlasGetModuleHandleExW(flags: u32, name: usize, out: *mut usize) -> i32 {
     let name = name as u64;
     module_handle_ex(flags, name, out, true)
+}
+
+/// `RtlPcToFileHeader(pc, &base)`: the base of the module `pc` is in, also where `base` says; null for none.
+#[unsafe(no_mangle)]
+pub extern "system" fn RtlPcToFileHeader(pc: usize, base: *mut usize) -> usize {
+    let found = containing(pc as u64).map_or(0, |(b, _)| b as usize);
+    if !base.is_null() {
+        // SAFETY: the program's pointer.
+        unsafe { base.write(found) };
+    }
+    found
+}
+
+/// `RtlCaptureStackBackTrace(skip, count, &frames, &hash)`: no frames (a stack walk isn't kept for this yet), which
+/// callers take as a trace they can't have.
+#[unsafe(no_mangle)]
+pub extern "system" fn RtlCaptureStackBackTrace(_skip: u32, _count: u32, _frames: *mut usize, hash: *mut u32) -> u16 {
+    if !hash.is_null() {
+        // SAFETY: the program's pointer.
+        unsafe { hash.write(0) };
+    }
+    0
 }
 
 #[unsafe(no_mangle)]

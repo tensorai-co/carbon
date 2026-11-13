@@ -27,6 +27,41 @@ dll! {
     host CertAddEncodedCertificateToStore(6) => cert_add_encoded_certificate_to_store;
     host CertGetCertificateChain(8) => cert_get_certificate_chain;
     host CertFreeCertificateChain(1) => cert_free_certificate_chain;
+    // Not written yet: what larger programs import.
+    missing CertCreateCertificateChainEngine;
+    missing CertCreateSelfSignCertificate;
+    missing CertEnumCertificatesInStore;
+    missing CertFindCertificateInStore;
+    missing CertFindExtension;
+    missing CertFreeCertificateChainEngine;
+    missing CertGetNameStringA;
+    missing CertSetCertificateContextProperty;
+    missing CertStrToNameA;
+    missing CryptBinaryToStringA;
+    missing CryptDecodeObjectEx;
+    missing CryptEncodeObjectEx;
+    missing CryptHashCertificate2;
+    missing CryptQueryObject;
+    missing CryptStringToBinaryA;
+    missing PFXImportCertStore;
+    missing CertAddStoreToCollection;
+    missing CertCompareCertificateName;
+    missing CertControlStore;
+    missing CertFindChainInStore;
+    missing CertGetCertificateContextProperty;
+    missing CertGetEnhancedKeyUsage;
+    missing CertGetIntendedKeyUsage;
+    missing CertGetNameStringW;
+    missing CertOpenSystemStoreW;
+    missing CertVerifyTimeValidity;
+    missing CryptAcquireCertificatePrivateKey;
+    missing CryptMsgClose;
+    missing CryptMsgGetParam;
+    missing CryptProtectData;
+    missing CryptProtectMemory;
+    missing CryptUnprotectData;
+    missing CryptUnprotectMemory;
+    missing CryptVerifyCertificateSignatureEx;
 }
 
 const X509_ASN_ENCODING: u32 = 1;

@@ -27,6 +27,8 @@ pub enum Handle {
     Port(Arc<crate::ports::Port>),
     /// An access token: a process's own (`OpenProcessToken`), or a copy (`DuplicateTokenEx`).
     Token(Arc<crate::security::Token>),
+    /// A toolhelp snapshot: processes, threads and modules as they were.
+    Snapshot(Arc<std::sync::Mutex<crate::os::procapi::Snapshot>>),
 }
 
 /// `GetCurrentProcess()` and `GetCurrentThread()`.

@@ -1158,6 +1158,8 @@ enum Target {
     File(String),
     Key(u64),
     Token(Arc<Token>),
+    /// A window station (true) or desktop, by its handle.
+    User(u64, bool),
 }
 
 /// How a kernel object's generic rights map, by its kind.
@@ -1180,6 +1182,8 @@ impl Target {
             Target::File(_) => FILE,
             Target::Key(_) => KEY,
             Target::Token(_) => TOKEN,
+            Target::User(_, true) => crate::security::WINDOW_STATION,
+            Target::User(_, false) => crate::security::DESKTOP,
         }
     }
 }
@@ -1234,6 +1238,10 @@ impl Task {
         if let Some(root) = crate::registry::Root::from_handle(handle) {
             return Ok(Target::Key(lock(&self.k.registry).root(root)));
         }
+        let user = self.win32k().stations.get(handle).map(|o| o.is_station());
+        if let Some(station) = user {
+            return Ok(Target::User(handle, station));
+        }
         let found = lock(&self.process.state).handles.get(handle);
         Ok(match found {
             Some(Handle::Object(o)) => Target::Object(o),
@@ -1256,6 +1264,7 @@ impl Task {
             Target::Token(t) => lock(&t.security).clone(),
             Target::File(p) => lock(&self.k.file_security).get(p).cloned(),
             Target::Key(id) => lock(&self.k.key_security).get(id).cloned(),
+            Target::User(handle, _) => lock(&self.k.user_security).get(handle).cloned(),
         };
         kept.unwrap_or_else(|| match target {
             Target::File(_) => Descriptor::from_sddl(FILE_DEFAULT).expect("the files' default"),
@@ -1274,6 +1283,9 @@ impl Task {
             }
             Target::Key(id) => {
                 lock(&self.k.key_security).insert(*id, d);
+            }
+            Target::User(handle, _) => {
+                lock(&self.k.user_security).insert(*handle, d);
             }
         }
     }
@@ -1672,4 +1684,192 @@ pub fn impersonate_named_pipe_client(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]
         Ok(TRUE)
     })();
     reply(r)
+}
+
+// --- Trustees, and ACLs built from EXPLICIT_ACCESS entries ---
+
+const ERROR_INVALID_PARAMETER: u32 = 87;
+/// TRUSTEE_IS_SID and TRUSTEE_IS_NAME: what a TRUSTEE's name field is.
+const TRUSTEE_IS_SID: u32 = 0;
+const TRUSTEE_IS_NAME: u32 = 1;
+/// ACCESS_MODE: what an EXPLICIT_ACCESS entry does to the ACL.
+const GRANT_ACCESS: u32 = 1;
+const SET_ACCESS: u32 = 2;
+const DENY_ACCESS: u32 = 3;
+const REVOKE_ACCESS: u32 = 4;
+/// The ACE flags an entry's inheritance can have: OBJECT_INHERIT_ACE to INHERIT_ONLY_ACE.
+const INHERITANCE: u32 = 0xf;
+const INHERITED_ACE: u8 = 0x10;
+
+impl Task {
+    /// A TRUSTEE's size, and where its form and its name are: { multiple, operation, form, type, name }, the name
+    /// pointer-aligned.
+    fn trustee_layout(&self) -> (usize, usize, usize) {
+        if self.abi().width == 8 { (32, 12, 24) } else { (20, 8, 16) }
+    }
+
+    /// Fills a TRUSTEE: no multiple trustee, its form, TRUSTEE_IS_UNKNOWN, and `name` (a SID or a string).
+    fn put_trustee(&mut self, cx: &mut Cx<'_>, at: u64, form: u32, name: u64) -> Result<(), u64> {
+        let (size, form_at, name_at) = self.trustee_layout();
+        let mut b = vec![0u8; size];
+        b[form_at..form_at + 4].copy_from_slice(&form.to_le_bytes());
+        let ptr = self.abi().ptr(name);
+        b[name_at..].copy_from_slice(&ptr);
+        self.put(cx, at, &b)
+    }
+
+    /// The SID a TRUSTEE names: by its SID, or by an account's name (`CURRENT_USER` is the caller's user).
+    fn trustee_sid(&mut self, cx: &mut Cx<'_>, at: u64, unicode: bool) -> Result<Sid, u32> {
+        let (size, form_at, name_at) = self.trustee_layout();
+        let b = self.get(cx, at, size).map_err(|_| ERROR_INVALID_PARAMETER)?;
+        let form = u32_at(&b, form_at);
+        let name = self.abi().ptr_at(&b, name_at);
+        let multiple = self.abi().ptr_at(&b, 0);
+        if multiple != 0 || name == 0 {
+            return Err(ERROR_INVALID_PARAMETER);
+        }
+        match form {
+            TRUSTEE_IS_SID => self.read_sid(cx, name).map_err(|_| ERROR_INVALID_PARAMETER),
+            TRUSTEE_IS_NAME => {
+                let text = self.mem(cx, false, |t| read_text(&t.space(), name, 512, unicode)).map_err(|_| ERROR_INVALID_PARAMETER)?;
+                if text.eq_ignore_ascii_case("CURRENT_USER") {
+                    return Ok(lock(&self.effective_token().state).user.clone());
+                }
+                let (domain, account) = text.rsplit_once('\\').map_or((None, text.as_str()), |(d, n)| (Some(d), n));
+                accounts()
+                    .into_iter()
+                    .find(|(_, d, n, _)| n.eq_ignore_ascii_case(account) && domain.is_none_or(|w| w.eq_ignore_ascii_case(d)))
+                    .map(|(sid, ..)| sid)
+                    .ok_or(ERROR_NONE_MAPPED)
+            }
+            _ => Err(ERROR_INVALID_PARAMETER),
+        }
+    }
+}
+
+/// `BuildTrusteeWithSidW(&trustee, sid)` and `A`.
+pub fn build_trustee_with_sid(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let _ = task.put_trustee(cx, a[0], TRUSTEE_IS_SID, a[1]);
+    Reply::Value(0)
+}
+
+/// `BuildTrusteeWithNameW(&trustee, name)` and `A`.
+pub fn build_trustee_with_name(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let _ = task.put_trustee(cx, a[0], TRUSTEE_IS_NAME, a[1]);
+    Reply::Value(0)
+}
+
+/// `BuildExplicitAccessWithNameW(&entry, name, permissions, mode, inheritance)` and `A`: an EXPLICIT_ACCESS whose
+/// trustee is named.
+fn build_explicit_access_with_name(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let trustee_at = if task.abi().width == 8 { 16 } else { 12 };
+    let mut head = Vec::with_capacity(12);
+    for v in [a[2] as u32, a[3] as u32, a[4] as u32] {
+        head.extend(v.to_le_bytes());
+    }
+    if task.put(cx, a[0], &head).is_ok() {
+        let _ = task.put_trustee(cx, a[0] + trustee_at, TRUSTEE_IS_NAME, a[1]);
+    }
+    Reply::Value(0)
+}
+
+pub fn build_explicit_access_with_name_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    build_explicit_access_with_name(task, cx, a)
+}
+
+pub fn build_explicit_access_with_name_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    build_explicit_access_with_name(task, cx, a)
+}
+
+/// The ACL `entries` make of `old`'s ACEs: GRANT_ACCESS adds its rights to the trustee's explicit allowed ACE (or adds
+/// one), SET_ACCESS replaces the trustee's explicit ACEs with one allowing just those rights, DENY_ACCESS adds a
+/// denied ACE, REVOKE_ACCESS takes the trustee's explicit ACEs away. The result is in canonical order: explicit denied
+/// ACEs, explicit allowed ones, then inherited ones as they were.
+pub fn apply_entries(old: &[Ace], entries: &[(u32, u32, u32, Sid)]) -> Result<Vec<Ace>, u32> {
+    let mut aces = old.to_vec();
+    for (mask, mode, inheritance, sid) in entries {
+        let flags = (*inheritance & INHERITANCE) as u8;
+        let explicit_for = |a: &Ace| a.raw.is_none() && a.flags & INHERITED_ACE == 0 && a.sid == *sid;
+        match *mode {
+            0 => {}
+            GRANT_ACCESS => {
+                match aces.iter_mut().find(|a| explicit_for(a) && a.kind == ACCESS_ALLOWED && a.flags == flags) {
+                    Some(ace) => ace.mask |= mask,
+                    None => aces.push(Ace::new(ACCESS_ALLOWED, flags, *mask, sid.clone())),
+                }
+            }
+            SET_ACCESS => {
+                aces.retain(|a| !(explicit_for(a) && matches!(a.kind, ACCESS_ALLOWED | ACCESS_DENIED)));
+                aces.push(Ace::new(ACCESS_ALLOWED, flags, *mask, sid.clone()));
+            }
+            DENY_ACCESS => aces.push(Ace::new(ACCESS_DENIED, flags, *mask, sid.clone())),
+            REVOKE_ACCESS => aces.retain(|a| !explicit_for(a)),
+            _ => return Err(ERROR_INVALID_PARAMETER),
+        }
+    }
+    let rank = |a: &Ace| match (a.flags & INHERITED_ACE != 0, a.kind) {
+        (false, ACCESS_DENIED) => 0,
+        (false, _) => 1,
+        (true, _) => 2,
+    };
+    aces.sort_by_key(rank);
+    Ok(aces)
+}
+
+/// `SetEntriesInAclW(count, entries, old, &new)` and `A`: an error code; the new ACL is `LocalFree`d.
+fn set_entries_in_acl(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], unicode: bool) -> Reply {
+    let code = (|| {
+        if a[3] == 0 || (a[0] != 0 && a[1] == 0) {
+            return Err(ERROR_INVALID_PARAMETER);
+        }
+        let (entry_size, trustee_at) = if task.abi().width == 8 { (48, 16) } else { (32, 12) };
+        let mut entries = Vec::new();
+        for i in 0..a[0].min(4096) {
+            let at = a[1] + i * entry_size;
+            let head = task.get(cx, at, 12).map_err(|_| ERROR_INVALID_PARAMETER)?;
+            let sid = task.trustee_sid(cx, at + trustee_at, unicode)?;
+            entries.push((u32_at(&head, 0), u32_at(&head, 4), u32_at(&head, 8), sid));
+        }
+        let old = if a[2] == 0 { Vec::new() } else { task.read_acl(cx, a[2]).map_err(|_| ERROR_INVALID_ACL)?.aces };
+        let acl = Acl::new(apply_entries(&old, &entries)?);
+        let block = global_new(task, cx, &acl.to_bytes());
+        if block == 0 {
+            return Err(8);
+        }
+        task.put_ptr(cx, a[3], block).map_err(|_| ERROR_INVALID_PARAMETER)
+    })();
+    Reply::Value(u64::from(code.err().unwrap_or(0)))
+}
+
+pub fn set_entries_in_acl_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    set_entries_in_acl(task, cx, a, true)
+}
+
+pub fn set_entries_in_acl_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    set_entries_in_acl(task, cx, a, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entries_merge_into_an_acl_in_canonical_order() {
+        let user = Sid::parse("S-1-5-21-0-0-0-1000").unwrap();
+        let everyone = Sid::parse("S-1-1-0").unwrap();
+        let system = Sid::parse("S-1-5-18").unwrap();
+        let old = vec![Ace::new(ACCESS_ALLOWED, 0, 0x1, user.clone()), Ace::new(ACCESS_ALLOWED, INHERITED_ACE, 0x10, system.clone())];
+        let aces = apply_entries(&old, &[(0x2, GRANT_ACCESS, 0, user.clone()), (0x4, DENY_ACCESS, 0, everyone.clone()), (0x8, SET_ACCESS, 3, system.clone())]).unwrap();
+        // The deny first; the user's grant merged; the inherited ACE untouched, last.
+        let shown: Vec<(u8, u8, u32, String)> = aces.iter().map(|a| (a.kind, a.flags, a.mask, a.sid.to_string())).collect();
+        assert_eq!(shown, vec![
+            (ACCESS_DENIED, 0, 0x4, "S-1-1-0".into()),
+            (ACCESS_ALLOWED, 0, 0x3, "S-1-5-21-0-0-0-1000".into()),
+            (ACCESS_ALLOWED, 3, 0x8, "S-1-5-18".into()),
+            (ACCESS_ALLOWED, INHERITED_ACE, 0x10, "S-1-5-18".into()),
+        ]);
+        let revoked = apply_entries(&aces, &[(0, REVOKE_ACCESS, 0, user)]).unwrap();
+        assert_eq!(revoked.len(), 3);
+        assert_eq!(apply_entries(&[], &[(0, 9, 0, everyone)]), Err(ERROR_INVALID_PARAMETER));
+    }
 }

@@ -336,3 +336,55 @@ pub fn is_bad_write_ptr(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
 pub fn is_bad_read_ptr(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
     Reply::Value(u64::from(!accessible(task, a[0], a[1], false)))
 }
+
+/// The `...Ex` memory calls take a process first: this one's go as the plain call does; another's can't be reached
+/// from here yet (ERROR_ACCESS_DENIED).
+fn own(task: &mut Task, cx: &mut Cx<'_>, process: u64) -> Result<(), Reply> {
+    match task.process_of(process) {
+        Some(p) if Arc::ptr_eq(&p, &task.process) => Ok(()),
+        Some(_) => Err(task.fail(cx, 5)),
+        None => Err(task.fail(cx, ERROR_INVALID_HANDLE)),
+    }
+}
+
+pub fn virtual_alloc_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    own(task, cx, a[0]).map_or_else(|r| r, |()| super::kernel32::virtual_alloc_from(task, cx, &a[1..]))
+}
+
+pub fn virtual_free_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    own(task, cx, a[0]).map_or_else(|r| r, |()| super::kernel32::virtual_free_from(task, cx, &a[1..]))
+}
+
+pub fn virtual_protect_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    own(task, cx, a[0]).map_or_else(|r| r, |()| super::kernel32::virtual_protect_from(task, cx, &a[1..]))
+}
+
+pub fn virtual_query_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    own(task, cx, a[0]).map_or_else(|r| r, |()| virtual_query(task, cx, &a[1..]))
+}
+
+/// `ReadProcessMemory(process, from, buffer, size, &read)` and `WriteProcessMemory(process, to, buffer, size,
+/// &written)`, in this process.
+fn process_memory(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], write: bool) -> Reply {
+    if let Err(r) = own(task, cx, a[0]) {
+        return r;
+    }
+    let size = (a[3] as usize).min(1 << 30);
+    let (from, to) = if write { (a[2], a[1]) } else { (a[1], a[2]) };
+    let Ok(data) = task.mem(cx, false, |t| user::read_vec(&t.space(), from, size)) else { return task.fail(cx, 299) };
+    if task.mem(cx, true, |t| user::write(&mut t.space(), to, &data)).is_err() {
+        return task.fail(cx, 299);
+    }
+    if a[4] != 0 {
+        let _ = task.write_ptr(cx, a[4], size as u64);
+    }
+    Reply::Value(TRUE)
+}
+
+pub fn read_process_memory(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    process_memory(task, cx, a, false)
+}
+
+pub fn write_process_memory(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    process_memory(task, cx, a, true)
+}

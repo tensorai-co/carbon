@@ -6,6 +6,7 @@ use kernels_core::thread::Cx;
 use kernels_core::user;
 
 use super::secapi::*;
+use super::etw::{event_register, get_trace_logger_handle, register_trace_guids};
 use super::{Reply, dll};
 use crate::handles::Handle;
 use crate::process::Task;
@@ -152,6 +153,65 @@ dll! {
     host ReportEventW(9) => report_event;
     host ReportEventA(9) => report_event;
     host SystemFunction036(2) => system_function036;
+    // Not written yet: what larger programs import.
+    missing CloseEventLog;
+    host CloseServiceHandle(1) => close_service_handle;
+    missing ControlService;
+    missing CreateProcessAsUserW;
+    missing CryptAcquireContextA;
+    missing CryptCreateHash;
+    missing CryptDestroyHash;
+    missing CryptGenRandom;
+    missing CryptGetHashParam;
+    missing CryptHashData;
+    missing CryptReleaseContext;
+    host EventRegister(4) => event_register;
+    host EventSetInformation(4) => etw_zero;
+    host EventUnregister(1) => etw_zero;
+    host EventWriteTransfer(5) => etw_zero;
+    missing OpenEventLogA;
+    host OpenSCManagerW(3) => open_sc_manager;
+    host OpenServiceW(3) => open_service;
+    missing QueryServiceConfigW;
+    missing QueryServiceStatus;
+    missing QueryServiceStatusEx;
+    missing ReadEventLogW;
+    missing RegDeleteKeyValueW;
+    missing RegSetKeyValueW;
+    missing StartServiceW;
+    missing AllocateLocallyUniqueId;
+    host BuildExplicitAccessWithNameW(5) => build_explicit_access_with_name_w;
+    missing BuildSecurityDescriptorW;
+    host BuildTrusteeWithSidW(2) => build_trustee_with_sid;
+    missing CloseTrace;
+    missing ControlTraceW;
+    missing CreateRestrictedToken;
+    missing CryptGetProvParam;
+    missing CryptSetHashParam;
+    missing CryptSignHashW;
+    host EventWrite(3) => etw_zero;
+    host GetTraceEnableFlags(1) => etw_zero;
+    host GetTraceEnableLevel(1) => etw_zero;
+    host GetTraceLoggerHandle(1) => get_trace_logger_handle;
+    missing ImpersonateAnonymousToken;
+    missing LogonUserW;
+    missing LsaNtStatusToWinError;
+    missing OpenTraceW;
+    missing ProcessTrace;
+    missing RegDisablePredefinedCache;
+    host RegisterTraceGuidsW(8) => register_trace_guids;
+    host SetEntriesInAclW(4) => set_entries_in_acl_w;
+    missing StartTraceW;
+    host TraceEvent(2) => etw_zero;
+    host UnregisterTraceGuids(1) => etw_zero;
+    host OpenSCManagerA(3) => open_sc_manager;
+    host OpenServiceA(3) => open_service;
+    host BuildTrusteeWithSidA(2) => build_trustee_with_sid;
+    host BuildTrusteeWithNameW(2) => build_trustee_with_name;
+    host BuildTrusteeWithNameA(2) => build_trustee_with_name;
+    host BuildExplicitAccessWithNameA(5) => build_explicit_access_with_name_a;
+    host SetEntriesInAclA(4) => set_entries_in_acl_a;
+    host RegisterTraceGuidsA(8) => register_trace_guids;
 }
 
 const SUCCESS: u64 = 0;
@@ -827,4 +887,37 @@ impl Task {
         self.k.host.random(&mut bytes);
         len == 0 || self.mem(cx, true, |t| user::write(&mut t.space(), at, &bytes)).is_ok()
     }
+}
+
+// --- Services: the service manager opens, and no service is installed ---
+
+const SC_MANAGER: u64 = 0x5c00;
+const ERROR_SERVICE_DOES_NOT_EXIST: u32 = 1060;
+
+/// `OpenSCManagerW(machine, database, access)` and `A`: this machine's.
+fn open_sc_manager(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(SC_MANAGER)
+}
+
+/// `OpenServiceW(manager, name, access)` and `A`: no services are installed, so ERROR_SERVICE_DOES_NOT_EXIST.
+fn open_service(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[0] != SC_MANAGER {
+        task.set_last_error(cx, 6);
+        return Reply::Value(0);
+    }
+    task.set_last_error(cx, ERROR_SERVICE_DOES_NOT_EXIST);
+    Reply::Value(0)
+}
+
+fn close_service_handle(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[0] != SC_MANAGER {
+        task.set_last_error(cx, 6);
+        return Reply::Value(0);
+    }
+    Reply::Value(1)
+}
+
+/// What's written to a trace nobody runs, and what's asked of one: done, nothing.
+fn etw_zero(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(0)
 }

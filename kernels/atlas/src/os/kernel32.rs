@@ -6,7 +6,10 @@ use kernels_core::lock;
 use kernels_core::thread::Cx;
 use kernels_core::user;
 
+use super::advapi32::{reg_close_key, reg_create_key_ex_w, reg_delete_key_ex_w, reg_delete_value_w, reg_open_key_ex_a, reg_open_key_ex_w, reg_query_value_ex_a, reg_query_value_ex_w, reg_set_value_ex_w};
 use super::fileapi::*;
+use super::localeapi::*;
+use super::volumes::*;
 use super::ioapi::*;
 use super::memapi::*;
 use super::nlsapi::*;
@@ -95,6 +98,12 @@ dll! {
     host MoveFileA(2) => move_file_a;
     host CopyFileW(3) => copy_file_w;
     host CopyFileA(3) => copy_file_a;
+    host CopyFileExW(6) => copy_file_ex_w;
+    host DeleteFileTransactedW(2) => delete_file_transacted_w;
+    host MoveFileTransactedW(6) => move_file_transacted_w;
+    host CopyFileExA(6) => copy_file_ex_a;
+    host ReplaceFileW(6) => replace_file_w;
+    host ReplaceFileA(6) => replace_file_a;
     host CreateHardLinkW(3) => create_hard_link_w;
     host CreateHardLinkA(3) => create_hard_link_a;
     host CreateSymbolicLinkW(3) => create_symbolic_link_w;
@@ -153,6 +162,8 @@ dll! {
     guest AddVectoredContinueHandler => RtlAddVectoredContinueHandler;
     guest RemoveVectoredContinueHandler => RtlRemoveVectoredContinueHandler;
     guest RtlCaptureContext;
+    guest RtlPcToFileHeader;
+    guest RtlCaptureStackBackTrace;
     guest RtlLookupFunctionEntry;
     guest RtlVirtualUnwind;
     guest RtlUnwind;
@@ -485,6 +496,172 @@ dll! {
     host K32GetModuleFileNameExA(4) => get_module_file_name_ex_a;
     host K32GetModuleInformation(4) => get_module_information;
     host K32GetProcessMemoryInfo(3) => get_process_memory_info;
+    // Not written yet: what larger programs import.
+    host AllocConsole(0) => accept;
+    host AssignProcessToJobObject(2) => accept;
+    missing AttachConsole;
+    host CreateEventExW(4) => create_event_ex_w;
+    host CreateJobObjectA(2) => create_job_object;
+    host CreateSemaphoreExW(6) => create_semaphore_ex_w;
+    host CreateToolhelp32Snapshot(2) => create_toolhelp32_snapshot;
+    missing DebugActiveProcess;
+    missing DebugActiveProcessStop;
+    host FlushInstructionCache(3) => succeed;
+    host FlushProcessWriteBuffers(0) => zero;
+    host FoldStringW(5) => fold_string_w;
+    host FormatMessageA(7) => format_message_a;
+    host FormatMessageW(7) => format_message_w;
+    missing GenerateConsoleCtrlEvent;
+    missing GetBinaryTypeW;
+    missing GetConsoleScreenBufferInfo;
+    host GetCurrentProcessorNumber(0) => zero;
+    missing GetFileInformationByHandleEx;
+    host GetLocaleInfoA(4) => get_locale_info_a;
+    host GetLocaleInfoEx(4) => get_locale_info_ex;
+    host GetLocaleInfoW(4) => get_locale_info_w;
+    host GetLogicalDriveStringsA(2) => get_logical_drive_strings_a;
+    host GetLogicalDrives(0) => get_logical_drives;
+    host GetNumaHighestNodeNumber(1) => get_numa_highest_node_number;
+    missing GetPrivateProfileStringA;
+    host GetProcessIdOfThread(1) => get_process_id_of_thread;
+    host GetProcessTimes(5) => get_process_times;
+    missing GetProfileStringA;
+    host GetStringTypeA(5) => get_string_type_a;
+    host GetSystemPowerStatus(1) => get_system_power_status;
+    host GetSystemWindowsDirectoryW(2) => get_windows_directory_w;
+    missing GetTempFileNameA;
+    host GetThreadContext(2) => get_thread_context;
+    host GetThreadGroupAffinity(2) => get_thread_group_affinity;
+    host GetThreadTimes(5) => get_thread_times;
+    host GetUserDefaultLCID(0) => get_user_default_lcid;
+    host GetUserDefaultLangID(0) => get_user_default_lcid;
+    host GetVolumeInformationA(8) => get_volume_information_a;
+    host GetVolumeInformationW(8) => get_volume_information_w;
+    host GetVolumeNameForVolumeMountPointW(3) => get_volume_name_for_volume_mount_point_w;
+    host GetVolumePathNameW(3) => get_volume_path_name_w;
+    host GetVolumePathNamesForVolumeNameW(4) => get_volume_path_names_for_volume_name_w;
+    guest HeapCreate => AtlasHeapCreate;
+    guest HeapDestroy => AtlasHeapDestroy;
+    host IsValidLocale(2) => is_valid_locale;
+    host K32EnumProcessModules(4) => enum_process_modules;
+    host K32GetModuleBaseNameA(4) => get_module_base_name_a;
+    host LCMapStringA(6) => lc_map_string_a;
+    host Module32First(2) => module32_first;
+    host Module32Next(2) => module32_next;
+    host Process32First(2) => process32_first;
+    host Process32Next(2) => process32_next;
+    host QueryUnbiasedInterruptTime(1) => query_unbiased_interrupt_time;
+    missing ReadDirectoryChangesW;
+    host ReadProcessMemory(5) => read_process_memory;
+    host SetConsoleTextAttribute(2) => accept;
+    host SetDllDirectoryA(1) => succeed;
+    host SetDllDirectoryW(1) => succeed;
+    missing SetFileInformationByHandle;
+    host SetHandleCount(1) => handle_count;
+    host SetInformationJobObject(4) => accept;
+    host SetPriorityClass(2) => accept;
+    host SetProcessShutdownParameters(2) => succeed;
+    missing SetSystemPowerState;
+    missing SetThreadContext;
+    host SetThreadErrorMode(2) => set_thread_error_mode;
+    host SetThreadExecutionState(1) => set_thread_execution_state;
+    missing SignalObjectAndWait;
+    host VirtualAllocEx(5) => virtual_alloc_ex;
+    host VirtualProtectEx(5) => virtual_protect_ex;
+    host VirtualQueryEx(4) => virtual_query_ex;
+    host WTSGetActiveConsoleSessionId(0) => wts_get_active_console_session_id;
+    host WriteProcessMemory(5) => write_process_memory;
+    host K32GetModuleBaseNameW(4) => get_module_base_name_w;
+    host GetLogicalDriveStringsW(2) => get_logical_drive_strings_w;
+    host GetSystemDefaultLCID(0) => get_user_default_lcid;
+    host GetSystemDefaultLangID(0) => get_user_default_lcid;
+    host Process32FirstW(2) => process32_first_w;
+    host Process32NextW(2) => process32_next_w;
+    host Module32FirstW(2) => module32_first_w;
+    host Module32NextW(2) => module32_next_w;
+    host Thread32First(2) => thread32_first;
+    host Thread32Next(2) => thread32_next;
+    host CreateRemoteThread(7) => create_remote_thread;
+    host CreateRemoteThreadEx(8) => create_remote_thread_ex;
+    host VirtualFreeEx(4) => virtual_free_ex;
+    host CheckRemoteDebuggerPresent(2) => check_remote_debugger_present;
+    missing ClearCommError;
+    host CompareStringOrdinal(5) => compare_string_ordinal;
+    host CreateJobObjectW(2) => create_job_object;
+    missing CreateMemoryResourceNotification;
+    host DeleteProcThreadAttributeList(1) => accept;
+    missing DiscardVirtualMemory;
+    missing EnumSystemLocalesEx;
+    missing EscapeCommFunction;
+    missing FindFirstVolumeW;
+    missing FindNextVolumeW;
+    missing FindVolumeClose;
+    host FreeConsole(0) => accept;
+    missing GetCommModemStatus;
+    missing GetCommState;
+    missing GetConsoleDisplayMode;
+    missing GetCurrencyFormatEx;
+    host GetFirmwareType(1) => get_firmware_type;
+    missing GetGeoInfoW;
+    missing GetNumberFormatEx;
+    host GetPriorityClass(1) => get_priority_class;
+    host GetProcessHandleCount(2) => get_process_handle_count;
+    host GetProcessMitigationPolicy(4) => get_process_mitigation_policy;
+    host GetThreadLocale(0) => get_user_default_lcid;
+    host GetThreadPreferredUILanguages(4) => get_preferred_ui_languages;
+    host GetThreadPriorityBoost(2) => get_thread_priority_boost;
+    host GetUserDefaultLocaleName(2) => get_user_default_locale_name;
+    host GetUserDefaultUILanguage(0) => get_user_default_lcid;
+    host GetUserGeoID(1) => get_user_geo_id;
+    missing HeapCompact;
+    host InitializeProcThreadAttributeList(4) => initialize_proc_thread_attribute_list;
+    missing K32GetMappedFileNameW;
+    host K32GetPerformanceInfo(2) => get_performance_info;
+    missing K32QueryWorkingSetEx;
+    host LCIDToLocaleName(4) => lcid_to_locale_name;
+    host LocaleNameToLCID(2) => locale_name_to_lcid;
+    host LockFile(5) => accept;
+    host LockFileEx(6) => accept;
+    host PowerClearRequest(2) => accept;
+    host PowerCreateRequest(1) => power_create_request;
+    host PowerSetRequest(2) => accept;
+    missing PrefetchVirtualMemory;
+    missing PurgeComm;
+    host QueryDosDeviceW(3) => query_dos_device_w;
+    host QueryFullProcessImageNameA(4) => query_full_process_image_name_a;
+    host QueryFullProcessImageNameW(4) => query_full_process_image_name_w;
+    host QueryInformationJobObject(5) => query_information_job_object;
+    host QueryProcessCycleTime(2) => query_cycle_time;
+    host QueryThreadCycleTime(2) => query_cycle_time;
+    host ResolveLocaleName(3) => resolve_locale_name;
+    host RtlAddFunctionTable(3) => accept;
+    host RtlDeleteFunctionTable(1) => accept;
+    missing SetCommState;
+    missing SetCommTimeouts;
+    host SetDefaultDllDirectories(1) => accept;
+    host SetProcessInformation(4) => accept;
+    host SetProcessMitigationPolicy(3) => accept;
+    host SetThreadInformation(4) => accept;
+    host SetThreadPriorityBoost(2) => accept;
+    host TerminateJobObject(2) => accept;
+    host UnlockFile(5) => accept;
+    host UnlockFileEx(5) => accept;
+    host UpdateProcThreadAttribute(7) => accept;
+    host WerRegisterRuntimeExceptionModule(2) => zero;
+    missing Wow64GetThreadContext;
+    missing terminate;
+    missing CompareObjectHandles;
+    missing QueryUnbiasedInterruptTimePrecise;
+    host RegCloseKey(1) => reg_close_key;
+    host RegOpenKeyExA(5) => reg_open_key_ex_a;
+    host RegOpenKeyExW(5) => reg_open_key_ex_w;
+    host RegQueryValueExA(6) => reg_query_value_ex_a;
+    host RegQueryValueExW(6) => reg_query_value_ex_w;
+    // The registry functions kernel32 exports too, as Windows' does: advapi32's.
+    host RegCreateKeyExW(9) => reg_create_key_ex_w;
+    host RegSetValueExW(6) => reg_set_value_ex_w;
+    host RegDeleteKeyExW(4) => reg_delete_key_ex_w;
+    host RegDeleteValueW(2) => reg_delete_value_w;
 }
 
 const TRUE: u64 = 1;
@@ -568,14 +745,26 @@ fn query_performance_frequency(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> R
 }
 
 fn virtual_alloc(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    virtual_alloc_from(task, cx, a)
+}
+
+pub(crate) fn virtual_alloc_from(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     Reply::Value(task.virtual_alloc(cx, a[0], a[1], a[2] as u32, a[3] as u32).unwrap_or(0))
 }
 
 fn virtual_protect(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    virtual_protect_from(task, cx, a)
+}
+
+pub(crate) fn virtual_protect_from(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     Reply::Value(if task.virtual_protect(cx, a[0], a[1], a[2] as u32, a[3]) == 0 { TRUE } else { FALSE })
 }
 
 fn virtual_free(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    virtual_free_from(task, cx, a)
+}
+
+pub(crate) fn virtual_free_from(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     Reply::Value(if task.virtual_free(cx, a[0], a[1], a[2] as u32) { TRUE } else { FALSE })
 }
 

@@ -670,6 +670,8 @@ pub const SECTION: Mapping = Mapping { read: 0x2_0005, write: 0x2_0002, execute:
 pub const FILE: Mapping = Mapping { read: 0x12_0089, write: 0x12_0116, execute: 0x12_00a0, all: 0x1f_01ff };
 pub const KEY: Mapping = Mapping { read: 0x2_0019, write: 0x2_0006, execute: 0x2_0019, all: 0xf_003f };
 pub const TOKEN: Mapping = Mapping { read: 0x2_0008, write: 0x2_00e0, execute: 0x2_0000, all: 0xf_01ff };
+pub const WINDOW_STATION: Mapping = Mapping { read: 0x2_0303, write: 0x2_001c, execute: 0x2_0060, all: 0xf_037f };
+pub const DESKTOP: Mapping = Mapping { read: 0x2_0041, write: 0x2_00be, execute: 0x2_0100, all: 0xf_01ff };
 
 /// A mask's generic rights as the type's own (`MapGenericMask`).
 pub fn map_generic(mask: u32, m: &Mapping) -> u32 {

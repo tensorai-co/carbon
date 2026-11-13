@@ -166,3 +166,24 @@ pub extern "system" fn AtlasVariantCopy(dest: *mut u8, src: *const u8) -> u32 {
     }
     0
 }
+
+/// `PropVariantClear(&value)`: a PROPVARIANT's string (VT_LPSTR, VT_LPWSTR: from `CoTaskMemAlloc`) freed, or what
+/// a VARIANT owns, then VT_EMPTY.
+#[unsafe(no_mangle)]
+pub extern "system" fn AtlasPropVariantClear(v: *mut u8) -> u32 {
+    const VT_LPSTR: u16 = 30;
+    const VT_LPWSTR: u16 = 31;
+    if v.is_null() {
+        return 0;
+    }
+    // SAFETY: the program's PROPVARIANT.
+    unsafe {
+        let vt = v.cast::<u16>().read_unaligned();
+        if matches!(vt, VT_LPSTR | VT_LPWSTR) {
+            crate::heap::free(v.add(8).cast::<*mut u8>().read_unaligned());
+            core::ptr::write_bytes(v, 0, 8);
+            return 0;
+        }
+    }
+    AtlasVariantClear(v)
+}

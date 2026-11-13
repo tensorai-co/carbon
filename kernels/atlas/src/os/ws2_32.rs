@@ -77,6 +77,26 @@ dll! {
     host AtlasDisconnectEx(4) => disconnect_ex;
     // The process's network thread starts here.
     host AtlasNetPump(1) => net_pump;
+    // Not written yet: what larger programs import.
+    missing WSACloseEvent;
+    missing WSACreateEvent;
+    missing WSAEnumNetworkEvents;
+    missing WSAEventSelect;
+    missing WSAResetEvent;
+    missing WSASendMsg;
+    missing WSASetEvent;
+    missing WSAWaitForMultipleEvents;
+    missing WSCEnumProtocols;
+    missing getnameinfo;
+    missing inet_ntop;
+    missing inet_pton;
+    missing WSADuplicateSocketW;
+    missing WSAEnumNameSpaceProvidersW;
+    missing WSALookupServiceBeginW;
+    missing WSALookupServiceEnd;
+    missing WSALookupServiceNextW;
+    missing WSASetServiceW;
+    missing WSCGetProviderPath;
 }
 
 /// SOCKET_ERROR, as an int.

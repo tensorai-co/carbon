@@ -8,6 +8,7 @@ use kernels_core::user;
 
 use super::resapi::{load_string_a, load_string_w};
 use super::menuapi::*;
+use super::winuser::*;
 use super::{Reply, dll};
 use crate::process::Task;
 use crate::win32k::{self, Class, DESKTOP, Filter, Msg, WM_GETTEXT, WM_GETTEXTLENGTH, WM_SETTEXT, dialog, gdi, keys};
@@ -239,10 +240,10 @@ dll! {
     guest CharPrevW => AtlasCharPrevW;
     guest CharPrevA => AtlasCharPrevA;
     missing ExitWindowsEx;
-    missing GetMessagePos;
+    host GetMessagePos(0) => get_message_pos;
     missing MessageBoxIndirectW;
-    missing SendMessageTimeoutW;
-    missing SystemParametersInfoW;
+    host SendMessageTimeoutW(7) => send_message_timeout_w;
+    host SystemParametersInfoW(4) => system_parameters_info;
     guest wsprintfA => AtlasWsprintfA;
     guest wsprintfW => AtlasWsprintfW;
     guest wvsprintfA => AtlasWvsprintfA;
@@ -256,13 +257,175 @@ dll! {
     host GetMonitorInfoA(2) => get_monitor_info_a;
     host EnumDisplayMonitors(4) => enum_display_monitors;
     host GetProcessWindowStation(0) => get_process_window_station;
-    host GetThreadDesktop(1) => get_thread_desktop;
+    host GetThreadDesktop(1) => thread_desktop;
     host GetUserObjectInformationW(5) => get_user_object_information_w;
     host GetUserObjectInformationA(5) => get_user_object_information_a;
     host MapWindowPoints(4) => map_window_points;
     host RedrawWindow(4) => redraw_window;
     host MsgWaitForMultipleObjects(5) => msg_wait_for_multiple_objects;
     host MsgWaitForMultipleObjectsEx(5) => msg_wait_for_multiple_objects_ex;
+    // Not written yet: what larger programs import.
+    host ActivateKeyboardLayout(2) => activate_keyboard_layout;
+    missing AttachThreadInput;
+    host CallNextHookEx(4) => zero;
+    missing ChangeDisplaySettingsExA;
+    missing ChangeDisplaySettingsExW;
+    host CharLowerBuffW(2) => char_lower_buff_w;
+    host CloseDesktop(1) => close_desktop;
+    missing CopyIcon;
+    missing CopyImage;
+    host CreateCaret(4) => succeed;
+    missing CreateIconFromResource;
+    missing CreateIconFromResourceEx;
+    missing CreateIconIndirect;
+    host DestroyCaret(0) => succeed;
+    host DisplayConfigGetDeviceInfo(1) => not_supported;
+    host DisplayConfigSetDeviceInfo(1) => not_supported;
+    missing EnumDesktopWindows;
+    host EnumDisplayDevicesA(4) => enum_display_devices_a;
+    host EnumDisplayDevicesW(4) => enum_display_devices_w;
+    host EnumDisplaySettingsA(3) => enum_display_settings_a;
+    host EnumDisplaySettingsW(3) => enum_display_settings_w;
+    host GetAncestor(2) => get_ancestor;
+    host GetClassNameA(3) => get_class_name_a;
+    missing GetClassWord;
+    missing GetClipboardFormatNameA;
+    host GetClipboardSequenceNumber(0) => get_clipboard_sequence_number;
+    host GetCursorInfo(1) => get_cursor_info;
+    host GetDisplayConfigBufferSizes(3) => not_supported;
+    host GetDoubleClickTime(0) => get_double_click_time;
+    missing GetIconInfo;
+    host GetKeyboardLayout(1) => get_keyboard_layout;
+    host GetKeyboardLayoutList(2) => get_keyboard_layout_list;
+    host GetKeyboardState(1) => get_keyboard_state;
+    host GetMessageExtraInfo(0) => get_message_extra_info;
+    host GetMessageTime(0) => get_message_time;
+    missing GetPointerInfo;
+    host GetPropW(2) => get_prop_w;
+    host GetQueueStatus(1) => get_queue_status;
+    missing GetRawInputBuffer;
+    missing GetRawInputData;
+    missing GetRawInputDeviceInfoA;
+    host GetRawInputDeviceList(3) => get_raw_input_device_list;
+    host GetShellWindow(0) => get_shell_window;
+    host GetUpdateRect(3) => get_update_rect;
+    host GetWindowInfo(2) => get_window_info;
+    host GetWindowPlacement(2) => get_window_placement;
+    missing InitializeTouchInjection;
+    missing InjectTouchInput;
+    host IntersectRect(3) => intersect_rect;
+    host IsChild(2) => is_child;
+    host IsProcessDPIAware(0) => succeed;
+    host IsRectEmpty(1) => is_rect_empty;
+    host MapVirtualKeyA(2) => map_virtual_key;
+    host MapVirtualKeyExA(3) => map_virtual_key;
+    host MapVirtualKeyExW(3) => map_virtual_key;
+    host MapVirtualKeyW(2) => map_virtual_key;
+    host OffsetRect(3) => offset_rect;
+    host OpenDesktopA(4) => open_desktop_a;
+    host OpenDesktopW(4) => open_desktop_w;
+    host CreateDesktopA(6) => create_desktop_a;
+    host CreateWindowStationA(4) => create_window_station_a;
+    host OpenWindowStationW(3) => open_window_station_w;
+    host OpenWindowStationA(3) => open_window_station_a;
+    host OpenInputDesktop(3) => open_desktop;
+    host PtInRect(2) => pt_in_rect;
+    host QueryDisplayConfig(6) => not_supported;
+    host RegisterDeviceNotificationA(3) => new_handle;
+    host RegisterDeviceNotificationW(3) => new_handle;
+    host RegisterRawInputDevices(3) => succeed;
+    host RegisterWindowMessageA(1) => register_window_message_a;
+    host RegisterWindowMessageW(1) => register_window_message_w;
+    host RemovePropW(2) => remove_prop_w;
+    host SendMessageTimeoutA(7) => send_message_timeout_w;
+    host SendNotifyMessageA(4) => post_message_w;
+    host SetCaretPos(2) => succeed;
+    host SetCoalescableTimer(5) => set_timer;
+    host SetLayeredWindowAttributes(4) => succeed;
+    host SetParent(2) => set_parent;
+    host SetPropW(3) => set_prop_w;
+    host SetRectEmpty(1) => set_rect_empty;
+    host SetWinEventHook(7) => new_handle;
+    host SetWindowRgn(3) => succeed;
+    host SetWindowsHookExW(4) => new_handle;
+    host ShowCursor(1) => show_cursor;
+    host ShutdownBlockReasonCreate(2) => succeed;
+    host SystemParametersInfoA(4) => system_parameters_info;
+    host ToUnicode(6) => to_unicode;
+    host TrackMouseEvent(1) => succeed;
+    host UnhookWinEvent(1) => succeed;
+    host UnhookWindowsHookEx(1) => succeed;
+    host UnionRect(3) => union_rect;
+    host UnregisterDeviceNotification(1) => succeed;
+    host VkKeyScanExA(2) => vk_key_scan_ex;
+    host VkKeyScanExW(2) => vk_key_scan_ex;
+    missing WindowFromDC;
+    missing keybd_event;
+    host GetClassNameW(3) => get_class_name_w;
+    missing BeginDeferWindowPos;
+    missing CharToOemBuffW;
+    missing CharUpperW;
+    missing CloseTouchInputHandle;
+    host CloseWindowStation(1) => close_window_station;
+    host CreateDesktopW(6) => create_desktop_w;
+    host CreateWindowStationW(4) => create_window_station_w;
+    missing DdeClientTransaction;
+    missing DdeConnect;
+    missing DdeCreateStringHandleW;
+    missing DdeDisconnect;
+    missing DdeFreeStringHandle;
+    missing DdeGetLastError;
+    missing DdeInitializeW;
+    missing DdeUninitialize;
+    missing DefRawInputProc;
+    missing DeferWindowPos;
+    missing DrawEdge;
+    missing DrawFocusRect;
+    missing DrawFrameControl;
+    missing EndDeferWindowPos;
+    missing EnumDisplaySettingsExW;
+    missing EnumThreadWindows;
+    host EqualRect(2) => equal_rect;
+    host GetCaretBlinkTime(0) => get_caret_blink_time;
+    host GetGuiResources(2) => zero;
+    missing GetLastInputInfo;
+    missing GetLayeredWindowAttributes;
+    missing GetMenuInfo;
+    missing GetPointerDevice;
+    missing GetPointerDevices;
+    missing GetPointerPenInfo;
+    missing GetPointerType;
+    missing GetRawInputDeviceInfoW;
+    missing GetWindowDC;
+    missing GetWindowRgn;
+    host InflateRect(3) => inflate_rect;
+    missing InvertRect;
+    host LockWindowUpdate(1) => succeed;
+    host MessageBeep(1) => succeed;
+    host NotifyWinEvent(4) => zero;
+    missing OemToCharA;
+    missing OemToCharBuffA;
+    missing PrintWindow;
+    missing RegisterHotKey;
+    host RegisterPointerDeviceNotifications(2) => succeed;
+    host RegisterPowerSettingNotification(3) => register_notification;
+    host RegisterSuspendResumeNotification(2) => register_notification;
+    host RegisterTouchWindow(2) => succeed;
+    missing SetKeyboardState;
+    missing SetMenuInfo;
+    host SetProcessDPIAware(0) => succeed;
+    host SetProcessWindowStation(1) => set_process_window_station;
+    host SetRect(5) => set_rect;
+    host SetThreadDesktop(1) => set_thread_desktop;
+    missing SetWindowPlacement;
+    missing ToUnicodeEx;
+    missing UnregisterHotKey;
+    host UnregisterPowerSettingNotification(1) => succeed;
+    host UnregisterSuspendResumeNotification(1) => succeed;
+    missing UpdateLayeredWindow;
+    host SendNotifyMessageW(4) => post_message_w;
+    host ShowCaret(1) => succeed;
+    host HideCaret(1) => succeed;
 }
 
 const TRUE: u64 = 1;
@@ -1177,9 +1340,15 @@ fn get_client_rect(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 
 /// `GetWindowRect`: the whole window, frame and all, on the screen.
 fn get_window_rect(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let found = {
+    let Some(r) = window_rect_on_screen(task, a[0]) else { return Reply::Value(FALSE) };
+    Reply::Value(u64::from(task.write_rect(cx, a[1], &r)))
+}
+
+/// A window's whole rectangle, on the screen.
+pub(crate) fn window_rect_on_screen(task: &mut Task, hwnd: u64) -> Option<display::Rect> {
+    {
         let w = task.win32k();
-        w.windows.get(&a[0]).map(|win| {
+        w.windows.get(&hwnd).map(|win| {
             if win.top_level() {
                 win.rect
             } else {
@@ -1187,9 +1356,7 @@ fn get_window_rect(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
                 win.rect.offset(x, y)
             }
         })
-    };
-    let Some(r) = found else { return Reply::Value(FALSE) };
-    Reply::Value(u64::from(task.write_rect(cx, a[1], &r)))
+    }
 }
 
 fn move_window(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
@@ -1284,7 +1451,7 @@ fn is_window_visible(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
 }
 
 fn get_parent(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
-    Reply::Value(task.win32k().windows.get(&a[0]).map_or(0, |w| if w.parent == DESKTOP { 0 } else { w.parent }))
+    Reply::Value(task.win32k().windows.get(&a[0]).map_or(0, |w| if w.top_level() || w.message_only() { 0 } else { w.parent }))
 }
 
 fn get_desktop_window(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
@@ -1312,14 +1479,15 @@ fn find_window(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply
 /// `FindWindowExW(parent, after, class, title)`: the first of `parent`'s children (the top-level windows' for none)
 /// after `after`, in their stacking order, with that class and title, either of which may be left out.
 fn find_window_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
-    // HWND_MESSAGE: message-only windows, which there are none of.
-    if a[0] as u32 == (-3i32) as u32 {
-        return Reply::Value(0);
-    }
     let class = if a[2] == 0 { None } else { task.class_named_as(cx, a[2], wide) };
     let title = (a[3] != 0).then(|| task.text_arg(cx, a[3], wide));
     let w = task.win32k();
-    let parent = if a[0] == 0 { DESKTOP } else { a[0] };
+    // HWND_MESSAGE: the message-only windows.
+    let parent = match a[0] {
+        0 => DESKTOP,
+        h if h as u32 == 0xffff_fffd => win32k::MESSAGE_ROOT,
+        h => h,
+    };
     let order = w.z_order(parent);
     let start = if a[1] == 0 { 0 } else { order.iter().position(|&h| h == a[1]).map_or(order.len(), |i| i + 1) };
     let found = order[start..].iter().find(|h| {
@@ -2009,14 +2177,14 @@ fn get_clipboard_owner(task: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
 }
 
 fn register_clipboard_format_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    register_clipboard_format(task, cx, a, true)
+    register_clipboard_format_any(task, cx, a, true)
 }
 
 fn register_clipboard_format_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    register_clipboard_format(task, cx, a, false)
+    register_clipboard_format_any(task, cx, a, false)
 }
 
-fn register_clipboard_format(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+pub(crate) fn register_clipboard_format_any(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
     let name = task.text_arg(cx, a[0], wide);
     if name.is_empty() {
         return Reply::Value(0);
@@ -2081,8 +2249,7 @@ fn enum_display_monitors(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 
 // ---- The window station and desktop: WinSta0 and its Default ----
 
-const WINDOW_STATION: u64 = 0x7f00;
-const THREAD_DESKTOP: u64 = 0x7f04;
+pub(crate) use crate::win32k::stations::{DESKTOP as THREAD_DESKTOP, WINDOW_STATION};
 
 fn allow_set_foreground_window(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
     Reply::Value(TRUE)
@@ -2092,25 +2259,23 @@ fn get_process_window_station(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply 
     Reply::Value(WINDOW_STATION)
 }
 
-fn get_thread_desktop(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+pub(crate) fn thread_desktop(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
     Reply::Value(THREAD_DESKTOP)
 }
 
 /// `GetUserObjectInformationW(object, index, out, room, &needed)` and `A`: of the window station or desktop,
-/// UOI_FLAGS (visible, for the window station), UOI_NAME, UOI_TYPE, UOI_USER_SID (none) or UOI_IO (it takes input).
+/// UOI_FLAGS (visible, for WinSta0), UOI_NAME, UOI_TYPE, UOI_USER_SID (none) or UOI_IO (it takes input).
 fn get_user_object_information(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
-    let station = match a[0] {
-        WINDOW_STATION => true,
-        THREAD_DESKTOP => false,
-        _ => {
-            task.set_last_error(cx, 6);
-            return Reply::Value(FALSE);
-        }
+    let Some(object) = task.win32k().stations.get(a[0]).cloned() else {
+        task.set_last_error(cx, 6);
+        return Reply::Value(FALSE);
     };
+    let station = object.is_station();
     let text = |s: &str| -> Vec<u8> { if wide { s.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect() } else { s.bytes().chain([0]).collect() } };
     let data: Vec<u8> = match a[1] as u32 {
-        1 => [0u32, 0, u32::from(station)].iter().flat_map(|v| v.to_le_bytes()).collect(),
-        2 => text(if station { "WinSta0" } else { "Default" }),
+        // USEROBJECTFLAGS: WSF_VISIBLE for WinSta0 only, which has the screen.
+        1 => [0u32, 0, u32::from(a[0] == WINDOW_STATION)].iter().flat_map(|v| v.to_le_bytes()).collect(),
+        2 => text(&object.name),
         3 => text(if station { "WindowStation" } else { "Desktop" }),
         4 => Vec::new(),
         6 => 1u32.to_le_bytes().to_vec(),
@@ -2250,4 +2415,23 @@ fn msg_wait_for_multiple_objects(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) ->
 fn msg_wait_for_multiple_objects_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let flags = a[4] as u32;
     msg_wait(task, cx, a[0], a[1], flags & 1 != 0, a[2] as u32, flags & 2 != 0)
+}
+
+/// `SetParent(window, parent)`: the parent it had (a top-level window's is the desktop, given back as 0 as Windows
+/// does for one that had none); the window moves under the new one, where it is relative to its client area.
+fn set_parent(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let mut w = task.win32k();
+    if a[1] != 0 && !w.windows.contains_key(&a[1]) {
+        drop(w);
+        task.set_last_error(cx, 1400);
+        return Reply::Value(0);
+    }
+    let Some(win) = w.windows.get_mut(&a[0]) else {
+        drop(w);
+        task.set_last_error(cx, 1400);
+        return Reply::Value(0);
+    };
+    let old = win.parent;
+    win.parent = if a[1] == win32k::DESKTOP { 0 } else { a[1] };
+    Reply::Value(if old == 0 { win32k::DESKTOP } else { old })
 }

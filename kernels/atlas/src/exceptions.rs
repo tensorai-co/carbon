@@ -197,7 +197,7 @@ impl Task {
 
 /// A 32-bit thread's registers as x86's CONTEXT: everything, with x87's state both as `fnsave` has it (FloatSave)
 /// and as `fxsave` does (ExtendedRegisters), and the segments Windows gives a 32-bit process.
-fn encode_x86(regs: &Regs, fp: &FpRegs) -> Vec<u8> {
+pub(crate) fn encode_x86(regs: &Regs, fp: &FpRegs) -> Vec<u8> {
     let (Regs::X86(r), FpRegs::X86(f)) = (regs, fp) else { return Vec::new() };
     let mut b = vec![0u8; ctx::X86_SIZE as usize];
     let mut put = |o: u64, v: u32| b[o as usize..o as usize + 4].copy_from_slice(&v.to_le_bytes());
@@ -223,7 +223,7 @@ fn encode_x86(regs: &Regs, fp: &FpRegs) -> Vec<u8> {
 }
 
 /// A thread's registers as a CONTEXT.
-fn encode(regs: &Regs, fp: &FpRegs) -> Vec<u8> {
+pub(crate) fn encode(regs: &Regs, fp: &FpRegs) -> Vec<u8> {
     match (regs, fp) {
         (Regs::Arm64(r), FpRegs::Arm64(f)) => {
             let mut b = vec![0u8; ctx::ARM64_SIZE as usize];

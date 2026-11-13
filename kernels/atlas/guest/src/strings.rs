@@ -66,6 +66,22 @@ impl Message {
         self
     }
 
+    pub fn decimal(&mut self, v: u64) -> &mut Message {
+        let mut digits = [0u8; 20];
+        let mut n = 0;
+        let mut v = v;
+        loop {
+            digits[n] = b'0' + (v % 10) as u8;
+            n += 1;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        digits[..n].reverse();
+        self.text(&digits[..n])
+    }
+
     pub fn print(&self) {
         crate::sys::debug_print(&self.bytes[..self.len]);
     }

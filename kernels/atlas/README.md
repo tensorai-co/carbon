@@ -5,12 +5,14 @@ declaration made into a PE in memory, so a machine has no Windows files to insta
 has to run inside the program, ntdll, is a crate (`guest/`) that cargo builds for each ISA and embeds.
 
 **Where it stands.** Programs run on ARM64 natively and x86-64 translated, and 32-bit x86 programs run too (WoW64,
-translated on Apple silicon; phases 1 to 5 of its six, below, are done): 30 of the test programs pass every check as
+translated on Apple silicon; phases 1 to 5 of its six, below, are done): 31 of the test programs pass every check as
 32-bit programs, with x86's own SEH, PE32 images and 32-bit layouts throughout, and a real 32-bit installer starts,
 unpacks its data, runs its start-up script, shows its dialogs, installs its files with its progress shown, and finishes. The program it installs then starts, downloads its
 240 MB update over HTTPS (Winsock on `net`, its own TLS, crypt32 checking the server's certificates against the
-host's trust), verifies, unpacks and installs it, and starts the full program it updated to, whose own imports are
-next. They have the loader and SEH, threads and
+host's trust), verifies, unpacks and installs it, and starts the full program it updated to. That loads its own
+DLLs and starts its browser-engine helper process, which gets through its sandbox's setup (its own window station and
+desktop, DACLs built with `SetEntriesInAcl`, the registry by NT path), WinRT's strings and event tracing, and stops
+where it first needs DirectWrite. They have the loader and SEH, threads and
 waits, processes, anonymous and named pipes, sections, asynchronous I/O and completion ports, files, the registry,
 security (tokens, descriptors, access checks, impersonation), resources and version information, the system's
 version and information, and windows on the desktop with input. The loader is Windows' own in all but manifests: the
@@ -21,7 +23,8 @@ are shared as their opens say, with hard and symbolic links and times that can b
 program: work, timers and waits, on pools of their own or the process's. The registry tells watchers of changes, has
 WOW64's 32-bit view, and saves, restores, loads and unloads hives. Code pages convert as Windows' do, every `*A`
 function speaks Windows-1252, and ANSI windows get their messages' text in it. ucrtbase.dll is atlas's own C runtime, in the
-program, so MinGW-built C programs run. Fifteen DLLs declare 1,260 exports between them, 1,241 written and 19 stubs that say so, and ntdll has 332. A DLL's exports can have Windows' own ordinals,
+program, so MinGW-built C programs run. 69 DLLs declare 2,449 exports between them: 1,590 written, and 859 stubs that say so when they're called (most in
+DLLs declared so that larger programs load), and ntdll has 357. A DLL's exports can have Windows' own ordinals,
 gaps and all, which programs import oleaut32's, ws2_32's and some of shell32's by.
 
 ## Layout
@@ -74,10 +77,13 @@ The runner uses the host's `vm` backend; `CARBON_ISOLATION=sandbox` (or `auto`) 
 run on hvf so far (kvm and winkvm haven't run them yet; the sandboxes don't run them). ntdll is built from source
 for all three Windows targets: with rustup, that needs `rustup component add rust-src` and LLVM's `lld-link`
 (Debian's `lld` package has it); on Windows, MSVC (Visual Studio Build Tools) and `lld-link.exe`. `CARBON_TRACE=1`
-prints every host export with its result, and each thread that gives its CPU up, waits for one, or takes one again.
+prints every host export with its result, and each thread that gives its CPU up, waits for one, or takes one again;
+each thread and process as it ends, with its code; and, when the machine is stopped, where each thread was: in the
+program (its address, as a module and offset), waiting in a host export, or waiting on an address in ntdll. A panic
+in atlas's own ntdll says where in its source, and an exception nothing handles names its module.
 `cargo test -p atlas` runs the unit tests.
 
-On this Mac, through hvf, every test program passes, on ARM64 and x86-64, and the 28 built for i686 too. Each one's
+On this Mac, through hvf, every test program passes, on ARM64 and x86-64, and the 31 built for i686 too. Each one's
 opening comment says what it checks. `crt.exe` (and `crt-mingw.exe`) want the arguments `one "two words"`.
 
 | Program | What it covers |
@@ -94,6 +100,7 @@ opening comment says what it checks. `crt.exe` (and `crt-mingw.exe`) want the ar
 | atlas's `ansiwin.c`, both ISAs | ANSI windows: a class and window made with the `*A` functions, its `WndProc` given names, text and characters in 1252 however they're sent; a Unicode window driven by the `*A` functions; `GetMessageA` and `DispatchMessageA`; `WndProc`s set by `SetWindowLongPtrA` and `W` |
 | atlas's `ansi.c`, both ISAs | Code pages: `MultiByteToWideChar` and `WideCharToMultiByte` in 1252, 437 and UTF-8; `*A` functions with é in their names, as the `*W` ones see them: files, paths, the registry, the environment, objects, accounts, locales and version information |
 | atlas's `registry.c`, both ISAs | A fresh machine's hives, keys and every value type, enumeration, deletion, and saving; change notification, asynchronous and not; the 32-bit view; hives saved, restored, loaded and unloaded |
+| atlas's `sandbox.c`, both ISAs and i686 | What a browser engine's processes call setting up their sandbox: window stations and desktops made, named, opened, made current and closed, their DACLs read, extended with `SetEntriesInAcl` and set; DACLs built from trustees by name and by SID, a deny put first, a grant revoked; message-only windows, getting messages and passed by `FindWindow`; the registry by NT path (`NtCreateKey` and its disposition, relative to a key, `NtOpenKeyEx`, `NtQueryValueKey`'s three forms and short buffers, `NtDeleteKey`) and `RtlFormatCurrentUserKeyPath`; `GetThreadContext` of the caller, of a running thread suspended (its pc in its loop) and of one suspended while it waits; WinRT's start, activation finding no class, and HSTRINGs (copies, references, duplicates, comparisons, the null one, embedded NULs); event tracing's 64-bit handles; `ProcessPrng` |
 | atlas's `sockets.c`, both ISAs and i686 | Winsock over the machine's loopback: TCP's listen, connect, accept and names; send, recv, MSG_PEEK, FIONREAD; `select` and `WSAPoll`; non-blocking sockets and a connect seen through `select`; SO_RCVTIMEO; options; overlapped `WSARecv` through an event and a completion port, done at once and later, with and without FILE_SKIP_COMPLETION_PORT_ON_SUCCESS; `closesocket` aborting what's under way; shutdown; UDP; `ConnectEx`, `AcceptEx` and `GetAcceptExSockaddrs` from `WSAIoctl`; `getaddrinfo` (numeric, passive, localhost, the machine's own name, AI_NUMERICHOST); `gethostname`, `inet_addr`; ws2_32's old functions by ordinal |
 | atlas's `startup.c`, both ISAs and i686 | What larger programs call as they start: the heap's sizes, reallocation and queries; encoded pointers; `InitOnceBeginInitialize`/`Complete` and `ExecuteOnce`; interlocked lists; `IsDebuggerPresent`, `DebugBreak` to a vectored handler, `UnhandledExceptionFilter`; `IsBadWritePtr`/`ReadPtr`; `CompareString`, `LCMapString` (case and sort keys), `GetStringType`; `GetDateFormat`/`GetTimeFormat`; disk space, drive types, `FindFirstFileEx`; console modes and `SetStdHandle`; `OpenThread`, priorities, affinity, the session; psapi; the monitor, the window station, `MapWindowPoints`, `MsgWaitForMultipleObjects` (a timeout, a message, an object); memory fonts; the event log and `RtlGenRandom`; `CommandLineToArgvW`, `SHGetKnownFolderPath`, `IsUserAnAdmin`; oleaut32's BSTRs and VARIANTs, bcrypt's random bytes and Winsock's start, imported by ordinal |
 | atlas's `installer.c`, both ISAs and i686 | What installers call first: the `lstr*` functions, `CharNext`/`CharPrev`, `MulDiv`, `CompareFileTime`; `wsprintf` with its arguments past the registers, cut at 1024 characters, and `wvsprintf`; temporary and short names, disk space, `SearchPath`; .ini files; the error mode; COM's start, its task allocator and `CoCreateInstance` with no class registered; `SHGetFileInfo` with no flags |
@@ -820,7 +827,9 @@ By layer, bottom up. Items are host Rust unless marked **[guest]** (ntdll), or a
 - **Objects:** `SignalObjectAndWait`; keyed events; the object namespace as a tree (directories, symbolic links,
   `Global\` and `Local\`, private namespaces); `NtQueryObject`, with the handle lists' type numbers.
 - **Processes and threads:** `Read`/`WriteProcessMemory` and `VirtualAllocEx` across processes; `Get`/
-  `SetThreadContext`; `DuplicateHandle` of another process's pseudo-handles; `NtQueryInformationProcess` and
+  `SetThreadContext` (`GetThreadContext` is done: of the calling thread, or of another as it stopped, suspended or
+  inside a call, whose floating-point registers aren't read there); `DuplicateHandle` of another process's
+  pseudo-handles; `NtQueryInformationProcess` and
   `NtQueryInformationThread`; job objects (kill-on-close, limits, completion messages); `GetStartupInfo` with what
   the parent passed, and `CREATE_NEW_CONSOLE` and the other console flags; `SuspendThread` on a thread blocked in a
   wait.
@@ -858,7 +867,9 @@ By layer, bottom up. Items are host Rust unless marked **[guest]** (ntdll), or a
   views, editing labels, sorting, `LVN_GETDISPINFO`'s callback items, owner data);
   scroll bars and carets; icons' rest (`GetIconInfo`, `CreateIconIndirect`, `CopyImage`, PNG images, the system's own
   icons drawn, a window's icon in its frame); hooks
-  (`SetWindowsHookEx`); window stations and desktops as objects (there's one of each, by fixed handles, for now);
+  (`SetWindowsHookEx`); each desktop's windows apart (window stations and desktops are objects with names, a
+  security descriptor and a process's current station, and message-only windows are done, but every desktop's
+  windows still go on the one screen);
   `MsgWaitForMultipleObjects`' wake mask, told apart by kind of message; windows across processes (`SendMessage`, `EnumWindows`, `WindowFromPoint`);
   per-monitor DPI awareness; IME, with imm32.
 - **NtGdi:** bitmaps' rest (`CreateDIBSection` on shared pages, `StretchDIBits`, `SetDIBitsToDevice`, `GetDIBits`,

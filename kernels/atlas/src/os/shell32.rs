@@ -26,8 +26,8 @@ dll! {
     host SHGetFolderPathA(5) => sh_get_folder_path_a;
     host SHGetSpecialFolderPathW(4) => sh_get_special_folder_path_w;
     host SHGetSpecialFolderPathA(4) => sh_get_special_folder_path_a;
-    host ILFree(1) => il_free;
-    host ILCreateFromPathW(1) => il_create_from_path_w;
+    host ILFree(1) @ 155 => il_free;
+    host ILCreateFromPathW(1) @ 190 => il_create_from_path_w;
     host SHFileOperationW(1) => sh_file_operation_w;
     host SHFileOperationA(1) => sh_file_operation_a;
     host ShellExecuteW(6) => shell_execute_w;
@@ -38,6 +38,22 @@ dll! {
     host CommandLineToArgvW(2) => command_line_to_argv_w;
     host SHGetKnownFolderPath(4) => sh_get_known_folder_path;
     host IsUserAnAdmin(0) @ 680 => is_user_an_admin;
+    // Not written yet: what larger programs import.
+    missing ExtractIconExA;
+    missing SHAppBarMessage;
+    missing SHCreateItemFromParsingName;
+    missing SHGetMalloc;
+    missing SHOpenFolderAndSelectItems;
+    missing SHOpenWithDialog;
+    missing ShellExecuteExA;
+    missing Shell_NotifyIconW;
+    host SetCurrentProcessExplicitAppUserModelID(1) => set_app_user_model_id;
+    missing SHChangeNotify;
+    missing SHGetDesktopFolder;
+    missing SHGetPropertyStoreForWindow;
+    missing SHGetStockIconInfo;
+    missing SHQueryUserNotificationState;
+    missing Shell_NotifyIconA;
 }
 
 /// `DragAcceptFiles`: whether a window takes files dropped on it (its `WS_EX_ACCEPTFILES`).
@@ -639,6 +655,12 @@ fn sh_get_known_folder_path(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Repl
 /// `IsUserAnAdmin()`, shell32's #680: the user is, elevated.
 fn is_user_an_admin(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
     Reply::Value(1)
+}
+
+
+/// `SetCurrentProcessExplicitAppUserModelID(id)`: taken; there's no taskbar to group windows by it.
+fn set_app_user_model_id(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(S_OK)
 }
 
 #[cfg(test)]

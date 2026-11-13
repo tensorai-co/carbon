@@ -531,3 +531,487 @@ pub fn get_process_memory_info(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> R
     }
     Reply::Value(TRUE)
 }
+
+// --- Small things larger programs ask as they start ---
+
+/// FILETIMEs where the program asked, at each of `outs` (0: not asked for).
+fn put_times(task: &mut Task, cx: &mut Cx<'_>, outs: &[(u64, u64)]) -> Reply {
+    for &(at, v) in outs {
+        if at != 0 && task.mem(cx, true, |t| user::write(&mut t.space(), at, &v.to_le_bytes())).is_err() {
+            return task.fail(cx, 998);
+        }
+    }
+    Reply::Value(TRUE)
+}
+
+/// `GetProcessTimes(process, &created, &exited, &kernel, &user)`: when it started; no exit; CPU time isn't counted
+/// per process yet, so none.
+pub fn get_process_times(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(process) = task.process_of(a[0]) else { return task.fail(cx, ERROR_INVALID_HANDLE) };
+    let created = lock(&process.state).created;
+    put_times(task, cx, &[(a[1], created), (a[2], 0), (a[3], 0), (a[4], 0)])
+}
+
+/// `GetThreadTimes(thread, &created, &exited, &kernel, &user)`: the process's start, and no CPU time counted yet.
+pub fn get_thread_times(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if task.thread_of(a[0]).is_none() {
+        return task.fail(cx, ERROR_INVALID_HANDLE);
+    }
+    let created = lock(&task.process.state).created;
+    put_times(task, cx, &[(a[1], created), (a[2], 0), (a[3], 0), (a[4], 0)])
+}
+
+/// `GetProcessIdOfThread(thread)`: the process it's in.
+pub fn get_process_id_of_thread(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(thread) = task.thread_of(a[0]) else { return task.fail(cx, ERROR_INVALID_HANDLE) };
+    let pid = task.k.processes().into_iter().find(|p| lock(&p.state).threads.contains_key(&thread.tid)).map_or(0, |p| p.pid);
+    Reply::Value(pid)
+}
+
+/// `GetThreadGroupAffinity(thread, &affinity)`: group 0, every processor.
+pub fn get_thread_group_affinity(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let abi = task.abi();
+    let bits = task.cpus().min(abi.width as u32 * 8);
+    let mask = if bits >= 64 { u64::MAX } else { (1 << bits) - 1 };
+    let mut b = abi.ptr(mask);
+    b.extend([0u8; 8]);
+    if task.mem(cx, true, |t| user::write(&mut t.space(), a[1], &b)).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(TRUE)
+}
+
+/// What returns a value it was given, or a constant, and does nothing else: `SetHandleCount(n)` gives n back;
+/// `GetCurrentProcessorNumber` is 0; `FlushInstructionCache` (the translator sees code change on its own),
+/// `FlushProcessWriteBuffers`, `SetProcessShutdownParameters`, `SetDllDirectory` and `SetThreadErrorMode` succeed.
+pub fn handle_count(_: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(a[0] as u32 as u64)
+}
+
+pub fn zero(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(0)
+}
+
+pub fn succeed(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(TRUE)
+}
+
+/// `SetThreadErrorMode(mode, &old)`: the old mode, none.
+pub fn set_thread_error_mode(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[1] != 0 {
+        let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[1], 0));
+    }
+    Reply::Value(TRUE)
+}
+
+/// `SetThreadExecutionState(flags)`: ES_CONTINUOUS, the state before (nothing kept awake).
+pub fn set_thread_execution_state(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(0x8000_0000)
+}
+
+/// `QueryUnbiasedInterruptTime(&time)`: 100 ns units since the machine started.
+pub fn query_unbiased_interrupt_time(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let t = task.k.host.monotonic() / 100;
+    put_times(task, cx, &[(a[0], t)])
+}
+
+/// `GetNumaHighestNodeNumber(&node)`: one node, 0.
+pub fn get_numa_highest_node_number(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[0], 0)).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(TRUE)
+}
+
+/// `WTSGetActiveConsoleSessionId()`: session 1, the user's.
+pub fn wts_get_active_console_session_id(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(1)
+}
+
+// --- psapi's module lists ---
+
+/// This process's modules' bases: its program's first, then each DLL.
+fn module_bases(task: &mut Task, cx: &mut Cx<'_>) -> Vec<u64> {
+    let abi = task.abi();
+    let peb = lock(&task.process.state).peb;
+    let exe = task.mem(cx, false, |t| user::read_ptr(&t.space(), peb + abi.peb.image_base, abi.width)).unwrap_or(0);
+    let mut bases = vec![exe];
+    bases.extend(lock(&task.process.state).mapped.values().map(|(b, _)| *b));
+    bases
+}
+
+/// `K32EnumProcessModules(process, &modules, size, &needed)`: this process's (another's aren't listed).
+pub fn enum_process_modules(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(process) = task.process_of(a[0]) else { return task.fail(cx, ERROR_INVALID_HANDLE) };
+    if !Arc::ptr_eq(&process, &task.process) {
+        return task.fail(cx, 299); // ERROR_PARTIAL_COPY, as for a process it can't read
+    }
+    let abi = task.abi();
+    let bases = module_bases(task, cx);
+    let needed = bases.len() as u64 * abi.width;
+    let fit = (a[2] as u32 as u64 / abi.width) as usize;
+    let bytes: Vec<u8> = bases.iter().take(fit).flat_map(|b| abi.ptr(*b)).collect();
+    let wrote = task.mem(cx, true, |t| {
+        if !bytes.is_empty() {
+            user::write(&mut t.space(), a[1], &bytes)?;
+        }
+        user::write_u32(&mut t.space(), a[3], needed as u32)
+    });
+    if wrote.is_err() { task.fail(cx, 998) } else { Reply::Value(TRUE) }
+}
+
+/// `K32GetModuleBaseNameW(process, module, out, room)` and `A`: its file name, cut to fit.
+fn get_module_base_name(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let Some(process) = task.process_of(a[0]) else { return task.fail(cx, ERROR_INVALID_HANDLE) };
+    let path = if a[1] == 0 {
+        lock(&process.state).image.clone()
+    } else {
+        match lock(&process.state).mapped.values().find(|(b, _)| *b == a[1]) {
+            Some((_, p)) => p.clone(),
+            None if Arc::ptr_eq(&process, &task.process) && module_bases(task, cx).first() == Some(&a[1]) => lock(&process.state).image.clone(),
+            None => return task.fail(cx, ERROR_INVALID_HANDLE),
+        }
+    };
+    let name = path.rsplit('\\').next().unwrap_or(&path).to_string();
+    let room = a[3] as u32 as usize;
+    if room == 0 {
+        return task.fail(cx, ERROR_INSUFFICIENT_BUFFER);
+    }
+    let bytes: Vec<u8> = if wide {
+        let units: Vec<u16> = name.encode_utf16().take(room - 1).collect();
+        units.iter().chain([&0]).flat_map(|u| u.to_le_bytes()).collect()
+    } else {
+        crate::ansi::bytes(&name).iter().take(room - 1).copied().chain([0]).collect()
+    };
+    let n = bytes.len() / if wide { 2 } else { 1 } - 1;
+    if task.mem(cx, true, |t| user::write(&mut t.space(), a[2], &bytes)).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(n as u64)
+}
+
+pub fn get_module_base_name_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    get_module_base_name(task, cx, a, true)
+}
+
+pub fn get_module_base_name_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    get_module_base_name(task, cx, a, false)
+}
+
+// --- Toolhelp: snapshots of the processes, threads and modules ---
+
+/// What a snapshot holds, and how far through each list `Next` has come.
+#[derive(Default)]
+pub(crate) struct Snapshot {
+    /// ID, parent's ID, how many threads, program's file name.
+    processes: Vec<(u64, u64, usize, String)>,
+    /// ID, its process's ID.
+    threads: Vec<(u64, u64)>,
+    /// Base, size, file name, full path.
+    modules: Vec<(u64, u32, String, String)>,
+    at: [usize; 3],
+}
+
+/// `CreateToolhelp32Snapshot(flags, pid)`: TH32CS_SNAPPROCESS (2), SNAPTHREAD (4), SNAPMODULE (8, and SNAPMODULE32,
+/// 0x10): every process and thread as they are now, and a process's modules (this one's, for pid 0).
+pub fn create_toolhelp32_snapshot(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let flags = a[0] as u32;
+    let mut s = Snapshot::default();
+    if flags & 6 != 0 {
+        for p in task.k.processes() {
+            let state = lock(&p.state);
+            let name = state.image.rsplit('\\').next().unwrap_or(&state.image).to_string();
+            s.processes.push((p.pid, state.parent, state.threads.len(), name));
+            s.threads.extend(state.threads.keys().map(|&tid| (tid, p.pid)));
+        }
+    }
+    if flags & 0x18 != 0 {
+        let pid = a[1] as u32 as u64;
+        if pid != 0 && pid != task.process.pid {
+            return Reply::Value(u64::MAX);
+        }
+        let image = lock(&task.process.state).image.clone();
+        let mut list: Vec<(u64, String)> = vec![(module_bases(task, cx)[0], image)];
+        list.extend(lock(&task.process.state).mapped.values().map(|(b, p)| (*b, p.clone())));
+        for (base, path) in list {
+            let size = task
+                .mem(cx, false, |t| {
+                    let lfanew = u64::from(user::read_u32(&t.space(), base + 0x3c)?);
+                    user::read_u32(&t.space(), base + lfanew + 0x50)
+                })
+                .unwrap_or(0);
+            let name = path.rsplit('\\').next().unwrap_or(&path).to_string();
+            s.modules.push((base, size, name, path));
+        }
+    }
+    Reply::Value(lock(&task.process.state).handles.add(Handle::Snapshot(Arc::new(std::sync::Mutex::new(s)))))
+}
+
+/// Text in a fixed field: UTF-16 or ANSI, `chars` long, NUL-padded.
+fn field(s: &str, chars: usize, wide: bool) -> Vec<u8> {
+    let mut b: Vec<u8> = if wide { s.encode_utf16().take(chars - 1).flat_map(u16::to_le_bytes).collect() } else { crate::ansi::bytes(s).iter().take(chars - 1).copied().collect() };
+    b.resize(if wide { chars * 2 } else { chars }, 0);
+    b
+}
+
+/// The next entry of a snapshot's list `which` (0 processes, 1 threads, 2 modules), from the start with `first`,
+/// as its structure for this ISA; FALSE with ERROR_NO_MORE_FILES at the end.
+fn snapshot_entry(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], which: usize, first: bool, wide: bool) -> Reply {
+    let Some(Handle::Snapshot(snap)) = lock(&task.process.state).handles.get(a[0]) else { return task.fail(cx, ERROR_INVALID_HANDLE) };
+    let abi = task.abi();
+    let w = abi.width as usize;
+    let entry = {
+        let mut s = lock(&snap);
+        if first {
+            s.at[which] = 0;
+        }
+        let i = s.at[which];
+        s.at[which] += 1;
+        let mut b = Vec::new();
+        let pad = |b: &mut Vec<u8>, n: usize| b.resize(b.len().next_multiple_of(n), 0);
+        match which {
+            0 => s.processes.get(i).map(|(pid, parent, threads, name)| {
+                b.extend(0u32.to_le_bytes());
+                b.extend(0u32.to_le_bytes());
+                b.extend((*pid as u32).to_le_bytes());
+                pad(&mut b, w);
+                b.extend(abi.ptr(0));
+                for v in [0u32, *threads as u32, *parent as u32, 8, 0] {
+                    b.extend(v.to_le_bytes());
+                }
+                b.extend(field(name, 260, wide));
+                pad(&mut b, w);
+                b
+            }),
+            1 => s.threads.get(i).map(|(tid, pid)| {
+                for v in [28u32, 0, *tid as u32, *pid as u32, 8, 0, 0] {
+                    b.extend(v.to_le_bytes());
+                }
+                b
+            }),
+            _ => s.modules.get(i).map(|(base, size, name, path)| {
+                for v in [0u32, 1, task.process.pid as u32, 0xffff, 0xffff] {
+                    b.extend(v.to_le_bytes());
+                }
+                pad(&mut b, w);
+                b.extend(abi.ptr(*base));
+                b.extend(size.to_le_bytes());
+                pad(&mut b, w);
+                b.extend(abi.ptr(*base));
+                b.extend(field(name, 256, wide));
+                b.extend(field(path, 260, wide));
+                pad(&mut b, w);
+                b
+            }),
+        }
+    };
+    let Some(mut b) = entry else { return task.fail(cx, 18) };
+    // dwSize, first, as the structure is.
+    let size = b.len() as u32;
+    b[..4].copy_from_slice(&size.to_le_bytes());
+    if task.mem(cx, true, |t| user::write(&mut t.space(), a[1], &b)).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(TRUE)
+}
+
+pub fn process32_first_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    snapshot_entry(task, cx, a, 0, true, true)
+}
+
+pub fn process32_next_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    snapshot_entry(task, cx, a, 0, false, true)
+}
+
+pub fn process32_first(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    snapshot_entry(task, cx, a, 0, true, false)
+}
+
+pub fn process32_next(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    snapshot_entry(task, cx, a, 0, false, false)
+}
+
+pub fn thread32_first(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    snapshot_entry(task, cx, a, 1, true, true)
+}
+
+pub fn thread32_next(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    snapshot_entry(task, cx, a, 1, false, true)
+}
+
+pub fn module32_first_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    snapshot_entry(task, cx, a, 2, true, true)
+}
+
+pub fn module32_next_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    snapshot_entry(task, cx, a, 2, false, true)
+}
+
+pub fn module32_first(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    snapshot_entry(task, cx, a, 2, true, false)
+}
+
+pub fn module32_next(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    snapshot_entry(task, cx, a, 2, false, false)
+}
+
+/// `CreateRemoteThread(process, attributes, stack, start, parameter, flags, &tid)` and its `Ex` form: in this process,
+/// as `CreateThread`; another process's threads can't be started from here yet (ERROR_ACCESS_DENIED).
+pub fn create_remote_thread(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    match task.process_of(a[0]) {
+        Some(p) if Arc::ptr_eq(&p, &task.process) => super::synch::create_thread(task, cx, &[a[1], a[2], a[3], a[4], a[5], a[6]]),
+        Some(_) => task.fail(cx, 5),
+        None => task.fail(cx, ERROR_INVALID_HANDLE),
+    }
+}
+
+pub fn create_remote_thread_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    create_remote_thread(task, cx, &[a[0], a[1], a[2], a[3], a[4], a[5], a[7]])
+}
+
+// --- Policies, priorities, attribute lists and jobs, as a browser's processes set them up ---
+
+/// `GetPriorityClass(process)`: NORMAL_PRIORITY_CLASS.
+pub fn get_priority_class(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(0x20)
+}
+
+/// A BOOL or other value of 4 bytes written where asked, then TRUE.
+fn put_u32(task: &mut Task, cx: &mut Cx<'_>, at: u64, v: u32) -> Reply {
+    if at != 0 && task.mem(cx, true, |t| user::write_u32(&mut t.space(), at, v)).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(TRUE)
+}
+
+/// `CheckRemoteDebuggerPresent(process, &present)`: no.
+pub fn check_remote_debugger_present(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    put_u32(task, cx, a[1], 0)
+}
+
+/// `GetThreadPriorityBoost(thread, &disabled)`: boosting's on.
+pub fn get_thread_priority_boost(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    put_u32(task, cx, a[1], 0)
+}
+
+/// `GetFirmwareType(&type)`: FirmwareTypeUefi.
+pub fn get_firmware_type(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    put_u32(task, cx, a[0], 2)
+}
+
+/// `GetProcessHandleCount(process, &count)`.
+pub fn get_process_handle_count(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(process) = task.process_of(a[0]) else { return task.fail(cx, ERROR_INVALID_HANDLE) };
+    let n = lock(&process.state).handles.iter().count() as u32;
+    put_u32(task, cx, a[1], n)
+}
+
+/// `QueryProcessCycleTime(process, &cycles)` and `QueryThreadCycleTime`: the time since the machine started, as
+/// cycles of a 1 GHz clock (CPU time isn't counted apart yet).
+pub fn query_cycle_time(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let t = task.k.host.monotonic();
+    if task.mem(cx, true, |m| user::write(&mut m.space(), a[1], &t.to_le_bytes())).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(TRUE)
+}
+
+/// `GetProcessMitigationPolicy(process, policy, &buffer, length)`: every policy off (zeros).
+pub fn get_process_mitigation_policy(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let zeros = vec![0u8; (a[3] as usize).min(64)];
+    if task.mem(cx, true, |t| user::write(&mut t.space(), a[2], &zeros)).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(TRUE)
+}
+
+/// `QueryFullProcessImageNameW(process, flags, out, &room)` and `A`: its program's path; the length without the NUL
+/// where `room` was.
+fn query_full_process_image_name(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let Some(process) = task.process_of(a[0]) else { return task.fail(cx, ERROR_INVALID_HANDLE) };
+    let path = lock(&process.state).image.clone();
+    let Ok(room) = task.mem(cx, false, |t| user::read_u32(&t.space(), a[3])) else { return task.fail(cx, 998) };
+    match task.put_text(cx, a[2], u64::from(room), &path, wide) {
+        Reply::Value(n) if n < u64::from(room) => put_u32(task, cx, a[3], n as u32),
+        _ => task.fail(cx, ERROR_INSUFFICIENT_BUFFER),
+    }
+}
+
+pub fn query_full_process_image_name_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    query_full_process_image_name(task, cx, a, true)
+}
+
+pub fn query_full_process_image_name_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    query_full_process_image_name(task, cx, a, false)
+}
+
+/// `InitializeProcThreadAttributeList(list, count, flags, &size)`: with no list, the size one needs (and FALSE with
+/// ERROR_INSUFFICIENT_BUFFER, as Windows says it); with one, TRUE. Its attributes are taken and not acted on.
+pub fn initialize_proc_thread_attribute_list(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let size = 48 + 24 * (a[1] as u32 as u64);
+    if task.write_ptr(cx, a[3], size).is_err() {
+        return task.fail(cx, 998);
+    }
+    if a[0] == 0 {
+        return task.fail(cx, ERROR_INSUFFICIENT_BUFFER);
+    }
+    Reply::Value(TRUE)
+}
+
+/// `CreateJobObjectW(attributes, name)` and `A`: a job, as an object to wait on and close; what's put in it and its
+/// limits are taken and not kept.
+pub fn create_job_object(task: &mut Task, cx: &mut Cx<'_>, _: &[u64]) -> Reply {
+    super::synch::create_event_w(task, cx, &[0, 1, 0, 0])
+}
+
+/// `QueryInformationJobObject(job, class, &info, length, &returned)`: nothing set (zeros).
+pub fn query_information_job_object(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let zeros = vec![0u8; (a[3] as u32 as usize).min(4096)];
+    if task.mem(cx, true, |t| user::write(&mut t.space(), a[2], &zeros)).is_err() {
+        return task.fail(cx, 998);
+    }
+    if a[4] != 0 {
+        let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[4], zeros.len() as u32));
+    }
+    Reply::Value(TRUE)
+}
+
+/// `K32GetPerformanceInfo(&info, size)`: PERFORMANCE_INFORMATION, as a machine with the memory the host says.
+pub fn get_performance_info(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let abi = task.abi();
+    let pages = 4u64 << 30 >> 12;
+    let processes = task.k.processes().len() as u32;
+    let mut b = Vec::new();
+    b.extend(((4 + 10 * abi.width + 12) as u32).to_le_bytes());
+    if abi.width == 8 {
+        b.extend([0u8; 4]);
+    }
+    // Commit total, limit and peak; physical total and free; system cache; kernel total, paged and nonpaged; the
+    // page size.
+    for v in [pages / 4, pages, pages / 4, pages, pages / 2, pages / 8, pages / 16, pages / 32, pages / 32, 4096] {
+        b.extend(abi.ptr(v));
+    }
+    for v in [processes * 64, processes, processes * 4] {
+        b.extend(v.to_le_bytes());
+    }
+    let size = (a[1] as u32 as usize).min(b.len());
+    if task.mem(cx, true, |t| user::write(&mut t.space(), a[0], &b[..size])).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(TRUE)
+}
+
+/// What's taken and has nothing to do here: priority classes, boosts, mitigation and process or thread information
+/// set, default DLL folders, job assignments and limits, attribute updates, file locks (no other program shares
+/// the disk), the function tables JIT compilers register (unwinding through their code isn't there yet), power
+/// requests, and a runtime exception module for WER.
+pub fn accept(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(TRUE)
+}
+
+static POWER_REQUESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x0099_0000);
+
+/// `PowerCreateRequest(&reason)`: a request's handle.
+pub fn power_create_request(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(POWER_REQUESTS.fetch_add(4, std::sync::atomic::Ordering::Relaxed))
+}

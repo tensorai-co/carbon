@@ -42,6 +42,8 @@ pub enum Object {
     Bitmap,
     /// An icon or a cursor: its pixels, with alpha, are `Gdi::icons`'.
     Icon,
+    /// A region, as its bounding rectangle (regions of other shapes aren't kept yet).
+    Region(Rect),
 }
 
 const STOCK: u64 = 0x0080_0010;
@@ -124,6 +126,25 @@ impl Gdi {
         }
     }
 
+    /// A region's rectangle.
+    pub fn region(&self, handle: u64) -> Option<Rect> {
+        match self.objects.get(&handle)? {
+            Object::Region(r) => Some(*r),
+            _ => None,
+        }
+    }
+
+    /// Changes a region's rectangle: whether it's one.
+    pub fn set_region(&mut self, handle: u64, rect: Rect) -> bool {
+        match self.objects.get_mut(&handle) {
+            Some(Object::Region(r)) => {
+                *r = rect;
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn create(&mut self, object: Object) -> u64 {
         self.next = self.next.max(0x0030_0000) + 4;
         self.objects.insert(self.next, object);
@@ -191,6 +212,11 @@ impl Gdi {
             // A bitmap goes into a memory DC only.
             Object::Bitmap if dc.memory => &mut dc.bitmap,
             Object::Bitmap | Object::Icon => return None,
+            // A region selected is the clip (SelectClipRgn's), and what comes back is SIMPLEREGION.
+            Object::Region(r) => {
+                dc.clip = r;
+                return Some(2);
+            }
         };
         Some(std::mem::replace(slot, handle))
     }

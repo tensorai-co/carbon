@@ -135,6 +135,14 @@ pub fn x86_wide(name: &str) -> Option<(usize, Join)> {
         "WindowFromPoint" => (2, |s| vec![s[0] & LOW | (s[1] & LOW) << 32]),
         // (POINT, flags)
         "MonitorFromPoint" => (3, |s| vec![s[0] & LOW | (s[1] & LOW) << 32, s[2]]),
+        // (&rect, POINT)
+        "PtInRect" => (3, |s| vec![s[0], s[1] & LOW | (s[2] & LOW) << 32]),
+        // Event tracing's 64-bit handles, first: (handle), (handle, &header), (handle, &descriptor, count, &data),
+        // (handle, class, &information, length), (handle, &descriptor, &activity, &related, count, &data).
+        "EventUnregister" | "UnregisterTraceGuids" | "GetTraceEnableFlags" | "GetTraceEnableLevel" => (2, |s| vec![s[0] & LOW | (s[1] & LOW) << 32]),
+        "TraceEvent" => (3, |s| vec![s[0] & LOW | (s[1] & LOW) << 32, s[2]]),
+        "EventWrite" | "EventSetInformation" => (5, |s| vec![s[0] & LOW | (s[1] & LOW) << 32, s[2], s[3], s[4]]),
+        "EventWriteTransfer" => (7, |s| vec![s[0] & LOW | (s[1] & LOW) << 32, s[2], s[3], s[4], s[5], s[6]]),
         _ => return None,
     };
     Some(joined)
@@ -142,7 +150,7 @@ pub fn x86_wide(name: &str) -> Option<(usize, Join)> {
 
 /// The exports that return 64 bits, which x86 returns in edx:eax.
 pub fn x86_returns_wide(name: &str) -> bool {
-    matches!(name, "GetTickCount64" | "VerSetConditionMask")
+    matches!(name, "GetTickCount64" | "VerSetConditionMask" | "GetTraceLoggerHandle")
 }
 
 /// Whether an export is cdecl on x86: the C runtime's, and those with a variable number of arguments.

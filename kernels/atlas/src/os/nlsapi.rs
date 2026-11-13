@@ -505,6 +505,49 @@ pub fn get_string_type_ex_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Repl
     string_type(task, cx, a[1] as u32, src, a[4])
 }
 
+
+/// `FoldStringW(flags, source, length, out, room)`: the text as it is (its compatibility forms, ligatures and
+/// digits are folded already, being what English text has).
+pub fn fold_string_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let src = task.units_arg(cx, a[1], a[2] as i32);
+    let units = match src {
+        Ok(u) => u,
+        Err(e) => return failed(task, cx, e),
+    };
+    let mut out = units;
+    if a[2] as i32 == -1 {
+        out.push(0);
+    }
+    let bytes: Vec<u8> = out.iter().flat_map(|u| u.to_le_bytes()).collect();
+    task.give_back(cx, a[3], a[4] as i32, &bytes, 2)
+}
+
+/// `LCMapStringA(locale, flags, source, length, out, room)`.
+pub fn lc_map_string_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let flags = a[1] as u32;
+    let src = task.ansi_units_arg(cx, a[2], a[3] as i32);
+    if flags & LCMAP_SORTKEY != 0 {
+        return lc_map(task, cx, flags, src, a[4], a[5] as i32, false);
+    }
+    let units = match src {
+        Ok(u) => u,
+        Err(e) => return failed(task, cx, e),
+    };
+    let text = String::from_utf16_lossy(&units);
+    let mapped = if flags & LCMAP_LOWERCASE != 0 { text.to_lowercase() } else if flags & LCMAP_UPPERCASE != 0 { text.to_uppercase() } else { text };
+    let mut bytes = crate::ansi::bytes(&mapped).to_vec();
+    if a[3] as i32 == -1 {
+        bytes.push(0);
+    }
+    task.give_back(cx, a[4], a[5] as i32, &bytes, 1)
+}
+
+/// `GetStringTypeA(locale, info type, source, length, &types)`.
+pub fn get_string_type_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let src = task.ansi_units_arg(cx, a[2], a[3] as i32);
+    string_type(task, cx, a[1] as u32, src, a[4])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -161,3 +161,14 @@ GetUserObjectInformationW
 MapWindowPoints
 MsgWaitForMultipleObjects
 PostThreadMessageW
+FindWindowExW
+GetAncestor
+CreateWindowStationW
+OpenWindowStationW
+CloseWindowStation
+SetProcessWindowStation
+CreateDesktopW
+OpenDesktopW
+CloseDesktop
+SetThreadDesktop
+GetThreadDesktop

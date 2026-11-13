@@ -19,6 +19,7 @@ mod loader;
 mod lstr;
 #[cfg(target_arch = "x86")]
 mod msvc32;
+mod nt;
 mod oleaut;
 mod pe;
 mod pool;
@@ -38,8 +39,15 @@ use core::ffi::c_void;
 #[unsafe(no_mangle)]
 pub static _fltused: i32 = 0;
 
+/// A bug in atlas's own guest code: it says where, and the process ends as a failed security check would.
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    let mut m = strings::Message::new();
+    m.text(b"atlas-guest: panicked");
+    if let Some(at) = info.location() {
+        m.text(b" at ").text(at.file().as_bytes()).text(b":").decimal(u64::from(at.line()));
+    }
+    m.text(b"\n").print();
     sys::terminate(atlas_abi::status::STACK_BUFFER_OVERRUN)
 }
 
@@ -118,6 +126,17 @@ pub extern "system" fn RtlLockHeap(_heap: *mut c_void) -> u8 {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn RtlUnlockHeap(_heap: *mut c_void) -> u8 {
+    1
+}
+
+/// `HeapCreate(options, initial, maximum)`: the process heap, which every heap is here; `HeapDestroy` leaves it.
+#[unsafe(no_mangle)]
+pub extern "system" fn AtlasHeapCreate(_options: u32, _initial: usize, _maximum: usize) -> *mut c_void {
+    heap::process_heap()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn AtlasHeapDestroy(_heap: *mut c_void) -> i32 {
     1
 }
 
@@ -268,4 +287,123 @@ pub extern "system" fn NtQuerySystemInformation(class: u32, buffer: *mut c_void,
 #[unsafe(no_mangle)]
 pub extern "system" fn ZwQuerySystemInformation(class: u32, buffer: *mut c_void, length: u32, returned: *mut u32) -> u32 {
     NtQuerySystemInformation(class, buffer, length, returned)
+}
+
+/// `RtlNtStatusToDosError(status)`: the Win32 error an NTSTATUS is, for the ones programs meet.
+#[unsafe(no_mangle)]
+pub extern "system" fn RtlNtStatusToDosError(status: u32) -> u32 {
+    match status {
+        0 => 0,
+        0x0000_0103 => 997,
+        0x8000_0005 => 234,
+        0x8000_001a => 259,
+        0xc000_0001 => 31,
+        0xc000_0002 => 1,
+        0xc000_0005 => 998,
+        0xc000_0008 => 6,
+        0xc000_000d => 87,
+        0xc000_000f | 0xc000_0034 => 2,
+        0xc000_0011 => 38,
+        0xc000_0017 => 8,
+        0xc000_0022 => 5,
+        0xc000_0023 => 122,
+        0xc000_0035 => 183,
+        0xc000_003a => 3,
+        0xc000_0043 => 32,
+        0xc000_00bb => 50,
+        0xc000_0120 => 995,
+        0xc000_0135 => 126,
+        0xc000_0139 => 127,
+        s if s & 0xffff_0000 == 0xe000_0000 => s & 0xffff,
+        _ => 317,
+    }
+}
+
+/// `RtlGetUnloadEventTraceEx(&size, &count, &trace)`: no DLLs' unloads kept.
+#[unsafe(no_mangle)]
+pub extern "system" fn RtlGetUnloadEventTraceEx(size: *mut *mut u32, count: *mut *mut u32, trace: *mut *mut c_void) {
+    static NONE: [u32; 2] = [0, 0];
+    // SAFETY: the program's pointers, each to a pointer.
+    unsafe {
+        if !size.is_null() {
+            size.write((&raw const NONE[0]).cast_mut());
+        }
+        if !count.is_null() {
+            count.write((&raw const NONE[1]).cast_mut());
+        }
+        if !trace.is_null() {
+            trace.write(core::ptr::null_mut());
+        }
+    }
+}
+
+const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xc000_0004;
+const STATUS_INVALID_INFO_CLASS: u32 = 0xc000_0003;
+const STATUS_NOT_IMPLEMENTED: u32 = 0xc000_0002;
+
+/// Writes `fields` (pointer-sized each) as an information class's answer, if there's room, and its length.
+fn answer_fields(fields: &[usize], out: *mut usize, length: u32, returned: *mut u32) -> u32 {
+    let size = core::mem::size_of_val(fields) as u32;
+    if !returned.is_null() {
+        // SAFETY: the program's ULONG.
+        unsafe { returned.write(size) };
+    }
+    if length < size {
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+    // SAFETY: the program's buffer, `length` long.
+    unsafe { core::ptr::copy_nonoverlapping(fields.as_ptr(), out, fields.len()) };
+    0
+}
+
+/// `NtQueryInformationProcess(process, class, out, length, &returned)`, for this process: ProcessBasicInformation
+/// (its PEB and ID; its parent's ID isn't known here, so 0), ProcessDebugPort (none), ProcessWow64Information (the
+/// 32-bit PEB a WoW64 process has: none, as this isn't one of those from inside), ProcessDebugFlags (no debugger:
+/// 1). Another process's, and other classes, aren't answered yet.
+#[unsafe(no_mangle)]
+pub extern "system" fn NtQueryInformationProcess(process: usize, class: u32, out: *mut usize, length: u32, returned: *mut u32) -> u32 {
+    if process != usize::MAX {
+        return STATUS_NOT_IMPLEMENTED;
+    }
+    let pid = sync::AtlasGetCurrentProcessId() as usize;
+    match class {
+        // STILL_ACTIVE, the PEB, affinity, base priority, the ID, the parent's.
+        0 => answer_fields(&[0x103, peb() as usize, 1, 8, pid, 0], out, length, returned),
+        7 | 26 => answer_fields(&[0], out, length, returned),
+        31 => {
+            if length < 4 {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            // SAFETY: the program's ULONG.
+            unsafe { out.cast::<u32>().write_unaligned(1) };
+            if !returned.is_null() {
+                // SAFETY: as above.
+                unsafe { returned.write(4) };
+            }
+            0
+        }
+        _ => STATUS_INVALID_INFO_CLASS,
+    }
+}
+
+/// `NtQueryInformationThread(thread, class, out, length, &returned)`, for this thread: ThreadBasicInformation (exit
+/// status, its TEB, its process's and its own ID, affinity, priority).
+#[unsafe(no_mangle)]
+pub extern "system" fn NtQueryInformationThread(thread: usize, class: u32, out: *mut usize, length: u32, returned: *mut u32) -> u32 {
+    if thread != usize::MAX - 1 {
+        return STATUS_NOT_IMPLEMENTED;
+    }
+    match class {
+        0 => {
+            // NTSTATUS ExitStatus (pointer-aligned), TEB, CLIENT_ID (process, thread), affinity, then priority and
+            // base priority, two LONGs in one slot.
+            let ids = [sync::AtlasGetCurrentProcessId() as usize, sync::AtlasGetCurrentThreadId() as usize];
+            #[cfg(target_pointer_width = "64")]
+            let fields = [0x103, teb() as usize, ids[0], ids[1], 1, 8 | 8 << 32];
+            #[cfg(target_pointer_width = "32")]
+            let fields = [0x103, teb() as usize, ids[0], ids[1], 1, 8, 8];
+            answer_fields(&fields, out, length, returned)
+        }
+        _ => STATUS_INVALID_INFO_CLASS,
+    }
 }

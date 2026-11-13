@@ -14,6 +14,7 @@ pub mod gdi;
 pub mod image;
 pub mod keys;
 pub mod menu;
+pub mod stations;
 mod paint;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -83,6 +84,13 @@ const WA_ACTIVE: u64 = 1;
 
 /// The desktop: every top-level window's parent.
 pub const DESKTOP: u64 = 0x10010;
+/// The parent message-only windows have (`HWND_MESSAGE` when they're made): they get messages, but have no place on
+/// the screen, and `FindWindow` and `EnumWindows` pass them by.
+pub const MESSAGE_ROOT: u64 = 0x10014;
+/// `HWND_MESSAGE`, as a program passes it: (HWND)-3, at its pointers' width.
+fn is_hwnd_message(h: u64) -> bool {
+    h as u32 == 0xffff_fffd && (h >> 32 == 0 || h >> 32 == 0xffff_ffff)
+}
 pub const SCREEN: (i32, i32) = (1280, 800);
 pub const WS_POPUP: u32 = 0x8000_0000;
 pub const WS_CHILD: u32 = 0x4000_0000;
@@ -281,6 +289,10 @@ impl Window {
     pub fn top_level(&self) -> bool {
         self.parent == DESKTOP
     }
+
+    pub fn message_only(&self) -> bool {
+        self.parent == MESSAGE_ROOT
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -470,6 +482,8 @@ pub struct Win32k {
     pub menus: BTreeMap<u64, menu::Menu>,
     pub tracking: Option<menu::Tracking>,
     pub menu_bars: BTreeMap<u64, u64>,
+    /// Window stations and desktops.
+    pub stations: stations::Stations,
 }
 
 /// A window's system menu's handle is this plus the window's.
@@ -576,6 +590,7 @@ impl Win32k {
             menus: BTreeMap::new(),
             tracking: None,
             menu_bars: BTreeMap::new(),
+            stations: stations::Stations::default(),
         };
         w.register_system_classes();
         w
@@ -656,7 +671,7 @@ impl Win32k {
     pub fn top_level_of(&self, mut hwnd: u64) -> Option<u64> {
         loop {
             let w = self.windows.get(&hwnd)?;
-            if w.top_level() {
+            if w.top_level() || w.message_only() {
                 return Some(hwnd);
             }
             hwnd = w.parent;
@@ -1206,8 +1221,14 @@ impl Task {
             rect[2] = 640;
             rect[3] = 480;
         }
-        // A top-level window's parent, as CreateWindowExW has it, is its owner.
-        let (parent, owner) = if child { (parent, 0) } else { (DESKTOP, parent) };
+        // A top-level window's parent, as CreateWindowExW has it, is its owner; HWND_MESSAGE makes it message-only.
+        let (parent, owner) = if is_hwnd_message(parent) {
+            (MESSAGE_ROOT, 0)
+        } else if child {
+            (parent, 0)
+        } else {
+            (DESKTOP, parent)
+        };
         let hwnd = {
             let mut w = self.win32k();
             let Some(class) = w.class_by_name(&class_name).cloned() else {
@@ -1215,7 +1236,7 @@ impl Task {
                 self.set_last_error(cx, ERROR_CANNOT_FIND_WND_CLASS);
                 return Ok(0);
             };
-            if (parent != DESKTOP && !w.windows.contains_key(&parent)) || (owner != 0 && !w.windows.contains_key(&owner)) {
+            if (parent != DESKTOP && parent != MESSAGE_ROOT && !w.windows.contains_key(&parent)) || (owner != 0 && !w.windows.contains_key(&owner)) {
                 drop(w);
                 self.set_last_error(cx, ERROR_INVALID_WINDOW_HANDLE);
                 return Ok(0);
@@ -1291,7 +1312,7 @@ impl Task {
             // The ints after the four pointers; the names after them, aligned to a pointer.
             let ints = 4 * w;
             let names = (ints + 20).next_multiple_of(w);
-            for (o, v) in [(0, param), (w, instance), (2 * w, menu), (3 * w, if parent == DESKTOP { 0 } else { parent }), (names, name_ptr), (names + w, class_ptr)] {
+            for (o, v) in [(0, param), (w, instance), (2 * w, menu), (3 * w, match parent { DESKTOP => 0, MESSAGE_ROOT => u64::MAX - 2, _ => parent }), (names, name_ptr), (names + w, class_ptr)] {
                 cs[o..o + w].copy_from_slice(&v.to_le_bytes()[..w]);
             }
             for (o, v) in [(ints, rect[3]), (ints + 4, rect[2]), (ints + 8, rect[1]), (ints + 12, rect[0]), (ints + 16, style as i32), (names + 2 * w, ex_style as i32)] {
@@ -1399,6 +1420,10 @@ impl Task {
         let (was, shown) = {
             let mut w = self.win32k();
             let Some(win) = w.windows.get_mut(&hwnd) else { return Ok(false) };
+            // A message-only window is never seen.
+            if win.message_only() {
+                return Ok(false);
+            }
             let was = win.visible;
             win.visible = show;
             if show && !was {

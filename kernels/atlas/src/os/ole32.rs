@@ -59,6 +59,38 @@ dll! {
     host AtlasLinkSave(3) => link_save;
     host AtlasLinkSaveCompleted(2) => link_save_completed;
     host AtlasLinkGetCurFile(2) => link_get_cur_file;
+    // Not written yet: what larger programs import.
+    host CLSIDFromString(2) => clsid_from_string;
+    host IIDFromString(2) => clsid_from_string;
+    host StringFromCLSID(2) => string_from_iid;
+    host CoSetProxyBlanket(8) => s_ok;
+    host DoDragDrop(4) => do_drag_drop;
+    guest PropVariantClear => AtlasPropVariantClear;
+    host RegisterDragDrop(2) => s_ok;
+    host ReleaseStgMedium(1) => nothing;
+    host RevokeDragDrop(1) => s_ok;
+    host StringFromIID(2) => string_from_iid;
+    missing CoAddRefServerProcess;
+    missing CoAllowSetForegroundWindow;
+    missing CoCreateFreeThreadedMarshaler;
+    missing CoCreateGuid;
+    missing CoGetApartmentType;
+    missing CoGetContextToken;
+    missing CoGetInterfaceAndReleaseStream;
+    missing CoGetMalloc;
+    missing CoGetObjectContext;
+    missing CoMarshalInterThreadInterfaceInStream;
+    missing CoRegisterInitializeSpy;
+    missing CoReleaseServerProcess;
+    missing CoRevokeInitializeSpy;
+    missing CreateILockBytesOnHGlobal;
+    missing CreateStreamOnHGlobal;
+    missing GetHGlobalFromILockBytes;
+    missing GetHGlobalFromStream;
+    missing OleDuplicateData;
+    missing PropVariantCopy;
+    missing StgCreateDocfileOnILockBytes;
+    missing StringFromGUID2;
 }
 
 const S_OK: u64 = 0;
@@ -87,6 +119,68 @@ fn co_create_instance(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     match task.create_com_object(cx, a[0], a[3], a[4]) {
         Ok(Some(hr)) => Reply::Value(hr),
         Ok(None) => Reply::Value(CLASS_NOT_REGISTERED),
+        Err(reply) => reply,
+    }
+}
+
+fn s_ok(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(S_OK)
+}
+
+/// `DoDragDrop(data, source, effects, &effect)`: DRAGDROP_S_CANCEL, nothing dropped (dragging out of a window isn't
+/// there yet).
+fn do_drag_drop(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[3] != 0 {
+        let _ = task.mem(cx, true, |t| kernels_core::user::write_u32(&mut t.space(), a[3], 0));
+    }
+    Reply::Value(0x0004_0101)
+}
+
+/// A GUID's text, `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}`, as its 16 bytes.
+fn parse_guid(s: &str) -> Option<[u8; 16]> {
+    let hex: String = s.strip_prefix('{')?.strip_suffix('}')?.split('-').collect();
+    let parts: Vec<&str> = s.trim_matches(['{', '}']).split('-').collect();
+    if hex.len() != 32 || parts.iter().map(|p| p.len()).collect::<Vec<_>>() != [8, 4, 4, 4, 12] {
+        return None;
+    }
+    let byte = |i: usize| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok();
+    let mut g = [0u8; 16];
+    let a = u32::from_str_radix(&hex[..8], 16).ok()?;
+    let b = u16::from_str_radix(&hex[8..12], 16).ok()?;
+    let c = u16::from_str_radix(&hex[12..16], 16).ok()?;
+    g[..4].copy_from_slice(&a.to_le_bytes());
+    g[4..6].copy_from_slice(&b.to_le_bytes());
+    g[6..8].copy_from_slice(&c.to_le_bytes());
+    for (i, b) in g.iter_mut().enumerate().skip(8) {
+        *b = byte(i)?;
+    }
+    Some(g)
+}
+
+/// `CLSIDFromString(text, &clsid)` and `IIDFromString`: a GUID's braced text; CO_E_CLASSSTRING for what isn't one.
+fn clsid_from_string(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let text = task.wstr(cx, a[0]);
+    match parse_guid(&text) {
+        Some(g) if task.mem(cx, true, |t| kernels_core::user::write(&mut t.space(), a[1], &g)).is_ok() => Reply::Value(S_OK),
+        _ => Reply::Value(0x8004_01f3),
+    }
+}
+
+/// `StringFromIID(&iid, &text)` and `StringFromCLSID`: its braced text, in a block from `CoTaskMemAlloc`.
+fn string_from_iid(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Ok(g) = task.mem(cx, false, |t| kernels_core::user::read_vec(&t.space(), a[0], 16)) else { return Reply::Value(0x8007_0057) };
+    let text = format!(
+        "{{{:08X}-{:04X}-{:04X}-{}-{}}}",
+        u32::from_le_bytes([g[0], g[1], g[2], g[3]]),
+        u16::from_le_bytes([g[4], g[5]]),
+        u16::from_le_bytes([g[6], g[7]]),
+        g[8..10].iter().map(|b| format!("{b:02X}")).collect::<String>(),
+        g[10..16].iter().map(|b| format!("{b:02X}")).collect::<String>()
+    );
+    let bytes: Vec<u8> = text.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+    match task.task_alloc(cx, &bytes) {
+        Ok(at) if at != 0 && task.write_ptr(cx, a[1], at).is_ok() => Reply::Value(S_OK),
+        Ok(_) => Reply::Value(0x8007_000e),
         Err(reply) => reply,
     }
 }

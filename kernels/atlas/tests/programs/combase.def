@@ -1,0 +1,14 @@
+LIBRARY COMBASE.dll
+EXPORTS
+RoInitialize
+RoUninitialize
+RoGetActivationFactory
+WindowsCreateString
+WindowsCreateStringReference
+WindowsDeleteString
+WindowsDuplicateString
+WindowsGetStringLen
+WindowsGetStringRawBuffer
+WindowsIsStringEmpty
+WindowsStringHasEmbeddedNull
+WindowsCompareStringOrdinal

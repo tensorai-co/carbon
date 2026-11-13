@@ -342,3 +342,5 @@ GetProcessAffinityMask
 SetThreadAffinityMask
 ProcessIdToSessionId
 SetUnhandledExceptionFilter
+SuspendThread
+GetThreadContext

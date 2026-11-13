@@ -8,6 +8,9 @@ use crate::process::Task;
 dll! {
     "bcrypt.dll";
     host BCryptGenRandom(4) => b_crypt_gen_random;
+    // Not written yet: what larger programs import.
+    host BCryptCloseAlgorithmProvider(2) => b_crypt_close_algorithm_provider;
+    host BCryptOpenAlgorithmProvider(4) => b_crypt_open_algorithm_provider;
 }
 
 const STATUS_INVALID_HANDLE: u64 = 0xc000_0008;
@@ -25,4 +28,19 @@ fn b_crypt_gen_random(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
         return Reply::Value(STATUS_INVALID_PARAMETER);
     }
     Reply::Value(0)
+}
+
+/// An algorithm provider's handle: there's one generator, so every provider is the same.
+const PROVIDER: u64 = 0xbc00;
+
+/// `BCryptOpenAlgorithmProvider(&handle, algorithm, implementation, flags)`.
+fn b_crypt_open_algorithm_provider(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[0] == 0 || task.write_ptr(cx, a[0], PROVIDER).is_err() {
+        return Reply::Value(STATUS_INVALID_PARAMETER);
+    }
+    Reply::Value(0)
+}
+
+fn b_crypt_close_algorithm_provider(_: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(if a[0] == PROVIDER { 0 } else { STATUS_INVALID_HANDLE })
 }

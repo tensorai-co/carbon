@@ -90,3 +90,9 @@ RegisterEventSourceW
 ReportEventW
 DeregisterEventSource
 SystemFunction036
+SetEntriesInAclW
+BuildExplicitAccessWithNameW
+BuildTrusteeWithSidW
+EventRegister
+EventWrite
+EventUnregister

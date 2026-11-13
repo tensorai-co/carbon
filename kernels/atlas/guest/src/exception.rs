@@ -298,7 +298,19 @@ fn unhandled(record: &mut Record, context: &mut Context) -> ! {
             sys::continue_with(context);
         }
     }
-    Message::new().text(b"atlas-guest: unhandled exception ").hex(u64::from(record.code)).text(b" at ").hex(record.address as u64).text(b"\n").print();
+    {
+        let at = record.address as u64;
+        let mut m = Message::new();
+        m.text(b"atlas-guest: unhandled exception ").hex(u64::from(record.code)).text(b" at ").hex(at);
+        if let Some((name, offset)) = crate::loader::whose(at) {
+            m.text(b" (").text(name.as_bytes()).text(b"+").hex(offset).text(b")");
+        }
+        // An access violation's kind (0 read, 1 write, 8 execute) and address.
+        if record.code == 0xc000_0005 && record.count >= 2 {
+            m.text(if record.information[0] == 1 { b", writing " } else if record.information[0] == 8 { b", running " } else { b", reading " }).hex(record.information[1] as u64);
+        }
+        m.text(b"\n").print();
+    }
     sys::terminate(record.code)
 }
 
@@ -531,7 +543,19 @@ pub extern "system" fn AtlasUnhandledExceptionFilter(pointers: *mut Pointers) ->
     }
     // SAFETY: the program's EXCEPTION_POINTERS, if any.
     if let Some(record) = unsafe { pointers.as_ref() }.and_then(|p| unsafe { p.record.as_ref() }) {
-        Message::new().text(b"atlas-guest: unhandled exception ").hex(u64::from(record.code)).text(b" at ").hex(record.address as u64).text(b"\n").print();
+        {
+        let at = record.address as u64;
+        let mut m = Message::new();
+        m.text(b"atlas-guest: unhandled exception ").hex(u64::from(record.code)).text(b" at ").hex(at);
+        if let Some((name, offset)) = crate::loader::whose(at) {
+            m.text(b" (").text(name.as_bytes()).text(b"+").hex(offset).text(b")");
+        }
+        // An access violation's kind (0 read, 1 write, 8 execute) and address.
+        if record.code == 0xc000_0005 && record.count >= 2 {
+            m.text(if record.information[0] == 1 { b", writing " } else if record.information[0] == 8 { b", running " } else { b", reading " }).hex(record.information[1] as u64);
+        }
+        m.text(b"\n").print();
+    }
     }
     EXECUTE_HANDLER
 }

@@ -10,3 +10,13 @@ LdrRegisterDllNotification
 LdrUnregisterDllNotification
 _except_handler3
 _local_unwind2
+RtlFormatCurrentUserKeyPath
+RtlFreeUnicodeString
+RtlInitUnicodeString
+NtCreateKey
+NtOpenKeyEx
+NtOpenKey
+NtSetValueKey
+NtQueryValueKey
+NtDeleteKey
+NtClose
