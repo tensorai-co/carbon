@@ -3,33 +3,47 @@
 //! turn; a handler that takes it unwinds to its target with `RtlUnwindEx`, running termination handlers on the way.
 //! `RtlRaiseException` does the same for an exception the program raises itself. Vectored exception handlers are
 //! asked first, before any frame's; vectored continue handlers hear each exception the program carries on from.
+//!
+//! x86 has no unwind data: its frames' handlers are a chain from the TEB, which `seh32` walks. What's here for every
+//! ISA is the records, the vectored handlers, the unhandled filter and raising.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
-use atlas_abi::{record, status};
+use atlas_abi::record;
+#[cfg(not(target_arch = "x86"))]
+use atlas_abi::status;
 
-use crate::arch::{Context, RESULT, RtlCaptureContext};
+use crate::arch::Context;
+#[cfg(not(target_arch = "x86"))]
+use crate::arch::{RESULT, RtlCaptureContext};
 use crate::strings::Message;
 use crate::sys;
+#[cfg(not(target_arch = "x86"))]
 use crate::unwind::{self, CALL_BACK, EHANDLER, UHANDLER, Unwound};
 
-/// EXCEPTION_RECORD.
+/// EXCEPTION_RECORD: its pointers and its information are pointer-sized.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Record {
     pub code: u32,
     pub flags: u32,
-    pub record: u64,
-    pub address: u64,
+    pub record: usize,
+    pub address: usize,
     pub count: u32,
-    pub pad: u32,
-    pub information: [u64; 15],
+    pub information: [usize; 15],
 }
 
 const _: () = assert!(size_of::<Record>() == record::SIZE as usize);
 
+impl Record {
+    pub fn new(code: u32, flags: u32) -> Record {
+        Record { code, flags, record: 0, address: 0, count: 0, information: [0; 15] }
+    }
+}
+
 /// DISPATCHER_CONTEXT, as both ISAs have it (ARM64's last two fields are padding on x64).
+#[cfg(not(target_arch = "x86"))]
 #[repr(C)]
 pub struct Dispatcher {
     pub control_pc: u64,
@@ -53,35 +67,40 @@ pub struct Pointers {
     pub context: *mut Context,
 }
 
+#[cfg(not(target_arch = "x86"))]
 type Handler = extern "system" fn(*mut Record, u64, *mut Context, *mut Dispatcher) -> u32;
 
 /// How many frames a dispatch or an unwind walks at most: each is higher up the stack than the last, so this only
 /// stops a broken one going round in circles.
-const MOST_FRAMES: usize = 1 << 20;
+pub(crate) const MOST_FRAMES: usize = 1 << 20;
 
-const CONTINUE_EXECUTION: u32 = 0;
-const CONTINUE_SEARCH: u32 = 1;
-const UNWINDING: u32 = 2;
-const EXIT_UNWIND: u32 = 4;
-const TARGET_UNWIND: u32 = 0x20;
+pub(crate) const CONTINUE_EXECUTION: u32 = 0;
+pub(crate) const CONTINUE_SEARCH: u32 = 1;
+pub(crate) const UNWINDING: u32 = 2;
+pub(crate) const EXIT_UNWIND: u32 = 4;
+#[cfg_attr(target_arch = "x86", allow(dead_code))]
+pub(crate) const TARGET_UNWIND: u32 = 0x20;
 
 /// A dispatch in progress: the context it started from, which unwinding from inside it starts from too (the frames
 /// between are atlas-guest's own, with no handlers), and the one it interrupted.
-struct Dispatch {
-    context: *mut Context,
-    previous: *mut Dispatch,
+pub(crate) struct Dispatch {
+    /// What unwinding from inside the dispatch starts from: x64's and ARM64's, which unwind by tables.
+    #[cfg_attr(target_arch = "x86", allow(dead_code))]
+    pub(crate) context: *mut Context,
+    pub(crate) previous: *mut Dispatch,
 }
 
 /// This thread's dispatch in progress, kept in its TEB.
-fn dispatching() -> &'static AtomicPtr<Dispatch> {
+pub(crate) fn dispatching() -> &'static AtomicPtr<Dispatch> {
     // SAFETY: atlas-guest's own slot in this thread's TEB, a pointer in size and alignment.
     unsafe { &*crate::teb().add(atlas_abi::teb::ATLAS_DISPATCH as usize).cast::<AtomicPtr<Dispatch>>() }
 }
 /// `SetUnhandledExceptionFilter`'s.
-static UNHANDLED_FILTER: AtomicU64 = AtomicU64::new(0);
+static UNHANDLED_FILTER: AtomicUsize = AtomicUsize::new(0);
 
 /// One frame up: `c` becomes its caller. `unwound` says `c.pc` is a return address, not where it stopped. None at the
 /// top of the stack, or where it can't be unwound.
+#[cfg(not(target_arch = "x86"))]
 fn step(c: &mut Context, handler_type: u32, unwound: bool) -> Option<(Unwound, u64, u64)> {
     let sp = c.sp();
     let found = unwind::lookup(if unwound { c.pc - CALL_BACK } else { c.pc });
@@ -111,7 +130,7 @@ const MOST_VECTORED: usize = 64;
 /// Each list's handlers and where each goes: lower first. A handler added first gets a place below every other's,
 /// one added last a place above.
 struct Lists {
-    slots: [[(u64, i64); MOST_VECTORED]; 2],
+    slots: [[(usize, i64); MOST_VECTORED]; 2],
     first: i64,
     last: i64,
 }
@@ -137,11 +156,11 @@ fn with_vectored<R>(f: impl FnOnce(&mut Lists) -> R) -> R {
 }
 
 /// A handler's handle: its slot's address, which is the same for as long as it's there.
-fn handle_of(list: usize, slot: usize) -> u64 {
-    (&raw const VECTORED.lists) as u64 + ((list * MOST_VECTORED + slot) * 16) as u64
+fn handle_of(list: usize, slot: usize) -> usize {
+    (&raw const VECTORED.lists) as usize + (list * MOST_VECTORED + slot) * 16
 }
 
-fn add_vectored(list: usize, first: u32, handler: u64) -> u64 {
+fn add_vectored(list: usize, first: u32, handler: usize) -> usize {
     if handler == 0 {
         return 0;
     }
@@ -159,7 +178,7 @@ fn add_vectored(list: usize, first: u32, handler: u64) -> u64 {
     })
 }
 
-fn remove_vectored(list: usize, handle: u64) -> u32 {
+fn remove_vectored(list: usize, handle: usize) -> u32 {
     with_vectored(|l| {
         let slot = (0..MOST_VECTORED).find(|&i| handle_of(list, i) == handle && l.slots[list][i].0 != 0);
         match slot {
@@ -175,7 +194,7 @@ fn remove_vectored(list: usize, handle: u64) -> u32 {
 /// Asks a list's handlers in turn, as `EXCEPTION_POINTERS`: true if one says to carry on (only exception handlers
 /// can; every continue handler is told).
 fn call_vectored(list: usize, record: &mut Record, context: &mut Context) -> bool {
-    let mut handlers = [(0u64, 0i64); MOST_VECTORED];
+    let mut handlers = [(0usize, 0i64); MOST_VECTORED];
     let n = with_vectored(|l| {
         let mut n = 0;
         for &s in l.slots[list].iter().filter(|s| s.0 != 0) {
@@ -198,28 +217,30 @@ fn call_vectored(list: usize, record: &mut Record, context: &mut Context) -> boo
 
 /// `AddVectoredExceptionHandler(first, handler)`: a handle, or null.
 #[unsafe(no_mangle)]
-pub extern "system" fn RtlAddVectoredExceptionHandler(first: u32, handler: u64) -> u64 {
+pub extern "system" fn RtlAddVectoredExceptionHandler(first: u32, handler: usize) -> usize {
     add_vectored(EXCEPTION_HANDLERS, first, handler)
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn RtlRemoveVectoredExceptionHandler(handle: u64) -> u32 {
+pub extern "system" fn RtlRemoveVectoredExceptionHandler(handle: usize) -> u32 {
     remove_vectored(EXCEPTION_HANDLERS, handle)
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn RtlAddVectoredContinueHandler(first: u32, handler: u64) -> u64 {
+pub extern "system" fn RtlAddVectoredContinueHandler(first: u32, handler: usize) -> usize {
     add_vectored(CONTINUE_HANDLERS, first, handler)
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn RtlRemoveVectoredContinueHandler(handle: u64) -> u32 {
+pub extern "system" fn RtlRemoveVectoredContinueHandler(handle: usize) -> u32 {
     remove_vectored(CONTINUE_HANDLERS, handle)
 }
 
 /// Asks the vectored exception handlers, then each frame's handler, from where it happened up. True to carry on from
 /// `context`, once the vectored continue handlers have heard.
 fn dispatch(record: &mut Record, context: &mut Context) -> bool {
+    #[cfg(target_arch = "x86")]
+    use crate::seh32::dispatch_frames;
     let handled = call_vectored(EXCEPTION_HANDLERS, record, context) || dispatch_frames(record, context);
     if handled {
         call_vectored(CONTINUE_HANDLERS, record, context);
@@ -228,6 +249,7 @@ fn dispatch(record: &mut Record, context: &mut Context) -> bool {
 }
 
 /// Asks each frame's handler about an exception, from where it happened up. True to carry on from `context`.
+#[cfg(not(target_arch = "x86"))]
 fn dispatch_frames(record: &mut Record, context: &mut Context) -> bool {
     let mut c = *context;
     let mut unwound = false;
@@ -276,12 +298,12 @@ fn unhandled(record: &mut Record, context: &mut Context) -> ! {
             sys::continue_with(context);
         }
     }
-    Message::new().text(b"atlas-guest: unhandled exception ").hex(u64::from(record.code)).text(b" at ").hex(record.address).text(b"\n").print();
+    Message::new().text(b"atlas-guest: unhandled exception ").hex(u64::from(record.code)).text(b" at ").hex(record.address as u64).text(b"\n").print();
     sys::terminate(record.code)
 }
 
 /// Runs a dispatch with `context` as the current one.
-fn dispatch_from(record: &mut Record, context: &mut Context) -> ! {
+pub(crate) fn dispatch_from(record: &mut Record, context: &mut Context) -> ! {
     let mut frame = Dispatch { context, previous: dispatching().load(Ordering::Acquire) };
     dispatching().store(&mut frame, Ordering::Release);
     let handled = dispatch(record, context);
@@ -300,12 +322,20 @@ pub extern "system" fn AtlasDispatchException(record: *mut Record, context: *mut
     dispatch_from(record, context)
 }
 
-fn raise_simple(code: u32, flags: u32) {
-    let mut r = Record { code, flags, record: 0, address: 0, count: 0, pad: 0, information: [0; 15] };
-    RtlRaiseException(&mut r);
+pub(crate) fn raise_simple(code: u32, flags: u32) {
+    let mut r = Record::new(code, flags);
+    #[allow(unused_unsafe)]
+    // SAFETY: a record of our own (x86's RtlRaiseException is an assembly stub, so declared unsafe).
+    unsafe {
+        RtlRaiseException(&mut r)
+    };
 }
 
+#[cfg(target_arch = "x86")]
+use crate::seh32::RtlRaiseException;
+
 /// Raises an exception in this thread, as if it had happened where this was called from.
+#[cfg(not(target_arch = "x86"))]
 #[unsafe(no_mangle)]
 pub extern "system" fn RtlRaiseException(record: *mut Record) {
     let mut c = crate::arch::empty();
@@ -318,7 +348,7 @@ pub extern "system" fn RtlRaiseException(record: *mut Record) {
     // SAFETY: the caller's record.
     let record = unsafe { &mut *record };
     if record.address == 0 {
-        record.address = c.pc;
+        record.address = c.pc as usize;
     }
     // This returns when a handler says to carry on: the dispatcher continues at `c`, which is this call's return.
     // The compiler mustn't see that it never returns otherwise, or its caller's code after the call is gone.
@@ -329,19 +359,25 @@ pub extern "system" fn RtlRaiseException(record: *mut Record) {
 
 /// `RaiseException`, as kernel32 has it.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasRaiseException(code: u32, flags: u32, count: u32, arguments: *const u64) {
-    let mut r = Record { code, flags: flags & record::NONCONTINUABLE, record: 0, address: 0, count: count.min(15), pad: 0, information: [0; 15] };
+pub extern "system" fn AtlasRaiseException(code: u32, flags: u32, count: u32, arguments: *const usize) {
+    let mut r = Record { count: count.min(15), ..Record::new(code, flags & record::NONCONTINUABLE) };
     for i in 0..r.count as usize {
         // SAFETY: the caller's arguments, `count` of them.
         r.information[i] = unsafe { *arguments.add(i) };
     }
-    RtlRaiseException(&mut r);
+    #[allow(unused_unsafe)]
+    // SAFETY: as in `raise_simple`.
+    unsafe {
+        RtlRaiseException(&mut r)
+    };
 }
 
 /// Unwinds to `target_frame`, calling each frame's termination handlers on the way, then carries on at `target_ip`
 /// with `return_value` as the function's result. With no target frame, unwinds the whole stack.
+#[cfg(not(target_arch = "x86"))]
 #[unsafe(no_mangle)]
-pub extern "system" fn RtlUnwindEx(target_frame: u64, target_ip: u64, record: *mut Record, return_value: u64, _context: *mut Context, _history: u64) -> ! {
+pub extern "system" fn RtlUnwindEx(target_frame: usize, target_ip: usize, record: *mut Record, return_value: usize, _context: *mut Context, _history: usize) -> ! {
+    let (target_frame, target_ip, return_value) = (target_frame as u64, target_ip as u64, return_value as u64);
     let current = dispatching().load(Ordering::Acquire);
     let mut c = if current.is_null() {
         let mut c = crate::arch::empty();
@@ -352,7 +388,7 @@ pub extern "system" fn RtlUnwindEx(target_frame: u64, target_ip: u64, record: *m
         // SAFETY: the dispatch in progress, whose context is on the stack below it.
         unsafe { *(*current).context }
     };
-    let mut own = Record { code: status::UNWIND, flags: 0, record: 0, address: c.pc, count: 0, pad: 0, information: [0; 15] };
+    let mut own = Record { address: c.pc as usize, ..Record::new(status::UNWIND, 0) };
     // SAFETY: the caller's record, if it gave one.
     let record = if record.is_null() { &mut own } else { unsafe { &mut *record } };
     record.flags |= UNWINDING;
@@ -403,15 +439,19 @@ pub extern "system" fn RtlUnwindEx(target_frame: u64, target_ip: u64, record: *m
     sys::continue_with(&c)
 }
 
+#[cfg(not(target_arch = "x86"))]
 #[unsafe(no_mangle)]
-pub extern "system" fn RtlUnwind(target_frame: u64, target_ip: u64, record: *mut Record, return_value: u64) -> ! {
-    RtlUnwindEx(target_frame, target_ip, record, return_value, core::ptr::null_mut(), 0)
+pub extern "system" fn RtlUnwind(target_frame: usize, target_ip: usize, record: *mut Record, return_value: usize) -> ! {
+    let (target_frame, target_ip, return_value) = (target_frame as u64, target_ip as u64, return_value as u64);
+    RtlUnwindEx(target_frame as usize, target_ip as usize, record, return_value as usize, core::ptr::null_mut(), 0)
 }
 
 /// The handler C's `__try` uses: its data is a table of scopes, each a range of code with a filter and where its
 /// `__except` is, or with a `__finally` and no target.
+#[cfg(not(target_arch = "x86"))]
 #[unsafe(no_mangle)]
-pub extern "system" fn __C_specific_handler(record: *mut Record, frame: u64, context: *mut Context, d: *mut Dispatcher) -> u32 {
+pub extern "system" fn __C_specific_handler(record: *mut Record, frame: usize, context: *mut Context, d: *mut Dispatcher) -> u32 {
+    let frame = frame as u64;
     // SAFETY: what the dispatcher or unwinder gives every handler.
     let (r, d) = unsafe { (&mut *record, &mut *d) };
     let base = d.image_base;
@@ -443,7 +483,7 @@ pub extern "system" fn __C_specific_handler(record: *mut Record, frame: u64, con
                 return CONTINUE_EXECUTION;
             }
             if decision > 0 {
-                RtlUnwind(frame, base + u64::from(target), record, u64::from(r.code));
+                RtlUnwind(frame as usize, (base + u64::from(target)) as usize, record, (u64::from(r.code)) as usize);
             }
         }
     } else {
@@ -469,37 +509,47 @@ pub extern "system" fn __C_specific_handler(record: *mut Record, frame: u64, con
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasSetUnhandledExceptionFilter(filter: u64) -> u64 {
+pub extern "system" fn AtlasSetUnhandledExceptionFilter(filter: usize) -> usize {
     UNHANDLED_FILTER.swap(filter, Ordering::AcqRel)
 }
 
 /// `RtlLookupFunctionEntry`: the `.pdata` entry for `pc`, and its image's base.
+#[cfg(not(target_arch = "x86"))]
 #[unsafe(no_mangle)]
-pub extern "system" fn RtlLookupFunctionEntry(pc: u64, base: *mut u64, _history: u64) -> u64 {
-    match unwind::lookup(pc) {
-        Some((image, entry)) => {
-            // SAFETY: the caller's out-parameter.
-            unsafe { *base = image };
-            entry
+pub extern "system" fn RtlLookupFunctionEntry(pc: usize, base: *mut u64, _history: usize) -> usize {
+    let pc = pc as u64;
+    let result = (|| -> u64 {
+        match unwind::lookup(pc) {
+            Some((image, entry)) => {
+                // SAFETY: the caller's out-parameter.
+                unsafe { *base = image };
+                entry
+            }
+            None => 0,
         }
-        None => 0,
-    }
+    })();
+    result as usize
 }
 
 /// `RtlVirtualUnwind`: unwinds `context` one frame, giving its language handler, if it has one of `handler_type`.
+#[cfg(not(target_arch = "x86"))]
 #[unsafe(no_mangle)]
-pub extern "system" fn RtlVirtualUnwind(handler_type: u32, base: u64, pc: u64, entry: u64, context: *mut Context, handler_data: *mut u64, establisher: *mut u64, _pointers: u64) -> u64 {
-    // SAFETY: the caller's context and out-parameters.
-    unsafe {
-        let c = &mut *context;
-        c.pc = pc;
-        match unwind::virtual_unwind(base, entry, c, handler_type) {
-            Ok(u) => {
-                *establisher = u.establisher;
-                *handler_data = u.handler_data;
-                u.handler
+pub extern "system" fn RtlVirtualUnwind(handler_type: u32, base: usize, pc: usize, entry: usize, context: *mut Context, handler_data: *mut u64, establisher: *mut u64, _pointers: usize) -> usize {
+    let (base, pc, entry) = (base as u64, pc as u64, entry as u64);
+    let result = (|| -> u64 {
+        // SAFETY: the caller's context and out-parameters.
+        unsafe {
+            let c = &mut *context;
+            c.pc = pc;
+            match unwind::virtual_unwind(base, entry, c, handler_type) {
+                Ok(u) => {
+                    *establisher = u.establisher;
+                    *handler_data = u.handler_data;
+                    u.handler
+                }
+                Err(()) => 0,
             }
-            Err(()) => 0,
         }
-    }
+    })();
+    result as usize
 }

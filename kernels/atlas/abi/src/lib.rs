@@ -1,10 +1,22 @@
 //! What atlas and `atlas-guest` (the part of Windows that runs inside programs) share: the numbers of atlas's calls,
 //! Windows' status codes, and where things are in the TEB and PEB. Both sides come from the same build, so there's no
 //! version to check.
+//!
+//! The layouts with pointers in them come twice, 64-bit (`teb64`, `peb64`, …) and 32-bit (`teb32`, …), and `teb`,
+//! `peb`, `ldr`, `params` and `record` are the ones of whatever this is built for: the guest gets its own ISA's, and
+//! atlas, always 64-bit, picks a 32-bit process's by name.
 #![no_std]
 
+#[cfg(target_pointer_width = "64")]
+pub use self::{ldr64 as ldr, params64 as params, peb64 as peb, record64 as record, teb64 as teb};
+#[cfg(target_pointer_width = "32")]
+pub use self::{ldr32 as ldr, params32 as params, peb32 as peb, record32 as record, teb32 as teb};
+
 /// How a program reaches atlas: `svc #0` with the number in `x8` (ARM64), or `syscall` with it in `eax` and the
-/// first argument in `r10` (x86-64), as Windows' own system calls do.
+/// first argument in `r10` (x86-64), as Windows' own system calls do. 32-bit x86 uses `int 0x2e` with the number in
+/// `eax` and its arguments on the stack above a return address, as a stdcall function has them when it's called: a
+/// host export's stub is `mov eax, nr; int 0x2e; ret 4n`, and ntdll's own calls push theirs and a dummy return
+/// address the same way.
 pub mod call {
     /// atlas's own page of code in every process, below the system DLLs: what threads and upcalls return to, and
     /// x86-64's trampoline into atlas.
@@ -108,10 +120,33 @@ pub mod context {
     pub const ARM64_FPSR: u64 = 0x314;
     /// CONTEXT_ARM64 | CONTROL | INTEGER | FLOATING_POINT.
     pub const ARM64_FULL: u32 = 0x0040_0007;
+
+    /// x86's: 0x2cc bytes, 4-aligned. FloatSave is x87's `fnsave` area (0x70 bytes); ExtendedRegisters is
+    /// `fxsave`'s 512, with the xmm registers.
+    pub const X86_SIZE: u64 = 0x2cc;
+    pub const X86_FLAGS: u64 = 0;
+    pub const X86_FLOAT_SAVE: u64 = 0x1c;
+    pub const X86_SEG_GS: u64 = 0x8c;
+    pub const X86_SEG_FS: u64 = 0x90;
+    pub const X86_EDI: u64 = 0x9c;
+    pub const X86_ESI: u64 = 0xa0;
+    pub const X86_EBX: u64 = 0xa4;
+    pub const X86_EDX: u64 = 0xa8;
+    pub const X86_ECX: u64 = 0xac;
+    pub const X86_EAX: u64 = 0xb0;
+    pub const X86_EBP: u64 = 0xb4;
+    pub const X86_EIP: u64 = 0xb8;
+    pub const X86_SEG_CS: u64 = 0xbc;
+    pub const X86_EFLAGS: u64 = 0xc0;
+    pub const X86_ESP: u64 = 0xc4;
+    pub const X86_SEG_SS: u64 = 0xc8;
+    pub const X86_EXTENDED: u64 = 0xcc;
+    /// CONTEXT_i386 | CONTROL | INTEGER | SEGMENTS | FLOATING_POINT | EXTENDED_REGISTERS.
+    pub const X86_FULL: u32 = 0x0001_002f;
 }
 
 /// EXCEPTION_RECORD, 64-bit: 0x98 bytes.
-pub mod record {
+pub mod record64 {
     pub const SIZE: u64 = 0x98;
     pub const CODE: u64 = 0;
     pub const FLAGS: u64 = 4;
@@ -121,8 +156,19 @@ pub mod record {
     pub const NONCONTINUABLE: u32 = 1;
 }
 
+/// EXCEPTION_RECORD, 32-bit: 0x50 bytes.
+pub mod record32 {
+    pub const SIZE: u64 = 0x50;
+    pub const CODE: u64 = 0;
+    pub const FLAGS: u64 = 4;
+    pub const ADDRESS: u64 = 0x0c;
+    pub const PARAMETER_COUNT: u64 = 0x10;
+    pub const PARAMETERS: u64 = 0x14;
+    pub const NONCONTINUABLE: u32 = 1;
+}
+
 /// Where things are in a 64-bit TEB.
-pub mod teb {
+pub mod teb64 {
     /// NT_TIB: the stack's top and bottom.
     pub const STACK_BASE: u64 = 0x08;
     pub const STACK_LIMIT: u64 = 0x10;
@@ -151,8 +197,30 @@ pub mod teb {
     pub const SIZE: u64 = 0x1838;
 }
 
+/// Where things are in a 32-bit TEB. `fs` points at it.
+pub mod teb32 {
+    /// NT_TIB.ExceptionList: the chain of SEH frames, newest first, ending at -1.
+    pub const EXCEPTION_LIST: u64 = 0x00;
+    pub const STACK_BASE: u64 = 0x04;
+    pub const STACK_LIMIT: u64 = 0x08;
+    pub const FIBER_DATA: u64 = 0x10;
+    pub const SELF: u64 = 0x18;
+    pub const CLIENT_ID: u64 = 0x20;
+    pub const THREAD_LOCAL_STORAGE: u64 = 0x2c;
+    pub const PEB: u64 = 0x30;
+    pub const LAST_ERROR: u64 = 0x34;
+    pub const DEALLOCATION_STACK: u64 = 0xe0c;
+    pub const TLS_SLOTS: u64 = 0xe10;
+    pub const FLS_DATA: u64 = 0xfb4;
+    pub const SAME_TEB_FLAGS: u64 = 0xfca;
+    /// atlas-guest's own, past the TEB's end, as in the 64-bit one.
+    pub const ATLAS_DISPATCH: u64 = 0x1000;
+    pub const ATLAS_ERRNO: u64 = 0x1004;
+    pub const SIZE: u64 = 0xff8;
+}
+
 /// Where things are in a 64-bit PEB.
-pub mod peb {
+pub mod peb64 {
     pub const IMAGE_BASE: u64 = 0x10;
     /// PEB_LDR_DATA: the loader's three lists of modules, which ntdll keeps and programs walk.
     pub const LDR: u64 = 0x18;
@@ -171,8 +239,25 @@ pub mod peb {
     pub const SIZE: u64 = 0x7c8;
 }
 
+/// Where things are in a 32-bit PEB.
+pub mod peb32 {
+    pub const IMAGE_BASE: u64 = 0x08;
+    pub const LDR: u64 = 0x0c;
+    pub const PROCESS_PARAMETERS: u64 = 0x10;
+    pub const PROCESS_HEAP: u64 = 0x18;
+    pub const NUMBER_OF_PROCESSORS: u64 = 0x64;
+    pub const OS_MAJOR_VERSION: u64 = 0xa4;
+    pub const OS_MINOR_VERSION: u64 = 0xa8;
+    pub const OS_BUILD_NUMBER: u64 = 0xac;
+    pub const OS_PLATFORM_ID: u64 = 0xb0;
+    pub const IMAGE_SUBSYSTEM: u64 = 0xb4;
+    pub const IMAGE_SUBSYSTEM_MAJOR: u64 = 0xb8;
+    pub const IMAGE_SUBSYSTEM_MINOR: u64 = 0xbc;
+    pub const SIZE: u64 = 0x480;
+}
+
 /// The loader's structures, 64-bit: PEB_LDR_DATA, and an LDR_DATA_TABLE_ENTRY for each module, as Windows 10 has them.
-pub mod ldr {
+pub mod ldr64 {
     pub const DATA_SIZE: u64 = 0x58;
     pub const DATA_INITIALIZED: u64 = 0x04;
     /// Three LIST_ENTRY heads: load order, memory order, initialization order.
@@ -209,8 +294,37 @@ pub mod ldr {
     pub const REASON_DYNAMIC: u32 = 4;
 }
 
+/// The same, 32-bit: LIST_ENTRYs of two pointers, UNICODE_STRINGs of 8 bytes.
+pub mod ldr32 {
+    pub const DATA_SIZE: u64 = 0x30;
+    pub const DATA_INITIALIZED: u64 = 0x04;
+    pub const IN_LOAD_ORDER: u64 = 0x0c;
+    pub const IN_MEMORY_ORDER: u64 = 0x14;
+    pub const IN_INITIALIZATION_ORDER: u64 = 0x1c;
+    pub const DATA_SHUTDOWN_IN_PROGRESS: u64 = 0x28;
+
+    pub const ENTRY_SIZE: u64 = 0xa8;
+    pub const LOAD_LINKS: u64 = 0x00;
+    pub const MEMORY_LINKS: u64 = 0x08;
+    pub const INITIALIZATION_LINKS: u64 = 0x10;
+    pub const DLL_BASE: u64 = 0x18;
+    pub const ENTRY_POINT: u64 = 0x1c;
+    pub const SIZE_OF_IMAGE: u64 = 0x20;
+    pub const FULL_DLL_NAME: u64 = 0x24;
+    pub const BASE_DLL_NAME: u64 = 0x2c;
+    pub const FLAGS: u64 = 0x34;
+    pub const OBSOLETE_LOAD_COUNT: u64 = 0x38;
+    pub const TLS_INDEX: u64 = 0x3a;
+    pub const TIME_DATE_STAMP: u64 = 0x44;
+    pub const ORIGINAL_BASE: u64 = 0x80;
+    pub const LOAD_REASON: u64 = 0x94;
+    pub const REFERENCE_COUNT: u64 = 0x9c;
+
+    pub use super::ldr64::{ENTRY_PROCESSED, IMAGE_DLL, PROCESS_ATTACH_CALLED, REASON_DYNAMIC, REASON_STATIC};
+}
+
 /// Where things are in 64-bit RTL_USER_PROCESS_PARAMETERS. Each is a UNICODE_STRING: lengths, then a pointer.
-pub mod params {
+pub mod params64 {
     pub const STANDARD_INPUT: u64 = 0x20;
     pub const STANDARD_OUTPUT: u64 = 0x28;
     pub const STANDARD_ERROR: u64 = 0x30;
@@ -222,6 +336,19 @@ pub mod params {
     /// Its size, in bytes.
     pub const ENVIRONMENT_SIZE: u64 = 0x3f0;
     pub const SIZE: u64 = 0x440;
+}
+
+/// The same, 32-bit.
+pub mod params32 {
+    pub const STANDARD_INPUT: u64 = 0x18;
+    pub const STANDARD_OUTPUT: u64 = 0x1c;
+    pub const STANDARD_ERROR: u64 = 0x20;
+    pub const CURRENT_DIRECTORY: u64 = 0x24;
+    pub const IMAGE_PATH_NAME: u64 = 0x38;
+    pub const COMMAND_LINE: u64 = 0x40;
+    pub const ENVIRONMENT: u64 = 0x48;
+    pub const ENVIRONMENT_SIZE: u64 = 0x290;
+    pub const SIZE: u64 = 0x2b0;
 }
 
 /// Windows-1252, the ANSI code page atlas's `*A` functions speak (`GetACP`), both ways. Its 0x80 to 0x9F aren't

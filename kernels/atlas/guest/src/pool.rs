@@ -245,7 +245,7 @@ fn new_pool(max: u32) -> *mut Pool {
 /// The pool a callback environment names, else the process's own.
 fn pool_of(state: &mut State, environment: u64) -> *mut Pool {
     // SAFETY: TP_CALLBACK_ENVIRON's Pool, if there's one.
-    let named = if environment != 0 { unsafe { *((environment + 8) as *const u64) } } else { 0 };
+    let named = if environment != 0 { unsafe { crate::pe::ptr_at(environment + crate::pe::PTR) } } else { 0 };
     if named != 0 {
         return named as *mut Pool;
     }
@@ -257,7 +257,7 @@ fn pool_of(state: &mut State, environment: u64) -> *mut Pool {
 
 fn group_of(environment: u64) -> *mut Group {
     // SAFETY: TP_CALLBACK_ENVIRON's CleanupGroup.
-    (if environment != 0 { unsafe { *((environment + 0x10) as *const u64) } } else { 0 }) as *mut Group
+    (if environment != 0 { unsafe { crate::pe::ptr_at(environment + 2 * crate::pe::PTR) } } else { 0 }) as usize as *mut Group
 }
 
 /// A new object, in its pool and cleanup group.
@@ -514,38 +514,39 @@ fn run(object: *mut Object, result: u32, overlapped: u64, bytes: u64) {
     // SAFETY: the object, which can't go while it's running; its callback, as Windows calls each kind.
     unsafe {
         let (kind, callback, context) = ((*object).kind, (*object).callback, (*object).context);
-        let me = &raw mut instance as u64;
+        let me = &raw mut instance as usize;
+        let (callback, context, object_at, overlapped) = (callback as usize, context as usize, object as usize, overlapped as usize);
         match kind {
             Kind::Work | Kind::Timer => {
-                let f: extern "system" fn(u64, u64, u64) = core::mem::transmute(callback);
-                f(me, context, object as u64);
+                let f: extern "system" fn(usize, usize, usize) = core::mem::transmute(callback);
+                f(me, context, object_at);
             }
             Kind::Wait => {
-                let f: extern "system" fn(u64, u64, u64, u32) = core::mem::transmute(callback);
-                f(me, context, object as u64, result);
+                let f: extern "system" fn(usize, usize, usize, u32) = core::mem::transmute(callback);
+                f(me, context, object_at, result);
             }
             Kind::Simple => {
-                let f: extern "system" fn(u64, u64) = core::mem::transmute(callback);
+                let f: extern "system" fn(usize, usize) = core::mem::transmute(callback);
                 f(me, context);
             }
             Kind::UserItem => {
-                let f: extern "system" fn(u64) -> u32 = core::mem::transmute(callback);
+                let f: extern "system" fn(usize) -> u32 = core::mem::transmute(callback);
                 f(context);
             }
             Kind::Registered => {
-                let f: extern "system" fn(u64, u8) = core::mem::transmute(callback);
+                let f: extern "system" fn(usize, u8) = core::mem::transmute(callback);
                 f(context, u8::from(result == WAIT_TIMEOUT));
             }
             Kind::Io => {
-                let f: extern "system" fn(u64, u64, u64, u32, u64, u64) = core::mem::transmute(callback);
-                f(me, context, overlapped, result, bytes, object as u64);
+                let f: extern "system" fn(usize, usize, usize, u32, usize, usize) = core::mem::transmute(callback);
+                f(me, context, overlapped, result, bytes as usize, object_at);
             }
             Kind::Bound => {
-                let f: extern "system" fn(u32, u32, u64) = core::mem::transmute(callback);
+                let f: extern "system" fn(u32, u32, usize) = core::mem::transmute(callback);
                 f(result, bytes as u32, overlapped);
             }
             Kind::QueueTimer => {
-                let f: extern "system" fn(u64, u8) = core::mem::transmute(callback);
+                let f: extern "system" fn(usize, u8) = core::mem::transmute(callback);
                 f(context, 1);
             }
         }
@@ -563,7 +564,7 @@ fn run(object: *mut Object, result: u32, overlapped: u64, bytes: u64) {
         set_event(instance.event);
     }
     if instance.library != 0 {
-        crate::loader::AtlasFreeLibrary(instance.library);
+        crate::loader::AtlasFreeLibrary(instance.library as usize);
     }
     if !instance.disassociated {
         callback_over(object);
@@ -586,17 +587,21 @@ fn callback_over(object: *mut Object) {
 // ---- Pools ----
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasCreateThreadpool(_reserved: u64) -> u64 {
-    let pool = new_pool(MOST_THREADS);
-    if pool.is_null() {
-        crate::RtlSetLastWin32Error(ERROR_NOT_ENOUGH_MEMORY);
-    }
-    pool as u64
+pub extern "system" fn AtlasCreateThreadpool(_reserved: usize) -> usize {
+    let result = (|| -> u64 {
+        let pool = new_pool(MOST_THREADS);
+        if pool.is_null() {
+            crate::RtlSetLastWin32Error(ERROR_NOT_ENOUGH_MEMORY);
+        }
+        pool as u64
+    })();
+    result as usize
 }
 
 /// `CloseThreadpool`: its workers end once what's queued has run, and it goes with the last.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasCloseThreadpool(pool: u64) {
+pub extern "system" fn AtlasCloseThreadpool(pool: usize) {
+    let pool = pool as u64;
     let pool = pool as *mut Pool;
     if pool.is_null() {
         return;
@@ -614,7 +619,8 @@ pub extern "system" fn AtlasCloseThreadpool(pool: u64) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasSetThreadpoolThreadMaximum(pool: u64, most: u32) {
+pub extern "system" fn AtlasSetThreadpoolThreadMaximum(pool: usize, most: u32) {
+    let pool = pool as u64;
     let pool = pool as *mut Pool;
     // SAFETY: the program's pool, under the lock.
     with(|_| unsafe {
@@ -625,7 +631,8 @@ pub extern "system" fn AtlasSetThreadpoolThreadMaximum(pool: u64, most: u32) {
 
 /// `SetThreadpoolThreadMinimum`: as many workers as that start now, and stay.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasSetThreadpoolThreadMinimum(pool: u64, least: u32) -> i32 {
+pub extern "system" fn AtlasSetThreadpoolThreadMinimum(pool: usize, least: u32) -> i32 {
+    let pool = pool as u64;
     let pool = pool as *mut Pool;
     // SAFETY: as above.
     with(|_| unsafe {
@@ -645,29 +652,37 @@ pub extern "system" fn AtlasSetThreadpoolThreadMinimum(pool: u64, least: u32) ->
 // ---- Work ----
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasCreateThreadpoolWork(callback: u64, context: u64, environment: u64) -> u64 {
-    make(Kind::Work, callback, context, environment) as u64
+pub extern "system" fn AtlasCreateThreadpoolWork(callback: usize, context: usize, environment: usize) -> usize {
+    let (callback, context, environment) = (callback as u64, context as u64, environment as u64);
+    let result = (|| -> u64 {
+        make(Kind::Work, callback, context, environment) as u64
+    })();
+    result as usize
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasSubmitThreadpoolWork(work: u64) {
+pub extern "system" fn AtlasSubmitThreadpoolWork(work: usize) {
+    let work = work as u64;
     // SAFETY: the program's work, under the lock.
     with(|_| unsafe { submit(work as *mut Object, 0) });
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasWaitForThreadpoolWorkCallbacks(work: u64, cancel: i32) {
+pub extern "system" fn AtlasWaitForThreadpoolWorkCallbacks(work: usize, cancel: i32) {
+    let work = work as u64;
     wait_callbacks(work as *mut Object, cancel != 0);
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasCloseThreadpoolWork(work: u64) {
+pub extern "system" fn AtlasCloseThreadpoolWork(work: usize) {
+    let work = work as u64;
     close(work as *mut Object);
 }
 
 /// `TrySubmitThreadpoolCallback(callback, context, environment)`: once, on the pool.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasTrySubmitThreadpoolCallback(callback: u64, context: u64, environment: u64) -> i32 {
+pub extern "system" fn AtlasTrySubmitThreadpoolCallback(callback: usize, context: usize, environment: usize) -> i32 {
+    let (callback, context, environment) = (callback as u64, context as u64, environment as u64);
     let object = make(Kind::Simple, callback, context, environment);
     if object.is_null() {
         return 0;
@@ -679,7 +694,8 @@ pub extern "system" fn AtlasTrySubmitThreadpoolCallback(callback: u64, context: 
 
 /// `QueueUserWorkItem(function, context, flags)`: `function(context)` once, on the process's pool.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasQueueUserWorkItem(function: u64, context: u64, flags: u32) -> i32 {
+pub extern "system" fn AtlasQueueUserWorkItem(function: usize, context: usize, flags: u32) -> i32 {
+    let (function, context) = (function as u64, context as u64);
     let object = make(Kind::UserItem, function, context, 0);
     if object.is_null() {
         return 0;
@@ -722,8 +738,12 @@ unsafe fn more_if_none_idle(pool: *mut Pool) -> bool {
 // ---- Timers ----
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasCreateThreadpoolTimer(callback: u64, context: u64, environment: u64) -> u64 {
-    make(Kind::Timer, callback, context, environment) as u64
+pub extern "system" fn AtlasCreateThreadpoolTimer(callback: usize, context: usize, environment: usize) -> usize {
+    let (callback, context, environment) = (callback as u64, context as u64, environment as u64);
+    let result = (|| -> u64 {
+        make(Kind::Timer, callback, context, environment) as u64
+    })();
+    result as usize
 }
 
 /// Takes a timer off the list of those set. Under the lock.
@@ -749,7 +769,8 @@ unsafe fn unlink_timer(state: &mut State, timer: *mut Object) {
 /// `SetThreadpoolTimer(timer, &due, period, window)`: due when the FILETIME says (relative if negative), then every
 /// `period` milliseconds if that isn't 0; with no due time, not set. Callbacks queued already still run.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasSetThreadpoolTimer(timer: u64, due: *const i64, period_ms: u32, _window: u32) {
+pub extern "system" fn AtlasSetThreadpoolTimer(timer: usize, due: *const i64, period_ms: u32, _window: u32) {
+    let timer = timer as u64;
     // SAFETY: the program's due time, if it gives one.
     let when = if due.is_null() { None } else { Some(deadline(unsafe { due.read_unaligned() })) };
     arm_timer(timer as *mut Object, when, period_ms);
@@ -776,19 +797,22 @@ fn arm_timer(timer: *mut Object, due: Option<u64>, period_ms: u32) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasIsThreadpoolTimerSet(timer: u64) -> i32 {
+pub extern "system" fn AtlasIsThreadpoolTimerSet(timer: usize) -> i32 {
+    let timer = timer as u64;
     // SAFETY: the program's timer.
     with(|_| i32::from(unsafe { (*(timer as *mut Object)).armed }))
 }
 
 /// `WaitForThreadpoolTimerCallbacks(timer, cancel)`: with `cancel`, it isn't set any more either.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasWaitForThreadpoolTimerCallbacks(timer: u64, cancel: i32) {
+pub extern "system" fn AtlasWaitForThreadpoolTimerCallbacks(timer: usize, cancel: i32) {
+    let timer = timer as u64;
     wait_callbacks(timer as *mut Object, cancel != 0);
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasCloseThreadpoolTimer(timer: u64) {
+pub extern "system" fn AtlasCloseThreadpoolTimer(timer: usize) {
+    let timer = timer as u64;
     close(timer as *mut Object);
     signal(&TIMER_SIGNAL, true);
 }
@@ -830,8 +854,12 @@ extern "system" fn AtlasPoolTimers(_: u64) -> u32 {
 // ---- Waits ----
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasCreateThreadpoolWait(callback: u64, context: u64, environment: u64) -> u64 {
-    make(Kind::Wait, callback, context, environment) as u64
+pub extern "system" fn AtlasCreateThreadpoolWait(callback: usize, context: usize, environment: usize) -> usize {
+    let (callback, context, environment) = (callback as u64, context as u64, environment as u64);
+    let result = (|| -> u64 {
+        make(Kind::Wait, callback, context, environment) as u64
+    })();
+    result as usize
 }
 
 /// Sets a wait (or a registered wait) on `handle`, timing out at `timeout` (0: never); with no handle, not set.
@@ -871,14 +899,16 @@ fn arm(wait: *mut Object, handle: u64, timeout: u64) {
 /// `SetThreadpoolWait(wait, handle, &timeout)`: one callback, as the handle's signalled or the time's up (none: never;
 /// relative if negative), with WAIT_OBJECT_0 or WAIT_TIMEOUT.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasSetThreadpoolWait(wait: u64, handle: u64, timeout: *const i64) {
+pub extern "system" fn AtlasSetThreadpoolWait(wait: usize, handle: usize, timeout: *const i64) {
+    let (wait, handle) = (wait as u64, handle as u64);
     // SAFETY: the program's FILETIME, if it gives one.
     let when = if timeout.is_null() { 0 } else { deadline(unsafe { timeout.read_unaligned() }).max(1) };
     arm(wait as *mut Object, handle, when);
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasWaitForThreadpoolWaitCallbacks(wait: u64, cancel: i32) {
+pub extern "system" fn AtlasWaitForThreadpoolWaitCallbacks(wait: usize, cancel: i32) {
+    let wait = wait as u64;
     if cancel != 0 {
         // SAFETY: the program's wait, under the lock.
         with(|_| unsafe { (*(wait as *mut Object)).armed = false });
@@ -887,7 +917,8 @@ pub extern "system" fn AtlasWaitForThreadpoolWaitCallbacks(wait: u64, cancel: i3
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasCloseThreadpoolWait(wait: u64) {
+pub extern "system" fn AtlasCloseThreadpoolWait(wait: usize) {
+    let wait = wait as u64;
     close(wait as *mut Object);
 }
 
@@ -955,7 +986,8 @@ extern "system" fn AtlasPoolWaiter(wait: u64) -> u32 {
 /// `RegisterWaitForSingleObject(&wait, handle, callback, context, milliseconds, flags)`: `callback(context, timed
 /// out)` each time the handle's signalled (or the time's up), or only the first time (WT_EXECUTEONLYONCE).
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasRegisterWaitForSingleObject(out: *mut u64, handle: u64, callback: u64, context: u64, ms: u32, flags: u32) -> i32 {
+pub extern "system" fn AtlasRegisterWaitForSingleObject(out: *mut usize, handle: usize, callback: usize, context: usize, ms: u32, flags: u32) -> i32 {
+    let (handle, callback, context) = (handle as u64, callback as u64, context as u64);
     if out.is_null() || handle == 0 {
         crate::RtlSetLastWin32Error(ERROR_INVALID_PARAMETER);
         return 0;
@@ -968,7 +1000,7 @@ pub extern "system" fn AtlasRegisterWaitForSingleObject(out: *mut u64, handle: u
     unsafe {
         (*wait).once = flags & WT_EXECUTEONLYONCE != 0;
         (*wait).period_ms = ms;
-        out.write_unaligned(wait as u64);
+        out.write_unaligned((wait as u64) as usize);
     }
     arm(wait, handle, if ms == INFINITE { 0 } else { now() + u64::from(ms) * 10_000 });
     1
@@ -977,7 +1009,8 @@ pub extern "system" fn AtlasRegisterWaitForSingleObject(out: *mut u64, handle: u
 /// `UnregisterWaitEx(wait, event)`: no more callbacks. With INVALID_HANDLE_VALUE, it waits for those running; with an
 /// event, it sets it once they've run.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasUnregisterWaitEx(wait: u64, event: u64) -> i32 {
+pub extern "system" fn AtlasUnregisterWaitEx(wait: usize, event: usize) -> i32 {
+    let (wait, event) = (wait as u64, event as u64);
     let object = wait as *mut Object;
     if object.is_null() {
         crate::RtlSetLastWin32Error(ERROR_INVALID_PARAMETER);
@@ -996,8 +1029,9 @@ pub extern "system" fn AtlasUnregisterWaitEx(wait: u64, event: u64) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasUnregisterWait(wait: u64) -> i32 {
-    AtlasUnregisterWaitEx(wait, 0)
+pub extern "system" fn AtlasUnregisterWait(wait: usize) -> i32 {
+    let wait = wait as u64;
+    AtlasUnregisterWaitEx(wait as usize, 0)
 }
 
 // ---- I/O ----
@@ -1081,20 +1115,26 @@ fn bind(kind: Kind, handle: u64, callback: u64, context: u64, environment: u64) 
 /// `CreateThreadpoolIo(file, callback, context, environment)`: the file's overlapped I/O, completed, is the callback's
 /// on the pool.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasCreateThreadpoolIo(file: u64, callback: u64, context: u64, environment: u64) -> u64 {
-    bind(Kind::Io, file, callback, context, environment) as u64
+pub extern "system" fn AtlasCreateThreadpoolIo(file: usize, callback: usize, context: usize, environment: usize) -> usize {
+    let (file, callback, context, environment) = (file as u64, callback as u64, context as u64, environment as u64);
+    let result = (|| -> u64 {
+        bind(Kind::Io, file, callback, context, environment) as u64
+    })();
+    result as usize
 }
 
 /// `StartThreadpoolIo`: before each operation, as Windows asks.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasStartThreadpoolIo(io: u64) {
+pub extern "system" fn AtlasStartThreadpoolIo(io: usize) {
+    let io = io as u64;
     // SAFETY: the program's I/O object, under the lock.
     with(|_| unsafe { (*(io as *mut Object)).pending_io += 1 });
 }
 
 /// `CancelThreadpoolIo`: an operation that failed at once, and won't complete.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasCancelThreadpoolIo(io: u64) {
+pub extern "system" fn AtlasCancelThreadpoolIo(io: usize) {
+    let io = io as u64;
     // SAFETY: as above.
     with(|_| unsafe {
         let o = io as *mut Object;
@@ -1103,19 +1143,22 @@ pub extern "system" fn AtlasCancelThreadpoolIo(io: u64) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasWaitForThreadpoolIoCallbacks(io: u64, cancel: i32) {
+pub extern "system" fn AtlasWaitForThreadpoolIoCallbacks(io: usize, cancel: i32) {
+    let io = io as u64;
     wait_callbacks(io as *mut Object, cancel != 0);
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasCloseThreadpoolIo(io: u64) {
+pub extern "system" fn AtlasCloseThreadpoolIo(io: usize) {
+    let io = io as u64;
     close(io as *mut Object);
 }
 
 /// `BindIoCompletionCallback(file, function, flags)`: each of the file's completions is `function(error, bytes,
 /// overlapped)` on the process's pool.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasBindIoCompletionCallback(file: u64, function: u64, _flags: u32) -> i32 {
+pub extern "system" fn AtlasBindIoCompletionCallback(file: usize, function: usize, _flags: u32) -> i32 {
+    let (file, function) = (file as u64, function as u64);
     i32::from(!bind(Kind::Bound, file, function, 0, 0).is_null())
 }
 
@@ -1123,14 +1166,18 @@ pub extern "system" fn AtlasBindIoCompletionCallback(file: u64, function: u64, _
 
 /// `CreateTimerQueue`: a group of timers, deleted together.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasCreateTimerQueue() -> u64 {
-    new(Group { head: core::ptr::null_mut() }) as u64
+pub extern "system" fn AtlasCreateTimerQueue() -> usize {
+    let result = (|| -> u64 {
+        new(Group { head: core::ptr::null_mut() }) as u64
+    })();
+    result as usize
 }
 
 /// `CreateTimerQueueTimer(&timer, queue, callback, parameter, due ms, period ms, flags)`: `callback(parameter,
 /// TRUE)` on the process's pool when it's due, and every period after (but once, with WT_EXECUTEONLYONCE).
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasCreateTimerQueueTimer(out: *mut u64, queue: u64, callback: u64, parameter: u64, due_ms: u32, period_ms: u32, flags: u32) -> i32 {
+pub extern "system" fn AtlasCreateTimerQueueTimer(out: *mut usize, queue: usize, callback: usize, parameter: usize, due_ms: u32, period_ms: u32, flags: u32) -> i32 {
+    let (queue, callback, parameter) = (queue as u64, callback as u64, parameter as u64);
     if out.is_null() {
         crate::RtlSetLastWin32Error(ERROR_INVALID_PARAMETER);
         return 0;
@@ -1151,13 +1198,14 @@ pub extern "system" fn AtlasCreateTimerQueueTimer(out: *mut u64, queue: u64, cal
     let period = if flags & WT_EXECUTEONLYONCE != 0 { 0 } else { period_ms };
     arm_timer(timer, Some(now() + u64::from(due_ms) * 10_000), period);
     // SAFETY: the program's out pointer.
-    unsafe { out.write_unaligned(timer as u64) };
+    unsafe { out.write_unaligned((timer as u64) as usize) };
     1
 }
 
 /// `ChangeTimerQueueTimer(queue, timer, due ms, period ms)`.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasChangeTimerQueueTimer(_queue: u64, timer: u64, due_ms: u32, period_ms: u32) -> i32 {
+pub extern "system" fn AtlasChangeTimerQueueTimer(_queue: usize, timer: usize, due_ms: u32, period_ms: u32) -> i32 {
+    let timer = timer as u64;
     arm_timer(timer as *mut Object, Some(now() + u64::from(due_ms) * 10_000), period_ms);
     1
 }
@@ -1177,7 +1225,8 @@ fn delete_queue_timer(timer: *mut Object, event: u64) {
 
 /// `DeleteTimerQueueTimer(queue, timer, completion event)`.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasDeleteTimerQueueTimer(_queue: u64, timer: u64, event: u64) -> i32 {
+pub extern "system" fn AtlasDeleteTimerQueueTimer(_queue: usize, timer: usize, event: usize) -> i32 {
+    let (timer, event) = (timer as u64, event as u64);
     if timer == 0 {
         crate::RtlSetLastWin32Error(ERROR_INVALID_PARAMETER);
         return 0;
@@ -1188,7 +1237,8 @@ pub extern "system" fn AtlasDeleteTimerQueueTimer(_queue: u64, timer: u64, event
 
 /// `DeleteTimerQueueEx(queue, completion event)`: each of its timers deleted, then the queue.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasDeleteTimerQueueEx(queue: u64, event: u64) -> i32 {
+pub extern "system" fn AtlasDeleteTimerQueueEx(queue: usize, event: usize) -> i32 {
+    let (queue, event) = (queue as u64, event as u64);
     let queue = queue as *mut Group;
     if queue.is_null() {
         crate::RtlSetLastWin32Error(ERROR_INVALID_PARAMETER);
@@ -1210,21 +1260,26 @@ pub extern "system" fn AtlasDeleteTimerQueueEx(queue: u64, event: u64) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasDeleteTimerQueue(queue: u64) -> i32 {
-    AtlasDeleteTimerQueueEx(queue, 0)
+pub extern "system" fn AtlasDeleteTimerQueue(queue: usize) -> i32 {
+    let queue = queue as u64;
+    AtlasDeleteTimerQueueEx(queue as usize, 0)
 }
 
 // ---- Cleanup groups ----
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasCreateThreadpoolCleanupGroup() -> u64 {
-    new(Group { head: core::ptr::null_mut() }) as u64
+pub extern "system" fn AtlasCreateThreadpoolCleanupGroup() -> usize {
+    let result = (|| -> u64 {
+        new(Group { head: core::ptr::null_mut() }) as u64
+    })();
+    result as usize
 }
 
 /// `CloseThreadpoolCleanupGroupMembers(group, cancel, context)`: every object made with it, closed once its callbacks
 /// have run (those queued not run at all, with `cancel`).
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasCloseThreadpoolCleanupGroupMembers(group: u64, cancel: i32, _context: u64) {
+pub extern "system" fn AtlasCloseThreadpoolCleanupGroupMembers(group: usize, cancel: i32, _context: usize) {
+    let group = group as u64;
     let group = group as *mut Group;
     loop {
         // SAFETY: the program's group, under the lock.
@@ -1240,7 +1295,8 @@ pub extern "system" fn AtlasCloseThreadpoolCleanupGroupMembers(group: u64, cance
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasCloseThreadpoolCleanupGroup(group: u64) {
+pub extern "system" fn AtlasCloseThreadpoolCleanupGroup(group: usize) {
+    let group = group as u64;
     free(group as *mut Group);
 }
 
@@ -1252,35 +1308,41 @@ fn instance(at: u64) -> &'static mut Instance {
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasSetEventWhenCallbackReturns(at: u64, event: u64) {
+pub extern "system" fn AtlasSetEventWhenCallbackReturns(at: usize, event: usize) {
+    let (at, event) = (at as u64, event as u64);
     instance(at).event = event;
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasReleaseSemaphoreWhenCallbackReturns(at: u64, semaphore: u64, count: u32) {
+pub extern "system" fn AtlasReleaseSemaphoreWhenCallbackReturns(at: usize, semaphore: usize, count: u32) {
+    let (at, semaphore) = (at as u64, semaphore as u64);
     let i = instance(at);
     i.semaphore = semaphore;
     i.semaphore_count = u64::from(count);
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasReleaseMutexWhenCallbackReturns(at: u64, mutex: u64) {
+pub extern "system" fn AtlasReleaseMutexWhenCallbackReturns(at: usize, mutex: usize) {
+    let (at, mutex) = (at as u64, mutex as u64);
     instance(at).mutex = mutex;
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasLeaveCriticalSectionWhenCallbackReturns(at: u64, section: u64) {
+pub extern "system" fn AtlasLeaveCriticalSectionWhenCallbackReturns(at: usize, section: usize) {
+    let (at, section) = (at as u64, section as u64);
     instance(at).section = section;
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasFreeLibraryWhenCallbackReturns(at: u64, module: u64) {
+pub extern "system" fn AtlasFreeLibraryWhenCallbackReturns(at: usize, module: usize) {
+    let (at, module) = (at as u64, module as u64);
     instance(at).library = module;
 }
 
 /// `CallbackMayRunLong`: another worker starts if none is idle, so the pool isn't held up. FALSE if it's at its most.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasCallbackMayRunLong(at: u64) -> i32 {
+pub extern "system" fn AtlasCallbackMayRunLong(at: usize) -> i32 {
+    let at = at as u64;
     let object = instance(at).object;
     // SAFETY: the running callback's object and its pool, under the lock.
     with(|_| i32::from(unsafe { more_if_none_idle((*object).pool) }))
@@ -1288,7 +1350,8 @@ pub extern "system" fn AtlasCallbackMayRunLong(at: u64) -> i32 {
 
 /// `DisassociateCurrentThreadFromCallback`: waiting for its object's callbacks doesn't wait for this one any more.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasDisassociateCurrentThreadFromCallback(at: u64) {
+pub extern "system" fn AtlasDisassociateCurrentThreadFromCallback(at: usize) {
+    let at = at as u64;
     let i = instance(at);
     if !i.disassociated {
         i.disassociated = true;

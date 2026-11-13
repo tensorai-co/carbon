@@ -1116,7 +1116,7 @@ fn string_array<T: Unit>(mut fill: impl FnMut(&mut dyn FnMut(&[T]))) -> (*mut *m
         count += 1;
         units += s.len() + 1;
     });
-    let table = AtlasCrtMalloc((count + 1) * 8).cast::<*mut T>();
+    let table = AtlasCrtMalloc((count + 1) * size_of::<usize>()).cast::<*mut T>();
     let strings = AtlasCrtMalloc(units.max(1) * size_of::<T>()).cast::<T>();
     if table.is_null() || strings.is_null() {
         return (core::ptr::null_mut(), 0);
@@ -1150,10 +1150,10 @@ fn narrow_command_line() -> &'static [u8] {
 fn wide_command_line() -> &'static [u16] {
     // SAFETY: the PEB's process parameters' command line, a UNICODE_STRING.
     unsafe {
-        let params = *(crate::peb().add(atlas_abi::peb::PROCESS_PARAMETERS as usize) as *const u64);
+        let params = *(crate::peb().add(atlas_abi::peb::PROCESS_PARAMETERS as usize) as *const usize) as u64;
         let string = params + atlas_abi::params::COMMAND_LINE;
-        let len = usize::from(*(string as *const u16)) / 2;
-        let buffer = *((string + 8) as *const *const u16);
+        let len = usize::from(*(string as usize as *const u16)) / 2;
+        let buffer = *((string + crate::pe::PTR) as usize as *const *const u16);
         if buffer.is_null() { &[] } else { core::slice::from_raw_parts(buffer, len) }
     }
 }
@@ -1496,14 +1496,18 @@ static HANDLERS: [AtomicU64; SIGNALS] = [const { AtomicU64::new(0) }; SIGNALS];
 
 /// `signal(sig, handler)`: the one before, or SIG_ERR (-1) for a signal there isn't.
 #[unsafe(no_mangle)]
-pub extern "C" fn AtlasCrtSignal(sig: i32, handler: u64) -> u64 {
-    match HANDLERS.get(sig as usize) {
-        Some(slot) if sig > 0 => slot.swap(handler, Ordering::AcqRel),
-        _ => {
-            set_errno(EINVAL);
-            u64::MAX
+pub extern "C" fn AtlasCrtSignal(sig: i32, handler: usize) -> usize {
+    let handler = handler as u64;
+    let result = (|| -> u64 {
+        match HANDLERS.get(sig as usize) {
+            Some(slot) if sig > 0 => slot.swap(handler, Ordering::AcqRel),
+            _ => {
+                set_errno(EINVAL);
+                u64::MAX
+            }
         }
-    }
+    })();
+    result as usize
 }
 
 /// `raise(sig)`: its handler (reset to the default first, as C has it); with none, SIGABRT ends the process with 3,
@@ -1519,7 +1523,7 @@ pub extern "C" fn AtlasCrtRaise(sig: i32) -> i32 {
         0 | 1 => 0,
         handler => {
             // SAFETY: the program's handler.
-            let f: extern "C" fn(i32) = unsafe { core::mem::transmute(handler) };
+            let f: extern "C" fn(i32) = unsafe { core::mem::transmute(handler as usize) };
             f(sig);
             0
         }
@@ -1539,8 +1543,12 @@ pub extern "C" fn AtlasCrtAbort() -> ! {
 static INVALID_PARAMETER: AtomicU64 = AtomicU64::new(0);
 
 #[unsafe(no_mangle)]
-pub extern "C" fn AtlasCrtSetInvalidParameterHandler(handler: u64) -> u64 {
-    INVALID_PARAMETER.swap(handler, Ordering::AcqRel)
+pub extern "C" fn AtlasCrtSetInvalidParameterHandler(handler: usize) -> usize {
+    let handler = handler as u64;
+    let result = (|| -> u64 {
+        INVALID_PARAMETER.swap(handler, Ordering::AcqRel)
+    })();
+    result as usize
 }
 
 #[unsafe(no_mangle)]
@@ -1548,7 +1556,7 @@ pub extern "C" fn AtlasCrtInvalidParameterNoinfo() {
     let handler = INVALID_PARAMETER.load(Ordering::Acquire);
     if handler != 0 {
         // SAFETY: the program's handler: (expression, function, file, line, reserved), all null.
-        let f: extern "C" fn(u64, u64, u64, u32, u64) = unsafe { core::mem::transmute(handler) };
+        let f: extern "C" fn(usize, usize, usize, u32, usize) = unsafe { core::mem::transmute(handler as usize) };
         f(0, 0, 0, 0, 0);
         return;
     }

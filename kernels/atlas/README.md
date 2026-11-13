@@ -208,7 +208,7 @@ code), heaps, the uncontended path of every lock, SEH and unwinding (they walk t
 and `GetLastError` (programs read them directly), the trampolines where atlas enters the program, and, to come, the C
 runtime's hot half (`mem*`, `str*`, `printf`'s formatting). It's a real PE per ISA, so unwinding through it works.
 
-`atlas-guest` is `no_std` Rust built by atlas's `build.rs` for `aarch64-pc-windows-msvc` and `x86_64-pc-windows-msvc`,
+`atlas-guest` is `no_std` Rust built by atlas's `build.rs` for `aarch64-pc-windows-msvc`, `x86_64-pc-windows-msvc` and `i686-pc-windows-msvc`,
 linked with LLVM's `lld-link`, and embedded with `include_bytes!`. `core` is always built from source (see the open
 questions, below). Where it can't be built, atlas says so and won't start Windows programs.
 
@@ -749,10 +749,18 @@ First `cmd.exe` (variables, `if`, `for`, `goto`, `call`, pipes, redirection, `.b
   order, each phase ending with its tests passing:
   1. [x] **exec runs 32-bit x86** on hvf: the translator's 32-bit mode, checked by exec's conformance suite. kvm
      and winkvm have a 32-bit code segment in the shim already; their conformance cases still need running there.
-  2. [ ] **The i686 ntdll**: `build.rs` builds `atlas-guest` for `i686-pc-windows-msvc` too; `arch.rs`, `sys.rs`
-     and `fiber.rs` in i686 assembly (atlas's calls by `int 0x2e`, number in eax, arguments as exec's `Trap::Int2e`
-     reads them); x86's `CONTEXT` (0x2cc bytes, with the x87 save area); and SEH as x86 has it: a chain of frames
-     from `fs:[0]`, walked by `RtlDispatchException` and unwound by `RtlUnwind`, not unwind tables.
+  2. [x] **The i686 ntdll**, built and embedded beside the others, though nothing runs it until phases 3 and 4 do:
+     `atlas-abi` has every layout with pointers in it twice (`teb32`, `peb32`, `ldr32`, `params32`, `record32`, and
+     x86's 0x2cc-byte `CONTEXT`), the guest gets its own ISA's; every export takes pointer-sized arguments as
+     `usize` (stdcall would pass a `u64` as two slots), and pointer-sized memory as `pe::ptr_at`/`put_ptr` (PE32's
+     thunks, TLS directory and image base too); SRW locks, condition variables, TLS and FLS slots are a pointer
+     wide; printf reads x86's `va_list` (4-byte slots, 8 for `long long` and doubles). The TEB is `fs:[0x18]`;
+     atlas's calls are `int 0x2e` with the arguments pushed above a dummy return address, as a stdcall stub has
+     them; fibers switch in i686 assembly, each with its own SEH chain. SEH is x86's (`seh32.rs`): the chain from
+     `fs:[0]`, cdecl handlers, `RtlUnwind` calling and unlinking frames above its target, and `RtlRaiseException` and
+     `RtlUnwind` as stubs that capture their caller's registers. `_alldiv`, `_aulldiv`, `_allrem` and `_aullrem` wrap
+     compiler_builtins'. Still to do there: a nested exception's own registration (`ExceptionNestedException` is
+     taken as handlers return it, not detected), and `_except_handler3`/`4` for the C runtime (phase 6).
   3. [ ] **32-bit processes**: PE32 images parsed, mapped and relocated (`IMAGE_REL_BASED_HIGHLOW`); a 32-bit
      layout below 2 GiB (or 4 GiB for a large-address-aware program), with atlas's page, ntdll and the system DLLs
      in it; the TEB32, PEB32, `RTL_USER_PROCESS_PARAMETERS32` and loader entries with 32-bit pointers, `fs` at the

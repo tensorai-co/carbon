@@ -1,4 +1,4 @@
-//! Each ISA's CONTEXT, as Windows lays it out, and capturing the caller's registers into one.
+//! Each ISA's CONTEXT, as Windows lays it out (ARM64, x64 and x86), and capturing the caller's registers into one.
 
 use atlas_abi::context;
 
@@ -185,9 +185,95 @@ mod imp {
     );
 }
 
+#[cfg(target_arch = "x86")]
+mod imp {
+    use super::context;
+
+    /// x86's CONTEXT.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Context {
+        pub flags: u32,
+        pub debug: [u32; 6],
+        /// x87's `fnsave` area.
+        pub float_save: [u8; 0x70],
+        pub seg_gs: u32,
+        pub seg_fs: u32,
+        pub seg_es: u32,
+        pub seg_ds: u32,
+        pub edi: u32,
+        pub esi: u32,
+        pub ebx: u32,
+        pub edx: u32,
+        pub ecx: u32,
+        pub eax: u32,
+        pub ebp: u32,
+        pub eip: u32,
+        pub seg_cs: u32,
+        pub eflags: u32,
+        pub esp: u32,
+        pub seg_ss: u32,
+        /// `fxsave`'s area: MXCSR and the xmm registers.
+        pub extended: [u8; 512],
+    }
+
+    const _: () = assert!(size_of::<Context>() == context::X86_SIZE as usize);
+    const _: () = assert!(core::mem::offset_of!(Context, edi) == context::X86_EDI as usize);
+    const _: () = assert!(core::mem::offset_of!(Context, eip) == context::X86_EIP as usize);
+    const _: () = assert!(core::mem::offset_of!(Context, esp) == context::X86_ESP as usize);
+    const _: () = assert!(core::mem::offset_of!(Context, extended) == context::X86_EXTENDED as usize);
+
+    // x86's SEH captures contexts in its own stubs (`seh32`): RtlCaptureContext is for programs.
+    #[allow(dead_code)]
+    impl Context {
+        pub fn sp(&self) -> u64 {
+            u64::from(self.esp)
+        }
+    }
+
+    #[allow(dead_code)]
+    unsafe extern "system" {
+        /// Fills a CONTEXT with its caller's registers, as they'll be when it returns (and has popped its argument).
+        pub fn RtlCaptureContext(context: *mut Context);
+    }
+
+    // The segments are Windows' own selectors for a 32-bit process, which programs may compare.
+    core::arch::global_asm!(
+        ".globl \"_RtlCaptureContext@4\"",
+        "\"_RtlCaptureContext@4\":",
+        "push ecx",
+        "mov ecx, [esp + 8]",
+        "mov [ecx + 0xb0], eax",
+        "mov [ecx + 0xa8], edx",
+        "mov [ecx + 0xa4], ebx",
+        "mov [ecx + 0xa0], esi",
+        "mov [ecx + 0x9c], edi",
+        "mov [ecx + 0xb4], ebp",
+        "mov eax, [esp]",
+        "mov [ecx + 0xac], eax",
+        "mov eax, [esp + 4]",
+        "mov [ecx + 0xb8], eax",
+        "lea eax, [esp + 12]",
+        "mov [ecx + 0xc4], eax",
+        "mov dword ptr [ecx + 0xc0], 0x202",
+        "mov dword ptr [ecx + 0xbc], 0x23",
+        "mov dword ptr [ecx + 0xc8], 0x2b",
+        "mov dword ptr [ecx + 0x98], 0x2b",
+        "mov dword ptr [ecx + 0x94], 0x2b",
+        "mov dword ptr [ecx + 0x90], 0x53",
+        "mov dword ptr [ecx + 0x8c], 0x2b",
+        "mov dword ptr [ecx + 0xe4], 0x1f80",
+        "mov dword ptr [ecx], 0x10007",
+        "mov eax, [ecx + 0xb0]",
+        "pop ecx",
+        "ret 4",
+    );
+}
+
 pub use imp::*;
 
 /// A context, zeroed.
+#[cfg_attr(target_arch = "x86", allow(dead_code))]
 pub fn empty() -> Context {
     // SAFETY: every field is plain integers, for which zero is a value.
     unsafe { core::mem::zeroed() }

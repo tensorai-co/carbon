@@ -1,6 +1,8 @@
 //! Calls into atlas, by its own numbers: `svc #0` with the number in `x8` on ARM64; on x86-64, the number in `eax` and
 //! the first argument in `r10`, as Windows' own system calls have them, through atlas's trampoline (`call::TRAP_AT`),
-//! which is `syscall` or the backend's gate.
+//! which is `syscall` or the backend's gate; on x86, `int 0x2e` with the number in `eax` and the arguments on the stack
+//! above a return address, as a stdcall host export's stub has them. Arguments are pointer-sized there: each is
+//! passed as its low 32 bits.
 
 use atlas_abi::call;
 
@@ -8,6 +10,7 @@ use atlas_abi::call;
 pub fn call4(nr: u64, a: u64, b: u64, c: u64, d: u64) -> u64 {
     let result: u64;
     // SAFETY: a trap into atlas, which changes only the result register (and, on x86-64, what `syscall` does).
+    #[cfg(not(target_arch = "x86"))]
     unsafe {
         #[cfg(target_arch = "aarch64")]
         core::arch::asm!("svc #0", in("x8") nr, inlateout("x0") a => result, in("x1") b, in("x2") c, in("x3") d, options(nostack));
@@ -15,7 +18,38 @@ pub fn call4(nr: u64, a: u64, b: u64, c: u64, d: u64) -> u64 {
         core::arch::asm!("call r11", inlateout("rax") nr => result, in("r10") a, in("rdx") b, in("r8") c, in("r9") d,
             inlateout("r11") call::TRAP_AT => _, lateout("rcx") _);
     }
+    #[cfg(target_arch = "x86")]
+    {
+        result = stack_call(nr, &[a as u32, b as u32, c as u32, d as u32, 0, 0, 0, 0]);
+    }
     result
+}
+
+/// x86's way in: the eight arguments pushed, last first, then a dummy return address, then `int 0x2e`.
+#[cfg(target_arch = "x86")]
+#[inline(always)]
+fn stack_call(nr: u64, args: &[u32; 8]) -> u64 {
+    let result: u32;
+    // SAFETY: a trap into atlas, which changes only eax; the stack is put back as it was.
+    unsafe {
+        core::arch::asm!(
+            "push dword ptr [{p} + 28]",
+            "push dword ptr [{p} + 24]",
+            "push dword ptr [{p} + 20]",
+            "push dword ptr [{p} + 16]",
+            "push dword ptr [{p} + 12]",
+            "push dword ptr [{p} + 8]",
+            "push dword ptr [{p} + 4]",
+            "push dword ptr [{p}]",
+            "push 0",
+            "int 0x2e",
+            "add esp, 36",
+            p = in(reg) args.as_ptr(),
+            inlateout("eax") nr as u32 => result,
+            lateout("ecx") _, lateout("edx") _,
+        );
+    }
+    u64::from(result)
 }
 
 /// A call with up to eight arguments: past the fourth they go where a Windows call has them, in `x4` to `x7` on
@@ -25,6 +59,7 @@ pub fn call4(nr: u64, a: u64, b: u64, c: u64, d: u64) -> u64 {
 pub fn call8(nr: u64, a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, h: u64) -> u64 {
     let result: u64;
     // SAFETY: a trap into atlas, as `call4`; on x86-64, the stack is put back as it was.
+    #[cfg(not(target_arch = "x86"))]
     unsafe {
         #[cfg(target_arch = "aarch64")]
         core::arch::asm!("svc #0", in("x8") nr, inlateout("x0") a => result, in("x1") b, in("x2") c, in("x3") d, in("x4") e, in("x5") f, in("x6") g, in("x7") h, options(nostack));
@@ -51,6 +86,10 @@ pub fn call8(nr: u64, a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, h:
             );
         }
     }
+    #[cfg(target_arch = "x86")]
+    {
+        result = stack_call(nr, &[a as u32, b as u32, c as u32, d as u32, e as u32, f as u32, g as u32, h as u32]);
+    }
     result
 }
 
@@ -61,7 +100,7 @@ pub fn export(slot: &core::sync::atomic::AtomicU64, name: &[u8]) -> u64 {
     if n != 0 {
         return n;
     }
-    let n = call4(call::EXPORT_NUMBER, name.as_ptr() as u64, name.len() as u64, 0, 0);
+    let n = call4(call::EXPORT_NUMBER, name.as_ptr() as usize as u64, name.len() as u64, 0, 0);
     slot.store(n, Ordering::Relaxed);
     n
 }
@@ -89,7 +128,7 @@ macro_rules! host {
 pub(crate) use host;
 
 pub fn terminate(status: u32) -> ! {
-    call4(call::TERMINATE_PROCESS, u64::MAX, u64::from(status), 0, 0);
+    call4(call::TERMINATE_PROCESS, usize::MAX as u64, u64::from(status), 0, 0);
     // atlas never comes back from ending the process.
     loop {
         core::hint::spin_loop();
@@ -100,29 +139,29 @@ pub fn terminate(status: u32) -> ! {
 pub fn allocate(size: usize) -> *mut u8 {
     const COMMIT_RESERVE: u64 = 0x3000;
     const READ_WRITE: u64 = 4;
-    call4(call::ALLOCATE_VIRTUAL_MEMORY, 0, size as u64, COMMIT_RESERVE, READ_WRITE) as *mut u8
+    call4(call::ALLOCATE_VIRTUAL_MEMORY, 0, size as u64, COMMIT_RESERVE, READ_WRITE) as usize as *mut u8
 }
 
 /// Changes pages' protection (a `PAGE_*`), giving the old one, or None.
 pub fn protect(addr: u64, size: u64, protection: u32) -> Option<u32> {
     let mut old = 0u32;
-    let status = call4(call::PROTECT_VIRTUAL_MEMORY, addr, size, u64::from(protection), (&raw mut old) as u64);
+    let status = call4(call::PROTECT_VIRTUAL_MEMORY, addr, size, u64::from(protection), (&raw mut old) as usize as u64);
     (status == 0).then_some(old)
 }
 
 /// Maps a DLL by name: its base and path, or a status.
 pub fn map_image(name: &[u8], path: &mut [u16; 260]) -> Result<u64, u32> {
-    let mut base = 0u64;
-    let status = call4(call::MAP_IMAGE, name.as_ptr() as u64, name.len() as u64, (&raw mut base) as u64, path.as_mut_ptr() as u64) as u32;
-    if status == 0 { Ok(base) } else { Err(status) }
+    let mut base = 0usize;
+    let status = call4(call::MAP_IMAGE, name.as_ptr() as usize as u64, name.len() as u64, (&raw mut base) as usize as u64, path.as_mut_ptr() as usize as u64) as u32;
+    if status == 0 { Ok(base as u64) } else { Err(status) }
 }
 
 /// Sets this thread's registers from `context`, and carries on there.
 pub fn continue_with(context: &crate::arch::Context) -> ! {
-    call4(call::CONTINUE, context as *const _ as u64, 0, 0, 0);
+    call4(call::CONTINUE, context as *const _ as usize as u64, 0, 0, 0);
     terminate(atlas_abi::status::INVALID_PARAMETER)
 }
 
 pub fn debug_print(text: &[u8]) {
-    call4(call::DEBUG_PRINT, text.as_ptr() as u64, text.len() as u64, 0, 0);
+    call4(call::DEBUG_PRINT, text.as_ptr() as usize as u64, text.len() as u64, 0, 0);
 }

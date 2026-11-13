@@ -15,18 +15,23 @@ mod exception;
 mod fiber;
 mod heap;
 mod loader;
+#[cfg(target_arch = "x86")]
+mod msvc32;
 mod pe;
 mod pool;
+#[cfg(target_arch = "x86")]
+mod seh32;
 mod strings;
 mod stdio;
 mod sync;
 mod sys;
+#[cfg(not(target_arch = "x86"))]
 mod unwind;
 
 use core::ffi::c_void;
 
 /// MSVC's linker wants this wherever floating point might be used; the C runtime that usually defines it isn't here.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 #[unsafe(no_mangle)]
 pub static _fltused: i32 = 0;
 
@@ -35,7 +40,7 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
     sys::terminate(atlas_abi::status::STACK_BUFFER_OVERRUN)
 }
 
-/// This thread's TEB: in `x18` on ARM64, at `gs:[0x30]` on x86-64.
+/// This thread's TEB: in `x18` on ARM64, at `gs:[0x30]` on x86-64, at `fs:[0x18]` on x86.
 #[inline(always)]
 pub(crate) fn teb() -> *mut u8 {
     let teb: *mut u8;
@@ -45,6 +50,8 @@ pub(crate) fn teb() -> *mut u8 {
         core::arch::asm!("mov {}, x18", out(reg) teb, options(nomem, nostack, preserves_flags));
         #[cfg(target_arch = "x86_64")]
         core::arch::asm!("mov {}, gs:[0x30]", out(reg) teb, options(nostack, preserves_flags, readonly));
+        #[cfg(target_arch = "x86")]
+        core::arch::asm!("mov {}, fs:[0x18]", out(reg) teb, options(nostack, preserves_flags, readonly));
     }
     teb
 }
@@ -137,7 +144,7 @@ pub extern "system" fn RtlGetNtVersionNumbers(major: *mut u32, minor: *mut u32, 
 /// `NtQuerySystemInformation(class, buffer, length, &return length)`: atlas answers it.
 #[unsafe(no_mangle)]
 pub extern "system" fn NtQuerySystemInformation(class: u32, buffer: *mut c_void, length: u32, returned: *mut u32) -> u32 {
-    sys::call4(atlas_abi::call::QUERY_SYSTEM_INFORMATION, u64::from(class), buffer as u64, u64::from(length), returned as u64) as u32
+    sys::call4(atlas_abi::call::QUERY_SYSTEM_INFORMATION, u64::from(class), buffer as usize as u64, u64::from(length), returned as usize as u64) as u32
 }
 
 #[unsafe(no_mangle)]

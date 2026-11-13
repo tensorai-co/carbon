@@ -29,10 +29,11 @@ const _: () = assert!(ATLAS_PAGE == SYSTEM_BASE - 0x1_0000);
 pub fn guest(isa: Isa) -> Option<&'static [u8]> {
     static ARM64: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ntdll-aarch64.dll"));
     static X86_64: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ntdll-x86_64.dll"));
+    static X86: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ntdll-i686.dll"));
     let image = match isa {
         Isa::Arm64 => ARM64,
         Isa::X86_64 => X86_64,
-        Isa::X86_32 => &[],
+        Isa::X86_32 => X86,
     };
     (!image.is_empty()).then_some(image)
 }

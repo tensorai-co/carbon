@@ -4,6 +4,8 @@
 
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+use crate::pe::PTR;
+
 use atlas_abi::{call, teb};
 
 use crate::sys::call4;
@@ -22,15 +24,16 @@ fn wake_address(addr: u64, all: bool) {
 }
 
 fn wait_while_u32(word: &AtomicU32, value: u32, timeout_ms: u32) -> bool {
-    wait_address(word as *const _ as u64, (&raw const value) as u64, 4, timeout_ms)
+    wait_address(word as *const _ as usize as u64, (&raw const value) as usize as u64, 4, timeout_ms)
 }
 
-fn wait_while_u64(word: &AtomicU64, value: u64, timeout_ms: u32) -> bool {
-    wait_address(word as *const _ as u64, (&raw const value) as u64, 8, timeout_ms)
+fn wait_while_word(word: &AtomicUsize, value: usize, timeout_ms: u32) -> bool {
+    wait_address(word as *const _ as usize as u64, (&raw const value) as usize as u64, PTR, timeout_ms)
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasWaitOnAddress(addr: u64, compare: u64, size: usize, timeout_ms: u32) -> i32 {
+pub extern "system" fn AtlasWaitOnAddress(addr: usize, compare: usize, size: usize, timeout_ms: u32) -> i32 {
+    let (addr, compare) = (addr as u64, compare as u64);
     if wait_address(addr, compare, size as u64, timeout_ms) {
         1
     } else {
@@ -40,12 +43,14 @@ pub extern "system" fn AtlasWaitOnAddress(addr: u64, compare: u64, size: usize, 
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasWakeByAddressSingle(addr: u64) {
+pub extern "system" fn AtlasWakeByAddressSingle(addr: usize) {
+    let addr = addr as u64;
     wake_address(addr, false);
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasWakeByAddressAll(addr: u64) {
+pub extern "system" fn AtlasWakeByAddressAll(addr: usize) {
+    let addr = addr as u64;
     wake_address(addr, true);
 }
 
@@ -85,13 +90,13 @@ pub extern "system" fn AtlasGetCurrentProcessId() -> u32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasGetCurrentThread() -> u64 {
-    u64::MAX - 1
+pub extern "system" fn AtlasGetCurrentThread() -> usize {
+    usize::MAX - 1
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasGetCurrentProcess() -> u64 {
-    u64::MAX
+pub extern "system" fn AtlasGetCurrentProcess() -> usize {
+    usize::MAX
 }
 
 #[unsafe(no_mangle)]
@@ -164,7 +169,7 @@ pub extern "system" fn RtlEnterCriticalSection(cs: *mut CriticalSection) -> u32 
         section.lock_semaphore.store(1, Ordering::Release);
         let held = section.lock_count.load(Ordering::Acquire);
         if held != -1 {
-            let word = &section.lock_count as *const AtomicI32 as u64;
+            let word = &section.lock_count as *const AtomicI32 as usize as u64;
             wait_address(word, (&raw const held) as u64, 4, INFINITE);
         }
     }
@@ -182,7 +187,7 @@ pub extern "system" fn RtlLeaveCriticalSection(cs: *mut CriticalSection) -> u32 
         section.owning_thread.store(0, Ordering::Relaxed);
         section.lock_count.store(-1, Ordering::Release);
         if section.lock_semaphore.load(Ordering::Acquire) != 0 {
-            wake_address(&section.lock_count as *const AtomicI32 as u64, false);
+            wake_address(&section.lock_count as *const AtomicI32 as usize as u64, false);
         }
     }
     0
@@ -191,36 +196,36 @@ pub extern "system" fn RtlLeaveCriticalSection(cs: *mut CriticalSection) -> u32 
 // ---- SRW locks: 0 free, 1 held exclusively, otherwise twice the number of shared holders ----
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasInitializeSRWLock(lock: &AtomicU64) {
+pub extern "system" fn AtlasInitializeSRWLock(lock: &AtomicUsize) {
     lock.store(0, Ordering::Release);
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasTryAcquireSRWLockExclusive(lock: &AtomicU64) -> u8 {
+pub extern "system" fn AtlasTryAcquireSRWLockExclusive(lock: &AtomicUsize) -> u8 {
     u8::from(lock.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok())
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasAcquireSRWLockExclusive(lock: &AtomicU64) {
+pub extern "system" fn AtlasAcquireSRWLockExclusive(lock: &AtomicUsize) {
     loop {
         match lock.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed) {
             Ok(_) => return,
             Err(0) => continue,
             Err(held) => {
-                wait_while_u64(lock, held, INFINITE);
+                wait_while_word(lock, held, INFINITE);
             }
         }
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasTryAcquireSRWLockShared(lock: &AtomicU64) -> u8 {
+pub extern "system" fn AtlasTryAcquireSRWLockShared(lock: &AtomicUsize) -> u8 {
     let s = lock.load(Ordering::Relaxed);
     u8::from(s & 1 == 0 && lock.compare_exchange(s, s + 2, Ordering::Acquire, Ordering::Relaxed).is_ok())
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasAcquireSRWLockShared(lock: &AtomicU64) {
+pub extern "system" fn AtlasAcquireSRWLockShared(lock: &AtomicUsize) {
     loop {
         let s = lock.load(Ordering::Relaxed);
         if s & 1 == 0 {
@@ -228,49 +233,49 @@ pub extern "system" fn AtlasAcquireSRWLockShared(lock: &AtomicU64) {
                 return;
             }
         } else {
-            wait_while_u64(lock, s, INFINITE);
+            wait_while_word(lock, s, INFINITE);
         }
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasReleaseSRWLockExclusive(lock: &AtomicU64) {
+pub extern "system" fn AtlasReleaseSRWLockExclusive(lock: &AtomicUsize) {
     lock.store(0, Ordering::Release);
-    wake_address(lock as *const AtomicU64 as u64, true);
+    wake_address(lock as *const AtomicUsize as u64, true);
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasReleaseSRWLockShared(lock: &AtomicU64) {
+pub extern "system" fn AtlasReleaseSRWLockShared(lock: &AtomicUsize) {
     if lock.fetch_sub(2, Ordering::Release) == 2 {
-        wake_address(lock as *const AtomicU64 as u64, true);
+        wake_address(lock as *const AtomicUsize as u64, true);
     }
 }
 
 // ---- Condition variables: a count of wakes, which sleepers wait to change ----
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasInitializeConditionVariable(cv: &AtomicU64) {
+pub extern "system" fn AtlasInitializeConditionVariable(cv: &AtomicUsize) {
     cv.store(0, Ordering::Release);
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasWakeConditionVariable(cv: &AtomicU64) {
+pub extern "system" fn AtlasWakeConditionVariable(cv: &AtomicUsize) {
     cv.fetch_add(1, Ordering::AcqRel);
-    wake_address(cv as *const AtomicU64 as u64, false);
+    wake_address(cv as *const AtomicUsize as u64, false);
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasWakeAllConditionVariable(cv: &AtomicU64) {
+pub extern "system" fn AtlasWakeAllConditionVariable(cv: &AtomicUsize) {
     cv.fetch_add(1, Ordering::AcqRel);
-    wake_address(cv as *const AtomicU64 as u64, true);
+    wake_address(cv as *const AtomicUsize as u64, true);
 }
 
 /// Sleeps on `cv` with `release` let go of, and `reacquire` taken again after. FALSE with ERROR_TIMEOUT if the time ran
 /// out.
-fn sleep_on(cv: &AtomicU64, timeout_ms: u32, release: impl FnOnce(), reacquire: impl FnOnce()) -> i32 {
+fn sleep_on(cv: &AtomicUsize, timeout_ms: u32, release: impl FnOnce(), reacquire: impl FnOnce()) -> i32 {
     let seen = cv.load(Ordering::Acquire);
     release();
-    let woken = wait_while_u64(cv, seen, timeout_ms);
+    let woken = wait_while_word(cv, seen, timeout_ms);
     reacquire();
     if woken || cv.load(Ordering::Acquire) != seen {
         1
@@ -281,7 +286,7 @@ fn sleep_on(cv: &AtomicU64, timeout_ms: u32, release: impl FnOnce(), reacquire: 
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasSleepConditionVariableSRW(cv: &AtomicU64, lock: &AtomicU64, timeout_ms: u32, flags: u32) -> i32 {
+pub extern "system" fn AtlasSleepConditionVariableSRW(cv: &AtomicUsize, lock: &AtomicUsize, timeout_ms: u32, flags: u32) -> i32 {
     const SHARED: u32 = 1;
     if flags & SHARED != 0 {
         sleep_on(cv, timeout_ms, || AtlasReleaseSRWLockShared(lock), || AtlasAcquireSRWLockShared(lock))
@@ -291,7 +296,7 @@ pub extern "system" fn AtlasSleepConditionVariableSRW(cv: &AtomicU64, lock: &Ato
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasSleepConditionVariableCS(cv: &AtomicU64, cs: *mut CriticalSection, timeout_ms: u32) -> i32 {
+pub extern "system" fn AtlasSleepConditionVariableCS(cv: &AtomicUsize, cs: *mut CriticalSection, timeout_ms: u32) -> i32 {
     // The section may be held more than once: let go of it fully, and take it back as deeply.
     // SAFETY: a section this thread holds.
     let depth = unsafe { (*cs).recursion_count };
@@ -311,7 +316,7 @@ pub extern "system" fn AtlasSleepConditionVariableCS(cv: &AtomicU64, cs: *mut Cr
 // ---- One-time initialization: 0 not yet, 1 running, 2 done ----
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasInitOnceExecuteOnce(once: &AtomicU32, function: extern "system" fn(*const AtomicU32, u64, *mut u64) -> i32, parameter: u64, context: *mut u64) -> i32 {
+pub extern "system" fn AtlasInitOnceExecuteOnce(once: &AtomicU32, function: extern "system" fn(*const AtomicU32, usize, *mut usize) -> i32, parameter: usize, context: *mut usize) -> i32 {
     loop {
         match once.compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire) {
             Ok(_) => {
@@ -357,20 +362,20 @@ fn free_slot(used: &AtomicU64, slot: u32) -> i32 {
     1
 }
 
-fn tls_slot(slot: u32) -> *mut u64 {
+fn tls_slot(slot: u32) -> *mut usize {
     // SAFETY: TlsSlots, 64 of them, in this thread's TEB.
-    unsafe { crate::teb().add(teb::TLS_SLOTS as usize).cast::<u64>().add(slot as usize) }
+    unsafe { crate::teb().add(teb::TLS_SLOTS as usize).cast::<usize>().add(slot as usize) }
 }
 
 /// An FLS block: two links into the list of every block (so `FlsFree` can reach every thread's and fiber's value),
 /// then 64 slots. A thread's, or a fiber's, is made the first time it's wanted.
 const FLS_LINKS: usize = 2;
-const FLS_BLOCK: usize = (FLS_LINKS + 64) * 8;
+const FLS_BLOCK: usize = (FLS_LINKS + 64) * size_of::<usize>();
 
 /// Each slot's callback, run with a value as its thread or fiber ends, or the slot is freed.
-static FLS_CALLBACKS: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+static FLS_CALLBACKS: [AtomicUsize; 64] = [const { AtomicUsize::new(0) }; 64];
 /// The list of blocks: its head's links, and the lock that guards the list.
-static FLS_HEAD: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static FLS_HEAD: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
 static FLS_LOCK: AtomicU32 = AtomicU32::new(0);
 
 fn with_fls_list<R>(f: impl FnOnce(u64) -> R) -> R {
@@ -380,8 +385,8 @@ fn with_fls_list<R>(f: impl FnOnce(u64) -> R) -> R {
     let head = (&raw const FLS_HEAD) as u64;
     // An empty list points at itself.
     if FLS_HEAD[0].load(Ordering::Relaxed) == 0 {
-        FLS_HEAD[0].store(head, Ordering::Relaxed);
-        FLS_HEAD[1].store(head, Ordering::Relaxed);
+        FLS_HEAD[0].store(head as usize, Ordering::Relaxed);
+        FLS_HEAD[1].store(head as usize, Ordering::Relaxed);
     }
     let result = f(head);
     FLS_LOCK.store(0, Ordering::Release);
@@ -389,12 +394,12 @@ fn with_fls_list<R>(f: impl FnOnce(u64) -> R) -> R {
 }
 
 /// Word `i` of a block's, or the head's, links and slots.
-fn link(at: u64, i: u64) -> *mut u64 {
-    (at + i * 8) as *mut u64
+fn link(at: u64, i: u64) -> *mut usize {
+    (at + i * PTR) as usize as *mut usize
 }
 
 /// A new FLS block, on the list: its slots' address, which is what FlsData points at.
-fn new_fls_block() -> *mut u64 {
+fn new_fls_block() -> *mut usize {
     let block = crate::heap::allocate(FLS_BLOCK, true) as u64;
     if block == 0 {
         return core::ptr::null_mut();
@@ -403,20 +408,20 @@ fn new_fls_block() -> *mut u64 {
         // SAFETY: the new block's links and the list's, under the list's lock.
         unsafe {
             let last = *link(head, 1);
-            *link(block, 0) = head;
+            *link(block, 0) = head as usize;
             *link(block, 1) = last;
-            *link(last, 0) = block;
-            *link(head, 1) = block;
+            *link(last as u64, 0) = block as usize;
+            *link(head, 1) = block as usize;
         }
     });
-    (block + FLS_LINKS as u64 * 8) as *mut u64
+    (block + FLS_LINKS as u64 * PTR) as usize as *mut usize
 }
 
 /// This thread's (or fiber's) FLS slots, made the first time they're wanted.
-fn fls_slot(slot: u32) -> *mut u64 {
+fn fls_slot(slot: u32) -> *mut usize {
     // SAFETY: FlsData in this thread's TEB, and the block it points at.
     unsafe {
-        let data = crate::teb().add(teb::FLS_DATA as usize).cast::<*mut u64>();
+        let data = crate::teb().add(teb::FLS_DATA as usize).cast::<*mut usize>();
         if (*data).is_null() {
             *data = new_fls_block();
         }
@@ -426,17 +431,17 @@ fn fls_slot(slot: u32) -> *mut u64 {
 
 /// An FLS block that's over, as its thread or fiber ends: each slot with a value and a callback has it called, then
 /// the block goes.
-pub fn release_fls(slots: *mut u64) {
+pub fn release_fls(slots: *mut usize) {
     if slots.is_null() {
         return;
     }
-    let block = slots as u64 - FLS_LINKS as u64 * 8;
+    let block = slots as usize as u64 - FLS_LINKS as u64 * PTR;
     with_fls_list(|_| {
         // SAFETY: a block on the list, under its lock.
         unsafe {
             let (next, prev) = (*link(block, 0), *link(block, 1));
-            *link(prev, 0) = next;
-            *link(next, 1) = prev;
+            *link(prev as u64, 0) = next;
+            *link(next as u64, 1) = prev;
         }
     });
     for (i, callback) in FLS_CALLBACKS.iter().enumerate() {
@@ -445,7 +450,7 @@ pub fn release_fls(slots: *mut u64) {
         let callback = callback.load(Ordering::Acquire);
         if value != 0 && callback != 0 && FLS_USED.load(Ordering::Acquire) & 1 << i != 0 {
             // SAFETY: the program's callback, as Windows calls it.
-            let callback: extern "system" fn(u64) = unsafe { core::mem::transmute(callback) };
+            let callback: extern "system" fn(usize) = unsafe { core::mem::transmute(callback) };
             callback(value);
         }
     }
@@ -456,7 +461,7 @@ pub fn release_fls(slots: *mut u64) {
 pub fn release_thread_fls() {
     // SAFETY: FlsData in this thread's TEB.
     let slots = unsafe {
-        let data = crate::teb().add(teb::FLS_DATA as usize).cast::<*mut u64>();
+        let data = crate::teb().add(teb::FLS_DATA as usize).cast::<*mut usize>();
         core::mem::take(&mut *data)
     };
     release_fls(slots);
@@ -473,43 +478,48 @@ pub extern "system" fn AtlasTlsFree(slot: u32) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasTlsGetValue(slot: u32) -> u64 {
-    if slot >= 64 {
-        crate::RtlSetLastWin32Error(ERROR_INVALID_PARAMETER);
-        return 0;
-    }
-    // TlsGetValue clears the last error when it succeeds, so a zero value can be told from a failure.
-    crate::RtlSetLastWin32Error(0);
-    // SAFETY: a slot in this thread's TEB.
-    unsafe { tls_slot(slot).read() }
+pub extern "system" fn AtlasTlsGetValue(slot: u32) -> usize {
+    let result = (|| -> u64 {
+        if slot >= 64 {
+            crate::RtlSetLastWin32Error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        // TlsGetValue clears the last error when it succeeds, so a zero value can be told from a failure.
+        crate::RtlSetLastWin32Error(0);
+        // SAFETY: a slot in this thread's TEB.
+        unsafe { (tls_slot(slot).read()) as u64 }
+    })();
+    result as usize
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasTlsSetValue(slot: u32, value: u64) -> i32 {
+pub extern "system" fn AtlasTlsSetValue(slot: u32, value: usize) -> i32 {
+    let value = value as u64;
     if slot >= 64 {
         crate::RtlSetLastWin32Error(ERROR_INVALID_PARAMETER);
         return 0;
     }
     // SAFETY: as above.
-    unsafe { tls_slot(slot).write(value) };
+    unsafe { tls_slot(slot).write(value as usize) };
     1
 }
 
 /// `FlsAlloc(callback)`: a slot, every thread's and fiber's value 0, with a callback for each value left as a thread
 /// or fiber ends, or the slot is freed.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasFlsAlloc(callback: u64) -> u32 {
+pub extern "system" fn AtlasFlsAlloc(callback: usize) -> u32 {
+    let callback = callback as u64;
     let slot = alloc_slot(&FLS_USED);
     if slot != OUT_OF_INDEXES {
-        FLS_CALLBACKS[slot as usize].store(callback, Ordering::Release);
+        FLS_CALLBACKS[slot as usize].store(callback as usize, Ordering::Release);
         // A slot used before starts at 0 everywhere.
         with_fls_list(|head| {
             // SAFETY: every block on the list, under its lock.
             unsafe {
                 let mut at = *link(head, 0);
-                while at != head {
-                    *link(at, FLS_LINKS as u64 + u64::from(slot)) = 0;
-                    at = *link(at, 0);
+                while at != head as usize {
+                    *link(at as u64, FLS_LINKS as u64 + u64::from(slot)) = 0;
+                    at = *link(at as u64, 0);
                 }
             }
         });
@@ -531,12 +541,12 @@ pub extern "system" fn AtlasFlsFree(slot: u32) -> i32 {
             // SAFETY: as in `AtlasFlsAlloc`.
             unsafe {
                 let mut at = *link(head, 0);
-                while at != head {
-                    let v = core::mem::replace(&mut *link(at, FLS_LINKS as u64 + u64::from(slot)), 0);
+                while at != head as usize {
+                    let v = core::mem::replace(&mut *link(at as u64, FLS_LINKS as u64 + u64::from(slot)), 0);
                     if v != 0 {
                         return v;
                     }
-                    at = *link(at, 0);
+                    at = *link(at as u64, 0);
                 }
             }
             0
@@ -546,7 +556,7 @@ pub extern "system" fn AtlasFlsFree(slot: u32) -> i32 {
         }
         if callback != 0 {
             // SAFETY: the program's callback.
-            let callback: extern "system" fn(u64) = unsafe { core::mem::transmute(callback) };
+            let callback: extern "system" fn(usize) = unsafe { core::mem::transmute(callback) };
             callback(value);
         }
     }
@@ -554,23 +564,27 @@ pub extern "system" fn AtlasFlsFree(slot: u32) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasFlsGetValue(slot: u32) -> u64 {
-    if slot >= 64 || FLS_USED.load(Ordering::Acquire) & 1 << slot == 0 {
-        crate::RtlSetLastWin32Error(ERROR_INVALID_PARAMETER);
-        return 0;
-    }
-    crate::RtlSetLastWin32Error(0);
-    // SAFETY: a slot in this thread's FLS block.
-    unsafe { fls_slot(slot).read() }
+pub extern "system" fn AtlasFlsGetValue(slot: u32) -> usize {
+    let result = (|| -> u64 {
+        if slot >= 64 || FLS_USED.load(Ordering::Acquire) & 1 << slot == 0 {
+            crate::RtlSetLastWin32Error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        crate::RtlSetLastWin32Error(0);
+        // SAFETY: a slot in this thread's FLS block.
+        unsafe { (fls_slot(slot).read()) as u64 }
+    })();
+    result as usize
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasFlsSetValue(slot: u32, value: u64) -> i32 {
+pub extern "system" fn AtlasFlsSetValue(slot: u32, value: usize) -> i32 {
+    let value = value as u64;
     if slot >= 64 || FLS_USED.load(Ordering::Acquire) & 1 << slot == 0 {
         crate::RtlSetLastWin32Error(ERROR_INVALID_PARAMETER);
         return 0;
     }
     // SAFETY: as above.
-    unsafe { fls_slot(slot).write(value) };
+    unsafe { fls_slot(slot).write(value as usize) };
     1
 }

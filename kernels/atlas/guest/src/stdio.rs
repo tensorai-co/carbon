@@ -516,17 +516,34 @@ impl Sink for ToStream<'_> {
     }
 }
 
-/// The arguments after the format, as a `va_list` has them on both ISAs: one 8-byte slot each, a double's bits
-/// too.
-struct Args(*const u64);
+/// The arguments after the format, as a `va_list` has them: on the 64-bit ISAs one 8-byte slot each, a double's
+/// bits too; on x86 a 4-byte slot for anything up to a pointer's size, and 8 bytes for a `long long` or a double.
+struct Args(*const u8);
+
+const POINTER_BITS: u32 = usize::BITS;
 
 impl Args {
-    fn next(&mut self) -> u64 {
+    fn take<T: Copy>(&mut self) -> T {
         // SAFETY: the program's va_list, as long as its format says.
-        let v = unsafe { self.0.read_unaligned() };
+        let v = unsafe { self.0.cast::<T>().read_unaligned() };
         // SAFETY: as above.
-        self.0 = unsafe { self.0.add(1) };
+        self.0 = unsafe { self.0.add(size_of::<T>()) };
         v
+    }
+
+    /// An int, a pointer or anything between: a slot of its own.
+    fn next(&mut self) -> u64 {
+        self.take::<usize>() as u64
+    }
+
+    /// A 64-bit integer, or a double's bits.
+    fn quad(&mut self) -> u64 {
+        self.take::<u64>()
+    }
+
+    /// An integer of this many bits.
+    fn int(&mut self, bits: u32) -> u64 {
+        if bits == 64 { self.quad() } else { self.next() }
     }
 }
 
@@ -870,8 +887,13 @@ fn format(sink: &mut dyn Sink, fmt: Format, args: &mut Args) {
                     i += 1;
                 }
                 b'L' => i += 1,
-                b'j' | b'z' | b't' => {
+                b'j' => {
                     bits = 64;
+                    i += 1;
+                }
+                // size_t and ptrdiff_t: a pointer's size.
+                b'z' | b't' => {
+                    bits = POINTER_BITS;
                     i += 1;
                 }
                 b'I' if fmt.at(i + 1) == u32::from(b'6') && fmt.at(i + 2) == u32::from(b'4') => {
@@ -883,7 +905,7 @@ fn format(sink: &mut dyn Sink, fmt: Format, args: &mut Args) {
                     i += 3;
                 }
                 b'I' => {
-                    bits = 64;
+                    bits = POINTER_BITS;
                     i += 1;
                 }
                 _ => break,
@@ -905,17 +927,17 @@ fn format(sink: &mut dyn Sink, fmt: Format, args: &mut Args) {
         };
         match conversion {
             b'd' | b'i' => {
-                let v = signed(args.next());
+                let v = signed(args.int(bits));
                 integer(sink, &spec, v.unsigned_abs(), v < 0, 10, false, conversion);
             }
-            b'u' => integer(sink, &spec, unsigned(args.next()), false, 10, false, conversion),
-            b'x' | b'X' => integer(sink, &spec, unsigned(args.next()), false, 16, conversion == b'X', conversion),
-            b'o' => integer(sink, &spec, unsigned(args.next()), false, 8, false, conversion),
+            b'u' => integer(sink, &spec, unsigned(args.int(bits)), false, 10, false, conversion),
+            b'x' | b'X' => integer(sink, &spec, unsigned(args.int(bits)), false, 16, conversion == b'X', conversion),
+            b'o' => integer(sink, &spec, unsigned(args.int(bits)), false, 8, false, conversion),
             b'p' => {
-                let p = Spec { precision: Some(16), alternate: false, ..spec };
+                let p = Spec { precision: Some(POINTER_BITS as usize / 4), alternate: false, ..spec };
                 integer(sink, &p, args.next(), false, 16, true, b'p');
             }
-            b'f' | b'F' | b'e' | b'E' | b'g' | b'G' | b'a' | b'A' => floating(sink, &spec, f64::from_bits(args.next()), if conversion | 0x20 == b'a' { b'e' } else { conversion }),
+            b'f' | b'F' | b'e' | b'E' | b'g' | b'G' | b'a' | b'A' => floating(sink, &spec, f64::from_bits(args.quad()), if conversion | 0x20 == b'a' { b'e' } else { conversion }),
             b'c' | b'C' => {
                 let as_wide = text_wide.unwrap_or(wide == (conversion == b'c'));
                 let v = args.next();
@@ -971,47 +993,47 @@ fn to_buffer<T: Copy + Default>(options: u64, buffer: *mut T, count: usize, sink
 
 /// `__stdio_common_vfprintf(options, stream, format, locale, args)`.
 #[unsafe(no_mangle)]
-pub extern "C" fn AtlasCrtVfprintf(_options: u64, f: *mut File, fmt: *const u8, _locale: u64, args: *const u64) -> i32 {
+pub extern "C" fn AtlasCrtVfprintf(_options: u64, f: *mut File, fmt: *const u8, _locale: usize, args: *const u8) -> i32 {
     let Some(file) = stream(f) else { return -1 };
     let mut sink = ToStream { file, chunk: [0; 256], used: 0, n: 0, failed: false };
-    format(&mut sink, Format::Narrow(fmt), &mut Args(args));
+    format(&mut sink, Format::Narrow(fmt), &mut Args(args.cast()));
     sink.flush();
     if sink.failed { -1 } else { sink.n as i32 }
 }
 
 /// `__stdio_common_vfwprintf(options, stream, format, locale, args)`: to a stream, in the ANSI code page.
 #[unsafe(no_mangle)]
-pub extern "C" fn AtlasCrtVfwprintf(_options: u64, f: *mut File, fmt: *const u16, _locale: u64, args: *const u64) -> i32 {
+pub extern "C" fn AtlasCrtVfwprintf(_options: u64, f: *mut File, fmt: *const u16, _locale: usize, args: *const u8) -> i32 {
     let Some(file) = stream(f) else { return -1 };
     let mut sink = ToStream { file, chunk: [0; 256], used: 0, n: 0, failed: false };
-    format(&mut sink, Format::Wide(fmt), &mut Args(args));
+    format(&mut sink, Format::Wide(fmt), &mut Args(args.cast()));
     sink.flush();
     if sink.failed { -1 } else { sink.n as i32 }
 }
 
 /// `__stdio_common_vsprintf(options, buffer, count, format, locale, args)`.
 #[unsafe(no_mangle)]
-pub extern "C" fn AtlasCrtVsprintf(options: u64, buffer: *mut u8, count: usize, fmt: *const u8, _locale: u64, args: *const u64) -> i32 {
+pub extern "C" fn AtlasCrtVsprintf(options: u64, buffer: *mut u8, count: usize, fmt: *const u8, _locale: usize, args: *const u8) -> i32 {
     to_buffer(options, buffer, count, |out| {
         let mut sink = Buffer { out, n: 0 };
-        format(&mut sink, Format::Narrow(fmt), &mut Args(args));
+        format(&mut sink, Format::Narrow(fmt), &mut Args(args.cast()));
         sink.count()
     })
 }
 
 /// `__stdio_common_vswprintf(options, buffer, count, format, locale, args)`.
 #[unsafe(no_mangle)]
-pub extern "C" fn AtlasCrtVswprintf(options: u64, buffer: *mut u16, count: usize, fmt: *const u16, _locale: u64, args: *const u64) -> i32 {
+pub extern "C" fn AtlasCrtVswprintf(options: u64, buffer: *mut u16, count: usize, fmt: *const u16, _locale: usize, args: *const u8) -> i32 {
     to_buffer(options, buffer, count, |out| {
         let mut sink = Buffer { out, n: 0 };
-        format(&mut sink, Format::Wide(fmt), &mut Args(args));
+        format(&mut sink, Format::Wide(fmt), &mut Args(args.cast()));
         sink.count()
     })
 }
 
 /// `__stdio_common_vsprintf_s(options, buffer, size, format, locale, args)`: all of it, or -1 and the buffer emptied.
 #[unsafe(no_mangle)]
-pub extern "C" fn AtlasCrtVsprintfS(_options: u64, buffer: *mut u8, size: usize, fmt: *const u8, _locale: u64, args: *const u64) -> i32 {
+pub extern "C" fn AtlasCrtVsprintfS(_options: u64, buffer: *mut u8, size: usize, fmt: *const u8, _locale: usize, args: *const u8) -> i32 {
     if buffer.is_null() || size == 0 {
         crate::crt::set_errno(22);
         return -1;
@@ -1029,7 +1051,7 @@ pub extern "C" fn AtlasCrtVsprintfS(_options: u64, buffer: *mut u8, size: usize,
 /// `__stdio_common_vsnprintf_s(options, buffer, size, max, format, locale, args)`: at most `max` characters
 /// (`_TRUNCATE`, all that fits, -1 if that's not all).
 #[unsafe(no_mangle)]
-pub extern "C" fn AtlasCrtVsnprintfS(_options: u64, buffer: *mut u8, size: usize, max: usize, fmt: *const u8, _locale: u64, args: *const u64) -> i32 {
+pub extern "C" fn AtlasCrtVsnprintfS(_options: u64, buffer: *mut u8, size: usize, max: usize, fmt: *const u8, _locale: usize, args: *const u8) -> i32 {
     if buffer.is_null() || size == 0 {
         crate::crt::set_errno(22);
         return -1;

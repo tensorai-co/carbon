@@ -1,7 +1,14 @@
-//! Reading PE images where they're mapped: headers, data directories, exports, imports and TLS.
+//! Reading PE images where they're mapped: headers, data directories, exports, imports and TLS. An image is PE32+ on
+//! the 64-bit ISAs and PE32 on x86, where its pointers (thunks, the TLS directory's, the image base) are 4 bytes.
+
+/// The size of a pointer, a handle or a SIZE_T in this ISA, in bytes.
+pub const PTR: u64 = size_of::<usize>() as u64;
+/// An import thunk's bit that says it's by ordinal: the top one.
+pub const ORDINAL: u64 = 1 << (PTR * 8 - 1);
 
 pub const DIR_EXPORT: usize = 0;
 pub const DIR_IMPORT: usize = 1;
+#[cfg_attr(target_arch = "x86", allow(dead_code))]
 pub const DIR_EXCEPTION: usize = 3;
 pub const DIR_TLS: usize = 9;
 pub const DIR_IAT: usize = 12;
@@ -37,6 +44,26 @@ pub unsafe fn u32_at(at: u64) -> u32 {
 pub unsafe fn u64_at(at: u64) -> u64 {
     // SAFETY: as the caller says.
     unsafe { core::ptr::read_unaligned(at as *const u64) }
+}
+
+/// A pointer-sized value: a pointer, a handle, a SIZE_T.
+///
+/// # Safety
+///
+/// `at` is readable.
+pub unsafe fn ptr_at(at: u64) -> u64 {
+    // SAFETY: as the caller says.
+    unsafe { core::ptr::read_unaligned(at as usize as *const usize) as u64 }
+}
+
+/// Writes a pointer-sized value.
+///
+/// # Safety
+///
+/// `at` is writable.
+pub unsafe fn put_ptr(at: u64, v: u64) {
+    // SAFETY: as the caller says.
+    unsafe { core::ptr::write_unaligned(at as usize as *mut usize, v as usize) }
 }
 
 /// A NUL-terminated string in an image.
@@ -86,21 +113,23 @@ impl Image {
         unsafe { u32_at(self.optional() - 16) }
     }
 
-    /// The base it was linked for (PE32+).
+    /// The base it was linked for.
     pub fn preferred_base(self) -> u64 {
         // SAFETY: as above.
-        unsafe { u64_at(self.optional() + 24) }
+        unsafe { if PTR == 8 { u64_at(self.optional() + 24) } else { u64::from(u32_at(self.optional() + 28)) } }
     }
 
     /// A data directory, as an address and size, if the image has it.
     pub fn dir(self, index: usize) -> Option<(u64, u64)> {
         let opt = self.optional();
-        // SAFETY: as above; PE32+ only.
+        // The directories follow the optional header's fixed part, which PE32's 4-byte fields make 16 bytes shorter.
+        let count_at = if PTR == 8 { opt + 108 } else { opt + 92 };
+        // SAFETY: as above.
         unsafe {
-            if u32_at(opt + 108) as usize <= index {
+            if u32_at(count_at) as usize <= index {
                 return None;
             }
-            let at = opt + 112 + index as u64 * 8;
+            let at = count_at + 4 + index as u64 * 8;
             let (rva, size) = (u32_at(at), u32_at(at + 4));
             (rva != 0 && size != 0).then(|| (self.0 + u64::from(rva), u64::from(size)))
         }

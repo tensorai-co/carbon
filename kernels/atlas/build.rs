@@ -1,5 +1,5 @@
-//! Builds `atlas-guest` (ntdll) for each ISA a Windows program can use, for `images::guest` to embed. It's `no_std`
-//! Rust for the `*-pc-windows-msvc` targets, linked with LLVM's `lld-link`.
+//! Builds `atlas-guest` (ntdll) for each ISA a Windows program can use, for `images::guest` to embed: ARM64, x86-64,
+//! and x86 for WoW64. It's `no_std` Rust for the `*-pc-windows-msvc` targets, linked with LLVM's `lld-link`.
 //!
 //! `core` and `compiler_builtins` are always built from source (`-Zbuild-std`, under `RUSTC_BOOTSTRAP`), with
 //! `compiler-builtins-mem`: ntdll has no C runtime under it, so `memcpy`, `memset`, `memcmp` and `strlen`, which the
@@ -19,7 +19,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", manifest.join("abi/src").display());
     println!("cargo:rerun-if-env-changed=ATLAS_GUEST_LINKER");
     let linker = std::env::var("ATLAS_GUEST_LINKER").ok().or_else(find_lld_link);
-    for arch in ["aarch64", "x86_64"] {
+    for arch in ["aarch64", "x86_64", "i686"] {
         let dest = out.join(format!("ntdll-{arch}.dll"));
         let built = linker.as_deref().ok_or("no lld-link found (set ATLAS_GUEST_LINKER)".to_string()).and_then(|linker| build(&guest, &out, arch, linker));
         match built {
@@ -45,7 +45,7 @@ fn build(guest: &Path, out: &Path, arch: &str, linker: &str) -> Result<PathBuf, 
         .arg(&target_dir)
         .env(format!("CARGO_TARGET_{}_LINKER", target.to_uppercase().replace('-', "_")), linker)
         // Exports written in assembly, which rustc doesn't export by itself.
-        .env("RUSTFLAGS", "-C link-arg=/NOENTRY -C link-arg=/NODEFAULTLIB -C link-arg=/EXPORT:RtlCaptureContext -C link-arg=/EXPORT:AtlasSwitchToFiber")
+        .env("RUSTFLAGS", rustflags(arch))
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .env_remove("RUSTC_WORKSPACE_WRAPPER");
     command.env("RUSTC_BOOTSTRAP", "1").args(["-Zbuild-std=core,compiler_builtins", "-Zbuild-std-features=compiler-builtins-mem"]);
@@ -55,6 +55,20 @@ fn build(guest: &Path, out: &Path, arch: &str, linker: &str) -> Result<PathBuf, 
         return Err(stderr.lines().find(|l| l.contains("error")).unwrap_or("cargo failed").to_string());
     }
     Ok(target_dir.join(&target).join("release/atlas_guest.dll"))
+}
+
+/// What the link needs: no entry point or C runtime, and the exports written in assembly (on x86, raising and unwinding
+/// too, which capture their caller's registers).
+fn rustflags(arch: &str) -> String {
+    let mut exports = vec!["RtlCaptureContext", "AtlasSwitchToFiber"];
+    if arch == "i686" {
+        exports.extend(["RtlRaiseException", "RtlUnwind"]);
+    }
+    let mut flags = String::from("-C link-arg=/NOENTRY -C link-arg=/NODEFAULTLIB");
+    for e in exports {
+        flags.push_str(&format!(" -C link-arg=/EXPORT:{e}"));
+    }
+    flags
 }
 
 fn find_lld_link() -> Option<String> {

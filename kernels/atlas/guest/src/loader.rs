@@ -14,7 +14,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use atlas_abi::{ldr, peb, status, teb};
 
-use crate::pe::{self, Export, Image, Wanted, cstr, u16_at, u32_at, u64_at};
+use crate::pe::{self, Export, Image, ORDINAL, PTR, Wanted, cstr, ptr_at, put_ptr, u16_at, u32_at};
 use crate::strings::{Message, Name};
 use crate::sys;
 
@@ -138,14 +138,6 @@ pub fn containing(addr: u64) -> Option<(u64, u64)> {
 /// # Safety
 ///
 /// `at` is writable.
-unsafe fn put64(at: u64, v: u64) {
-    // SAFETY: as the caller says.
-    unsafe { core::ptr::write_unaligned(at as *mut u64, v) }
-}
-
-/// # Safety
-///
-/// `at` is writable.
 unsafe fn put32(at: u64, v: u32) {
     // SAFETY: as the caller says.
     unsafe { core::ptr::write_unaligned(at as *mut u32, v) }
@@ -167,8 +159,8 @@ unsafe fn put16(at: u64, v: u16) {
 unsafe fn list_init(head: u64) {
     // SAFETY: as the caller says.
     unsafe {
-        put64(head, head);
-        put64(head + 8, head);
+        put_ptr(head, head);
+        put_ptr(head + PTR, head);
     }
 }
 
@@ -180,11 +172,11 @@ unsafe fn list_init(head: u64) {
 unsafe fn list_append(head: u64, links: u64) {
     // SAFETY: as the caller says.
     unsafe {
-        let last = u64_at(head + 8);
-        put64(links, head);
-        put64(links + 8, last);
-        put64(last, links);
-        put64(head + 8, links);
+        let last = ptr_at(head + PTR);
+        put_ptr(links, head);
+        put_ptr(links + PTR, last);
+        put_ptr(last, links);
+        put_ptr(head + PTR, links);
     }
 }
 
@@ -196,12 +188,12 @@ unsafe fn list_append(head: u64, links: u64) {
 unsafe fn list_remove(links: u64) {
     // SAFETY: as the caller says.
     unsafe {
-        let (next, prev) = (u64_at(links), u64_at(links + 8));
+        let (next, prev) = (ptr_at(links), ptr_at(links + PTR));
         if next == 0 || next == links {
             return;
         }
-        put64(prev, next);
-        put64(next + 8, prev);
+        put_ptr(prev, next);
+        put_ptr(next + PTR, prev);
         list_init(links);
     }
 }
@@ -219,7 +211,7 @@ fn ldr_init() {
         for head in [ldr::IN_LOAD_ORDER, ldr::IN_MEMORY_ORDER, ldr::IN_INITIALIZATION_ORDER] {
             list_init(at + head);
         }
-        put64(crate::peb() as u64 + peb::LDR, at);
+        put_ptr(crate::peb() as u64 + peb::LDR, at);
     }
     with(|t| t.ldr = at);
 }
@@ -242,17 +234,17 @@ fn ldr_entry(ldr_at: u64, base: u64, path: &[u16; 260], count: u32, static_load:
     unsafe {
         core::ptr::copy_nonoverlapping(path.as_ptr(), full_at as *mut u16, len);
         core::ptr::copy_nonoverlapping(path[file..].as_ptr(), base_name_at as *mut u16, base_len);
-        put64(at + ldr::DLL_BASE, base);
-        put64(at + ldr::ENTRY_POINT, image.entry().unwrap_or(0));
+        put_ptr(at + ldr::DLL_BASE, base);
+        put_ptr(at + ldr::ENTRY_POINT, image.entry().unwrap_or(0));
         put32(at + ldr::SIZE_OF_IMAGE, image.size() as u32);
         for (string, buffer, units) in [(ldr::FULL_DLL_NAME, full_at, len), (ldr::BASE_DLL_NAME, base_name_at, base_len)] {
             put16(at + string, (units * 2) as u16);
             put16(at + string + 2, (units * 2 + 2) as u16);
-            put64(at + string + 8, buffer);
+            put_ptr(at + string + PTR, buffer);
         }
         put32(at + ldr::FLAGS, if image.is_dll() { ldr::IMAGE_DLL } else { 0 });
         put32(at + ldr::TIME_DATE_STAMP, image.time_date_stamp());
-        put64(at + ldr::ORIGINAL_BASE, image.preferred_base());
+        put_ptr(at + ldr::ORIGINAL_BASE, image.preferred_base());
         put32(at + ldr::LOAD_REASON, if static_load { ldr::REASON_STATIC } else { ldr::REASON_DYNAMIC });
         list_init(at + ldr::INITIALIZATION_LINKS);
         list_append(ldr_at + ldr::IN_LOAD_ORDER, at + ldr::LOAD_LINKS);
@@ -434,17 +426,17 @@ fn resolve_imports(image: Image, why: Why, static_load: bool, depth: usize) -> R
             let mut slot = image.0 + u64::from(iat_rva);
             let mut entry = lookup;
             loop {
-                let thunk = u64_at(entry);
+                let thunk = ptr_at(entry);
                 if thunk == 0 {
                     break;
                 }
-                let wanted = if thunk & (1 << 63) != 0 { Wanted::Ordinal(thunk as u16) } else { Wanted::Name(cstr(image.0 + (thunk & 0x7fff_ffff) + 2)) };
+                let wanted = if thunk & ORDINAL != 0 { Wanted::Ordinal(thunk as u16) } else { Wanted::Name(cstr(image.0 + (thunk & 0x7fff_ffff) + 2)) };
                 match resolve(dll_base, wanted, depth) {
                     Some(address) => {
                         if iat.is_none() {
-                            sys::protect(slot, 8, PAGE_READWRITE);
+                            sys::protect(slot, PTR, PAGE_READWRITE);
                         }
-                        core::ptr::write_volatile(slot as *mut u64, address);
+                        core::ptr::write_volatile(slot as usize as *mut usize, address as usize);
                     }
                     None => {
                         let shown = match wanted {
@@ -455,8 +447,8 @@ fn resolve_imports(image: Image, why: Why, static_load: bool, depth: usize) -> R
                         break;
                     }
                 }
-                entry += 8;
-                slot += 8;
+                entry += PTR;
+                slot += PTR;
             }
             if result.is_err() {
                 break;
@@ -511,7 +503,7 @@ fn set_up_tls(image: Image) {
     };
     // SAFETY: the TLS directory's index field, in a mapped image.
     unsafe {
-        let index_at = u64_at(dir + 16);
+        let index_at = ptr_at(dir + 2 * PTR);
         if index_at != 0 {
             core::ptr::write_volatile(index_at as *mut u32, index as u32);
         }
@@ -520,12 +512,12 @@ fn set_up_tls(image: Image) {
 }
 
 /// This thread's static TLS slots, made if it has none yet.
-fn tls_slots() -> *mut u64 {
+fn tls_slots() -> *mut usize {
     // SAFETY: this thread's TEB.
     unsafe {
-        let slots = crate::teb().add(teb::THREAD_LOCAL_STORAGE as usize).cast::<*mut u64>();
+        let slots = crate::teb().add(teb::THREAD_LOCAL_STORAGE as usize).cast::<*mut usize>();
         if (*slots).is_null() {
-            *slots = crate::heap::allocate(MOST_TLS * 8, true).cast();
+            *slots = crate::heap::allocate(MOST_TLS * PTR as usize, true).cast();
         }
         *slots
     }
@@ -535,11 +527,11 @@ fn tls_slots() -> *mut u64 {
 fn tls_block(index: usize, dir: u64) {
     // SAFETY: the TLS directory and its template in a mapped image, and this thread's slots.
     unsafe {
-        let (start, end) = (u64_at(dir), u64_at(dir + 8));
-        let zero_fill = u64::from(u32_at(dir + 32));
+        let (start, end) = (ptr_at(dir), ptr_at(dir + PTR));
+        let zero_fill = u64::from(u32_at(dir + 4 * PTR));
         let block = crate::heap::allocate(((end - start + zero_fill) as usize).max(16), true);
         core::ptr::copy_nonoverlapping(start as *const u8, block, (end - start) as usize);
-        *tls_slots().add(index) = block as u64;
+        *tls_slots().add(index) = (block as u64) as usize;
     }
 }
 
@@ -547,7 +539,7 @@ fn tls_block(index: usize, dir: u64) {
 fn free_tls_blocks() {
     // SAFETY: this thread's TEB and slots, which nothing else uses.
     unsafe {
-        let slots = crate::teb().add(teb::THREAD_LOCAL_STORAGE as usize).cast::<*mut u64>();
+        let slots = crate::teb().add(teb::THREAD_LOCAL_STORAGE as usize).cast::<*mut usize>();
         if (*slots).is_null() {
             return;
         }
@@ -566,18 +558,18 @@ fn run_tls_callbacks(image: Image, reason: u32) {
     let Some((dir, _)) = image.dir(pe::DIR_TLS) else { return };
     // SAFETY: the TLS directory's null-terminated list of callbacks.
     unsafe {
-        let mut at = u64_at(dir + 24);
+        let mut at = ptr_at(dir + 3 * PTR);
         if at == 0 {
             return;
         }
         loop {
-            let callback = u64_at(at);
+            let callback = ptr_at(at);
             if callback == 0 {
                 break;
             }
-            let callback: extern "system" fn(u64, u32, u64) = core::mem::transmute(callback);
-            callback(image.0, reason, 0);
-            at += 8;
+            let callback: extern "system" fn(usize, u32, usize) = core::mem::transmute(callback as usize);
+            callback(image.0 as usize, reason, 0);
+            at += PTR;
         }
     }
 }
@@ -586,8 +578,8 @@ fn run_tls_callbacks(image: Image, reason: u32) {
 fn dll_main(base: u64, reason: u32, reserved: u64) -> bool {
     let Some(entry) = Image(base).entry() else { return true };
     // SAFETY: a DLL's entry point, as Windows calls it.
-    let main: extern "system" fn(u64, u32, u64) -> i32 = unsafe { core::mem::transmute(entry) };
-    main(base, reason, reserved) != 0
+    let main: extern "system" fn(usize, u32, usize) -> i32 = unsafe { core::mem::transmute(entry as usize) };
+    main(base as usize, reason, reserved as usize) != 0
 }
 
 // ---- Starting and ending ----
@@ -614,13 +606,14 @@ fn started_newest_first(out: &mut [u64; MOST_MODULES], threads: bool) -> usize {
 
 fn exe() -> Image {
     // SAFETY: the PEB's image base.
-    Image(unsafe { u64_at(exe_base()) })
+    Image(unsafe { ptr_at(exe_base()) })
 }
 
 /// Where a new thread starts: it waits here if it was made suspended, gets its own static TLS, tells each DLL it's
 /// started, then runs `start(parameter)` and ends with what it returns.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasThreadStart(start: u64, parameter: u64) -> ! {
+pub extern "system" fn AtlasThreadStart(start: usize, parameter: usize) -> ! {
+    let (start, parameter) = (start as u64, parameter as u64);
     sys::call4(atlas_abi::call::THREAD_STARTED, 0, 0, 0, 0);
     let mut at = 0;
     loop {
@@ -643,8 +636,8 @@ pub extern "system" fn AtlasThreadStart(start: u64, parameter: u64) -> ! {
     }
     run_tls_callbacks(exe(), DLL_THREAD_ATTACH);
     // SAFETY: the program's thread routine, as Windows calls it.
-    let start: extern "system" fn(u64) -> u32 = unsafe { core::mem::transmute(start) };
-    AtlasExitThread(start(parameter))
+    let start: extern "system" fn(usize) -> u32 = unsafe { core::mem::transmute(start as usize) };
+    AtlasExitThread(start(parameter as usize))
 }
 
 /// `ExitThread`, `RtlExitUserThread`: the process's last thread ends the process, as Windows has it. Otherwise each
@@ -735,16 +728,17 @@ fn attach_all() -> bool {
 
 /// Where the first thread starts: loads what the program imports, runs every DLL's start, then the program.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasProcessStart(peb_at: u64, ntdll: u64) -> ! {
+pub extern "system" fn AtlasProcessStart(peb_at: usize, ntdll: usize) -> ! {
+    let (peb_at, ntdll) = (peb_at as u64, ntdll as u64);
     // A process made suspended waits here for `ResumeThread`, before anything of it has run.
     sys::call4(atlas_abi::call::THREAD_STARTED, 0, 0, 0, 0);
     ldr_init();
     // SAFETY: the PEB atlas made, and its process parameters' image path.
     let (exe, path) = unsafe {
-        let exe = u64_at(peb_at + peb::IMAGE_BASE);
-        let params = u64_at(peb_at + peb::PROCESS_PARAMETERS);
+        let exe = ptr_at(peb_at + peb::IMAGE_BASE);
+        let params = ptr_at(peb_at + peb::PROCESS_PARAMETERS);
         let string = params + atlas_abi::params::IMAGE_PATH_NAME;
-        let (len, buffer) = (u16_at(string) as usize / 2, u64_at(string + 8));
+        let (len, buffer) = (u16_at(string) as usize / 2, ptr_at(string + PTR));
         let mut path = [0u16; 260];
         for (i, unit) in path.iter_mut().enumerate().take(len.min(259)) {
             *unit = u16_at(buffer + i as u64 * 2);
@@ -785,8 +779,8 @@ pub extern "system" fn AtlasProcessStart(peb_at: u64, ntdll: u64) -> ! {
     run_tls_callbacks(Image(exe), DLL_PROCESS_ATTACH);
     let Some(entry) = Image(exe).entry() else { sys::terminate(status::INVALID_IMAGE_FORMAT) };
     // SAFETY: the program's entry point, as Windows calls it.
-    let main: extern "system" fn(u64) -> u32 = unsafe { core::mem::transmute(entry) };
-    let code = main(peb_at);
+    let main: extern "system" fn(usize) -> u32 = unsafe { core::mem::transmute(entry as usize) };
+    let code = main(peb_at as usize);
     RtlExitUserProcess(code)
 }
 
@@ -876,19 +870,20 @@ fn notify(base: u64, reason: u32) {
         return;
     }
     // LDR_DLL_NOTIFICATION_DATA: flags, the full and base names, the base and the size.
-    let data: [u64; 5] = [0, entry + ldr::FULL_DLL_NAME, entry + ldr::BASE_DLL_NAME, base, size];
+    let data: [usize; 5] = [0, (entry + ldr::FULL_DLL_NAME) as usize, (entry + ldr::BASE_DLL_NAME) as usize, base as usize, size as usize];
     for (callback, context) in callbacks {
         if callback != 0 {
             // SAFETY: the program's callback, as Windows calls it.
-            let f: extern "system" fn(u32, *const u64, u64) = unsafe { core::mem::transmute(callback) };
-            f(reason, data.as_ptr(), context);
+            let f: extern "system" fn(u32, *const usize, usize) = unsafe { core::mem::transmute(callback as usize) };
+            f(reason, data.as_ptr(), context as usize);
         }
     }
 }
 
 /// `LdrRegisterDllNotification(flags, callback, context, &cookie)`.
 #[unsafe(no_mangle)]
-pub extern "system" fn LdrRegisterDllNotification(flags: u32, callback: u64, context: u64, cookie: *mut u64) -> u32 {
+pub extern "system" fn LdrRegisterDllNotification(flags: u32, callback: usize, context: usize, cookie: *mut usize) -> u32 {
+    let (callback, context) = (callback as u64, context as u64);
     if flags != 0 || callback == 0 || cookie.is_null() {
         return status::INVALID_PARAMETER;
     }
@@ -900,7 +895,7 @@ pub extern "system" fn LdrRegisterDllNotification(flags: u32, callback: u64, con
     match slot {
         Some(i) => {
             // SAFETY: the program's cookie.
-            unsafe { cookie.write_unaligned(i as u64 + 1) };
+            unsafe { cookie.write_unaligned((i as u64 + 1) as usize) };
             status::SUCCESS
         }
         None => status::NO_MEMORY,
@@ -909,7 +904,8 @@ pub extern "system" fn LdrRegisterDllNotification(flags: u32, callback: u64, con
 
 /// `LdrUnregisterDllNotification(cookie)`.
 #[unsafe(no_mangle)]
-pub extern "system" fn LdrUnregisterDllNotification(cookie: u64) -> u32 {
+pub extern "system" fn LdrUnregisterDllNotification(cookie: usize) -> u32 {
+    let cookie = cookie as u64;
     with(|t| match t.notifications.get_mut((cookie as usize).wrapping_sub(1)) {
         Some(slot) if slot.0 != 0 => {
             *slot = (0, 0);
@@ -978,28 +974,45 @@ fn load_library(at: u64, wide: bool) -> u64 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasLoadLibraryA(name: u64) -> u64 {
-    load_library(name, false)
+pub extern "system" fn AtlasLoadLibraryA(name: usize) -> usize {
+    let name = name as u64;
+    let result = (|| -> u64 {
+        load_library(name, false)
+    })();
+    result as usize
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasLoadLibraryW(name: u64) -> u64 {
-    load_library(name, true)
+pub extern "system" fn AtlasLoadLibraryW(name: usize) -> usize {
+    let name = name as u64;
+    let result = (|| -> u64 {
+        load_library(name, true)
+    })();
+    result as usize
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasLoadLibraryExA(name: u64, _file: u64, _flags: u32) -> u64 {
-    load_library(name, false)
+pub extern "system" fn AtlasLoadLibraryExA(name: usize, _file: usize, _flags: u32) -> usize {
+    let name = name as u64;
+    let result = (|| -> u64 {
+        load_library(name, false)
+    })();
+    result as usize
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasLoadLibraryExW(name: u64, _file: u64, _flags: u32) -> u64 {
-    load_library(name, true)
+pub extern "system" fn AtlasLoadLibraryExW(name: usize, _file: usize, _flags: u32) -> usize {
+    let name = name as u64;
+    let result = (|| -> u64 {
+        load_library(name, true)
+    })();
+    result as usize
 }
 
 /// `FreeLibrary`: one reference fewer, and the DLL unloaded if that was the last.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasFreeLibrary(module: u64) -> i32 {
+pub extern "system" fn AtlasFreeLibrary(module: usize) -> i32 {
+    let module = module as u64;
     if release(module) {
         1
     } else {
@@ -1009,13 +1022,15 @@ pub extern "system" fn AtlasFreeLibrary(module: u64) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasFreeLibraryAndExitThread(module: u64, code: u32) -> ! {
+pub extern "system" fn AtlasFreeLibraryAndExitThread(module: usize, code: u32) -> ! {
+    let module = module as u64;
     release(module);
     AtlasExitThread(code)
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasDisableThreadLibraryCalls(module: u64) -> i32 {
+pub extern "system" fn AtlasDisableThreadLibraryCalls(module: usize) -> i32 {
+    let module = module as u64;
     let found = with(|t| t.by_base(module).map(|m| m.no_thread_calls = true).is_some());
     if !found {
         set_last_error(ERROR_INVALID_PARAMETER);
@@ -1025,13 +1040,13 @@ pub extern "system" fn AtlasDisableThreadLibraryCalls(module: u64) -> i32 {
 
 fn exe_base() -> u64 {
     // SAFETY: this thread's TEB and its PEB.
-    unsafe { u64_at(crate::teb() as u64 + teb::PEB) }.wrapping_add(peb::IMAGE_BASE)
+    unsafe { ptr_at(crate::teb() as u64 + teb::PEB) }.wrapping_add(peb::IMAGE_BASE)
 }
 
 fn module_handle(at: u64, wide: bool) -> u64 {
     if at == 0 {
         // SAFETY: the PEB's image base.
-        return unsafe { u64_at(exe_base()) };
+        return unsafe { ptr_at(exe_base()) };
     }
     let mut name = [0u8; 260];
     // SAFETY: the program's string.
@@ -1043,18 +1058,26 @@ fn module_handle(at: u64, wide: bool) -> u64 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasGetModuleHandleA(name: u64) -> u64 {
-    module_handle(name, false)
+pub extern "system" fn AtlasGetModuleHandleA(name: usize) -> usize {
+    let name = name as u64;
+    let result = (|| -> u64 {
+        module_handle(name, false)
+    })();
+    result as usize
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasGetModuleHandleW(name: u64) -> u64 {
-    module_handle(name, true)
+pub extern "system" fn AtlasGetModuleHandleW(name: usize) -> usize {
+    let name = name as u64;
+    let result = (|| -> u64 {
+        module_handle(name, true)
+    })();
+    result as usize
 }
 
 /// `GetModuleHandleEx(flags, name or address, &module)`: by name, or by an address in it
 /// (GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS); with a reference taken, unless UNCHANGED_REFCOUNT, or pinned (PIN).
-fn module_handle_ex(flags: u32, name: u64, out: *mut u64, wide: bool) -> i32 {
+fn module_handle_ex(flags: u32, name: u64, out: *mut usize, wide: bool) -> i32 {
     const PIN: u32 = 1;
     const UNCHANGED_REFCOUNT: u32 = 2;
     const FROM_ADDRESS: u32 = 4;
@@ -1068,7 +1091,7 @@ fn module_handle_ex(flags: u32, name: u64, out: *mut u64, wide: bool) -> i32 {
         module_handle(name, wide)
     };
     // SAFETY: the program's out pointer.
-    unsafe { out.write_unaligned(base) };
+    unsafe { out.write_unaligned(base as usize) };
     if base == 0 {
         set_last_error(ERROR_MOD_NOT_FOUND);
         return 0;
@@ -1082,37 +1105,44 @@ fn module_handle_ex(flags: u32, name: u64, out: *mut u64, wide: bool) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasGetModuleHandleExA(flags: u32, name: u64, out: *mut u64) -> i32 {
+pub extern "system" fn AtlasGetModuleHandleExA(flags: u32, name: usize, out: *mut usize) -> i32 {
+    let name = name as u64;
     module_handle_ex(flags, name, out, false)
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasGetModuleHandleExW(flags: u32, name: u64, out: *mut u64) -> i32 {
+pub extern "system" fn AtlasGetModuleHandleExW(flags: u32, name: usize, out: *mut usize) -> i32 {
+    let name = name as u64;
     module_handle_ex(flags, name, out, true)
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasGetProcAddress(module: u64, name: u64) -> u64 {
-    // SAFETY: the PEB's image base.
-    let base = if module == 0 { unsafe { u64_at(exe_base()) } } else { module };
-    if containing(base).is_none() {
-        set_last_error(ERROR_MOD_NOT_FOUND);
-        return 0;
-    }
-    // An ordinal is a "pointer" below 64 KiB.
-    // SAFETY: the program's string, if it isn't an ordinal.
-    let wanted = if name < 0x1_0000 { Wanted::Ordinal(name as u16) } else { Wanted::Name(unsafe { cstr(name) }) };
-    resolve(base, wanted, 0).unwrap_or_else(|| {
-        set_last_error(ERROR_PROC_NOT_FOUND);
-        0
-    })
+pub extern "system" fn AtlasGetProcAddress(module: usize, name: usize) -> usize {
+    let (module, name) = (module as u64, name as u64);
+    let result = (|| -> u64 {
+        // SAFETY: the PEB's image base.
+        let base = if module == 0 { unsafe { ptr_at(exe_base()) } } else { module };
+        if containing(base).is_none() {
+            set_last_error(ERROR_MOD_NOT_FOUND);
+            return 0;
+        }
+        // An ordinal is a "pointer" below 64 KiB.
+        // SAFETY: the program's string, if it isn't an ordinal.
+        let wanted = if name < 0x1_0000 { Wanted::Ordinal(name as u16) } else { Wanted::Name(unsafe { cstr(name) }) };
+        resolve(base, wanted, 0).unwrap_or_else(|| {
+            set_last_error(ERROR_PROC_NOT_FOUND);
+            0
+        })
+    })();
+    result as usize
 }
 
 /// `GetModuleFileNameA`: the path in the ANSI code page.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasGetModuleFileNameA(module: u64, buffer: *mut u8, size: u32) -> u32 {
+pub extern "system" fn AtlasGetModuleFileNameA(module: usize, buffer: *mut u8, size: u32) -> u32 {
+    let module = module as u64;
     // SAFETY: the PEB's image base.
-    let base = if module == 0 { unsafe { u64_at(exe_base()) } } else { module };
+    let base = if module == 0 { unsafe { ptr_at(exe_base()) } } else { module };
     let Some(path) = with(|t| t.modules[..t.count].iter().find(|m| m.base == base).map(|m| m.path)) else {
         set_last_error(ERROR_MOD_NOT_FOUND);
         return 0;
@@ -1133,9 +1163,10 @@ pub extern "system" fn AtlasGetModuleFileNameA(module: u64, buffer: *mut u8, siz
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasGetModuleFileNameW(module: u64, buffer: *mut u16, size: u32) -> u32 {
+pub extern "system" fn AtlasGetModuleFileNameW(module: usize, buffer: *mut u16, size: u32) -> u32 {
+    let module = module as u64;
     // SAFETY: the PEB's image base.
-    let base = if module == 0 { unsafe { u64_at(exe_base()) } } else { module };
+    let base = if module == 0 { unsafe { ptr_at(exe_base()) } } else { module };
     let Some(path) = with(|t| t.modules[..t.count].iter().find(|m| m.base == base).map(|m| m.path)) else {
         set_last_error(ERROR_MOD_NOT_FOUND);
         return 0;
@@ -1166,7 +1197,7 @@ unsafe fn counted(string: u64, wide: bool, out: &mut [u8; 260]) -> Option<usize>
     }
     // SAFETY: as the caller says.
     unsafe {
-        let (bytes, buffer) = (usize::from(u16_at(string)), u64_at(string + 8));
+        let (bytes, buffer) = (usize::from(u16_at(string)), ptr_at(string + PTR));
         if buffer == 0 {
             return None;
         }
@@ -1176,7 +1207,8 @@ unsafe fn counted(string: u64, wide: bool, out: &mut [u8; 260]) -> Option<usize>
 
 /// `LdrLoadDll(search path, &flags, name, &base)`.
 #[unsafe(no_mangle)]
-pub extern "system" fn LdrLoadDll(_path: u64, _flags: u64, name: u64, base: *mut u64) -> u32 {
+pub extern "system" fn LdrLoadDll(_path: usize, _flags: usize, name: usize, base: *mut usize) -> u32 {
+    let name = name as u64;
     let mut raw = [0u8; 260];
     // SAFETY: the program's UNICODE_STRING.
     let Some(n) = (unsafe { counted(name, true, &mut raw) }) else { return status::INVALID_PARAMETER };
@@ -1186,7 +1218,7 @@ pub extern "system" fn LdrLoadDll(_path: u64, _flags: u64, name: u64, base: *mut
     match load_dynamic(&raw[..n]) {
         Ok(at) => {
             // SAFETY: the program's out pointer.
-            unsafe { base.write_unaligned(at) };
+            unsafe { base.write_unaligned(at as usize) };
             status::SUCCESS
         }
         Err(code) => code,
@@ -1195,13 +1227,15 @@ pub extern "system" fn LdrLoadDll(_path: u64, _flags: u64, name: u64, base: *mut
 
 /// `LdrUnloadDll(base)`.
 #[unsafe(no_mangle)]
-pub extern "system" fn LdrUnloadDll(base: u64) -> u32 {
+pub extern "system" fn LdrUnloadDll(base: usize) -> u32 {
+    let base = base as u64;
     if release(base) { status::SUCCESS } else { status::DLL_NOT_FOUND }
 }
 
 /// `LdrGetDllHandle(search path, characteristics, name, &base)`.
 #[unsafe(no_mangle)]
-pub extern "system" fn LdrGetDllHandle(_path: u64, _characteristics: u64, name: u64, base: *mut u64) -> u32 {
+pub extern "system" fn LdrGetDllHandle(_path: usize, _characteristics: usize, name: usize, base: *mut usize) -> u32 {
+    let name = name as u64;
     let mut raw = [0u8; 260];
     // SAFETY: the program's UNICODE_STRING.
     let Some(n) = (unsafe { counted(name, true, &mut raw) }) else { return status::INVALID_PARAMETER };
@@ -1210,13 +1244,14 @@ pub extern "system" fn LdrGetDllHandle(_path: u64, _characteristics: u64, name: 
     }
     let found = find(&Name::module(&raw[..n]));
     // SAFETY: the program's out pointer.
-    unsafe { base.write_unaligned(found.unwrap_or(0)) };
+    unsafe { base.write_unaligned((found.unwrap_or(0)) as usize) };
     if found.is_some() { status::SUCCESS } else { status::DLL_NOT_FOUND }
 }
 
 /// `LdrGetProcedureAddress(base, name, ordinal, &address)`: by an ANSI_STRING's name, or with none, the ordinal.
 #[unsafe(no_mangle)]
-pub extern "system" fn LdrGetProcedureAddress(base: u64, name: u64, ordinal: u32, address: *mut u64) -> u32 {
+pub extern "system" fn LdrGetProcedureAddress(base: usize, name: usize, ordinal: u32, address: *mut usize) -> u32 {
+    let (base, name) = (base as u64, name as u64);
     if address.is_null() {
         return status::INVALID_PARAMETER;
     }
@@ -1227,13 +1262,13 @@ pub extern "system" fn LdrGetProcedureAddress(base: u64, name: u64, ordinal: u32
         resolve(base, Wanted::Ordinal(ordinal as u16), 0).ok_or(status::ORDINAL_NOT_FOUND)
     } else {
         // SAFETY: the program's ANSI_STRING, whose buffer needn't end in a NUL.
-        let wanted = unsafe { core::slice::from_raw_parts(u64_at(name + 8) as *const u8, usize::from(u16_at(name))) };
+        let wanted = unsafe { core::slice::from_raw_parts(ptr_at(name + PTR) as usize as *const u8, usize::from(u16_at(name))) };
         resolve(base, Wanted::Name(wanted), 0).ok_or(status::PROCEDURE_NOT_FOUND)
     };
     match found {
         Ok(at) => {
             // SAFETY: the program's out pointer.
-            unsafe { address.write_unaligned(at) };
+            unsafe { address.write_unaligned(at as usize) };
             status::SUCCESS
         }
         Err(code) => code,
@@ -1242,12 +1277,13 @@ pub extern "system" fn LdrGetProcedureAddress(base: u64, name: u64, ordinal: u32
 
 /// `LdrFindEntryForAddress(address, &entry)`: the LDR_DATA_TABLE_ENTRY of the module it's in.
 #[unsafe(no_mangle)]
-pub extern "system" fn LdrFindEntryForAddress(address: u64, out: *mut u64) -> u32 {
+pub extern "system" fn LdrFindEntryForAddress(address: usize, out: *mut usize) -> u32 {
+    let address = address as u64;
     let entry = with(|t| t.modules[..t.count].iter().find(|m| address >= m.base && address < m.base + m.size).map(|m| m.entry));
     match entry {
         Some(entry) if entry != 0 && !out.is_null() => {
             // SAFETY: the program's out pointer.
-            unsafe { out.write_unaligned(entry) };
+            unsafe { out.write_unaligned(entry as usize) };
             status::SUCCESS
         }
         _ => status::DLL_NOT_FOUND,
@@ -1262,57 +1298,61 @@ pub extern "system" fn LdrFindEntryForAddress(address: u64, out: *mut u64) -> u3
 /// thunk. If either fails, the hooks are asked for something to use instead (`DELAYLOAD_INFO`); with nothing,
 /// it raises the delay-load helper's exception for the module (0xC06D007E) or the procedure (0xC06D007F).
 #[unsafe(no_mangle)]
-pub extern "system" fn LdrResolveDelayLoadedAPI(parent: u64, descriptor: u64, dll_hook: u64, system_hook: u64, thunk: u64, _flags: u32) -> u64 {
-    // SAFETY: the parent's delay-load descriptor and its tables, all RVAs from its base.
-    unsafe {
-        let rva = |at: u64| parent + u64::from(u32_at(descriptor + at));
-        let dll = cstr(rva(4));
-        let (handle_at, iat, names) = (rva(8), rva(12), rva(16));
-        let index = thunk.wrapping_sub(iat) / 8;
-        let entry = u64_at(names + index * 8);
-        let (wanted, by_name, name_at) = if entry & (1 << 63) != 0 {
-            (Wanted::Ordinal(entry as u16), false, entry & 0xffff)
-        } else {
-            let at = parent + (entry & 0x7fff_ffff) + 2;
-            (Wanted::Name(cstr(at)), true, at)
-        };
-        let mut module = u64_at(handle_at);
-        if module == 0 {
-            match load_dynamic(dll) {
-                Ok(base) => {
-                    let slot = &*(handle_at as *const AtomicU64);
-                    // Another thread got here first: its reference is the one kept.
-                    if slot.compare_exchange(0, base, Ordering::AcqRel, Ordering::Acquire).is_err() {
-                        release(base);
+pub extern "system" fn LdrResolveDelayLoadedAPI(parent: usize, descriptor: usize, dll_hook: usize, system_hook: usize, thunk: usize, _flags: u32) -> usize {
+    let (parent, descriptor, dll_hook, system_hook, thunk) = (parent as u64, descriptor as u64, dll_hook as u64, system_hook as u64, thunk as u64);
+    let result = (|| -> u64 {
+        // SAFETY: the parent's delay-load descriptor and its tables, all RVAs from its base.
+        unsafe {
+            let rva = |at: u64| parent + u64::from(u32_at(descriptor + at));
+            let dll = cstr(rva(4));
+            let (handle_at, iat, names) = (rva(8), rva(12), rva(16));
+            let index = thunk.wrapping_sub(iat) / 8;
+            let entry = ptr_at(names + index * PTR);
+            let (wanted, by_name, name_at) = if entry & ORDINAL != 0 {
+                (Wanted::Ordinal(entry as u16), false, entry & 0xffff)
+            } else {
+                let at = parent + (entry & 0x7fff_ffff) + 2;
+                (Wanted::Name(cstr(at)), true, at)
+            };
+            let mut module = ptr_at(handle_at);
+            if module == 0 {
+                match load_dynamic(dll) {
+                    Ok(base) => {
+                        let slot = &*(handle_at as *const AtomicU64);
+                        // Another thread got here first: its reference is the one kept.
+                        if slot.compare_exchange(0, base, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                            release(base);
+                        }
+                        module = slot.load(Ordering::Acquire);
                     }
-                    module = slot.load(Ordering::Acquire);
+                    Err(_) => {
+                        set_last_error(ERROR_MOD_NOT_FOUND);
+                        return delay_failed(3, descriptor, thunk, dll, by_name, name_at, 0, dll_hook, system_hook);
+                    }
                 }
-                Err(_) => {
-                    set_last_error(ERROR_MOD_NOT_FOUND);
-                    return delay_failed(3, descriptor, thunk, dll, by_name, name_at, 0, dll_hook, system_hook);
+            }
+            match resolve(module, wanted, 0) {
+                Some(address) => {
+                    write_thunk(thunk, address);
+                    address
+                }
+                None => {
+                    set_last_error(ERROR_PROC_NOT_FOUND);
+                    delay_failed(4, descriptor, thunk, dll, by_name, name_at, module, dll_hook, system_hook)
                 }
             }
         }
-        match resolve(module, wanted, 0) {
-            Some(address) => {
-                write_thunk(thunk, address);
-                address
-            }
-            None => {
-                set_last_error(ERROR_PROC_NOT_FOUND);
-                delay_failed(4, descriptor, thunk, dll, by_name, name_at, module, dll_hook, system_hook)
-            }
-        }
-    }
+    })();
+    result as usize
 }
 
 /// A delay-load thunk, written whatever its page's protection.
 fn write_thunk(thunk: u64, address: u64) {
-    let old = sys::protect(thunk, 8, PAGE_READWRITE);
+    let old = sys::protect(thunk, PTR, PAGE_READWRITE);
     // SAFETY: the thunk, writable now.
-    unsafe { core::ptr::write_volatile(thunk as *mut u64, address) };
+    unsafe { core::ptr::write_volatile(thunk as usize as *mut usize, address as usize) };
     if let Some(old) = old {
-        sys::protect(thunk, 8, old);
+        sys::protect(thunk, PTR, old);
     }
 }
 
@@ -1321,11 +1361,12 @@ fn write_thunk(thunk: u64, address: u64) {
 fn delay_failed(reason: u32, descriptor: u64, thunk: u64, dll: &[u8], by_name: bool, name: u64, module: u64, dll_hook: u64, system_hook: u64) -> u64 {
     // DELAYLOAD_INFO: size, descriptor, thunk, the DLL's name, the export (by name or ordinal), the module, unused,
     // and the last error.
-    let info: [u64; 9] = [0x48, descriptor, thunk, dll.as_ptr() as u64, u64::from(by_name), name, module, 0, u64::from(crate::RtlGetLastWin32Error())];
+    let info: [usize; 9] =
+        [9 * PTR as usize, descriptor as usize, thunk as usize, dll.as_ptr() as usize, usize::from(by_name), name as usize, module as usize, 0, crate::RtlGetLastWin32Error() as usize];
     if dll_hook != 0 {
         // SAFETY: the program's hook, as Windows calls it.
-        let hook: extern "system" fn(u32, *const u64) -> u64 = unsafe { core::mem::transmute(dll_hook) };
-        let instead = hook(reason, info.as_ptr());
+        let hook: extern "system" fn(u32, *const usize) -> usize = unsafe { core::mem::transmute(dll_hook as usize) };
+        let instead = hook(reason, info.as_ptr()) as u64;
         if instead != 0 {
             write_thunk(thunk, instead);
             return instead;
@@ -1333,15 +1374,15 @@ fn delay_failed(reason: u32, descriptor: u64, thunk: u64, dll: &[u8], by_name: b
     }
     if system_hook != 0 {
         // SAFETY: as above.
-        let hook: extern "system" fn(u64, u64) -> u64 = unsafe { core::mem::transmute(system_hook) };
-        let instead = hook(dll.as_ptr() as u64, name);
+        let hook: extern "system" fn(usize, usize) -> usize = unsafe { core::mem::transmute(system_hook as usize) };
+        let instead = hook(dll.as_ptr() as usize, name as usize) as u64;
         if instead != 0 {
             write_thunk(thunk, instead);
             return instead;
         }
     }
     let code = if reason == 3 { 0xc06d_007e } else { 0xc06d_007f };
-    let arguments = [info.as_ptr() as u64];
+    let arguments = [info.as_ptr() as usize];
     crate::exception::AtlasRaiseException(code, 0, 1, arguments.as_ptr());
     0
 }

@@ -21,8 +21,11 @@ const START: usize = 0x30;
 const OWNS_STACK: usize = 0x38;
 const SP: usize = 0x40;
 const PC: usize = 0x48;
-/// x64: rbx, rbp, rdi, rsi, r12 to r15, then xmm6 to xmm15 at 0x90. ARM64: x19 to x30, then d8 to d15 at 0xb0.
+/// x64: rbx, rbp, rdi, rsi, r12 to r15, then xmm6 to xmm15 at 0x90. ARM64: x19 to x30, then d8 to d15 at 0xb0. x86:
+/// ebx, ebp, edi, esi at 0x50, then its chain of SEH frames (`fs:[0]`), which is each fiber's own.
 const SIZE: usize = 0x140;
+#[cfg(target_arch = "x86")]
+const EXCEPTION_LIST: usize = 0x70;
 
 const HAS_FIBER_DATA: u16 = 4;
 const ERROR_INVALID_PARAMETER: u32 = 87;
@@ -35,11 +38,12 @@ const STACK_GUARD: u64 = 16 << 10;
 const PAGE_READWRITE_GUARD: u32 = 0x104;
 const MEM_RELEASE: u64 = 0x8000;
 
-fn field(fiber: u64, at: usize) -> *mut u64 {
-    (fiber + at as u64) as *mut u64
+/// A field of a fiber: each is pointer-sized, 8 bytes apart.
+fn field(fiber: u64, at: usize) -> *mut usize {
+    (fiber + at as u64) as usize as *mut usize
 }
 
-fn teb_u64(at: u64) -> *mut u64 {
+fn teb_word(at: u64) -> *mut usize {
     // SAFETY: a field of this thread's TEB.
     unsafe { crate::teb().add(at as usize).cast() }
 }
@@ -51,7 +55,7 @@ fn flags() -> *mut u16 {
 
 fn current() -> u64 {
     // SAFETY: the TEB's FiberData.
-    unsafe { teb_u64(teb::FIBER_DATA).read() }
+    unsafe { teb_word(teb::FIBER_DATA).read() as u64 }
 }
 
 /// `IsThreadAFiber()`.
@@ -63,28 +67,36 @@ pub extern "system" fn AtlasIsThreadAFiber() -> i32 {
 
 /// `ConvertThreadToFiber(parameter)`: this thread, as a fiber that runs on its own stack.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasConvertThreadToFiber(parameter: u64) -> u64 {
-    AtlasConvertThreadToFiberEx(parameter, 0)
+pub extern "system" fn AtlasConvertThreadToFiber(parameter: usize) -> usize {
+    let parameter = parameter as u64;
+    let result = (|| -> u64 {
+        (AtlasConvertThreadToFiberEx(parameter as usize, 0)) as u64
+    })();
+    result as usize
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasConvertThreadToFiberEx(parameter: u64, _flags: u32) -> u64 {
-    if AtlasIsThreadAFiber() != 0 {
-        crate::RtlSetLastWin32Error(ERROR_ALREADY_FIBER);
-        return 0;
-    }
-    let fiber = crate::heap::allocate(SIZE, true) as u64;
-    if fiber == 0 {
-        crate::RtlSetLastWin32Error(ERROR_NOT_ENOUGH_MEMORY);
-        return 0;
-    }
-    // SAFETY: the new fiber, and this thread's TEB.
-    unsafe {
-        *field(fiber, PARAMETER) = parameter;
-        *teb_u64(teb::FIBER_DATA) = fiber;
-        *flags() |= HAS_FIBER_DATA;
-    }
-    fiber
+pub extern "system" fn AtlasConvertThreadToFiberEx(parameter: usize, _flags: u32) -> usize {
+    let parameter = parameter as u64;
+    let result = (|| -> u64 {
+        if AtlasIsThreadAFiber() != 0 {
+            crate::RtlSetLastWin32Error(ERROR_ALREADY_FIBER);
+            return 0;
+        }
+        let fiber = crate::heap::allocate(SIZE, true) as usize as u64;
+        if fiber == 0 {
+            crate::RtlSetLastWin32Error(ERROR_NOT_ENOUGH_MEMORY);
+            return 0;
+        }
+        // SAFETY: the new fiber, and this thread's TEB.
+        unsafe {
+            *field(fiber, PARAMETER) = parameter as usize;
+            *teb_word(teb::FIBER_DATA) = fiber as usize;
+            *flags() |= HAS_FIBER_DATA;
+        }
+        fiber
+    })();
+    result as usize
 }
 
 /// `ConvertFiberToThread()`: the thread isn't a fiber any more.
@@ -97,7 +109,7 @@ pub extern "system" fn AtlasConvertFiberToThread() -> i32 {
     let fiber = current();
     // SAFETY: this thread's TEB.
     unsafe {
-        *teb_u64(teb::FIBER_DATA) = 0;
+        *teb_word(teb::FIBER_DATA) = 0;
         *flags() &= !HAS_FIBER_DATA;
     }
     crate::heap::free(fiber as *mut u8);
@@ -106,41 +118,55 @@ pub extern "system" fn AtlasConvertFiberToThread() -> i32 {
 
 /// `CreateFiber(stack size, routine, parameter)`.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasCreateFiber(stack_size: u64, start: u64, parameter: u64) -> u64 {
-    AtlasCreateFiberEx(stack_size, stack_size, 0, start, parameter)
+pub extern "system" fn AtlasCreateFiber(stack_size: usize, start: usize, parameter: usize) -> usize {
+    let (stack_size, start, parameter) = (stack_size as u64, start as u64, parameter as u64);
+    let result = (|| -> u64 {
+        (AtlasCreateFiberEx(stack_size as usize, stack_size as usize, 0, start as usize, parameter as usize)) as u64
+    })();
+    result as usize
 }
 
 /// `CreateFiberEx(commit, reserve, flags, routine, parameter)`: a fiber with a stack of its own, which first runs
 /// `routine(parameter)` when it's switched to.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasCreateFiberEx(commit: u64, reserve: u64, _flags: u32, start: u64, parameter: u64) -> u64 {
-    if start == 0 {
-        crate::RtlSetLastWin32Error(ERROR_INVALID_PARAMETER);
-        return 0;
-    }
-    let size = reserve.max(commit).max(STACK).next_multiple_of(0x1_0000);
-    let stack = sys::allocate(size as usize) as u64;
-    let fiber = crate::heap::allocate(SIZE, true) as u64;
-    if stack == 0 || fiber == 0 {
-        crate::RtlSetLastWin32Error(ERROR_NOT_ENOUGH_MEMORY);
-        return 0;
-    }
-    sys::protect(stack, STACK_GUARD, PAGE_READWRITE_GUARD);
-    let top = stack + size;
-    // SAFETY: the new fiber.
-    unsafe {
-        *field(fiber, PARAMETER) = parameter;
-        *field(fiber, STACK_BASE) = top;
-        *field(fiber, STACK_LIMIT) = stack + STACK_GUARD;
-        *field(fiber, DEALLOCATION_STACK) = stack;
-        *field(fiber, START) = start;
-        *field(fiber, OWNS_STACK) = 1;
-        *field(fiber, PC) = AtlasFiberStart as *const () as u64;
-        // As if `AtlasFiberStart` had been called: x64 has a return address (0) on the stack, with the 32 bytes of
-        // home space above it that it may use; ARM64's stack pointer is 16-aligned, with its link register 0.
-        *field(fiber, SP) = if cfg!(target_arch = "x86_64") { top - 0x38 } else { top - 0x10 };
-    }
-    fiber
+pub extern "system" fn AtlasCreateFiberEx(commit: usize, reserve: usize, _flags: u32, start: usize, parameter: usize) -> usize {
+    let (commit, reserve, start, parameter) = (commit as u64, reserve as u64, start as u64, parameter as u64);
+    let result = (|| -> u64 {
+        if start == 0 {
+            crate::RtlSetLastWin32Error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        let size = reserve.max(commit).max(STACK).next_multiple_of(0x1_0000);
+        let stack = sys::allocate(size as usize) as usize as u64;
+        let fiber = crate::heap::allocate(SIZE, true) as usize as u64;
+        if stack == 0 || fiber == 0 {
+            crate::RtlSetLastWin32Error(ERROR_NOT_ENOUGH_MEMORY);
+            return 0;
+        }
+        sys::protect(stack, STACK_GUARD, PAGE_READWRITE_GUARD);
+        let top = stack + size;
+        // SAFETY: the new fiber.
+        unsafe {
+            *field(fiber, PARAMETER) = parameter as usize;
+            *field(fiber, STACK_BASE) = top as usize;
+            *field(fiber, STACK_LIMIT) = (stack + STACK_GUARD) as usize;
+            *field(fiber, DEALLOCATION_STACK) = stack as usize;
+            *field(fiber, START) = start as usize;
+            *field(fiber, OWNS_STACK) = 1;
+            *field(fiber, PC) = AtlasFiberStart as *const () as usize;
+            // As if `AtlasFiberStart` had been called: x64 has a return address (0) on the stack, with the 32 bytes of
+            // home space above it that it may use; ARM64's stack pointer is 16-aligned, with its link register 0;
+            // x86's points at a return address of 0.
+            *field(fiber, SP) = (if cfg!(target_arch = "x86_64") { top - 0x38 } else { top - 0x10 }) as usize;
+            // A new fiber has no SEH frames.
+            #[cfg(target_arch = "x86")]
+            {
+                *field(fiber, EXCEPTION_LIST) = usize::MAX;
+            }
+        }
+        fiber
+    })();
+    result as usize
 }
 
 /// Where a fiber made by `CreateFiber` starts: its routine, and then, if that returns, the thread's end.
@@ -149,14 +175,15 @@ extern "system" fn AtlasFiberStart() -> ! {
     // SAFETY: the fiber that's running: its routine and parameter.
     let (start, parameter) = unsafe { (*field(fiber, START), *field(fiber, PARAMETER)) };
     // SAFETY: the program's fiber routine, as Windows calls it. It returns nothing: the thread ends with 0.
-    let start: extern "system" fn(u64) = unsafe { core::mem::transmute(start) };
+    let start: extern "system" fn(usize) = unsafe { core::mem::transmute(start) };
     start(parameter);
     crate::loader::AtlasExitThread(0)
 }
 
 /// `DeleteFiber(fiber)`: its FLS's callbacks run, and its stack goes. Deleting the running fiber ends the thread.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasDeleteFiber(fiber: u64) {
+pub extern "system" fn AtlasDeleteFiber(fiber: usize) {
+    let fiber = fiber as u64;
     if fiber == 0 {
         return;
     }
@@ -165,19 +192,66 @@ pub extern "system" fn AtlasDeleteFiber(fiber: u64) {
     }
     // SAFETY: a fiber that isn't running, which the program gives up.
     unsafe {
-        crate::sync::release_fls(*field(fiber, FLS_DATA) as *mut u64);
+        crate::sync::release_fls(*field(fiber, FLS_DATA) as *mut usize);
         if *field(fiber, OWNS_STACK) != 0 {
-            call4(atlas_abi::call::FREE_VIRTUAL_MEMORY, *field(fiber, DEALLOCATION_STACK), 0, MEM_RELEASE, 0);
+            call4(atlas_abi::call::FREE_VIRTUAL_MEMORY, *field(fiber, DEALLOCATION_STACK) as u64, 0, MEM_RELEASE, 0);
         }
     }
-    crate::heap::free(fiber as *mut u8);
+    crate::heap::free(fiber as usize as *mut u8);
 }
 
 #[allow(dead_code)]
 unsafe extern "system" {
     /// `SwitchToFiber(fiber)`: the running fiber's registers and TEB fields saved in it, and `fiber`'s taken.
-    pub fn AtlasSwitchToFiber(fiber: u64);
+    pub fn AtlasSwitchToFiber(fiber: usize);
 }
+
+#[cfg(target_arch = "x86")]
+core::arch::global_asm!(
+    ".globl \"_AtlasSwitchToFiber@4\"",
+    "\"_AtlasSwitchToFiber@4\":",
+    "mov edx, fs:[0x18]",
+    "mov eax, [edx + 0x10]",
+    "mov [eax + 0x50], ebx",
+    "mov [eax + 0x58], ebp",
+    "mov [eax + 0x60], edi",
+    "mov [eax + 0x68], esi",
+    "mov ecx, [esp + 4]",
+    // Where it returns to, and its stack once it has popped its argument.
+    "lea ebx, [esp + 8]",
+    "mov [eax + 0x40], ebx",
+    "mov ebx, [esp]",
+    "mov [eax + 0x48], ebx",
+    "mov ebx, [edx + 0x04]",
+    "mov [eax + 0x10], ebx",
+    "mov ebx, [edx + 0x08]",
+    "mov [eax + 0x18], ebx",
+    "mov ebx, [edx + 0xe0c]",
+    "mov [eax + 0x20], ebx",
+    "mov ebx, [edx + 0xfb4]",
+    "mov [eax + 0x28], ebx",
+    "mov ebx, [edx]",
+    "mov [eax + 0x70], ebx",
+    // The other's.
+    "mov [edx + 0x10], ecx",
+    "mov ebx, [ecx + 0x10]",
+    "mov [edx + 0x04], ebx",
+    "mov ebx, [ecx + 0x18]",
+    "mov [edx + 0x08], ebx",
+    "mov ebx, [ecx + 0x20]",
+    "mov [edx + 0xe0c], ebx",
+    "mov ebx, [ecx + 0x28]",
+    "mov [edx + 0xfb4], ebx",
+    "mov ebx, [ecx + 0x70]",
+    "mov [edx], ebx",
+    "mov ebp, [ecx + 0x58]",
+    "mov edi, [ecx + 0x60]",
+    "mov esi, [ecx + 0x68]",
+    "mov esp, [ecx + 0x40]",
+    "mov eax, [ecx + 0x48]",
+    "mov ebx, [ecx + 0x50]",
+    "jmp eax",
+);
 
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
