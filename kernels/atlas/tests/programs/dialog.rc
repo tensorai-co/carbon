@@ -1,0 +1,12 @@
+// dialog.exe's resources: a dialog as rc writes one (a DLGTEMPLATEEX). Built with llvm-rc, without the preprocessor,
+// so its styles are numbers: WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_SETFONT.
+LANGUAGE 0, 0
+10 DIALOGEX 0, 0, 160, 60
+STYLE 0x80C800C0
+CAPTION "From a resource"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    LTEXT "Resource text", 200, 7, 7, 100, 10
+    EDITTEXT 201, 7, 20, 100, 12
+    DEFPUSHBUTTON "OK", 1, 100, 40, 50, 14
+END

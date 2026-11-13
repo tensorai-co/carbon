@@ -49,7 +49,7 @@ impl Task {
     }
 
     /// A type or name as a program passes it: a number below 0x10000, else a string (`#123` being a number).
-    fn resource_id(&mut self, cx: &mut Cx<'_>, at: u64, wide: bool) -> Option<Id> {
+    pub(crate) fn resource_id(&mut self, cx: &mut Cx<'_>, at: u64, wide: bool) -> Option<Id> {
         if at >> 16 == 0 {
             return Some(Id::Num(at as u16));
         }
@@ -62,7 +62,7 @@ impl Task {
     }
 
     /// Finds a resource in a loaded module: its `IMAGE_RESOURCE_DATA_ENTRY`'s address, its bytes' and their size.
-    fn find_resource(&mut self, cx: &mut Cx<'_>, module: u64, kind: &Id, name: &Id, lang: Option<u16>) -> Result<(u64, u64, u32), u32> {
+    pub(crate) fn find_resource(&mut self, cx: &mut Cx<'_>, module: u64, kind: &Id, name: &Id, lang: Option<u16>) -> Result<(u64, u64, u32), u32> {
         let base = self.module_base(cx, module);
         let root = self.resource_root(cx, base)?;
         let mut tree = Tree::new(root, |at, len| self.mem(cx, false, |t| user::read_vec(&t.space(), base + u64::from(at), len)).ok());

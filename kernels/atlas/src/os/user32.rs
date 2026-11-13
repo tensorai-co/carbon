@@ -9,7 +9,7 @@ use kernels_core::user;
 use super::resapi::{load_string_a, load_string_w};
 use super::{Reply, dll};
 use crate::process::Task;
-use crate::win32k::{self, Class, DESKTOP, Filter, Msg, WM_GETTEXT, WM_GETTEXTLENGTH, WM_SETTEXT, gdi, keys};
+use crate::win32k::{self, Class, DESKTOP, Filter, Msg, WM_GETTEXT, WM_GETTEXTLENGTH, WM_SETTEXT, dialog, gdi, keys};
 
 dll! {
     "USER32.dll";
@@ -39,14 +39,16 @@ dll! {
     host GetWindowTextLengthW(1) => get_window_text_length_w;
     host GetWindowLongPtrW(2) => get_window_long_ptr_w;
     host SetWindowLongPtrW(3) => set_window_long_ptr_w;
-    host GetWindowLongW(2) => get_window_long_ptr_w;
-    host SetWindowLongW(3) => set_window_long_ptr_w;
+    host GetWindowLongW(2) => get_window_long_w;
+    host SetWindowLongW(3) => set_window_long_w;
     host GetClassLongPtrW(2) => get_class_long_ptr_w;
     host GetWindowLongPtrA(2) => get_window_long_ptr_w;
     host SetWindowLongPtrA(3) => set_window_long_ptr_a;
-    host GetWindowLongA(2) => get_window_long_ptr_w;
-    host SetWindowLongA(3) => set_window_long_ptr_a;
+    host GetWindowLongA(2) => get_window_long_w;
+    host SetWindowLongA(3) => set_window_long_a;
     host GetClassLongPtrA(2) => get_class_long_ptr_w;
+    host GetClassLongW(2) => get_class_long_ptr_w;
+    host GetClassLongA(2) => get_class_long_ptr_w;
     host GetClientRect(2) => get_client_rect;
     host GetWindowRect(2) => get_window_rect;
     host MoveWindow(6) => move_window;
@@ -61,6 +63,8 @@ dll! {
     host GetDesktopWindow(0) => get_desktop_window;
     host FindWindowW(2) => find_window_w;
     host FindWindowA(2) => find_window_a;
+    host FindWindowExW(4) => find_window_ex_w;
+    host FindWindowExA(4) => find_window_ex_a;
     host EnumWindows(2) => enum_windows;
     host GetWindow(2) => get_window;
     host GetTopWindow(1) => get_top_window;
@@ -140,31 +144,63 @@ dll! {
     host GetWindowTextA(3) => get_window_text_a;
     host GetWindowTextLengthA(1) => get_window_text_length_a;
     host IsWindowUnicode(1) => is_window_unicode;
+    // Dialogs, and the standard controls' procedures, which atlas's user32 exports so a program can call them.
+    host DefDlgProcW(4) => def_dlg_proc;
+    host DefDlgProcA(4) => def_dlg_proc;
+    host AtlasButtonWndProc(4) => button_wnd_proc;
+    host AtlasStaticWndProc(4) => static_wnd_proc;
+    host AtlasEditWndProc(4) => edit_wnd_proc;
+    host CreateDialogParamW(5) => create_dialog_param_w;
+    host CreateDialogParamA(5) => create_dialog_param_a;
+    host CreateDialogIndirectParamW(5) => create_dialog_indirect_param;
+    host CreateDialogIndirectParamA(5) => create_dialog_indirect_param;
+    host DialogBoxParamW(5) => dialog_box_param_w;
+    host DialogBoxParamA(5) => dialog_box_param_a;
+    host DialogBoxIndirectParamW(5) => dialog_box_indirect_param;
+    host DialogBoxIndirectParamA(5) => dialog_box_indirect_param;
+    host EndDialog(2) => end_dialog;
+    host IsDialogMessageW(2) => is_dialog_message;
+    host IsDialogMessageA(2) => is_dialog_message;
+    host GetDlgItem(2) => get_dlg_item;
+    host GetDlgCtrlID(1) => get_dlg_ctrl_id;
+    host SetDlgItemTextW(3) => set_dlg_item_text_w;
+    host SetDlgItemTextA(3) => set_dlg_item_text_a;
+    host GetDlgItemTextW(4) => get_dlg_item_text_w;
+    host GetDlgItemTextA(4) => get_dlg_item_text_a;
+    host SetDlgItemInt(4) => set_dlg_item_int;
+    host GetDlgItemInt(4) => get_dlg_item_int;
+    host SendDlgItemMessageW(5) => send_dlg_item_message_w;
+    host SendDlgItemMessageA(5) => send_dlg_item_message_a;
+    host CheckDlgButton(3) => check_dlg_button;
+    host IsDlgButtonChecked(2) => is_dlg_button_checked;
+    host CheckRadioButton(4) => check_radio_button;
+    host GetNextDlgTabItem(3) => get_next_dlg_tab_item;
+    host GetNextDlgGroupItem(3) => get_next_dlg_group_item;
+    host MapDialogRect(2) => map_dialog_rect;
+    host GetDialogBaseUnits(0) => get_dialog_base_units;
+    host EnableWindow(2) => enable_window;
+    host IsWindowEnabled(1) => is_window_enabled;
+    host GetClassInfoW(3) => get_class_info_w;
+    host GetClassInfoA(3) => get_class_info_a;
+    host GetClassInfoExW(3) => get_class_info_ex_w;
+    host GetClassInfoExA(3) => get_class_info_ex_a;
+    host SetClassLongW(3) => set_class_long;
+    host SetClassLongA(3) => set_class_long;
+    host SetClassLongPtrW(3) => set_class_long;
+    host SetClassLongPtrA(3) => set_class_long;
+    host GetSystemMenu(2) => get_system_menu;
+    host EnableMenuItem(3) => enable_menu_item;
     // Not written yet: what installers import.
     missing AppendMenuW;
     guest CharNextA => AtlasCharNextA;
     guest CharNextW => AtlasCharNextW;
     guest CharPrevW => AtlasCharPrevW;
     guest CharPrevA => AtlasCharPrevA;
-    missing CheckDlgButton;
-    missing CreateDialogParamW;
     missing CreatePopupMenu;
-    missing DialogBoxParamW;
-    missing EnableMenuItem;
-    missing EnableWindow;
-    missing EndDialog;
     missing ExitWindowsEx;
-    missing FindWindowExW;
-    missing GetClassInfoW;
-    missing GetDlgItem;
-    missing GetDlgItemTextW;
     missing GetMessagePos;
-    missing GetSystemMenu;
-    missing IsWindowEnabled;
     missing MessageBoxIndirectW;
     missing SendMessageTimeoutW;
-    missing SetClassLongW;
-    missing SetDlgItemTextW;
     missing SystemParametersInfoW;
     missing TrackPopupMenu;
     guest wsprintfA => AtlasWsprintfA;
@@ -330,17 +366,6 @@ fn def_window_proc_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     value(from_ansi(task, cx, message, a[2], a[3], |task, cx, w, l| task.def_window_proc(cx, hwnd, message, w, l)))
 }
 
-/// `SetWindowLongPtrA`: as the W, and a `WndProc` set this way takes ANSI.
-fn set_window_long_ptr_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let reply = set_window_long_ptr_w(task, cx, a);
-    if a[1] as i32 == GWLP_WNDPROC
-        && let Some(w) = task.win32k().windows.get_mut(&a[0])
-    {
-        w.ansi = true;
-    }
-    reply
-}
-
 fn destroy_window(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     match task.destroy_window(cx, a[0]) {
         Ok(done) => Reply::Value(u64::from(done)),
@@ -435,32 +460,12 @@ fn peek_message(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], ansi: bool) -> Repl
     }
 }
 
-/// No keyboard yet, so there's nothing to translate.
-/// `TranslateMessage`: for a key that types something, as the thread's key state has it, WM_CHAR (or WM_SYSCHAR),
-/// to be taken next. TRUE for any key-down message.
+/// `TranslateMessage`: for a key that types something, WM_CHAR (or WM_SYSCHAR), to be taken next. TRUE for any
+/// key-down message.
 fn translate_message(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let width = task.abi().width;
     let Ok(b) = task.mem(cx, false, |t| user::read_vec(&t.space(), a[0], Msg::size(width))) else { return Reply::Value(FALSE) };
-    let m = Msg::decode(&b, width);
-    if !matches!(m.message, win32k::WM_KEYDOWN | win32k::WM_SYSKEYDOWN) {
-        return Reply::Value(FALSE);
-    }
-    let tid = task.tid;
-    let mut w = task.win32k();
-    let held = w.thread_keys(tid);
-    let mut modifiers = 0;
-    for (vk, bit) in [(keys::VK_SHIFT, display::keys::SHIFT), (keys::VK_CONTROL, display::keys::CTRL), (keys::VK_MENU, display::keys::ALT)] {
-        if held[vk as usize] & 0x80 != 0 {
-            modifiers |= bit;
-        }
-    }
-    // Ctrl+Alt types nothing here (it's AltGr on other layouts).
-    let both = display::keys::CTRL | display::keys::ALT;
-    if let Some(c) = keys::code(m.wparam as u8).and_then(|code| display::keys::text(code, modifiers)).filter(|_| modifiers & both != both) {
-        let message = if m.message == win32k::WM_SYSKEYDOWN { win32k::WM_SYSCHAR } else { win32k::WM_CHAR };
-        w.post_front(m.hwnd, message, u64::from(c), m.lparam, m.time);
-    }
-    Reply::Value(TRUE)
+    Reply::Value(u64::from(task.translate(&Msg::decode(&b, width))))
 }
 
 fn dispatch_message_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
@@ -538,6 +543,16 @@ const GWL_EXSTYLE: i32 = -20;
 const GWLP_USERDATA: i32 = -21;
 
 fn get_window_long_ptr_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let width = task.abi().width as usize;
+    get_window_long(task, cx, a, width)
+}
+
+fn get_window_long_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    get_window_long(task, cx, a, 4)
+}
+
+/// `GetWindowLong(Ptr)`: what it names, its extra bytes `size` at a time (a LONG, or a pointer for the Ptr forms).
+fn get_window_long(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], size: usize) -> Reply {
     let w = task.win32k();
     let Some(win) = w.windows.get(&a[0]) else {
         drop(w);
@@ -545,34 +560,50 @@ fn get_window_long_ptr_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
         return Reply::Value(0);
     };
     let index = a[1] as i32;
-    Reply::Value(match index {
+    let v = match index {
         GWLP_WNDPROC => win.wndproc,
         GWLP_HINSTANCE => win.instance,
-        GWLP_HWNDPARENT => if win.parent == DESKTOP { 0 } else { win.parent },
+        GWLP_HWNDPARENT => if win.parent == DESKTOP { win.owner } else { win.parent },
         GWLP_ID => win.id,
         GWL_STYLE => u64::from(win.style | if win.visible { 0x1000_0000 } else { 0 }),
         GWL_EXSTYLE => u64::from(win.ex_style),
         GWLP_USERDATA => win.userdata,
-        i if i >= 0 => {
+        i if i >= 0 && (i as usize) + size <= win.extra.len() => {
             let at = i as usize;
             let mut b = [0u8; 8];
-            let n = win.extra.len().saturating_sub(at).min(8);
-            b[..n].copy_from_slice(&win.extra[at..at + n]);
+            b[..size].copy_from_slice(&win.extra[at..at + size]);
             u64::from_le_bytes(b)
         }
-        _ => 0,
-    })
+        _ => {
+            drop(w);
+            task.set_last_error(cx, 1413); // ERROR_INVALID_INDEX
+            return Reply::Value(0);
+        }
+    };
+    drop(w);
+    Reply::Value(if index == GWLP_WNDPROC { task.wndproc_address(v) } else { v })
 }
 
 fn set_window_long_ptr_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let width = task.abi().width as usize;
+    set_window_long(task, cx, a, width)
+}
+
+fn set_window_long_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    set_window_long(task, cx, a, 4)
+}
+
+/// `SetWindowLong(Ptr)`: what it had before.
+fn set_window_long(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], size: usize) -> Reply {
     let mut w = task.win32k();
     let Some(win) = w.windows.get_mut(&a[0]) else {
         drop(w);
         task.set_last_error(cx, win32k::ERROR_INVALID_WINDOW_HANDLE);
         return Reply::Value(0);
     };
-    let new = a[2];
-    let old = match a[1] as i32 {
+    let new = if size == 4 { a[2] & 0xffff_ffff } else { a[2] };
+    let index = a[1] as i32;
+    let old = match index {
         GWLP_WNDPROC => {
             // A `WndProc` set by the W function takes UTF-16 (the A one says otherwise after).
             win.ansi = false;
@@ -583,11 +614,12 @@ fn set_window_long_ptr_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
         GWL_STYLE => u64::from(std::mem::replace(&mut win.style, new as u32 & !0x1000_0000)),
         GWL_EXSTYLE => u64::from(std::mem::replace(&mut win.ex_style, new as u32)),
         GWLP_USERDATA => std::mem::replace(&mut win.userdata, new),
-        i if i >= 0 && (i as usize) + 8 <= win.extra.len() => {
+        i if i >= 0 && (i as usize) + size <= win.extra.len() => {
             let at = i as usize;
-            let old = u64::from_le_bytes(win.extra[at..at + 8].try_into().unwrap_or_default());
-            win.extra[at..at + 8].copy_from_slice(&new.to_le_bytes());
-            old
+            let mut b = [0u8; 8];
+            b[..size].copy_from_slice(&win.extra[at..at + size]);
+            win.extra[at..at + size].copy_from_slice(&new.to_le_bytes()[..size]);
+            u64::from_le_bytes(b)
         }
         _ => {
             drop(w);
@@ -595,21 +627,413 @@ fn set_window_long_ptr_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
             return Reply::Value(0);
         }
     };
-    Reply::Value(old)
+    drop(w);
+    Reply::Value(if index == GWLP_WNDPROC { task.wndproc_address(old) } else { old })
+}
+
+/// `SetWindowLongPtrA`: as the W, and a `WndProc` set this way takes ANSI.
+fn set_window_long_ptr_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let width = task.abi().width as usize;
+    set_window_long_ansi(task, cx, a, width)
+}
+
+fn set_window_long_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    set_window_long_ansi(task, cx, a, 4)
+}
+
+fn set_window_long_ansi(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], size: usize) -> Reply {
+    let reply = set_window_long(task, cx, a, size);
+    if a[1] as i32 == GWLP_WNDPROC
+        && let Some(w) = task.win32k().windows.get_mut(&a[0])
+    {
+        w.ansi = true;
+    }
+    reply
 }
 
 fn get_class_long_ptr_w(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let w = task.win32k();
-    let Some(class) = w.windows.get(&a[0]).and_then(|win| w.class_by_name(&win.class)) else { return Reply::Value(0) };
-    Reply::Value(match a[1] as i32 {
-        -10 => class.background,                // GCLP_HBRBACKGROUND
-        -14 => class.instance,                  // GCLP_HMODULE
-        -24 => class.wndproc,                   // GCLP_WNDPROC
-        -26 => u64::from(class.style),          // GCL_STYLE
-        -32 => u64::from(class.atom),           // GCW_ATOM
-        -18 => class.extra as u64,              // GCL_CBWNDEXTRA
-        _ => 0,
-    })
+    let width = task.abi().width;
+    let v = {
+        let w = task.win32k();
+        let Some(class) = w.windows.get(&a[0]).and_then(|win| w.class_by_name(&win.class)) else { return Reply::Value(0) };
+        match a[1] as i32 {
+            -10 => class.background,         // GCLP_HBRBACKGROUND
+            -12 => class.cursor,             // GCLP_HCURSOR
+            -16 => class.instance,           // GCLP_HMODULE
+            -24 => class.wndproc,            // GCLP_WNDPROC
+            -26 => u64::from(class.style),   // GCL_STYLE
+            -32 => u64::from(class.atom),    // GCW_ATOM
+            -18 => class_extra(class, width) as u64, // GCL_CBWNDEXTRA
+            _ => 0,
+        }
+    };
+    Reply::Value(if a[1] as i32 == -24 { task.wndproc_address(v) } else { v })
+}
+
+/// A class's extra bytes for its windows, as a program of this width is told: a dialog's are `DLGWINDOWEXTRA`.
+fn class_extra(class: &Class, width: u64) -> usize {
+    if win32k::SysProc::of(class.wndproc) == Some(win32k::SysProc::Dialog) && width == 4 { 30 } else { class.extra }
+}
+
+/// `SetClassLong(Ptr)`: a class's background, cursor, style or procedure changed, for every window of it. Its icons
+/// aren't drawn, so they're kept nowhere. What it had before.
+fn set_class_long(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let mut w = task.win32k();
+    let Some(name) = w.windows.get(&a[0]).map(|win| win.class.clone()) else {
+        drop(w);
+        task.set_last_error(cx, win32k::ERROR_INVALID_WINDOW_HANDLE);
+        return Reply::Value(0);
+    };
+    let Some(class) = w.class_mut(&name) else { return Reply::Value(0) };
+    let new = a[2];
+    let old = match a[1] as i32 {
+        -10 => std::mem::replace(&mut class.background, new),
+        -12 => std::mem::replace(&mut class.cursor, new),
+        -16 => std::mem::replace(&mut class.instance, new),
+        -24 => std::mem::replace(&mut class.wndproc, new),
+        -26 => u64::from(std::mem::replace(&mut class.style, new as u32)),
+        // GCLP_HICON, GCLP_HICONSM.
+        -14 | -34 => 0,
+        _ => {
+            drop(w);
+            task.set_last_error(cx, 1413); // ERROR_INVALID_INDEX
+            return Reply::Value(0);
+        }
+    };
+    drop(w);
+    Reply::Value(if a[1] as i32 == -24 { task.wndproc_address(old) } else { old })
+}
+
+/// `GetClassInfo(Ex)W` and `A`: a class's WNDCLASS(EX), its procedure as an address the program can call. The name
+/// it's given back is the one it asked by. The class's atom, or 0 with ERROR_CLASS_DOES_NOT_EXIST.
+fn class_info(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], ex: bool, ansi: bool) -> Reply {
+    let name = task.class_named_as(cx, a[1], !ansi).unwrap_or_default();
+    let width = task.abi().width;
+    let Some(class) = task.win32k().class_by_name(&name).cloned() else {
+        task.set_last_error(cx, 1411);
+        return Reply::Value(0);
+    };
+    let abi = task.abi();
+    let w = width as usize;
+    let start = if ex { 8 } else { w };
+    let size = start + 7 * w + 8 + if ex { w } else { 0 };
+    let mut b = vec![0u8; size];
+    let put = |b: &mut Vec<u8>, at: usize, v: u64| b[at..at + w].copy_from_slice(&abi.ptr(v));
+    let put32 = |b: &mut Vec<u8>, at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    if ex {
+        put32(&mut b, 0, size as u32);
+    }
+    put32(&mut b, if ex { 4 } else { 0 }, class.style);
+    put(&mut b, start, task.wndproc_address(class.wndproc));
+    put32(&mut b, start + w + 4, class_extra(&class, width) as u32);
+    let instance = if class.instance == 0 { a[0] } else { class.instance };
+    put(&mut b, start + w + 8, instance);
+    let handles = start + w + 8 + w;
+    put(&mut b, handles + w, class.cursor);
+    put(&mut b, handles + 2 * w, class.background);
+    put(&mut b, handles + 4 * w, a[1]);
+    if task.mem(cx, true, |t| user::write(&mut t.space(), a[2], &b)).is_err() {
+        return Reply::Value(0);
+    }
+    Reply::Value(u64::from(class.atom))
+}
+
+fn get_class_info_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    class_info(task, cx, a, false, false)
+}
+
+fn get_class_info_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    class_info(task, cx, a, false, true)
+}
+
+fn get_class_info_ex_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    class_info(task, cx, a, true, false)
+}
+
+fn get_class_info_ex_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    class_info(task, cx, a, true, true)
+}
+
+// ---- System menus ----
+
+/// `GetSystemMenu(window, revert)`: its system menu's handle, or, with `revert`, its commands enabled again and NULL.
+/// There's no menu to show yet, only the commands' states, which `DefWindowProc` heeds.
+fn get_system_menu(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let mut w = task.win32k();
+    let Some(top) = w.top_level_of(a[0]) else { return Reply::Value(0) };
+    if a[1] as u32 != 0 {
+        w.system_menus.remove(&top);
+        return Reply::Value(0);
+    }
+    w.system_menus.entry(top).or_insert_with(|| win32k::SYSTEM_COMMANDS.iter().map(|&c| (c, 0)).collect());
+    Reply::Value(win32k::SYSTEM_MENUS + top)
+}
+
+/// `EnableMenuItem(menu, item, flags)`: a system menu's command enabled, greyed or disabled (by command, or by
+/// position with MF_BYPOSITION); the state it had, or -1 if there's no such item. Other menus aren't there yet.
+fn enable_menu_item(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    const MF_BYPOSITION: u32 = 0x400;
+    const NONE: u64 = 0xffff_ffff;
+    let flags = a[2] as u32;
+    let mut w = task.win32k();
+    let Some(menu) = a[0].checked_sub(win32k::SYSTEM_MENUS).and_then(|top| w.system_menus.get_mut(&top)) else { return Reply::Value(NONE) };
+    let command = if flags & MF_BYPOSITION != 0 { win32k::SYSTEM_COMMANDS.get(a[1] as usize).copied() } else { Some(a[1] & 0xffff) };
+    match command.and_then(|c| menu.get_mut(&c)) {
+        Some(state) => Reply::Value(u64::from(std::mem::replace(state, flags & 3))),
+        None => Reply::Value(NONE),
+    }
+}
+
+// ---- Dialogs ----
+
+fn def_dlg_proc(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    value(task.def_dlg_proc(cx, a[0], a[1] as u32, a[2], a[3]))
+}
+
+fn button_wnd_proc(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    value(task.button_proc(cx, a[0], a[1] as u32, a[2], a[3]))
+}
+
+fn static_wnd_proc(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    value(task.static_proc(cx, a[0], a[1] as u32, a[2], a[3]))
+}
+
+fn edit_wnd_proc(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    value(task.edit_proc(cx, a[0], a[1] as u32, a[2], a[3]))
+}
+
+/// A template from a module's resources, by name or number: its address and contents.
+fn resource_template(task: &mut Task, cx: &mut Cx<'_>, instance: u64, name: u64, wide: bool) -> Option<(u64, dialog::Template)> {
+    let (at, bytes) = task.dialog_resource(cx, instance, name, wide)?;
+    Some((at, dialog::parse(&bytes)?))
+}
+
+fn memory_template(task: &mut Task, cx: &mut Cx<'_>, at: u64) -> Option<dialog::Template> {
+    let bytes = task.dialog_in_memory(cx, at);
+    dialog::parse(&bytes)
+}
+
+/// `CreateDialogParamW(instance, template, owner, procedure, parameter)`, and `A`.
+fn create_dialog_param(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let Some((at, t)) = resource_template(task, cx, a[0], a[1], wide) else {
+        task.set_last_error(cx, 1814); // ERROR_RESOURCE_NAME_NOT_FOUND
+        return Reply::Value(0);
+    };
+    value(task.create_dialog(cx, &t, at, a[0], a[2], a[3], a[4], false))
+}
+
+fn create_dialog_param_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    create_dialog_param(task, cx, a, true)
+}
+
+fn create_dialog_param_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    create_dialog_param(task, cx, a, false)
+}
+
+/// `CreateDialogIndirectParamW(instance, template, owner, procedure, parameter)`: from a template in memory.
+fn create_dialog_indirect_param(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(t) = memory_template(task, cx, a[1]) else {
+        task.set_last_error(cx, 87);
+        return Reply::Value(0);
+    };
+    value(task.create_dialog(cx, &t, a[1], a[0], a[2], a[3], a[4], false))
+}
+
+fn dialog_box_param(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let Some((at, t)) = resource_template(task, cx, a[0], a[1], wide) else {
+        task.set_last_error(cx, 1814);
+        return Reply::Value(u64::MAX);
+    };
+    value(task.dialog_box(cx, &t, at, a[0], a[2], a[3], a[4]))
+}
+
+/// `DialogBoxParamW(instance, template, owner, procedure, parameter)`: modal, until `EndDialog`.
+fn dialog_box_param_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    dialog_box_param(task, cx, a, true)
+}
+
+fn dialog_box_param_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    dialog_box_param(task, cx, a, false)
+}
+
+fn dialog_box_indirect_param(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(t) = memory_template(task, cx, a[1]) else {
+        task.set_last_error(cx, 87);
+        return Reply::Value(u64::MAX);
+    };
+    value(task.dialog_box(cx, &t, a[1], a[0], a[2], a[3], a[4]))
+}
+
+fn end_dialog(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    match task.end_dialog(cx, a[0], a[1]) {
+        Ok(done) => Reply::Value(u64::from(done)),
+        Err(reply) => reply,
+    }
+}
+
+/// `IsDialogMessageW(dialog, &msg)`.
+fn is_dialog_message(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let width = task.abi().width;
+    let Ok(b) = task.mem(cx, false, |t| user::read_vec(&t.space(), a[1], Msg::size(width))) else { return Reply::Value(FALSE) };
+    match task.is_dialog_message(cx, a[0], &Msg::decode(&b, width)) {
+        Ok(done) => Reply::Value(u64::from(done)),
+        Err(reply) => reply,
+    }
+}
+
+fn get_dlg_item(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let item = task.dialog_item(a[0], a[1]);
+    if item == 0 {
+        task.set_last_error(cx, 1421); // ERROR_CONTROL_ID_NOT_FOUND
+    }
+    Reply::Value(item)
+}
+
+fn get_dlg_ctrl_id(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(task.win32k().windows.get(&a[0]).filter(|w| !w.top_level()).map_or(0, |w| w.id))
+}
+
+fn set_dlg_item_text_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let item = task.dialog_item(a[0], a[1]);
+    if item == 0 {
+        return Reply::Value(FALSE);
+    }
+    value(task.send_message(cx, item, WM_SETTEXT, 0, a[2]))
+}
+
+fn set_dlg_item_text_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let item = task.dialog_item(a[0], a[1]);
+    if item == 0 {
+        return Reply::Value(FALSE);
+    }
+    send_message_a(task, cx, &[item, u64::from(WM_SETTEXT), 0, a[2]])
+}
+
+/// `GetDlgItemTextW(dialog, id, buffer, size)`: its text's length; an empty string for no such control.
+fn get_dlg_item_text_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let item = task.dialog_item(a[0], a[1]);
+    if item == 0 {
+        if a[3] as u32 > 0 {
+            let _ = task.mem(cx, true, |t| user::write(&mut t.space(), a[2], &[0, 0]));
+        }
+        return Reply::Value(0);
+    }
+    value(task.send_message(cx, item, WM_GETTEXT, a[3] & 0xffff_ffff, a[2]))
+}
+
+fn get_dlg_item_text_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let item = task.dialog_item(a[0], a[1]);
+    if item == 0 {
+        if a[3] as u32 > 0 {
+            let _ = task.mem(cx, true, |t| user::write(&mut t.space(), a[2], &[0]));
+        }
+        return Reply::Value(0);
+    }
+    send_message_a(task, cx, &[item, u64::from(WM_GETTEXT), a[3] & 0xffff_ffff, a[2]])
+}
+
+/// `SetDlgItemInt(dialog, id, value, signed)`.
+fn set_dlg_item_int(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let item = task.dialog_item(a[0], a[1]);
+    if item == 0 {
+        return Reply::Value(FALSE);
+    }
+    let text = if a[3] != 0 { (a[2] as u32 as i32).to_string() } else { (a[2] as u32).to_string() };
+    let wide: Vec<u8> = text.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+    value(task.with_scratch(cx, wide.len(), |_| wide.clone(), |task, cx, at| task.send_message(cx, item, WM_SETTEXT, 0, at)))
+}
+
+/// `GetDlgItemInt(dialog, id, &translated, signed)`: its text as a number, if it's one.
+fn get_dlg_item_int(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let item = task.dialog_item(a[0], a[1]);
+    let text = task.win32k().windows.get(&item).map(|w| w.text.trim().to_string()).unwrap_or_default();
+    let parsed: Option<u64> = if a[3] != 0 { text.parse::<i32>().ok().map(|v| v as u32 as u64) } else { text.parse::<u32>().ok().map(u64::from) };
+    if a[2] != 0 {
+        let ok = u32::from(parsed.is_some());
+        let _ = task.mem(cx, true, |t| user::write(&mut t.space(), a[2], &ok.to_le_bytes()));
+    }
+    Reply::Value(parsed.unwrap_or(0))
+}
+
+fn send_dlg_item_message_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let item = task.dialog_item(a[0], a[1]);
+    if item == 0 {
+        return Reply::Value(0);
+    }
+    value(task.send_message(cx, item, a[2] as u32, a[3], a[4]))
+}
+
+fn send_dlg_item_message_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let item = task.dialog_item(a[0], a[1]);
+    if item == 0 {
+        return Reply::Value(0);
+    }
+    send_message_a(task, cx, &[item, a[2], a[3], a[4]])
+}
+
+/// `CheckDlgButton(dialog, id, check)`: BM_SETCHECK to it.
+fn check_dlg_button(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let item = task.dialog_item(a[0], a[1]);
+    if item == 0 {
+        return Reply::Value(FALSE);
+    }
+    match task.send_message(cx, item, win32k::controls::BM_SETCHECK, a[2] & 0xffff_ffff, 0) {
+        Ok(_) => Reply::Value(TRUE),
+        Err(reply) => reply,
+    }
+}
+
+fn is_dlg_button_checked(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let item = task.dialog_item(a[0], a[1]);
+    if item == 0 {
+        return Reply::Value(0);
+    }
+    value(task.send_message(cx, item, win32k::controls::BM_GETCHECK, 0, 0))
+}
+
+/// `CheckRadioButton(dialog, first, last, check)`: `check` checked, and the others from `first` to `last` not.
+fn check_radio_button(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (first, last, check) = (a[1] as u32, a[2] as u32, a[3] as u32);
+    for id in first..=last.min(first.saturating_add(4096)) {
+        let item = task.dialog_item(a[0], u64::from(id));
+        if item != 0
+            && let Err(reply) = task.send_message(cx, item, win32k::controls::BM_SETCHECK, u64::from(id == check), 0)
+        {
+            return reply;
+        }
+    }
+    Reply::Value(TRUE)
+}
+
+fn get_next_dlg_tab_item(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(task.next_tab_item(a[0], a[1], a[2] != 0))
+}
+
+fn get_next_dlg_group_item(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(task.next_group_item(a[0], a[1], a[2] != 0))
+}
+
+/// `MapDialogRect(dialog, &rect)`: dialog units to pixels.
+fn map_dialog_rect(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(r) = task.read_rect(cx, a[1]) else { return Reply::Value(FALSE) };
+    Reply::Value(u64::from(task.write_rect(cx, a[1], &dialog::map_dialog_rect(&r))))
+}
+
+/// `GetDialogBaseUnits`: the one font's cell, a dialog's base units, its width low and its height high.
+fn get_dialog_base_units(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value((dialog::BASE_Y as u64) << 16 | dialog::BASE_X as u64)
+}
+
+/// `EnableWindow(window, enable)`: whether it was disabled before.
+fn enable_window(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    match task.enable_window(cx, a[0], a[1] as u32 != 0) {
+        Ok(was) => Reply::Value(u64::from(was)),
+        Err(reply) => reply,
+    }
+}
+
+fn is_window_enabled(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(u64::from(task.win32k().windows.get(&a[0]).is_some_and(|w| w.style & win32k::WS_DISABLED == 0)))
 }
 
 fn get_client_rect(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
@@ -749,6 +1173,33 @@ fn find_window(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply
         win.parent == DESKTOP && class.as_ref().is_none_or(|c| *c == win.class) && title.as_ref().is_none_or(|t| *t == win.text)
     });
     Reply::Value(found.map_or(0, |(&h, _)| h))
+}
+
+/// `FindWindowExW(parent, after, class, title)`: the first of `parent`'s children (the top-level windows' for none)
+/// after `after`, in their stacking order, with that class and title, either of which may be left out.
+fn find_window_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    // HWND_MESSAGE: message-only windows, which there are none of.
+    if a[0] as u32 == (-3i32) as u32 {
+        return Reply::Value(0);
+    }
+    let class = if a[2] == 0 { None } else { task.class_named_as(cx, a[2], wide) };
+    let title = (a[3] != 0).then(|| task.text_arg(cx, a[3], wide));
+    let w = task.win32k();
+    let parent = if a[0] == 0 { DESKTOP } else { a[0] };
+    let order = w.z_order(parent);
+    let start = if a[1] == 0 { 0 } else { order.iter().position(|&h| h == a[1]).map_or(order.len(), |i| i + 1) };
+    let found = order[start..].iter().find(|h| {
+        w.windows.get(h).is_some_and(|win| class.as_ref().is_none_or(|c| *c == win.class) && title.as_ref().is_none_or(|t| *t == win.text))
+    });
+    Reply::Value(found.copied().unwrap_or(0))
+}
+
+fn find_window_ex_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    find_window_ex(task, cx, a, true)
+}
+
+fn find_window_ex_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    find_window_ex(task, cx, a, false)
 }
 
 /// Calls `callback(hwnd, lParam)` for each window, until it returns FALSE.

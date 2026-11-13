@@ -7,6 +7,8 @@
 //! win32k keeps what Windows says about them (window and client rectangles, child windows, focus) and turns the
 //! desktop's events into messages (`pump`).
 
+pub mod controls;
+pub mod dialog;
 pub mod gdi;
 pub mod keys;
 mod paint;
@@ -58,6 +60,20 @@ pub const WM_NCLBUTTONDOWN: u32 = 0xa1;
 pub const WM_TIMER: u32 = 0x113;
 pub const WM_MOUSEMOVE: u32 = 0x200;
 pub const WM_MOUSEWHEEL: u32 = 0x20a;
+pub const WM_ENABLE: u32 = 0xa;
+pub const WM_SETFONT: u32 = 0x30;
+pub const WM_GETFONT: u32 = 0x31;
+pub const WM_GETDLGCODE: u32 = 0x87;
+pub const WM_COMMAND: u32 = 0x111;
+pub const WM_INITDIALOG: u32 = 0x110;
+pub const WM_CTLCOLOREDIT: u32 = 0x133;
+pub const WM_CTLCOLORLISTBOX: u32 = 0x134;
+pub const WM_CTLCOLORBTN: u32 = 0x135;
+pub const WM_CTLCOLORDLG: u32 = 0x136;
+pub const WM_CTLCOLORSTATIC: u32 = 0x138;
+pub const WM_LBUTTONDOWN: u32 = 0x201;
+pub const WM_LBUTTONUP: u32 = 0x202;
+pub const WM_LBUTTONDBLCLK: u32 = 0x203;
 pub const SC_CLOSE: u64 = 0xf060;
 const WA_INACTIVE: u64 = 0;
 const WA_ACTIVE: u64 = 1;
@@ -65,11 +81,17 @@ const WA_ACTIVE: u64 = 1;
 /// The desktop: every top-level window's parent.
 pub const DESKTOP: u64 = 0x10010;
 pub const SCREEN: (i32, i32) = (1280, 800);
-const WS_POPUP: u32 = 0x8000_0000;
-const WS_CHILD: u32 = 0x4000_0000;
-const WS_VISIBLE: u32 = 0x1000_0000;
+pub const WS_POPUP: u32 = 0x8000_0000;
+pub const WS_CHILD: u32 = 0x4000_0000;
+pub const WS_VISIBLE: u32 = 0x1000_0000;
+/// Takes no input: no clicks, no keys, no focus (`EnableWindow`).
+pub const WS_DISABLED: u32 = 0x0800_0000;
 const WS_CLIPSIBLINGS: u32 = 0x0400_0000;
-const WS_CAPTION: u32 = 0x00c0_0000;
+pub const WS_CAPTION: u32 = 0x00c0_0000;
+pub const WS_GROUP: u32 = 0x0002_0000;
+pub const WS_TABSTOP: u32 = 0x0001_0000;
+/// A child window whose own children the dialog manager's Tab goes into, as if they were its parent's.
+pub const WS_EX_CONTROLPARENT: u32 = 0x0001_0000;
 pub const WS_EX_TOPMOST: u32 = 0x8;
 /// The DPI a program's told: 96, as Windows tells a program that isn't DPI aware, whatever the output's scale. Its
 /// windows are drawn at 1× and magnified to the output's (`Desktop::screen_pixels`), as Windows virtualizes them. A
@@ -85,6 +107,47 @@ const SW_SHOWNA: u32 = 8;
 pub const ERROR_INVALID_WINDOW_HANDLE: u32 = 1400;
 pub const ERROR_CANNOT_FIND_WND_CLASS: u32 = 1407;
 pub const ERROR_CLASS_ALREADY_EXISTS: u32 = 1410;
+
+/// A window procedure that's win32k's own, in host Rust: the system classes' (`#32770`'s, a button's). A window or
+/// class holds it as a value no program address can be; a program asking for it (`GetClassInfo`,
+/// `GetWindowLongPtr`) is given the address of the user32 export that runs it, so calling that (`CallWindowProc`,
+/// a class of its own registered with it) comes back here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SysProc {
+    Dialog,
+    Button,
+    Static,
+    Edit,
+}
+
+const SYS_PROCS: u64 = 0xffff_ffff_fff0_0000;
+
+impl SysProc {
+    pub const ALL: [SysProc; 4] = [SysProc::Dialog, SysProc::Button, SysProc::Static, SysProc::Edit];
+
+    /// The value a window or class holds for it.
+    pub fn handle(self) -> u64 {
+        SYS_PROCS + self as u64
+    }
+
+    pub fn of(value: u64) -> Option<SysProc> {
+        value.checked_sub(SYS_PROCS).and_then(|i| SysProc::ALL.get(i as usize).copied())
+    }
+
+    /// The user32 export a program calls it through.
+    pub fn export(self) -> &'static str {
+        match self {
+            SysProc::Dialog => "DefDlgProcW",
+            SysProc::Button => "AtlasButtonWndProc",
+            SysProc::Static => "AtlasStaticWndProc",
+            SysProc::Edit => "AtlasEditWndProc",
+        }
+    }
+}
+
+/// `DLGWINDOWEXTRA`: a dialog's extra bytes, `DWLP_MSGRESULT`, `DWLP_DLGPROC` and `DWLP_USER`, a pointer each and
+/// room after; 48 for a 64-bit program and 30 for a 32-bit one. The class keeps the larger.
+pub const DLGWINDOWEXTRA: usize = 48;
 
 #[derive(Debug, Clone)]
 pub struct Class {
@@ -376,7 +439,19 @@ pub struct Win32k {
     pub clipboard: Clipboard,
     /// Each virtual key's state: 0x80 while it's down, 0x01 toggled by each press.
     pub keys: [u8; 256],
+    /// The dialog manager's state for each dialog: its font, the control that had the focus, how it ended.
+    pub dialogs: BTreeMap<u64, dialog::Dialog>,
+    /// Each system control's own state: a button's check, an edit's caret and selection.
+    pub controls: BTreeMap<u64, controls::Control>,
+    /// Each window's system menu, as `GetSystemMenu` gives it: its commands' states (`MF_GRAYED`, `MF_DISABLED`),
+    /// by command. A command greyed there is one `DefWindowProc` won't carry out.
+    pub system_menus: BTreeMap<u64, BTreeMap<u64, u32>>,
 }
+
+/// A window's system menu's handle is this plus the window's.
+pub const SYSTEM_MENUS: u64 = 0x0040_0000;
+/// The commands a system menu has: SC_SIZE, SC_MOVE, SC_MINIMIZE, SC_MAXIMIZE, SC_CLOSE and SC_RESTORE.
+pub const SYSTEM_COMMANDS: [u64; 6] = [0xf000, 0xf010, 0xf020, 0xf030, SC_CLOSE, 0xf120];
 
 /// What an `HDROP` holds: the files dropped (Windows paths), and where in the window's client area. It's win32k's own
 /// handle, read by shell32's `DragQueryFileW` and `DragQueryPoint`; not global memory a program can lock.
@@ -448,7 +523,7 @@ impl Win32k {
     }
 
     pub fn new(display: dt::Shared) -> Win32k {
-        Win32k {
+        let mut w = Win32k {
             windows: BTreeMap::new(),
             classes: HashMap::new(),
             next_hwnd: 0,
@@ -468,7 +543,68 @@ impl Win32k {
             drag_files: None,
             clipboard: Clipboard::default(),
             keys: [0; 256],
+            dialogs: BTreeMap::new(),
+            controls: BTreeMap::new(),
+            system_menus: BTreeMap::new(),
+        };
+        w.register_system_classes();
+        w
+    }
+
+    /// The classes every program has: the dialog's (`#32770`, atom 0x8002 as `WC_DIALOG` names it) and the standard
+    /// controls', whose procedures are win32k's own.
+    fn register_system_classes(&mut self) {
+        // COLOR_BTNFACE + 1, a dialog's face; IDC_ARROW, and IDC_IBEAM over an edit.
+        // Name, atom (or one of its own), procedure, extra bytes, background, cursor.
+        type System = (&'static str, Option<u16>, SysProc, usize, u64, u64);
+        let classes: [System; 4] = [
+            ("#32770", Some(0x8002), SysProc::Dialog, DLGWINDOWEXTRA, 16, 32512),
+            ("Button", None, SysProc::Button, 0, 0, 32512),
+            ("Static", None, SysProc::Static, 0, 0, 32512),
+            ("Edit", None, SysProc::Edit, 0, 0, 32513),
+        ];
+        for (name, atom, proc, extra, background, cursor) in classes {
+            let atom = atom.unwrap_or_else(|| {
+                self.next_atom = self.next_atom.max(0xc000) + 1;
+                self.next_atom
+            });
+            // 8: CS_DBLCLKS. A dialog's class is CS_SAVEBITS too, which means nothing here.
+            let class = Class { name: name.to_string(), atom, wndproc: proc.handle(), style: 8, extra, background, instance: 0, cursor: 0x0001_0000 | cursor, ansi: false };
+            self.classes.insert(name.to_lowercase(), class);
         }
+    }
+
+    /// A class to change (`SetClassLongPtr`).
+    pub fn class_mut(&mut self, name: &str) -> Option<&mut Class> {
+        self.classes.get_mut(&name.to_lowercase())
+    }
+
+    /// Whether a window takes input: neither it nor any window it's in is disabled.
+    pub fn enabled(&self, mut hwnd: u64) -> bool {
+        while let Some(w) = self.windows.get(&hwnd) {
+            if w.style & WS_DISABLED != 0 {
+                return false;
+            }
+            if w.top_level() {
+                return true;
+            }
+            hwnd = w.parent;
+        }
+        false
+    }
+
+    /// Whether a window is on the screen: it and every window it's in are shown.
+    pub fn showing(&self, mut hwnd: u64) -> bool {
+        while let Some(w) = self.windows.get(&hwnd) {
+            if !w.visible {
+                return false;
+            }
+            if w.top_level() {
+                return true;
+            }
+            hwnd = w.parent;
+        }
+        false
     }
 
     /// Wakes every thread with a message queue, to look at the desktop's events.
@@ -661,6 +797,10 @@ impl Win32k {
                         } else {
                             (top, x, y)
                         };
+                        // A disabled window takes no clicks, nor does anything in one (a modal dialog's owner).
+                        if !self.enabled(target) && !matches!(what, Pointer::Enter | Pointer::Move) {
+                            return;
+                        }
                         let message = match what {
                             Pointer::Down(Button::Left) => 0x201,
                             Pointer::Up(Button::Left) => 0x202,
@@ -792,6 +932,30 @@ impl Win32k {
         }
     }
 
+    /// Marks part of a window (all of it, for None) as needing painting, and the children it covers too: they're
+    /// drawn on the same pixels, so painting it paints over them. Wakes the threads that paint them.
+    pub fn invalidate(&mut self, hwnd: u64, rect: Option<Rect>, erase: bool) -> bool {
+        let Some(win) = self.windows.get_mut(&hwnd) else { return false };
+        let r = rect.unwrap_or(win.client()).intersect(&win.client());
+        if r.is_empty() {
+            return true;
+        }
+        win.invalid = win.invalid.union(&r);
+        win.erase |= erase;
+        let tid = win.tid;
+        if let Some(q) = self.queues.get(&tid) {
+            q.waiter.wake();
+        }
+        let children: Vec<(u64, Rect)> = self.windows.iter().filter(|(_, c)| c.parent == hwnd && c.visible).map(|(&h, c)| (h, c.rect)).collect();
+        for (child, at) in children {
+            let covered = r.intersect(&at);
+            if !covered.is_empty() {
+                self.invalidate(child, Some(covered.offset(-at.left, -at.top)), true);
+            }
+        }
+        true
+    }
+
     fn queue(&mut self, tid: u64, waiter: &Arc<Waiter>) -> &mut Queue {
         self.queues.entry(tid).or_insert_with(|| Queue { posted: VecDeque::new(), sent: VecDeque::new(), quit: None, timers: Vec::new(), waiter: waiter.clone(), keys: [0; 256] })
     }
@@ -808,6 +972,11 @@ impl Win32k {
             y += w.rect.top;
             hwnd = w.parent;
         }
+    }
+
+    /// A class's name, as win32k keys it, by its atom.
+    pub fn class_by_atom(&self, atom: u16) -> Option<String> {
+        self.classes.iter().find(|(_, c)| c.atom == atom).map(|(k, _)| k.clone())
     }
 
     pub fn class_by_name(&self, name: &str) -> Option<&Class> {
@@ -1168,6 +1337,9 @@ impl Task {
                     dt::lock(&shared).set_capture(None);
                 }
             }
+            w.dialogs.remove(h);
+            w.controls.remove(h);
+            w.system_menus.remove(h);
             for q in w.queues.values_mut() {
                 q.posted.retain(|m| m.hwnd != *h);
                 q.timers.retain(|t| t.hwnd != *h);
@@ -1188,10 +1360,15 @@ impl Task {
             let was = win.visible;
             win.visible = show;
             if show && !was {
-                win.invalid = win.client();
-                win.erase = true;
+                w.invalidate(hwnd, None, true);
             }
-            (was, win.shown)
+            let shown = w.windows.get(&hwnd).map_or(0, |win| win.shown);
+            // A child hidden: what was under it shows again.
+            if !show && was && shown == 0 {
+                let (parent, at) = w.windows.get(&hwnd).map(|c| (c.parent, c.rect)).unwrap_or_default();
+                w.invalidate(parent, Some(at), true);
+            }
+            (was, shown)
         };
         if shown != 0 {
             self.desktop(|d| {
@@ -1254,11 +1431,15 @@ impl Task {
             let (width, height) = if flags & NOSIZE != 0 { (old.width(), old.height()) } else { (width.max(0), height.max(0)) };
             win.rect = Rect::new(x, y, x + width, y + height);
             let sized = (width, height) != (old.width(), old.height()) || win.client() != old_client;
+            let (rect, shown, client, parent) = (win.rect, win.shown, win.client(), win.parent);
             if sized {
-                win.invalid = win.client();
-                win.erase = true;
+                w.invalidate(hwnd, None, true);
             }
-            let (rect, shown, client) = (win.rect, win.shown, win.client());
+            // A child moved or sized: where it was, and where it is.
+            if shown == 0 && rect != old {
+                w.invalidate(parent, Some(old), true);
+                w.invalidate(hwnd, None, true);
+            }
             if shown != 0 {
                 dt::lock(&w.display).set_rect(shown, rect);
                 w.fit(shown);
@@ -1286,10 +1467,66 @@ impl Task {
     pub fn call_wndproc(&mut self, cx: &mut Cx<'_>, hwnd: u64, message: u32, wparam: u64, lparam: u64) -> Result<u64, Reply> {
         let wndproc = self.win32k().windows.get(&hwnd).map(|w| (w.wndproc, w.ansi));
         match wndproc {
+            Some((f, _)) if let Some(proc) = SysProc::of(f) => self.sys_proc(cx, proc, hwnd, message, wparam, lparam),
             Some((f, true)) if f != 0 => self.call_ansi(cx, f, hwnd, message, wparam, lparam),
             Some((f, false)) if f != 0 => self.upcall(cx, f, &[hwnd, u64::from(message), wparam, lparam]),
             _ => Ok(0),
         }
+    }
+
+    /// Runs one of win32k's own window procedures.
+    pub fn sys_proc(&mut self, cx: &mut Cx<'_>, proc: SysProc, hwnd: u64, message: u32, wparam: u64, lparam: u64) -> Result<u64, Reply> {
+        match proc {
+            SysProc::Dialog => self.def_dlg_proc(cx, hwnd, message, wparam, lparam),
+            SysProc::Button => self.button_proc(cx, hwnd, message, wparam, lparam),
+            SysProc::Static => self.static_proc(cx, hwnd, message, wparam, lparam),
+            SysProc::Edit => self.edit_proc(cx, hwnd, message, wparam, lparam),
+        }
+    }
+
+    /// A window procedure as a program sees it: one of win32k's own is the address of the user32 export that runs
+    /// it, in this process.
+    pub fn wndproc_address(&self, value: u64) -> u64 {
+        match SysProc::of(value) {
+            Some(proc) => self.system_export("USER32.dll", proc.export()).unwrap_or(0),
+            None => value,
+        }
+    }
+
+    /// Where one of atlas's DLLs' exports is in this process.
+    pub fn system_export(&self, dll: &str, name: &str) -> Option<u64> {
+        use crate::images::pe::{Found, Pe, Wanted};
+        let index = crate::os::find(dll)?;
+        let image = self.k.images.get(self.isa, index);
+        let pe = Pe::parse(&image).ok()?;
+        match pe.export(&image, &Wanted::Name(name.to_string())).ok()?? {
+            Found::Rva(rva) => Some(crate::images::layout(self.isa).dll_base(index) + u64::from(rva)),
+            Found::Forward(_) => None,
+        }
+    }
+
+    /// `TranslateMessage`: for a key that types something, as the thread's key state has it, WM_CHAR (or
+    /// WM_SYSCHAR), to be taken next. True for any key-down message.
+    pub fn translate(&mut self, m: &Msg) -> bool {
+        if !matches!(m.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
+            return false;
+        }
+        let tid = self.tid;
+        let mut w = self.win32k();
+        let held = w.thread_keys(tid);
+        let mut modifiers = 0;
+        for (vk, bit) in [(keys::VK_SHIFT, display::keys::SHIFT), (keys::VK_CONTROL, display::keys::CTRL), (keys::VK_MENU, display::keys::ALT)] {
+            if held[vk as usize] & 0x80 != 0 {
+                modifiers |= bit;
+            }
+        }
+        // Ctrl+Alt types nothing here (it's AltGr on other layouts).
+        let both = display::keys::CTRL | display::keys::ALT;
+        if let Some(c) = keys::code(m.wparam as u8).and_then(|code| display::keys::text(code, modifiers)).filter(|_| modifiers & both != both) {
+            let message = if m.message == WM_SYSKEYDOWN { WM_SYSCHAR } else { WM_CHAR };
+            w.post_front(m.hwnd, message, u64::from(c), m.lparam, m.time);
+        }
+        true
     }
 
     /// Calls a `WndProc` that takes ANSI with a message in UTF-16: its text converted on the way in (WM_SETTEXT,
@@ -1445,7 +1682,7 @@ impl Task {
                 }
                 if filter.message(WM_PAINT) {
                     let painting = windows.iter().find(|&(&h, win)| {
-                        win.tid == tid && win.visible && !win.invalid.is_empty() && (filter.hwnd == 0 || filter.hwnd == h || is_descendant(windows, h, filter.hwnd))
+                        win.tid == tid && !win.invalid.is_empty() && w.showing(h) && (filter.hwnd == 0 || filter.hwnd == h || is_descendant(windows, h, filter.hwnd))
                     });
                     if let Some((&h, _)) = painting {
                         return Ok(Some(Msg { hwnd: h, message: WM_PAINT, wparam: 0, lparam: 0, time }));
@@ -1511,16 +1748,7 @@ impl Task {
 
     /// Marks part of a window (all of it, for None) as needing painting, and wakes its thread to paint it.
     pub fn invalidate(&mut self, hwnd: u64, rect: Option<Rect>, erase: bool) -> bool {
-        let mut w = self.win32k();
-        let Some(win) = w.windows.get_mut(&hwnd) else { return false };
-        let r = rect.unwrap_or(win.client()).intersect(&win.client());
-        win.invalid = win.invalid.union(&r);
-        win.erase |= erase;
-        let tid = win.tid;
-        if let Some(q) = w.queues.get(&tid) {
-            q.waiter.wake();
-        }
-        true
+        self.win32k().invalidate(hwnd, rect, erase)
     }
 
     /// Starts moving a top-level window by the pointer (or with `edges`, resizing it), as its frame would, while the
@@ -1573,6 +1801,11 @@ impl Task {
                 // SC_SIZE's low bits are which edge (WMSZ_LEFT, RIGHT, TOP, TOPLEFT, TOPRIGHT, BOTTOM, BOTTOMLEFT,
                 // BOTTOMRIGHT); SC_MOVE's are HTCAPTION from a click, as programs that draw their own send it.
                 let top = self.win32k().top_level_of(hwnd).unwrap_or(hwnd);
+                // A command greyed in its system menu isn't carried out.
+                let greyed = self.win32k().system_menus.get(&top).and_then(|m| m.get(&(wparam & 0xfff0))).is_some_and(|&s| s & 3 != 0);
+                if greyed {
+                    return Ok(0);
+                }
                 match wparam & 0xfff0 {
                     SC_CLOSE => {
                         self.send_message(cx, hwnd, WM_CLOSE, 0, 0)?;
@@ -1637,12 +1870,34 @@ impl Task {
             }
             WM_ERASEBKGND => Ok(u64::from(self.erase_background(hwnd, wparam))),
             WM_PAINT => {
-                // Painting nothing still validates, or WM_PAINT would come forever.
-                if let Some(win) = self.win32k().windows.get_mut(&hwnd) {
-                    win.invalid = Rect::default();
-                    win.erase = false;
+                // As BeginPaint and EndPaint: erased if it needs it, and validated, or WM_PAINT would come forever.
+                let erase = match self.win32k().windows.get_mut(&hwnd) {
+                    Some(win) => {
+                        let erase = win.erase;
+                        win.invalid = Rect::default();
+                        win.erase = false;
+                        erase
+                    }
+                    None => false,
+                };
+                if erase {
+                    let hdc = self.get_dc(hwnd);
+                    self.send_message(cx, hwnd, WM_ERASEBKGND, hdc, 0)?;
+                    self.release_dc(hdc);
                 }
                 Ok(0)
+            }
+            // The colours a control is drawn in, if its parent doesn't say: an edit's and a list's on the window's
+            // colour, the rest on a button's face; text in the window's text colour.
+            WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORBTN | WM_CTLCOLORDLG | WM_CTLCOLORSTATIC | 0x137 => {
+                const COLOR_WINDOW: u64 = 5;
+                const COLOR_BTNFACE: u64 = 15;
+                let index = if matches!(message, WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX) { COLOR_WINDOW } else { COLOR_BTNFACE };
+                if let Some(dc) = self.win32k().gdi.dcs.get_mut(&wparam) {
+                    dc.text = gdi::sys_color(8);
+                    dc.background = gdi::sys_color(index as u32);
+                }
+                Ok(Gdi::sys_brush(index))
             }
             _ => Ok(0),
         }

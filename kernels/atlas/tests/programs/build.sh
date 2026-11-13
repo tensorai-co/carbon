@@ -48,6 +48,9 @@ for arch in aarch64 x86_64; do
     "$llvm/llvm-rc" -no-preprocess -fo "$out/resources-$arch.res" resources.rc
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console resources.c "$out/kernel32-$arch.lib" "$out/user32-$arch.lib" "$out/version-$arch.lib" \
         -Wl,"$out/resources-$arch.res" -o "$out/loader-$arch/resources.exe"
+    "$llvm/llvm-rc" -no-preprocess -fo "$out/dialog-$arch.res" dialog.rc
+    $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:windows dialog.c "$out/kernel32-$arch.lib" "$out/user32-$arch.lib" "$out/gdi32-$arch.lib" \
+        -Wl,"$out/dialog-$arch.res" -o "$out/loader-$arch/dialog.exe"
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console installer.c "$out/kernel32-$arch.lib" "$out/user32-$arch.lib" "$out/ole32-$arch.lib" \
         "$out/shell32-$arch.lib" -o "$out/loader-$arch/installer.exe"
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console environment.c "$out/kernel32-$arch.lib" -o "$out/loader-$arch/environment.exe"
@@ -129,3 +132,5 @@ i686 threads.c "$o/threads.exe" "$o/mylib.lib" || echo "i686: threads.c doesn't 
     -Wl,/entry:mainCRTStartup -Wl,/subsystem:console wowchild.c "$out/kernel32-x86_64.lib" -o "$out/loader-i686/wowchild.exe"
 "$llvm/llvm-rc" -no-preprocess -fo "$out/resources-i686.res" resources.rc
 i686 resources.c "$out/loader-i686/resources.exe" -Wl,"$out/resources-i686.res"
+"$llvm/llvm-rc" -no-preprocess -fo "$out/dialog-i686.res" dialog.rc
+i686 dialog.c "$out/loader-i686/dialog.exe" -Wl,"$out/dialog-i686.res"

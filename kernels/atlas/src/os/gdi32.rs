@@ -12,6 +12,7 @@ dll! {
     "GDI32.dll";
     host GetStockObject(1) => get_stock_object;
     host CreateSolidBrush(1) => create_solid_brush;
+    host CreateBrushIndirect(1) => create_brush_indirect;
     host CreatePen(3) => create_pen;
     host CreateFontW(14) => create_font;
     host CreateFontIndirectW(1) => create_font;
@@ -36,7 +37,6 @@ dll! {
     missing CreateDIBSection;
     missing StretchDIBits;
     // Not written yet: what installers import.
-    missing CreateBrushIndirect;
 }
 
 const CLR_INVALID: u64 = 0xffff_ffff;
@@ -47,6 +47,18 @@ fn get_stock_object(_: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
 
 fn create_solid_brush(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
     Reply::Value(task.win32k().gdi.create(Object::Brush(Some(swap(a[0] as u32)))))
+}
+
+/// `CreateBrushIndirect(&LOGBRUSH)`: its style and colour (its hatch, a pointer wide, isn't read). A solid or
+/// hatched brush fills with its colour (hatching isn't drawn yet), a hollow one fills nothing; a pattern brush, whose
+/// bitmap there's no drawing of yet, is its colour too.
+fn create_brush_indirect(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    const BS_HOLLOW: u32 = 1;
+    let Ok(b) = task.mem(cx, false, |t| kernels_core::user::read_vec(&t.space(), a[0], 8)) else { return Reply::Value(0) };
+    let style = u32::from_le_bytes(b[0..4].try_into().unwrap_or_default());
+    let color = u32::from_le_bytes(b[4..8].try_into().unwrap_or_default());
+    let brush = if style == BS_HOLLOW { Object::Brush(None) } else { Object::Brush(Some(swap(color))) };
+    Reply::Value(task.win32k().gdi.create(brush))
 }
 
 fn create_pen(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
