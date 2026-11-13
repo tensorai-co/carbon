@@ -107,6 +107,8 @@ void mainCRTStartup(void) {
     out = GetStdHandle((DWORD)-11);
 #if defined(__aarch64__)
     say("sharing, links and times, arm64\n");
+#elif defined(__i386__)
+    say("sharing, links and times, x86 (WoW64)\n");
 #else
     say("sharing, links and times, x86-64\n");
 #endif

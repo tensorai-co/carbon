@@ -154,6 +154,8 @@ void mainCRTStartup(void) {
         if (same(s, " child", 6)) child();
 #if defined(__aarch64__)
     say("named pipes on atlas, arm64\n");
+#elif defined(__i386__)
+    say("named pipes on atlas, x86 (WoW64)\n");
 #else
     say("named pipes on atlas, x86-64\n");
 #endif

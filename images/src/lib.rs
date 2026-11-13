@@ -55,6 +55,8 @@ impl Platform {
         let arch = match arch {
             "arm64" | "aarch64" => "arm64",
             "amd64" | "x86_64" | "x86-64" => "amd64",
+            // 32-bit x86: Windows programs run it (atlas's WoW64); lambda doesn't yet.
+            "386" | "i386" | "i686" | "x86" if os == "windows" => "386",
             _ => return None,
         };
         matches!(os, "linux" | "windows").then(|| Platform { os: os.into(), arch: arch.into() })
@@ -282,6 +284,8 @@ mod tests {
     fn platforms() {
         assert_eq!(Platform::parse("linux/arm64"), Some(Platform { os: "linux".into(), arch: "arm64".into() }));
         assert_eq!(Platform::parse("amd64").map(|p| p.to_string()).as_deref(), Some("linux/amd64"));
+        assert_eq!(Platform::parse("windows/i386").map(|p| p.to_string()).as_deref(), Some("windows/386"));
+        assert_eq!(Platform::parse("linux/386"), None);
         assert_eq!(Platform::parse("linux/s390x"), None);
     }
 

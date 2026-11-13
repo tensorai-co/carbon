@@ -91,5 +91,8 @@ mkdir -p "$out/loader-i686"
 for prog in wow64 files io pipes process sections registry links environment security pool windows desktop ansiwin; do
     i686 $prog.c "$out/loader-i686/$prog.exe" || echo "i686: $prog.c doesn't build"
 done
+# wow64.exe's 64-bit partner, beside it: a 32-bit program starting a 64-bit one, which starts a 32-bit one.
+"$llvm/clang" --target=x86_64-pc-windows-msvc -nostdlib -ffreestanding -fno-builtin -fno-stack-protector -O2 -fuse-ld=lld \
+    -Wl,/entry:mainCRTStartup -Wl,/subsystem:console wowchild.c "$out/kernel32-x86_64.lib" -o "$out/loader-i686/wowchild.exe"
 "$llvm/llvm-rc" -no-preprocess -fo "$out/resources-i686.res" resources.rc
 i686 resources.c "$out/loader-i686/resources.exe" -Wl,"$out/resources-i686.res"

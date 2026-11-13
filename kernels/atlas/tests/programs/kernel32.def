@@ -280,3 +280,6 @@ ChangeTimerQueueTimer
 DeleteTimerQueueTimer
 DeleteTimerQueueEx
 DeleteTimerQueue
+GetSystemWow64DirectoryW
+Wow64DisableWow64FsRedirection
+Wow64RevertWow64FsRedirection

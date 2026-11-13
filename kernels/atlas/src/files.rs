@@ -3,7 +3,10 @@
 //! made in memory.
 
 use std::collections::VecDeque;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+use exec::Isa;
 
 use kernels_core::lock;
 use layers::{Ino, Kind, New};
@@ -45,8 +48,18 @@ pub const FILE_SHARE_ALL: u32 = 7;
 /// since 1970.
 const TIMES: &str = "atlas.times";
 
-/// Where System32 is, on the disk, and its DLLs' folder for 32-bit programs.
+/// Where System32 is, on the disk, and its DLLs' folder for 32-bit programs, SysWOW64, which WoW64 shows a 32-bit
+/// program as its System32. Sysnative is how a 32-bit program names the real System32.
 const SYSTEM32: &str = "/windows/system32";
+const SYSWOW64: &str = "/windows/syswow64";
+const SYSNATIVE: &str = "/windows/sysnative";
+/// System32's folders WoW64 leaves alone: they're shared by both kinds of program.
+const NOT_REDIRECTED: [&str; 6] = ["/catroot", "/catroot2", "/driverstore", "/drivers/etc", "/logfiles", "/spool"];
+
+/// The rest of `path` past `folder` (both lower case on the disk's side), if it's in it or is it.
+fn under<'a>(lower: &'a str, folder: &str) -> Option<&'a str> {
+    lower.strip_prefix(folder).filter(|rest| rest.is_empty() || rest.starts_with('/'))
+}
 const DIRECTORIES: [&str; 11] = [
     "/Windows",
     "/Windows/System32",
@@ -338,32 +351,67 @@ impl Task {
         self.cwd().trim_end_matches('\\').to_string()
     }
 
+    /// A path the program gave, as a Windows path and where it is on the disk, after WoW64's redirection.
     pub fn resolve(&self, raw: &str) -> Result<(String, String), u32> {
-        resolve(&self.cwd_for_join(), raw)
+        let (windows, disk) = resolve(&self.cwd_for_join(), raw)?;
+        Ok(self.redirect(windows, disk))
     }
 
-    /// A system-layer file: one of atlas's DLLs, as `System32` has it.
+    /// WoW64's file system redirection, for a 32-bit program: System32 is SysWOW64 (but for the folders both kinds
+    /// share, and while the thread has turned it off), and Sysnative is System32, always.
+    fn redirect(&self, windows: String, disk: String) -> (String, String) {
+        if self.isa != Isa::X86_32 {
+            return (windows, disk);
+        }
+        let lower = disk.to_ascii_lowercase();
+        let to = if under(&lower, SYSNATIVE).is_some() {
+            Some((SYSNATIVE, "System32"))
+        } else if let Some(rest) = under(&lower, SYSTEM32)
+            && !self.control.fs_redirection_off.load(Ordering::Relaxed)
+            && !NOT_REDIRECTED.iter().any(|f| under(rest, f).is_some())
+        {
+            Some((SYSTEM32, "SysWOW64"))
+        } else {
+            None
+        };
+        let Some((from, folder)) = to else { return (windows, disk) };
+        let rest = &disk[from.len()..];
+        (format!("C:\\Windows\\{folder}{}", rest.replace('/', "\\")), format!("/Windows/{folder}{rest}"))
+    }
+
+    /// Which ISA's DLLs a folder of the system layer has: SysWOW64's are 32-bit; System32's are the program's own,
+    /// or for a 32-bit program looking past its redirection, x86-64's, the machine's native ones.
+    fn system_isa(&self, lower: &str) -> Option<Isa> {
+        if lower == SYSWOW64 {
+            Some(Isa::X86_32)
+        } else if lower == SYSTEM32 {
+            Some(if self.isa == Isa::X86_32 { Isa::X86_64 } else { self.isa })
+        } else {
+            None
+        }
+    }
+
+    /// A system-layer file: one of atlas's DLLs, as `System32` or `SysWOW64` has it.
     fn system_file(&self, disk_path: &str) -> Option<Arc<Vec<u8>>> {
         let lower = disk_path.to_ascii_lowercase();
-        let name = lower.strip_prefix(SYSTEM32)?.strip_prefix('/')?;
+        let (dir, name) = lower.rsplit_once('/')?;
+        let isa = self.system_isa(dir)?;
         if name == "ntdll.dll" {
-            return images::guest(self.isa).map(|image| Arc::new(image.to_vec()));
+            return images::guest(isa).map(|image| Arc::new(image.to_vec()));
         }
         let dll = os::find(name)?;
-        (os::DLLS[dll].name.to_ascii_lowercase() == name).then(|| self.k.images.get(self.isa, dll))
+        (os::DLLS[dll].name.to_ascii_lowercase() == name).then(|| self.k.images.get(isa, dll))
     }
 
-    /// The system layer's entries in a folder: atlas's DLLs, in System32.
+    /// The system layer's entries in a folder: atlas's DLLs, in System32 and SysWOW64.
     fn system_listing(&self, disk_dir: &str) -> Vec<Found> {
-        if disk_dir.to_ascii_lowercase() != SYSTEM32 {
-            return Vec::new();
-        }
+        let Some(isa) = self.system_isa(&disk_dir.to_ascii_lowercase()) else { return Vec::new() };
         let mut found: Vec<Found> = os::DLLS
             .iter()
             .enumerate()
-            .map(|(i, d)| Found { name: d.name.to_string(), attributes: FILE_ATTRIBUTE_ARCHIVE, size: self.k.images.get(self.isa, i).len() as u64, modified: 0, created: 0, accessed: 0 })
+            .map(|(i, d)| Found { name: d.name.to_string(), attributes: FILE_ATTRIBUTE_ARCHIVE, size: self.k.images.get(isa, i).len() as u64, modified: 0, created: 0, accessed: 0 })
             .collect();
-        if let Some(image) = images::guest(self.isa) {
+        if let Some(image) = images::guest(isa) {
             found.push(Found { name: "ntdll.dll".to_string(), attributes: FILE_ATTRIBUTE_ARCHIVE, size: image.len() as u64, modified: 0, created: 0, accessed: 0 });
         }
         found

@@ -387,8 +387,15 @@ impl Machines {
                     let arch = if bytes.get(18) == Some(&0xB7) { "arm64" } else { "amd64" };
                     (Kernel::Lambda, Platform { os: "linux".into(), arch: arch.into() }, format!("/{file}"))
                 } else if bytes.starts_with(b"MZ") {
-                    let x86 = bytes.windows(6).take(1024).any(|w| w == b"PE\0\0\x64\x86");
-                    let arch = if x86 { "amd64" } else { "arm64" };
+                    // The PE header's machine: x86-64, 32-bit x86 (WoW64), or else ARM64.
+                    let machine = |m: &[u8; 2]| bytes.windows(6).take(1024).any(|w| w[..4] == *b"PE\0\0" && w[4..] == *m);
+                    let arch = if machine(b"\x64\x86") {
+                        "amd64"
+                    } else if machine(b"\x4c\x01") {
+                        "386"
+                    } else {
+                        "arm64"
+                    };
                     (Kernel::Atlas, Platform { os: "windows".into(), arch: arch.into() }, format!("C:\\{file}"))
                 } else if file.to_ascii_lowercase().ends_with(".msi") {
                     return Err("installing an .msi needs msiexec, which isn't there yet".into());
@@ -430,7 +437,8 @@ impl Machines {
         #[cfg(unix)]
         let relay = signals::Relay::start();
 
-        let tso = record.platform.arch == "amd64" && cfg!(target_arch = "aarch64");
+        // x86 of either width on Apple silicon wants the CPU's own x86 memory ordering.
+        let tso = matches!(record.platform.arch.as_str(), "amd64" | "386") && cfg!(target_arch = "aarch64");
         // Opens exec and boots the kernel on this thread, which its CPUs belong to.
         let start = |record: &mut Record, desktop: Option<display::desktop::Shared>| {
             let (exec, cpu) = open_exec(run.isolation, tso, run.memory)?;

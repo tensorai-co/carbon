@@ -30,6 +30,8 @@ pub(crate) struct ThreadControl {
     pub owned: Mutex<Vec<Weak<Object>>>,
     /// The token it's impersonating, if it is.
     pub token: Mutex<Option<Arc<crate::security::Token>>>,
+    /// `Wow64DisableWow64FsRedirection`: a 32-bit thread's System32 is System32, not SysWOW64, until it reverts.
+    pub fs_redirection_off: std::sync::atomic::AtomicBool,
 }
 
 impl ThreadControl {
@@ -45,6 +47,7 @@ impl ThreadControl {
             apcs: Mutex::new(Default::default()),
             owned: Mutex::new(Vec::new()),
             token: Mutex::new(None),
+            fs_redirection_off: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }

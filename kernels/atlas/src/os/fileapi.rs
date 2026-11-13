@@ -930,3 +930,42 @@ pub fn get_system_directory_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Re
 pub fn get_system_directory_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     task.put_ansi(cx, a[0], a[1] & 0xffff_ffff, "C:\\Windows\\System32")
 }
+
+/// `GetSystemWow64DirectoryW(buffer, size)`: SysWOW64, where 32-bit programs' system DLLs are, for programs of either
+/// kind, as 64-bit Windows says.
+pub fn get_system_wow64_directory_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    task.put_wide(cx, a[0], a[1] & 0xffff_ffff, "C:\\Windows\\SysWOW64")
+}
+
+pub fn get_system_wow64_directory_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    task.put_ansi(cx, a[0], a[1] & 0xffff_ffff, "C:\\Windows\\SysWOW64")
+}
+
+/// `Wow64DisableWow64FsRedirection(&old)`: this thread's System32 is System32 until it reverts, and `old` is what to
+/// revert to. Only a 32-bit program has redirection to turn off; a 64-bit one is told ERROR_INVALID_FUNCTION.
+pub fn wow64_disable_wow64_fs_redirection(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if task.isa != exec::Isa::X86_32 {
+        return task.fail(cx, 1);
+    }
+    let was_off = task.control.fs_redirection_off.swap(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = task.write_ptr(cx, a[0], u64::from(was_off));
+    Reply::Value(1)
+}
+
+/// `Wow64RevertWow64FsRedirection(old)`: back as it was when it was turned off.
+pub fn wow64_revert_wow64_fs_redirection(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if task.isa != exec::Isa::X86_32 {
+        return task.fail(cx, 1);
+    }
+    task.control.fs_redirection_off.store(a[0] & 1 != 0, std::sync::atomic::Ordering::Relaxed);
+    Reply::Value(1)
+}
+
+/// `Wow64EnableWow64FsRedirection(enable)`: on or off, BOOLEAN.
+pub fn wow64_enable_wow64_fs_redirection(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if task.isa != exec::Isa::X86_32 {
+        return Reply::Value(0);
+    }
+    task.control.fs_redirection_off.store(a[0] as u8 == 0, std::sync::atomic::Ordering::Relaxed);
+    Reply::Value(1)
+}

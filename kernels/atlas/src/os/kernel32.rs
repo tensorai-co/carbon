@@ -122,6 +122,11 @@ dll! {
     host GetWindowsDirectoryA(2) => get_windows_directory_a;
     host GetSystemDirectoryW(2) => get_system_directory_w;
     host GetSystemDirectoryA(2) => get_system_directory_a;
+    host GetSystemWow64DirectoryW(2) => get_system_wow64_directory_w;
+    host GetSystemWow64DirectoryA(2) => get_system_wow64_directory_a;
+    host Wow64DisableWow64FsRedirection(1) => wow64_disable_wow64_fs_redirection;
+    host Wow64RevertWow64FsRedirection(1) => wow64_revert_wow64_fs_redirection;
+    host Wow64EnableWow64FsRedirection(1) => wow64_enable_wow64_fs_redirection;
     host CloseHandle(1) => close_handle;
     guest ExitProcess => RtlExitUserProcess;
     host GetCommandLineA(0) => get_command_line_a;
@@ -262,7 +267,7 @@ dll! {
     host VerSetConditionMask(3) => ver_set_condition_mask;
     host GetProductInfo(5) => get_product_info;
     host GetSystemInfo(1) => get_system_info;
-    host GetNativeSystemInfo(1) => get_system_info;
+    host GetNativeSystemInfo(1) => get_native_system_info;
     host GlobalMemoryStatusEx(1) => global_memory_status_ex;
     host GlobalMemoryStatus(1) => global_memory_status;
     host IsProcessorFeaturePresent(1) => is_processor_feature_present;

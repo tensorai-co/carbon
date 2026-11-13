@@ -203,6 +203,8 @@ void mainCRTStartup(void) {
     if (*what) child(what);
 #if defined(__aarch64__)
     say("processes and pipes on atlas, arm64\n");
+#elif defined(__i386__)
+    say("processes and pipes on atlas, x86 (WoW64)\n");
 #else
     say("processes and pipes on atlas, x86-64\n");
 #endif

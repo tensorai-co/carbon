@@ -172,6 +172,8 @@ void mainCRTStartup(void) {
     if (*what) child(what);
 #if defined(__aarch64__)
     say("sections and timers on atlas, arm64\n");
+#elif defined(__i386__)
+    say("sections and timers on atlas, x86 (WoW64)\n");
 #else
     say("sections and timers on atlas, x86-64\n");
 #endif

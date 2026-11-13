@@ -5,7 +5,7 @@ declaration made into a PE in memory, so a machine has no Windows files to insta
 has to run inside the program, ntdll, is a crate (`guest/`) that cargo builds for each ISA and embeds.
 
 **Where it stands.** Programs run on ARM64 natively and x86-64 translated, and 32-bit x86 programs run too (WoW64,
-translated on Apple silicon; phases 1 to 4 of its six, below, are done): 15 of the test programs pass every check as
+translated on Apple silicon; phases 1 to 5 of its six, below, are done): 15 of the test programs pass every check as
 32-bit programs, with x86's own SEH, PE32 images and 32-bit layouts throughout. They have the loader and SEH, threads and
 waits, processes, anonymous and named pipes, sections, asynchronous I/O and completion ports, files, the registry,
 security (tokens, descriptors, access checks, impersonation), resources and version information, the system's
@@ -97,7 +97,7 @@ opening comment says what it checks. `crt.exe` (and `crt-mingw.exe`) want the ar
 | atlas's `io.c`, both ISAs | Completion ports and overlapped I/O: events, packets, `ReadFileEx` routines |
 | atlas's `pipes.c`, both ISAs | Named pipes, byte and message, pending I/O, and a pipe between two processes |
 | atlas's `files.c`, `io.c`, `pipes.c`, `process.c`, `sections.c`, `registry.c`, `links.c`, `environment.c`, `security.c`, `pool.c`, `windows.c`, `desktop.c`, `ansiwin.c`, `resources.c` | Also built for 32-bit x86, where every check passes too |
-| atlas's `wow64.c`, 32-bit x86 | WoW64: the TEB through fs and the PEB; GetSystemInfo's 32-bit layout; memory below 2 GiB; the heap, the last error, TLS and critical sections; GetProcAddress; a thread; an upcall; fibers; RaiseException to a vectored handler; a frame of its own on the fs:[0] chain unwound by RtlUnwind; an access violation from atlas |
+| atlas's `wow64.c`, 32-bit x86, with `wowchild.c` (x86-64) beside it | WoW64: IsWow64Process(2), GetNativeSystemInfo, the environment, System32 redirected (off and on, and Sysnative), the registry's 32-bit view, a 64-bit program started that starts a 32-bit one; and the TEB through fs and the PEB; GetSystemInfo's 32-bit layout; memory below 2 GiB; the heap, the last error, TLS and critical sections; GetProcAddress; a thread; an upcall; fibers; RaiseException to a vectored handler; a frame of its own on the fs:[0] chain unwound by RtlUnwind; an access violation from atlas |
 | atlas's `sysinfo.c`, both ISAs, with and without a manifest | `KUSER_SHARED_DATA`, the version as a program is told it, the machine, time and time zones, `NtQuerySystemInformation` |
 | atlas's `security.c`, both ISAs | Tokens and privileges, SIDs, ACLs, descriptors and SDDL, descriptors kept and checked, `AccessCheck`, impersonation |
 | atlas's `resources.c`, both ISAs, with `resources.rc` | Finding, loading and enumerating resources, string tables, and version information |
@@ -796,10 +796,17 @@ First `cmd.exe` (variables, `if`, `for`, `goto`, `call`, pipes, redirection, `.b
      `NtQuerySystemInformation`'s basic information and process list. Its handle lists and the kernel's modules
      answer that the class isn't there for a 32-bit program, for now. A 32-bit process has the shared data page
      too, saying the machine is AMD64, as x64 Windows' WoW64 does.
-  5. [ ] **WoW64 as programs see it**: `SysWOW64` for 32-bit processes, with `System32` redirected to it
-     (`Wow64DisableWow64FsRedirection` and `Sysnative`); the registry's 32-bit view by default; `IsWow64Process(2)`,
-     `GetNativeSystemInfo`, `PROCESSOR_ARCHITECTURE` and `PROCESSOR_ARCHITEW6432`; 32-bit and 64-bit processes
-     starting each other.
+  5. [x] **WoW64 as programs see it**: a 32-bit program's System32 is SysWOW64 (`Task::resolve`), but for the
+     folders both kinds share (`catroot`, `catroot2`, `driverstore`, `drivers\etc`, `logfiles`, `spool`) and while
+     its thread has turned that off (`Wow64DisableWow64FsRedirection`, `Revert`, `Enable`); `Sysnative` is System32,
+     always. SysWOW64 holds atlas's PE32 DLLs, System32 the 64-bit ones, and the loader looks in SysWOW64 for a
+     32-bit program's. The registry's 32-bit view is a 32-bit program's unless it asks for `KEY_WOW64_64KEY` (and
+     `RegGetValue` takes `RRF_SUBKEY_WOW64*KEY`). `IsWow64Process` says yes for a 32-bit process, `IsWow64Process2`
+     I386 under AMD64, and `GetNativeSystemInfo` x64, as x64 Windows' WoW64 does (on an ARM64 Mac too: atlas is an
+     x64 Windows to its programs). As each process starts, the variables that say what kind it is are set for it,
+     whatever its parent's said: PROCESSOR_ARCHITECTURE (x86, with PROCESSOR_ARCHITEW6432 AMD64), ProgramFiles and
+     CommonProgramFiles (the (x86) folders for a 32-bit program). 32-bit and 64-bit programs start each other.
+     `carbon run` knows a 32-bit `.exe` (platform `windows/386`), and gives it x86's memory ordering.
   6. [ ] **Every test program for i686**, passing; then an NSIS installer built from source, then Steam's. `build.sh`
      builds i686 programs with import libraries made from what each object imports (x86's `_Name@N` names). 15 run
      and pass every check (538): `wow64.c`, files, io, pipes, process, sections, registry, links, environment,

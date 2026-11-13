@@ -74,6 +74,8 @@ void mainCRTStartup(void) {
     out = GetStdHandle((DWORD)-11);
 #if defined(__aarch64__)
     say("files on atlas, arm64\n");
+#elif defined(__i386__)
+    say("files on atlas, x86 (WoW64)\n");
 #else
     say("files on atlas, x86-64\n");
 #endif

@@ -98,6 +98,8 @@ void mainCRTStartup(void) {
     out = GetStdHandle((DWORD)-11);
 #if defined(__aarch64__)
     say("the registry on atlas, arm64\n");
+#elif defined(__i386__)
+    say("the registry on atlas, x86 (WoW64)\n");
 #else
     say("the registry on atlas, x86-64\n");
 #endif
@@ -235,7 +237,8 @@ void mainCRTStartup(void) {
               RegOpenKeyExW(HKLM, W(1, "SOFTWARE\\WOW6432Node\\CarbonApp"), 0, 0x20019, &probe) == 0,
           "KEY_WOW64_32KEY: SOFTWARE\\X is SOFTWARE\\WOW6432Node\\X");
     RegCloseKey(probe);
-    check(RegOpenKeyExW(HKLM, W(0, "SOFTWARE\\CarbonApp"), 0, 0x20019, &probe) == 2, "  and isn't in the 64-bit view");
+    // KEY_WOW64_64KEY: the 64-bit view, which a 64-bit program has anyway and a 32-bit one only asking for it.
+    check(RegOpenKeyExW(HKLM, W(0, "SOFTWARE\\CarbonApp"), 0, 0x20019 | 0x100, &probe) == 2, "  and isn't in the 64-bit view");
     check(RegOpenKeyExW(HKLM, W(0, "SOFTWARE\\CarbonApp"), 0, 0x20019 | 0x200, &probe) == 0, "  but is in the 32-bit one");
     RegCloseKey(probe);
     WCHAR dir[64];
@@ -300,7 +303,13 @@ void mainCRTStartup(void) {
     RegDeleteTreeW(HKCU, W(0, "Software\\Restored"));
     DeleteFileW(W(0, "C:\\saved.hive"));
 
-    check(RegFlushKey(HKLM) == 0 && GetFileAttributesW(W(0, "C:\\Windows\\System32\\config\\REGISTRY")) != 0xffffffff, "RegFlushKey saves it, where Windows keeps its hives");
+#if defined(__i386__)
+    // A 32-bit program's System32 is SysWOW64; Sysnative is the real one.
+    const char *hives = "C:\\Windows\\Sysnative\\config\\REGISTRY";
+#else
+    const char *hives = "C:\\Windows\\System32\\config\\REGISTRY";
+#endif
+    check(RegFlushKey(HKLM) == 0 && GetFileAttributesW(W(0, hives)) != 0xffffffff, "RegFlushKey saves it, where Windows keeps its hives");
 
     ExitProcess(failures);
 }

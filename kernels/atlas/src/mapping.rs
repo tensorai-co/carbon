@@ -142,7 +142,9 @@ impl Task {
             vec![disk_path(raw)]
         } else {
             let dir = lock(&self.process.state).exe_dir.clone();
-            vec![format!("{dir}/{raw}"), format!("/Windows/System32/{raw}"), format!("{dir}/{name}"), format!("/Windows/System32/{name}")]
+            // A 32-bit program's System32 is SysWOW64.
+            let system = if self.isa == Isa::X86_32 { "/Windows/SysWOW64" } else { "/Windows/System32" };
+            vec![format!("{dir}/{raw}"), format!("{system}/{raw}"), format!("{dir}/{name}"), format!("{system}/{name}")]
         };
         let found = {
             let disk = lock(&self.k.disk);

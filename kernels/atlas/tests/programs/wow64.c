@@ -5,7 +5,10 @@
 // heap, the last error, TLS and critical sections in ntdll; GetModuleHandle and GetProcAddress; a thread and a wait;
 // an upcall (EnumSystemLocalesW); fibers; and exceptions: RaiseException to a vectored handler that carries on, a
 // frame of our own on the fs:[0] chain that takes an exception and unwinds with RtlUnwind, and an access violation
-// delivered by atlas.
+// delivered by atlas. Then WoW64 as a 32-bit program sees it: IsWow64Process(2), GetNativeSystemInfo, the
+// environment's architecture and Program Files, System32 redirected to SysWOW64 (and not, while it's turned off, or
+// through Sysnative), the registry's 32-bit view, and a 64-bit program started from here (wowchild.c), which starts
+// this one again as a 32-bit child (`wow64.exe child`, which checks what it sees and exits 32).
 
 typedef void *HANDLE;
 typedef unsigned long DWORD;
@@ -77,6 +80,26 @@ __declspec(dllimport) void *__stdcall AddVectoredExceptionHandler(DWORD, long(__
 __declspec(dllimport) DWORD __stdcall RemoveVectoredExceptionHandler(void *);
 __declspec(dllimport) void __stdcall RaiseException(DWORD, DWORD, DWORD, const ULONG_PTR *);
 __declspec(dllimport) void __stdcall RtlUnwind(void *, void *, EXCEPTION_RECORD *, void *);
+__declspec(dllimport) BOOL __stdcall IsWow64Process(HANDLE, BOOL *);
+__declspec(dllimport) BOOL __stdcall IsWow64Process2(HANDLE, unsigned short *, unsigned short *);
+__declspec(dllimport) HANDLE __stdcall GetCurrentProcess(void);
+__declspec(dllimport) void __stdcall GetNativeSystemInfo(SYSTEM_INFO *);
+__declspec(dllimport) DWORD __stdcall GetSystemWow64DirectoryW(WCHAR *, DWORD);
+__declspec(dllimport) DWORD __stdcall GetEnvironmentVariableW(const WCHAR *, WCHAR *, DWORD);
+__declspec(dllimport) BOOL __stdcall Wow64DisableWow64FsRedirection(void **);
+__declspec(dllimport) BOOL __stdcall Wow64RevertWow64FsRedirection(void *);
+__declspec(dllimport) HANDLE __stdcall CreateFileW(const WCHAR *, DWORD, DWORD, void *, DWORD, DWORD, HANDLE);
+__declspec(dllimport) BOOL __stdcall ReadFile(HANDLE, void *, DWORD, DWORD *, void *);
+__declspec(dllimport) BOOL __stdcall CloseHandle(HANDLE);
+__declspec(dllimport) WCHAR *__stdcall GetCommandLineW(void);
+__declspec(dllimport) BOOL __stdcall CreateProcessW(const WCHAR *, WCHAR *, void *, void *, BOOL, DWORD, void *, const WCHAR *, void *, void *);
+__declspec(dllimport) BOOL __stdcall GetExitCodeProcess(HANDLE, DWORD *);
+__declspec(dllimport) long __stdcall RegCreateKeyExW(HANDLE, const WCHAR *, DWORD, WCHAR *, DWORD, DWORD, void *, HANDLE *, DWORD *);
+__declspec(dllimport) long __stdcall RegOpenKeyExW(HANDLE, const WCHAR *, DWORD, DWORD, HANDLE *);
+__declspec(dllimport) long __stdcall RegCloseKey(HANDLE);
+__declspec(dllimport) long __stdcall RegDeleteKeyExW(HANDLE, const WCHAR *, DWORD, DWORD);
+#define HKLM ((HANDLE)0x80000002)
+#define KEY_WOW64_64KEY 0x100
 
 static HANDLE out;
 static int failures;
@@ -95,6 +118,55 @@ static void check(int ok, const char *what) {
     say(what);
     say("\n");
     if (!ok) failures++;
+}
+
+static int wsame(const WCHAR *a, const char *b) {
+    while (*b && *a == (WCHAR)*b) a++, b++;
+    return *a == 0 && *b == 0;
+}
+
+/// The value of an environment variable, as ASCII, or "" if there's none.
+static const char *env(const WCHAR *name) {
+    static char text[260];
+    WCHAR value[260];
+    DWORD n = GetEnvironmentVariableW(name, value, 260);
+    for (DWORD i = 0; i < n && i < 259; i++) text[i] = (char)value[i];
+    text[n < 259 ? n : 259] = 0;
+    return text;
+}
+static int same(const char *a, const char *b) {
+    while (*a && *a == *b) a++, b++;
+    return *a == *b;
+}
+
+/// The machine a PE says it's for, read through the file system as this thread sees it.
+static unsigned short machine_of(const WCHAR *path) {
+    HANDLE f = CreateFileW(path, 0x80000000, 1, 0, 3, 0, 0);
+    if (f == (HANDLE)-1) return 0;
+    unsigned char head[0x200];
+    DWORD n = 0;
+    ReadFile(f, head, sizeof head, &n, 0);
+    CloseHandle(f);
+    if (n < 0x40) return 0;
+    DWORD pe = *(DWORD *)(head + 0x3c);
+    return pe + 6 <= n ? *(unsigned short *)(head + pe + 4) : 0;
+}
+
+/// Runs a program with a command line, giving its exit code, or -1.
+static DWORD run(const WCHAR *line) {
+    WCHAR buffer[260];
+    int i = 0;
+    for (; line[i] && i < 259; i++) buffer[i] = line[i];
+    buffer[i] = 0;
+    DWORD si[17] = {68};
+    struct { HANDLE process, thread; DWORD pid, tid; } pi;
+    if (!CreateProcessW(0, buffer, 0, 0, 0, 0, 0, 0, si, &pi)) return (DWORD)-1;
+    DWORD code = (DWORD)-1;
+    WaitForSingleObject(pi.process, 0xffffffff);
+    GetExitCodeProcess(pi.process, &code);
+    CloseHandle(pi.thread);
+    CloseHandle(pi.process);
+    return code;
 }
 
 static void *teb(void) {
@@ -165,8 +237,21 @@ static __attribute__((noinline)) void through_frame(void) {
     __asm__ volatile("movl %0, %%eax\n movl %%eax, %%fs:0" ::"m"(frame.next) : "eax");
 }
 
+/// `wow64.exe child`: started by a 64-bit program, it sees what a 32-bit one should, and says so with its exit code.
+static void child(void) {
+    BOOL wow = 0;
+    IsWow64Process(GetCurrentProcess(), &wow);
+    int ok = wow && same(env(L"PROCESSOR_ARCHITECTURE"), "x86") && same(env(L"PROCESSOR_ARCHITEW6432"), "AMD64") &&
+             same(env(L"ProgramFiles"), "C:\\Program Files (x86)");
+    ExitProcess(ok ? 32 : 1);
+}
+
 void mainCRTStartup(void) {
     out = GetStdHandle((DWORD)-11);
+    const WCHAR *line = GetCommandLineW();
+    for (const WCHAR *p = line; *p; p++) {
+        if (p[0] == ' ' && wsame(p + 1, "child")) child();
+    }
     check(sizeof(void *) == 4, "pointers are 4 bytes");
 
     char *t = teb();
@@ -237,6 +322,38 @@ void mainCRTStartup(void) {
     __asm__ volatile("movl 0x10, %%eax" ::: "eax");
     RemoveVectoredExceptionHandler(h);
     check(av_seen, "an access violation, delivered by atlas, carried on from past it");
+
+    // WoW64, as a 32-bit program sees it.
+    BOOL wow = 0;
+    unsigned short process_machine = 0, native_machine = 0;
+    check(IsWow64Process(GetCurrentProcess(), &wow) && wow, "IsWow64Process: yes");
+    check(IsWow64Process2(GetCurrentProcess(), &process_machine, &native_machine) && process_machine == 0x14c && native_machine == 0x8664,
+          "IsWow64Process2: I386 under AMD64");
+    SYSTEM_INFO native;
+    GetNativeSystemInfo(&native);
+    check(native.arch == 9 && si.arch == 0, "GetNativeSystemInfo says x64; GetSystemInfo, x86");
+    WCHAR dir[64];
+    check(GetSystemWow64DirectoryW(dir, 64) == 19 && wsame(dir, "C:\\Windows\\SysWOW64"), "GetSystemWow64Directory: SysWOW64");
+    check(same(env(L"PROCESSOR_ARCHITECTURE"), "x86") && same(env(L"PROCESSOR_ARCHITEW6432"), "AMD64"), "PROCESSOR_ARCHITECTURE x86, PROCESSOR_ARCHITEW6432 AMD64");
+    check(same(env(L"ProgramFiles"), "C:\\Program Files (x86)") && same(env(L"ProgramW6432"), "C:\\Program Files") &&
+              same(env(L"CommonProgramFiles"), "C:\\Program Files (x86)\\Common Files"),
+          "ProgramFiles is the (x86) one; ProgramW6432 the other");
+    check(machine_of(L"C:\\Windows\\System32\\kernel32.dll") == 0x14c, "System32's kernel32.dll is SysWOW64's: I386");
+    void *old = 0;
+    check(Wow64DisableWow64FsRedirection(&old) && machine_of(L"C:\\Windows\\System32\\kernel32.dll") == 0x8664, "  with redirection off, System32's own: AMD64");
+    check(Wow64RevertWow64FsRedirection(old) && machine_of(L"C:\\Windows\\System32\\kernel32.dll") == 0x14c, "  and back on");
+    check(machine_of(L"C:\\Windows\\Sysnative\\kernel32.dll") == 0x8664, "Sysnative is System32");
+    HANDLE key = 0, seen = 0;
+    DWORD made = 0;
+    RegCreateKeyExW(HKLM, L"SOFTWARE\\CarbonWow64Test", 0, 0, 0, 0xf003f, 0, &key, &made);
+    check(key && RegOpenKeyExW(HKLM, L"SOFTWARE\\WOW6432Node\\CarbonWow64Test", 0, 0x20019 | KEY_WOW64_64KEY, &seen) == 0,
+          "the registry: HKLM\\SOFTWARE's keys are WOW6432Node's");
+    RegCloseKey(seen);
+    seen = 0;
+    check(RegOpenKeyExW(HKLM, L"SOFTWARE\\CarbonWow64Test", 0, 0x20019 | KEY_WOW64_64KEY, &seen) != 0, "  not the 64-bit view's");
+    RegCloseKey(key);
+    RegDeleteKeyExW(HKLM, L"SOFTWARE\\CarbonWow64Test", 0, 0);
+    check(run(L"wowchild.exe") == 64, "a 64-bit program started from here, which starts a 32-bit one");
 
     say(failures ? "some checks FAILED\n" : "all passed\n");
     ExitProcess(failures);

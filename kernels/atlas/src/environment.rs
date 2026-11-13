@@ -45,15 +45,12 @@ pub fn first(k: &Kernel, isa: Isa) -> Vec<(String, String)> {
             set(&mut vars, &name, value);
         }
     }
-    let architecture = match isa {
-        Isa::Arm64 => "ARM64",
-        Isa::X86_64 => "AMD64",
-        Isa::X86_32 => "x86",
-    };
     let session = [
         ("ALLUSERSPROFILE", "allusersprofile"),
         ("APPDATA", "appdata"),
         ("CommonProgramFiles", "commonprogramfiles"),
+        ("CommonProgramFiles(x86)", "commonprogramfiles(x86)"),
+        ("CommonProgramW6432", "commonprogramw6432"),
         ("COMPUTERNAME", "computername"),
         ("HOMEDRIVE", "homedrive"),
         ("HOMEPATH", "homepath"),
@@ -73,13 +70,51 @@ pub fn first(k: &Kernel, isa: Isa) -> Vec<(String, String)> {
             set(&mut vars, name, value.to_string());
         }
     }
-    set(&mut vars, "PROCESSOR_ARCHITECTURE", architecture.to_string());
     set(&mut vars, "NUMBER_OF_PROCESSORS", k.host.cpus().to_string());
     for (name, value) in &k.options.env {
         set(&mut vars, name, value.clone());
     }
-    vars.sort_by_key(|(n, _)| n.to_uppercase());
+    for_isa(&mut vars, isa);
     vars
+}
+
+/// The variables that say which kind of program it is, set for one of `isa`, as WoW64 sets them as a process starts
+/// (from its parent's, or the logon's): a 32-bit program has PROCESSOR_ARCHITECTURE x86 and the machine's own in
+/// PROCESSOR_ARCHITEW6432, and its ProgramFiles and CommonProgramFiles are the (x86) folders; a 64-bit one has its
+/// own architecture, no PROCESSOR_ARCHITEW6432, and the folders ProgramW6432 and CommonProgramW6432 name.
+pub fn for_isa(vars: &mut Vec<(String, String)>, isa: Isa) {
+    let get = |vars: &Vec<(String, String)>, name: &str| vars.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.clone());
+    let (architecture, folders) = match isa {
+        Isa::Arm64 => ("ARM64", ["ProgramW6432", "CommonProgramW6432"]),
+        Isa::X86_64 => ("AMD64", ["ProgramW6432", "CommonProgramW6432"]),
+        Isa::X86_32 => ("x86", ["ProgramFiles(x86)", "CommonProgramFiles(x86)"]),
+    };
+    set(vars, "PROCESSOR_ARCHITECTURE", architecture.to_string());
+    vars.retain(|(n, _)| !n.eq_ignore_ascii_case("PROCESSOR_ARCHITEW6432"));
+    if isa == Isa::X86_32 {
+        set(vars, "PROCESSOR_ARCHITEW6432", "AMD64".to_string());
+    }
+    for (name, from) in ["ProgramFiles", "CommonProgramFiles"].into_iter().zip(folders) {
+        if let Some(value) = get(vars, from) {
+            set(vars, name, value);
+        }
+    }
+    vars.sort_by_key(|(n, _)| n.to_uppercase());
+}
+
+/// A block's variables, back from its UTF-16.
+pub fn parse(block: &[u8]) -> Vec<(String, String)> {
+    let units: Vec<u16> = block.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
+    units
+        .split(|&u| u == 0)
+        .take_while(|s| !s.is_empty())
+        .filter_map(|s| {
+            let text = String::from_utf16_lossy(s);
+            // `=C:` and its kind start with `=`: the name is up to the next one.
+            let at = text.char_indices().skip(1).find(|&(_, c)| c == '=')?.0;
+            Some((text[..at].to_string(), text[at + 1..].to_string()))
+        })
+        .collect()
 }
 
 /// The block: each `NAME=VALUE` and a NUL, then a NUL.

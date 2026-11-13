@@ -239,13 +239,16 @@ impl Task {
     }
 }
 
-/// KEY_WOW64_32KEY: the 32-bit view, as a 32-bit program sees the registry.
+/// KEY_WOW64_32KEY and KEY_WOW64_64KEY: the 32-bit view, as a 32-bit program sees the registry, or the 64-bit one.
 const KEY_WOW64_32KEY: u32 = 0x200;
+const KEY_WOW64_64KEY: u32 = 0x100;
 
-/// Where `path` from `base` is, in the view `access` asks for.
+/// Where `path` from `base` is, in the view `access` asks for: a 32-bit program's is the 32-bit view unless it asks
+/// for the 64-bit one, as WoW64 has it; a 64-bit program's the 64-bit one unless it asks for the other.
 fn in_view(task: &Task, base: u64, path: String, access: u32) -> Result<(u64, String), u32> {
     let base = task.key_of(base)?;
-    Ok(if access & KEY_WOW64_32KEY != 0 { lock(&task.k.registry).view32(base, &path) } else { (base, path) })
+    let view32 = access & KEY_WOW64_32KEY != 0 || task.isa == exec::Isa::X86_32 && access & KEY_WOW64_64KEY == 0;
+    Ok(if view32 { lock(&task.k.registry).view32(base, &path) } else { (base, path) })
 }
 
 fn open_key(task: &mut Task, cx: &mut Cx<'_>, base: u64, subkey: u64, out: u64, wide: bool, access: u32) -> Reply {
@@ -397,8 +400,10 @@ pub fn reg_get_value_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 fn get_value(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
     const RRF_NOEXPAND: u32 = 0x1000_0000;
     let flags = a[3] as u32;
+    // RRF_SUBKEY_WOW6464KEY and RRF_SUBKEY_WOW6432KEY pick the subkey's view, as KEY_WOW64_* do.
+    let view = if flags & 0x1_0000 != 0 { KEY_WOW64_64KEY } else if flags & 0x2_0000 != 0 { KEY_WOW64_32KEY } else { 0 };
     let (subkey, name) = (task.reg_string(cx, a[1], wide), task.reg_string(cx, a[2], wide));
-    let found = task.key_of(a[0]).and_then(|key| {
+    let found = in_view(task, a[0], subkey, view).and_then(|(key, subkey)| {
         let registry = lock(&task.k.registry);
         let key = registry.open(key, &subkey)?;
         registry.value(key, &name).cloned()

@@ -686,6 +686,10 @@ pub(crate) fn launch(k: &Arc<Kernel>, cx: &mut Cx<'_>, launch: Launch) -> Result
         return Err(format!("{path} is a DLL"));
     }
     let isa = pe.isa;
+    // The variables that say what kind of program it is are its own, whatever its parent's said.
+    let mut vars = crate::environment::parse(&environment);
+    crate::environment::for_isa(&mut vars, isa);
+    let environment = crate::environment::block(&vars);
     let mut image = pe.layout().map_err(|_| format!("{path}: its sections don't fit its image"))?;
     let windows_path = format!("C:{}", path.replace('/', "\\"));
     let pid = k.new_id();

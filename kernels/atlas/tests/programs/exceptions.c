@@ -86,6 +86,8 @@ void mainCRTStartup(void) {
     out = GetStdHandle((DWORD)-11);
 #if defined(__aarch64__)
     say("exceptions, arm64\n");
+#elif defined(__i386__)
+    say("exceptions, x86 (WoW64)\n");
 #else
     say("exceptions, x86-64\n");
 #endif

@@ -13,6 +13,7 @@ use crate::system;
 
 const TRUE: u64 = 1;
 const FALSE: u64 = 0;
+const ERROR_INVALID_HANDLE: u32 = 6;
 const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_BUFFER_OVERFLOW: u32 = 111;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
@@ -187,13 +188,24 @@ pub fn get_product_info(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 
 // --- The machine ---
 
-/// `GetSystemInfo(&info)` and `GetNativeSystemInfo`: the same here, as every program runs as its own ISA. SYSTEM_INFO's
-/// two addresses and its processor mask are pointer-sized, so a 32-bit program's is 36 bytes, not 48.
+/// `GetSystemInfo(&info)`: the machine as the program's own ISA sees it. SYSTEM_INFO's two addresses and its processor
+/// mask are pointer-sized, so a 32-bit program's is 36 bytes, not 48.
 pub fn get_system_info(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    system_info(task, cx, a[0], task.isa)
+}
+
+/// `GetNativeSystemInfo(&info)`: the same, but a 32-bit (WoW64) program is told the machine is x64, as it is under it,
+/// in its own SYSTEM_INFO's layout.
+pub fn get_native_system_info(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let native = if task.isa == exec::Isa::X86_32 { exec::Isa::X86_64 } else { task.isa };
+    system_info(task, cx, a[0], native)
+}
+
+fn system_info(task: &mut Task, cx: &mut Cx<'_>, at: u64, isa: exec::Isa) -> Reply {
     let cpus = task.cpus();
     let abi = task.abi();
     let mut b = Vec::with_capacity(48);
-    b.extend(system::architecture(task.isa).to_le_bytes());
+    b.extend(system::architecture(isa).to_le_bytes());
     b.extend([0, 0]);
     b.extend(4096u32.to_le_bytes());
     b.extend(abi.ptr(GRANULE));
@@ -201,7 +213,7 @@ pub fn get_system_info(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     b.extend(abi.ptr(u64::MAX >> (64 - cpus.min(abi.width as u32 * 8))));
     b.extend(cpus.to_le_bytes());
     // PROCESSOR_AMD_X8664 or PROCESSOR_INTEL_PENTIUM, family 6; ARM64 has no processor type.
-    let (kind, level) = match task.isa {
+    let (kind, level) = match isa {
         exec::Isa::Arm64 => (0u32, 8u16),
         exec::Isa::X86_64 => (8664, 6),
         exec::Isa::X86_32 => (586, 6),
@@ -210,7 +222,7 @@ pub fn get_system_info(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     b.extend((GRANULE as u32).to_le_bytes());
     b.extend(level.to_le_bytes());
     b.extend([0, 0]);
-    let _ = task.put(cx, a[0], &b);
+    let _ = task.put(cx, at, &b);
     Reply::Value(0)
 }
 
@@ -279,15 +291,26 @@ pub fn get_system_times(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     reply(r.map(|_| TRUE))
 }
 
-/// `IsWow64Process(process, &wow64)`: never, as there's no 32-bit Windows under a 64-bit one here yet.
-pub fn is_wow64_process(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    reply(task.put(cx, a[1], &0u32.to_le_bytes()).map(|_| TRUE))
+/// The ISA of the program a process handle stands for.
+fn isa_of(task: &Task, handle: u64) -> Option<exec::Isa> {
+    task.process_of(handle).map(|p| p.isa)
 }
 
-/// `IsWow64Process2(process, &process machine, &native machine)`: not WOW64, on its own ISA's machine.
+/// `IsWow64Process(process, &wow64)`: whether it's a 32-bit program under 64-bit Windows, as every 32-bit program is.
+pub fn is_wow64_process(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(isa) = isa_of(task, a[0]) else { return task.fail(cx, ERROR_INVALID_HANDLE) };
+    reply(task.put(cx, a[1], &u32::from(isa == exec::Isa::X86_32).to_le_bytes()).map(|_| TRUE))
+}
+
+/// `IsWow64Process2(process, &process machine, &native machine)`: I386 under x64 for a 32-bit program; for a 64-bit
+/// one, not WoW64 (IMAGE_FILE_MACHINE_UNKNOWN), on its own ISA's machine.
 pub fn is_wow64_process2(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let native = system::machine(task.isa);
-    let r = task.put(cx, a[1], &0u16.to_le_bytes()).and_then(|_| if a[2] != 0 { task.put(cx, a[2], &native.to_le_bytes()) } else { Ok(()) });
+    let Some(isa) = isa_of(task, a[0]) else { return task.fail(cx, ERROR_INVALID_HANDLE) };
+    let (process, native) = match isa {
+        exec::Isa::X86_32 => (system::machine(isa), system::machine(exec::Isa::X86_64)),
+        other => (0, system::machine(other)),
+    };
+    let r = task.put(cx, a[1], &process.to_le_bytes()).and_then(|_| if a[2] != 0 { task.put(cx, a[2], &native.to_le_bytes()) } else { Ok(()) });
     reply(r.map(|_| TRUE))
 }
 
