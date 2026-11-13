@@ -81,6 +81,8 @@ pub(crate) struct ProcState {
     pub image: String,
     /// Its primary token: a copy of its parent's, or the user's.
     pub token: Arc<crate::security::Token>,
+    /// `SetErrorMode`'s.
+    pub error_mode: u32,
 }
 
 /// What the program was promised in a region.
@@ -830,7 +832,7 @@ pub(crate) fn launch(k: &Arc<Kernel>, cx: &mut Cx<'_>, launch: Launch) -> Result
     let mut threads = BTreeMap::new();
     threads.insert(tid, control.clone());
     let cwd = cwd.unwrap_or_else(|| format!("C:\\{}", exe_dir.trim_start_matches('/').replace('/', "\\")));
-    let state = ProcState { space, dispatcher, thread_start, peb, threads, mapped, exe_dir, cwd, regions, handles, std_handles, command_line: command, exiting: None, windows10, parent, created: crate::files::filetime(k.host.wall()), image: windows_path.clone(), token };
+    let state = ProcState { space, dispatcher, thread_start, peb, threads, mapped, exe_dir, cwd, regions, handles, std_handles, command_line: command, exiting: None, windows10, parent, created: crate::files::filetime(k.host.wall()), image: windows_path.clone(), token, error_mode: 0 };
     let object = Object::new(objects_mod::Kind::Process(pid), State::default());
     let process = Arc::new(Process { pid, isa, state: Mutex::new(state), remote: Mutex::new(false), object, ended: (Mutex::new(None), Condvar::new()) });
     k.started(&process);

@@ -114,7 +114,7 @@ fn make_dll(isa: Isa, dll: usize, gate: bool) -> Vec<u8> {
             (e.name, body)
         })
         .collect();
-    make::dll(isa, d.name, layout(isa).dll_base(dll), &exports, gate)
+    make::dll(isa, d.name, layout(isa).dll_base(dll), d.first_ordinal, &exports, gate)
 }
 
 /// Makes the arguments atlas reads from the stack slots x86 passed.

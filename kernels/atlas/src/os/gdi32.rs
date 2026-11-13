@@ -35,6 +35,8 @@ dll! {
     missing CreateCompatibleBitmap;
     missing CreateDIBSection;
     missing StretchDIBits;
+    // Not written yet: what installers import.
+    missing CreateBrushIndirect;
 }
 
 const CLR_INVALID: u64 = 0xffff_ffff;

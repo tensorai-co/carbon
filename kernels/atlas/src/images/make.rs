@@ -65,7 +65,8 @@ pub fn stub(isa: Isa, nr: u64, pop: u16, gate: bool) -> Vec<u8> {
 }
 
 /// A DLL's image: `name` (as `KERNEL32.dll`), at `base`, with `exports` in ordinal order from 1.
-pub fn dll(isa: Isa, name: &str, base: u64, exports: &[(&str, Body)], gate: bool) -> Vec<u8> {
+/// Its exports' ordinals start at `first_ordinal`.
+pub fn dll(isa: Isa, name: &str, base: u64, first_ordinal: u16, exports: &[(&str, Body)], gate: bool) -> Vec<u8> {
     // .text: one stub per trapping export, in order.
     let mut text = Vec::new();
     let mut functions = Vec::new();
@@ -113,7 +114,7 @@ pub fn dll(isa: Isa, name: &str, base: u64, exports: &[(&str, Body)], gate: bool
     // The directory: Characteristics, TimeDateStamp, Major and MinorVersion, Name, Base, NumberOfFunctions,
     // NumberOfNames, and the three tables' RVAs.
     let mut edata = Vec::new();
-    for v in [0u32, 0, 0, name_rva, 1, n as u32, n as u32, (edata_rva + functions_at) as u32, (edata_rva + names_at) as u32, (edata_rva + ordinals_at) as u32] {
+    for v in [0u32, 0, 0, name_rva, u32::from(first_ordinal), n as u32, n as u32, (edata_rva + functions_at) as u32, (edata_rva + names_at) as u32, (edata_rva + ordinals_at) as u32] {
         edata.extend(v.to_le_bytes());
     }
     for rva in &function_rvas {
@@ -204,7 +205,7 @@ mod tests {
     fn made_images_read_back() {
         let exports = [("WriteFile", Body::Trap { nr: 0x1001, pop: 20 }), ("HeapAlloc", Body::Forward("ntdll.RtlAllocateHeap".into())), ("ExitProcess", Body::Trap { nr: 0x1002, pop: 4 })];
         for (isa, base) in [(Isa::Arm64, 0x7ff0_0000_0000), (Isa::X86_64, 0x7ff0_0000_0000), (Isa::X86_32, 0x7040_0000)] {
-            let image = dll(isa, "KERNEL32.dll", base, &exports, false);
+            let image = dll(isa, "KERNEL32.dll", base, 1, &exports, false);
             let pe = Pe::parse(&image).unwrap();
             assert_eq!((pe.isa, pe.image_base, pe.is_dll), (isa, base, true));
             let laid = pe.layout().unwrap();

@@ -85,6 +85,8 @@ dll! {
     host LoadIconW(2) => load_resource;
     host LoadCursorA(2) => load_resource;
     host LoadIconA(2) => load_resource;
+    host LoadBitmapW(2) => load_resource;
+    host LoadImageW(6) => load_resource;
     host SetCursor(1) => set_cursor;
     host GetCursor(0) => get_cursor;
     host GetFocus(0) => get_focus;
@@ -138,6 +140,37 @@ dll! {
     host GetWindowTextA(3) => get_window_text_a;
     host GetWindowTextLengthA(1) => get_window_text_length_a;
     host IsWindowUnicode(1) => is_window_unicode;
+    // Not written yet: what installers import.
+    missing AppendMenuW;
+    guest CharNextA => AtlasCharNextA;
+    guest CharNextW => AtlasCharNextW;
+    guest CharPrevW => AtlasCharPrevW;
+    guest CharPrevA => AtlasCharPrevA;
+    missing CheckDlgButton;
+    missing CreateDialogParamW;
+    missing CreatePopupMenu;
+    missing DialogBoxParamW;
+    missing EnableMenuItem;
+    missing EnableWindow;
+    missing EndDialog;
+    missing ExitWindowsEx;
+    missing FindWindowExW;
+    missing GetClassInfoW;
+    missing GetDlgItem;
+    missing GetDlgItemTextW;
+    missing GetMessagePos;
+    missing GetSystemMenu;
+    missing IsWindowEnabled;
+    missing MessageBoxIndirectW;
+    missing SendMessageTimeoutW;
+    missing SetClassLongW;
+    missing SetDlgItemTextW;
+    missing SystemParametersInfoW;
+    missing TrackPopupMenu;
+    guest wsprintfA => AtlasWsprintfA;
+    guest wsprintfW => AtlasWsprintfW;
+    guest wvsprintfA => AtlasWvsprintfA;
+    guest wvsprintfW => AtlasWvsprintfW;
 }
 
 const TRUE: u64 = 1;
@@ -152,7 +185,8 @@ fn value(result: Result<u64, Reply>) -> Reply {
 
 
 
-/// `LoadCursorW` and `LoadIconW`: something that isn't null, until there are resources.
+/// `LoadCursorW`, `LoadIconW`, `LoadBitmapW` and `LoadImageW(instance, name, type, cx, cy, flags)`: something that
+/// isn't null, until there are resources.
 fn load_resource(_: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
     Reply::Value(0x0001_0000 | (a[1] & 0xffff))
 }

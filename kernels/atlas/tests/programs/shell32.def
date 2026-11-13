@@ -4,3 +4,4 @@ DragAcceptFiles
 DragQueryFileW
 DragQueryPoint
 DragFinish
+SHGetFileInfoW

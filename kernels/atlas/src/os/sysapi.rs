@@ -291,6 +291,13 @@ pub fn get_system_times(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     reply(r.map(|_| TRUE))
 }
 
+/// `SetErrorMode(mode)`: which errors the system shows the user itself (none, here): the process's mode, giving the
+/// one it had.
+pub fn set_error_mode(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let mut state = kernels_core::lock(&task.process.state);
+    Reply::Value(u64::from(std::mem::replace(&mut state.error_mode, a[0] as u32)))
+}
+
 /// The ISA of the program a process handle stands for.
 fn isa_of(task: &Task, handle: u64) -> Option<exec::Isa> {
     task.process_of(handle).map(|p| p.isa)

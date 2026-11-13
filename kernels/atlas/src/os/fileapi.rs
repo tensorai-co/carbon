@@ -969,3 +969,249 @@ pub fn wow64_enable_wow64_fs_redirection(task: &mut Task, _: &mut Cx<'_>, a: &[u
     task.control.fs_redirection_off.store(a[0] as u8 == 0, std::sync::atomic::Ordering::Relaxed);
     Reply::Value(1)
 }
+
+// --- What installers ask for: temporary names, short names, disk space, searching, and .ini files ---
+
+/// `GetTempFileNameW(folder, prefix, unique, &name)`: `folder\PRE<hex>.tmp`. With `unique` 0, a number no file has yet,
+/// whose empty file is made then, as Windows does; otherwise that number, and nothing made. Its number.
+pub fn get_temp_file_name_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const CREATE_NEW: u32 = 1;
+    let Some(folder) = task.path_arg(cx, a[0], true) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
+    let prefix: String = task.path_arg(cx, a[1], true).unwrap_or_default().chars().take(3).collect();
+    let folder = folder.trim_end_matches('\\').to_string();
+    let name = |n: u32| format!("{folder}\\{prefix}{n:X}.tmp");
+    let mut n = a[2] as u32 & 0xffff;
+    if n == 0 {
+        let start = (task.k.host.monotonic() as u32 & 0xffff).max(1);
+        n = start;
+        loop {
+            if task.open_file(&name(n), GENERIC_WRITE, 0, CREATE_NEW, 0x80).is_ok() {
+                break;
+            }
+            n = n % 0xffff + 1;
+            if n == start {
+                return task.fail(cx, 80); // ERROR_FILE_EXISTS
+            }
+        }
+    }
+    let _ = task.put_wide(cx, a[3], 260, &name(n));
+    Reply::Value(u64::from(n))
+}
+
+/// `GetShortPathNameW(long, &short, size)`: the long name, as Windows gives it where 8.3 names are turned off; the
+/// file must be there.
+pub fn get_short_path_name_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(path) = task.path_arg(cx, a[0], true) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
+    if let Err(e) = task.path_info(&path) {
+        task.set_last_error(cx, e);
+        return Reply::Value(0);
+    }
+    task.put_wide(cx, a[1], a[2] & 0xffff_ffff, &path)
+}
+
+/// `GetDiskFreeSpaceW(root, &sectors per cluster, &bytes per sector, &free clusters, &clusters)`: a 128 GiB disk with
+/// 96 GiB free, in 4 KiB clusters.
+pub fn get_disk_free_space_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (cluster, total, free) = (4096u64, 128u64 << 30, 96u64 << 30);
+    for (at, v) in [(a[1], 8u32), (a[2], 512), (a[3], (free / cluster) as u32), (a[4], (total / cluster) as u32)] {
+        if at != 0 && task.mem(cx, true, |t| user::write_u32(&mut t.space(), at, v)).is_err() {
+            return task.fail(cx, 998);
+        }
+    }
+    Reply::Value(TRUE)
+}
+
+/// `SearchPathW(path, file, extension, size, &buffer, &file part)`: the first folder of `path` (or of the program's
+/// folder, the current one, System32 and Windows) with the file, `extension` added if its name has none. Its full
+/// name's length, or the size it needs; 0 with ERROR_FILE_NOT_FOUND.
+pub fn search_path_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(file) = task.path_arg(cx, a[1], true) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
+    let extension = if a[2] != 0 { task.path_arg(cx, a[2], true).unwrap_or_default() } else { String::new() };
+    let last = file.rsplit(['\\', '/']).next().unwrap_or(&file);
+    let name = if last.contains('.') { file.clone() } else { format!("{file}{extension}") };
+    let folders: Vec<String> = if file.contains(['\\', '/', ':']) {
+        vec![String::new()]
+    } else if a[0] != 0 {
+        task.path_arg(cx, a[0], true).unwrap_or_default().split(';').filter(|d| !d.is_empty()).map(str::to_string).collect()
+    } else {
+        let exe_dir = lock(&task.process.state).exe_dir.clone();
+        vec![format!("C:{}", exe_dir.replace('/', "\\")), task.cwd(), "C:\\Windows\\System32".into(), "C:\\Windows".into()]
+    };
+    for folder in folders {
+        let candidate = if folder.is_empty() { name.clone() } else { format!("{}\\{name}", folder.trim_end_matches('\\')) };
+        let Ok(info) = task.path_info(&candidate) else { continue };
+        if info.attributes & crate::files::FILE_ATTRIBUTE_DIRECTORY != 0 {
+            continue;
+        }
+        let Ok((full, _)) = task.resolve(&candidate) else { continue };
+        let reply = task.put_wide(cx, a[4], a[3] & 0xffff_ffff, &full);
+        if let Reply::Value(n) = reply
+            && n < a[3] & 0xffff_ffff
+            && a[5] != 0
+        {
+            let part = full.rfind('\\').map_or(0, |i| full[..=i].encode_utf16().count() as u64);
+            let _ = task.write_ptr(cx, a[5], a[4] + part * 2);
+        }
+        return reply;
+    }
+    task.set_last_error(cx, 2);
+    Reply::Value(0)
+}
+
+/// An .ini file: its sections in order, each with its keys and values in order, and whether it was UTF-16.
+struct Ini {
+    sections: Vec<(String, Vec<(String, String)>)>,
+    wide: bool,
+}
+
+impl Ini {
+    fn parse(bytes: &[u8]) -> Ini {
+        let wide = bytes.starts_with(&[0xff, 0xfe]);
+        let text = if wide {
+            String::from_utf16_lossy(&bytes[2..].as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect::<Vec<_>>())
+        } else {
+            crate::ansi::text(bytes)
+        };
+        let mut sections: Vec<(String, Vec<(String, String)>)> = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                sections.push((name.trim().to_string(), Vec::new()));
+            } else if let Some((key, value)) = line.split_once('=')
+                && !line.starts_with(';')
+                && let Some((_, keys)) = sections.last_mut()
+            {
+                keys.push((key.trim().to_string(), value.trim().to_string()));
+            }
+        }
+        Ini { sections, wide }
+    }
+
+    fn render(&self) -> Vec<u8> {
+        let mut text = String::new();
+        for (name, keys) in &self.sections {
+            text.push_str(&format!("[{name}]\r\n"));
+            for (k, v) in keys {
+                text.push_str(&format!("{k}={v}\r\n"));
+            }
+        }
+        if self.wide {
+            [0xff, 0xfe].into_iter().chain(text.encode_utf16().flat_map(u16::to_le_bytes)).collect()
+        } else {
+            crate::ansi::bytes(&text)
+        }
+    }
+
+    fn section(&self, name: &str) -> Option<&Vec<(String, String)>> {
+        self.sections.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, k)| k)
+    }
+}
+
+impl Task {
+    /// Where an .ini file is: a bare name is in the Windows folder, as Windows has it.
+    fn ini_path(&mut self, cx: &mut Cx<'_>, at: u64) -> String {
+        let name = self.path_arg(cx, at, true).unwrap_or_else(|| "win.ini".to_string());
+        if name.contains(['\\', '/']) { name } else { format!("C:\\Windows\\{name}") }
+    }
+
+    fn ini_read(&self, path: &str) -> Ini {
+        let bytes = self.resolve(path).ok().and_then(|(_, disk_path)| {
+            let disk = lock(&self.k.disk);
+            let ino = disk.resolve(layers::ROOT, &disk_path, true).ok()?;
+            disk.contents(ino).ok()
+        });
+        Ini::parse(&bytes.unwrap_or_default())
+    }
+
+    fn ini_write(&self, path: &str, ini: &Ini) -> bool {
+        let Ok((_, disk_path)) = self.resolve(path) else { return false };
+        let now = self.k.host.wall();
+        let bytes = ini.render();
+        let mut disk = lock(&self.k.disk);
+        let dir = crate::Meta { attributes: crate::files::FILE_ATTRIBUTE_DIRECTORY };
+        let Ok(ino) = disk.put(&disk_path, layers::New::File, &[], crate::Meta { attributes: 0x20 }, dir) else { return false };
+        disk.truncate(ino, 0, now).is_ok() && disk.write(ino, 0, &bytes, now).is_ok()
+    }
+}
+
+/// `GetPrivateProfileStringW(section, key, default, &buffer, size, file)`: a key's value (or the default); with no
+/// key, the section's keys, and with no section, the sections' names, each with a NUL and then another. What it
+/// wrote, without the last NUL; cut short, `size` - 1 (or - 2 for a list).
+pub fn get_private_profile_string_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let size = (a[4] & 0xffff_ffff) as usize;
+    if size == 0 || a[3] == 0 {
+        return Reply::Value(0);
+    }
+    let path = task.ini_path(cx, a[5]);
+    let ini = task.ini_read(&path);
+    let (section, key) = (if a[0] != 0 { task.path_arg(cx, a[0], true) } else { None }, if a[1] != 0 { task.path_arg(cx, a[1], true) } else { None });
+    let list = |names: Vec<String>| -> (Vec<u16>, usize) {
+        let mut units: Vec<u16> = Vec::new();
+        for n in names {
+            let n: Vec<u16> = n.encode_utf16().collect();
+            if units.len() + n.len() + 2 > size {
+                let cut = size.saturating_sub(2);
+                units.truncate(cut);
+                units.extend(n.iter().take(cut.saturating_sub(units.len())));
+                units.truncate(cut);
+                units.extend([0, 0]);
+                return (units, cut);
+            }
+            units.extend(n);
+            units.push(0);
+        }
+        let n = units.len();
+        units.push(0);
+        (units, n.saturating_sub(0))
+    };
+    let (units, n) = match (&section, &key) {
+        (None, _) => list(ini.sections.iter().map(|(n, _)| n.clone()).collect()),
+        (Some(s), None) => list(ini.section(s).map(|k| k.iter().map(|(k, _)| k.clone()).collect()).unwrap_or_default()),
+        (Some(s), Some(k)) => {
+            let default = if a[2] != 0 { task.path_arg(cx, a[2], true).unwrap_or_default().trim_end().to_string() } else { String::new() };
+            let value = ini.section(s).and_then(|keys| keys.iter().find(|(name, _)| name.eq_ignore_ascii_case(k))).map(|(_, v)| {
+                // A value in matching quotes is given without them.
+                let q = v.strip_prefix('"').and_then(|v| v.strip_suffix('"')).or_else(|| v.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')));
+                q.unwrap_or(v).to_string()
+            });
+            let mut units: Vec<u16> = value.unwrap_or(default).encode_utf16().collect();
+            units.truncate(size - 1);
+            let n = units.len();
+            units.push(0);
+            (units, n)
+        }
+    };
+    let bytes: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+    if task.mem(cx, true, |t| user::write(&mut t.space(), a[3], &bytes)).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(n as u64)
+}
+
+/// `WritePrivateProfileStringW(section, key, value, file)`: sets a key; with no value, deletes it; with no key,
+/// deletes the section. The file is made if it isn't there.
+pub fn write_private_profile_string_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(section) = (if a[0] != 0 { task.path_arg(cx, a[0], true) } else { None }) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
+    let path = task.ini_path(cx, a[3]);
+    let mut ini = task.ini_read(&path);
+    let key = if a[1] != 0 { task.path_arg(cx, a[1], true) } else { None };
+    let value = if a[2] != 0 { task.path_arg(cx, a[2], true) } else { None };
+    match key {
+        None => ini.sections.retain(|(n, _)| !n.eq_ignore_ascii_case(&section)),
+        Some(key) => {
+            if !ini.sections.iter().any(|(n, _)| n.eq_ignore_ascii_case(&section)) {
+                ini.sections.push((section.clone(), Vec::new()));
+            }
+            let keys = &mut ini.sections.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(&section)).expect("added above").1;
+            match value {
+                None => keys.retain(|(k, _)| !k.eq_ignore_ascii_case(&key)),
+                Some(value) => match keys.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(&key)) {
+                    Some(entry) => entry.1 = value,
+                    None => keys.push((key, value)),
+                },
+            }
+        }
+    }
+    if task.ini_write(&path, &ini) { Reply::Value(TRUE) } else { task.fail(cx, 5) }
+}

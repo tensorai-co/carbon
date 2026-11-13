@@ -15,6 +15,13 @@ dll! {
     host DragQueryFileA(4) => drag_query_file_a;
     host DragQueryPoint(2) => drag_query_point;
     host DragFinish(1) => drag_finish;
+    host SHGetFileInfoW(5) => sh_get_file_info_w;
+    // Not written yet: what installers import.
+    missing SHBrowseForFolderW;
+    missing SHFileOperationW;
+    missing SHGetPathFromIDListW;
+    missing SHGetSpecialFolderLocation;
+    missing ShellExecuteW;
 }
 
 /// `DragAcceptFiles`: whether a window takes files dropped on it (its `WS_EX_ACCEPTFILES`).
@@ -75,4 +82,15 @@ fn drag_query_point(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 fn drag_finish(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
     task.win32k().hdrops.remove(&a[0]);
     Reply::Value(0)
+}
+
+/// `SHGetFileInfoW(path, attributes, &info, size, flags)`. Only what installers ask first, to start the shell: with no
+/// flags, `info` is cleared and the result TRUE. Icons, display and type names aren't written yet: with any flag,
+/// FALSE and `info` cleared, as Windows gives for a file it can't describe.
+fn sh_get_file_info_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (info, size, flags) = (a[2], (a[3] as u32).min(1024) as usize, a[4] as u32);
+    if info != 0 && task.mem(cx, true, |t| user::write(&mut t.space(), info, &vec![0; size])).is_err() {
+        return Reply::Value(0);
+    }
+    Reply::Value(u64::from(flags == 0))
 }

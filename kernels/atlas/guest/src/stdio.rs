@@ -1082,3 +1082,105 @@ pub extern "C" fn AtlasCrtVsnprintfS(_options: u64, buffer: *mut u8, size: usize
     }
     n
 }
+
+// ---- user32's wsprintf ----
+
+/// The most `wsprintf` writes, as Windows' does: 1024 units and the NUL.
+const WSPRINTF_MAX: usize = 1025;
+
+/// `wvsprintfW(buffer, format, args)`: `format` into `buffer`, which Windows takes to hold 1025 units, cut there and
+/// terminated. The units written, not counting the NUL.
+#[unsafe(no_mangle)]
+pub extern "system" fn AtlasWvsprintfW(buffer: *mut u16, fmt: *const u16, args: *const u8) -> i32 {
+    if buffer.is_null() || fmt.is_null() {
+        return 0;
+    }
+    // SAFETY: the program's buffer, as large as Windows' contract says.
+    let out = unsafe { core::slice::from_raw_parts_mut(buffer, WSPRINTF_MAX) };
+    let mut sink = Buffer { out, n: 0 };
+    format(&mut sink, Format::Wide(fmt), &mut Args(args));
+    let n = sink.count().min(WSPRINTF_MAX - 1);
+    // SAFETY: inside the buffer.
+    unsafe { *buffer.add(n) = 0 };
+    n as i32
+}
+
+/// `wvsprintfA(buffer, format, args)`: as `wvsprintfW`, in bytes.
+#[unsafe(no_mangle)]
+pub extern "system" fn AtlasWvsprintfA(buffer: *mut u8, fmt: *const u8, args: *const u8) -> i32 {
+    if buffer.is_null() || fmt.is_null() {
+        return 0;
+    }
+    // SAFETY: as above.
+    let out = unsafe { core::slice::from_raw_parts_mut(buffer, WSPRINTF_MAX) };
+    let mut sink = Buffer { out, n: 0 };
+    format(&mut sink, Format::Narrow(fmt), &mut Args(args));
+    let n = sink.count().min(WSPRINTF_MAX - 1);
+    // SAFETY: inside the buffer.
+    unsafe { *buffer.add(n) = 0 };
+    n as i32
+}
+
+// `wsprintfW(buffer, format, ...)` and `wsprintfA`: C-variadic, so in assembly, each making a `va_list` of its
+// arguments after the format and calling `wvsprintf` with it.
+
+/// x86: cdecl, the arguments on the stack, which is a `va_list` already. `wvsprintf` is stdcall and pops its three.
+#[cfg(target_arch = "x86")]
+macro_rules! wsprintf {
+    ($name:literal, $v:literal) => {
+        concat!(
+            ".globl _", $name, "\n",
+            "_", $name, ":\n",
+            "lea eax, [esp + 12]\n",
+            "push eax\n",
+            "push dword ptr [esp + 12]\n",
+            "push dword ptr [esp + 12]\n",
+            "call \"_", $v, "@12\"\n",
+            "ret\n",
+        )
+    };
+}
+
+/// x86-64: the first four in registers, with home slots above the return address for each. The variadic ones in r8
+/// and r9 go to their slots, so that the arguments from the third on lie in a row, and a frame of its own keeps
+/// `wvsprintf` from spilling into them.
+#[cfg(target_arch = "x86_64")]
+macro_rules! wsprintf {
+    ($name:literal, $v:literal) => {
+        concat!(
+            ".globl ", $name, "\n",
+            $name, ":\n",
+            "mov [rsp + 24], r8\n",
+            "mov [rsp + 32], r9\n",
+            "lea r8, [rsp + 24]\n",
+            "sub rsp, 40\n",
+            "call ", $v, "\n",
+            "add rsp, 40\n",
+            "ret\n",
+        )
+    };
+}
+
+/// ARM64: x0 to x7, then the stack. Windows' variadic convention: the eight are saved just below the arguments on
+/// the stack, so the third on lie in a row from x2's slot.
+#[cfg(target_arch = "aarch64")]
+macro_rules! wsprintf {
+    ($name:literal, $v:literal) => {
+        concat!(
+            ".globl ", $name, "\n",
+            $name, ":\n",
+            "stp x29, x30, [sp, #-80]!\n",
+            "mov x29, sp\n",
+            "stp x0, x1, [sp, #16]\n",
+            "stp x2, x3, [sp, #32]\n",
+            "stp x4, x5, [sp, #48]\n",
+            "stp x6, x7, [sp, #64]\n",
+            "add x2, sp, #32\n",
+            "bl ", $v, "\n",
+            "ldp x29, x30, [sp], #80\n",
+            "ret\n",
+        )
+    };
+}
+
+core::arch::global_asm!(wsprintf!("AtlasWsprintfW", "AtlasWvsprintfW"), wsprintf!("AtlasWsprintfA", "AtlasWvsprintfA"));

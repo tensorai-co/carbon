@@ -9,12 +9,14 @@
 #![allow(non_snake_case)]
 
 mod arch;
+mod com;
 mod crt;
 mod env;
 mod exception;
 mod fiber;
 mod heap;
 mod loader;
+mod lstr;
 #[cfg(target_arch = "x86")]
 mod msvc32;
 mod pe;

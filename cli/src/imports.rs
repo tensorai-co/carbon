@@ -46,7 +46,7 @@ fn kind(report: &Report) -> String {
     let (format, isa) = match report.isa {
         Isa::Arm64 => ("PE32+", "ARM64"),
         Isa::X86_64 => ("PE32+", "x86-64"),
-        _ => ("PE32", "x86 (32-bit: atlas doesn't run these yet)"),
+        _ => ("PE32", "x86 (32-bit, WoW64)"),
     };
     format!("{format} {isa} {}", if report.is_dll { "DLL" } else { "EXE" })
 }

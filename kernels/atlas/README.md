@@ -5,8 +5,9 @@ declaration made into a PE in memory, so a machine has no Windows files to insta
 has to run inside the program, ntdll, is a crate (`guest/`) that cargo builds for each ISA and embeds.
 
 **Where it stands.** Programs run on ARM64 natively and x86-64 translated, and 32-bit x86 programs run too (WoW64,
-translated on Apple silicon; phases 1 to 5 of its six, below, are done): 22 of the test programs pass every check as
-32-bit programs, with x86's own SEH, PE32 images and 32-bit layouts throughout. They have the loader and SEH, threads and
+translated on Apple silicon; phases 1 to 5 of its six, below, are done): 23 of the test programs pass every check as
+32-bit programs, with x86's own SEH, PE32 images and 32-bit layouts throughout, and a real 32-bit installer starts,
+unpacks its data and runs its start-up script as far as its first dialog. They have the loader and SEH, threads and
 waits, processes, anonymous and named pipes, sections, asynchronous I/O and completion ports, files, the registry,
 security (tokens, descriptors, access checks, impersonation), resources and version information, the system's
 version and information, and windows on the desktop with input. The loader is Windows' own in all but manifests: the
@@ -17,7 +18,7 @@ are shared as their opens say, with hard and symbolic links and times that can b
 program: work, timers and waits, on pools of their own or the process's. The registry tells watchers of changes, has
 WOW64's 32-bit view, and saves, restores, loads and unloads hives. Code pages convert as Windows' do, every `*A`
 function speaks Windows-1252, and ANSI windows get their messages' text in it. ucrtbase.dll is atlas's own C runtime, in the
-program, so MinGW-built C programs run. Seven DLLs declare 857 exports between them, and ntdll has 277.
+program, so MinGW-built C programs run. Nine DLLs declare 948 exports between them, 905 written and 43 stubs that say so, and ntdll has 300.
 
 ## Layout
 
@@ -72,7 +73,7 @@ for all three Windows targets: with rustup, that needs `rustup component add rus
 prints every host export with its result, and each thread that gives its CPU up, waits for one, or takes one again.
 `cargo test -p atlas` runs the unit tests.
 
-On this Mac, through hvf, every test program passes, on ARM64 and x86-64, and the 15 built for i686 too. Each one's
+On this Mac, through hvf, every test program passes, on ARM64 and x86-64, and the 23 built for i686 too. Each one's
 opening comment says what it checks. `crt.exe` (and `crt-mingw.exe`) want the arguments `one "two words"`.
 
 | Program | What it covers |
@@ -84,6 +85,7 @@ opening comment says what it checks. `crt.exe` (and `crt-mingw.exe`) want the ar
 | atlas's `ansiwin.c`, both ISAs | ANSI windows: a class and window made with the `*A` functions, its `WndProc` given names, text and characters in 1252 however they're sent; a Unicode window driven by the `*A` functions; `GetMessageA` and `DispatchMessageA`; `WndProc`s set by `SetWindowLongPtrA` and `W` |
 | atlas's `ansi.c`, both ISAs | Code pages: `MultiByteToWideChar` and `WideCharToMultiByte` in 1252, 437 and UTF-8; `*A` functions with é in their names, as the `*W` ones see them: files, paths, the registry, the environment, objects, accounts, locales and version information |
 | atlas's `registry.c`, both ISAs | A fresh machine's hives, keys and every value type, enumeration, deletion, and saving; change notification, asynchronous and not; the 32-bit view; hives saved, restored, loaded and unloaded |
+| atlas's `installer.c`, both ISAs and i686 | What installers call first: the `lstr*` functions, `CharNext`/`CharPrev`, `MulDiv`, `CompareFileTime`; `wsprintf` with its arguments past the registers, cut at 1024 characters, and `wvsprintf`; temporary and short names, disk space, `SearchPath`; .ini files; the error mode; COM's start, its task allocator and `CoCreateInstance` with no class registered; `SHGetFileInfo` with no flags |
 | atlas's `environment.c`, both ISAs | The environment a logon gives, from the registry: read, expanded, set and deleted |
 | atlas's `links.c`, both ISAs | Sharing modes, opens refused and allowed; deleting and moving open files; a deleted file still read where it's open; hard links; symbolic links to files and folders, as attributes, listings and `RemoveDirectory` see them; file times set and read back |
 | atlas's `files.c`, both ISAs | Folders and files: made, opened, read, found, copied, moved and deleted, and System32's DLLs |
@@ -756,7 +758,7 @@ First `cmd.exe` (variables, `if`, `for`, `goto`, `call`, pipes, redirection, `.b
 
 ### Across every layer
 
-- **32-bit x86 (WoW64)** **[exec]** **[guest]**: most installers are 32-bit (Steam's, NSIS's, Inno Setup's). In
+- **32-bit x86 (WoW64)** **[exec]** **[guest]**: most installers are 32-bit. In
   order, each phase ending with its tests passing:
   1. [x] **exec runs 32-bit x86** on hvf: the translator's 32-bit mode, checked by exec's conformance suite. kvm
      and winkvm have a 32-bit code segment in the shim already; their conformance cases still need running there.
@@ -807,11 +809,29 @@ First `cmd.exe` (variables, `if`, `for`, `goto`, `call`, pipes, redirection, `.b
      whatever its parent's said: PROCESSOR_ARCHITECTURE (x86, with PROCESSOR_ARCHITEW6432 AMD64), ProgramFiles and
      CommonProgramFiles (the (x86) folders for a 32-bit program). 32-bit and 64-bit programs start each other.
      `carbon run` knows a 32-bit `.exe` (platform `windows/386`), and gives it x86's memory ordering.
-  6. [ ] **Every test program for i686**, passing; then real installers, Steam's first. Every test program but
-     `sysinfo.c` (whose checks are 64-bit offsets; `wow64.c` checks the same calls at 32 bits) builds for i686 and
-     passes every check: 22 programs, 725 checks, with the loader's own DLLs, thread-local variables
-     (`__tls_array`), `__try` through `_except_handler3` (now in the i686 ntdll, with `_local_unwind2`), and the C
-     runtime. `build.sh` makes each program's import libraries from what its object imports, `__imp_` or not.
+  6. [ ] **Every test program for i686**, passing; then real installers. Every test program but `sysinfo.c` (whose
+     checks are 64-bit offsets; `wow64.c` checks the same calls at 32 bits) builds for i686 and passes every check:
+     23 programs, 771 checks, with the loader's own DLLs, thread-local variables (`__tls_array`), `__try` through
+     `_except_handler3` (now in the i686 ntdll, with `_local_unwind2`), and the C runtime. `build.sh` makes each
+     program's import libraries from what its object imports, `__imp_` or not. `installer.c` checks what installers
+     call first, on all three ISAs: `wsprintf` is C-variadic, so each ISA's is a few lines of the guest's assembly
+     that make a `va_list` of its registers and stack and call `wvsprintf` with it, which the printf engine formats.
+     A real 32-bit installer now starts, unpacks its compressed data, runs its start-up script (the registry, files,
+     `.onInit`'s checks) and stops at its first dialog, at `GetClassInfoW` for the dialog class. Still to do there,
+     in order:
+     - **The dialog manager:** the `#32770` class and `DefDlgProc`, `GetClassInfo` and `SetClassLong`; dialogs from
+       resource templates (`CreateDialogParam`, `DialogBoxParam`, `EndDialog`), and `GetDlgItem`,
+       `Get`/`SetDlgItemText`, `CheckDlgButton`, `EnableWindow`, `IsWindowEnabled`, `FindWindowEx`.
+     - **The controls it puts in them:** buttons, statics and edits; comctl32's progress bar, list view and tree view,
+       and image lists (`ImageList_Create`, `AddMasked`, `Destroy`).
+     - **Icons and bitmaps from resources:** `LoadImage` and `LoadBitmap` give a placeholder handle so far;
+       `CreateBrushIndirect`.
+     - **Menus:** `CreatePopupMenu`, `AppendMenu`, `TrackPopupMenu`, `GetSystemMenu`, `EnableMenuItem`.
+     - **The shell:** `SHGetSpecialFolderLocation` and `SHGetPathFromIDList`, `SHBrowseForFolder`,
+       `SHFileOperation`, `ShellExecute`, and `SHGetFileInfo`'s flags (it's only right with none).
+     - **The rest:** `MessageBoxIndirect`, `SendMessageTimeout`, `SystemParametersInfo`, `GetMessagePos`,
+       `ExitWindowsEx`. COM has no classes yet, so a shortcut an installer makes is skipped, as it is on Windows when
+       the class isn't there.
 - **ANSI and code pages:** each `*A` function still to come is the `*W` with 1252 strings, as those there are.
 - **Manifests:** side-by-side assemblies and activation contexts decide which comctl32 a program gets.
 - **API sets:** `ext-ms-*` sets, and the `api-ms-win-*` the map doesn't know yet, as programs ask.
@@ -846,7 +866,7 @@ NTLM, and the x87 stack missing from a 32-bit `CONTEXT`.
 - **The long tail:** `carbon atlas imports` ranks what folders of real programs lack; next is counting the `missing`
   stubs and `GetProcAddress` names programs reach as they run.
 - **Checkpoints**, each run headless and screenshotted: a console tool, a plain Win32 program, a dialog program with
-  the common controls, an NSIS installer built from source, a networked program, a Direct3D program, a browser
+  the common controls, an installer built from source, a networked program, a Direct3D program, a browser
   engine's sandboxed processes.
 
 The kernel's areas come first and are done. Then, each step ending with its tests passing on both ISAs: ntdll's

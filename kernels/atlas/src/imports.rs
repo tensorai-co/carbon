@@ -114,8 +114,8 @@ fn ntdll_exports(isa: Isa) -> &'static [String] {
     })
 }
 
-/// Where an import of `name` (or an ordinal) from `dll` stands, `provided` saying which DLLs the program brings.
-pub fn status(dll: &str, name: Option<&str>, isa: Isa, provided: &dyn Fn(&str) -> bool) -> Status {
+/// Where an import of `name` (or else `ordinal`) from `dll` stands, `provided` saying which DLLs the program brings.
+pub fn status(dll: &str, name: Option<&str>, ordinal: Option<u16>, isa: Isa, provided: &dyn Fn(&str) -> bool) -> Status {
     let dll = folded(dll);
     if dll == "ntdll.dll" {
         let Some(name) = name else { return Status::Undeclared };
@@ -124,8 +124,13 @@ pub fn status(dll: &str, name: Option<&str>, isa: Isa, provided: &dyn Fn(&str) -
     let Some(index) = crate::os::find(&dll) else {
         return if provided(&dll) { Status::Program } else { Status::NoDll };
     };
-    let Some(name) = name else { return Status::Undeclared };
-    match DLLS[index].exports.iter().find(|e| e.name == name).map(|e| e.kind) {
+    let d = DLLS[index];
+    let found = match (name, ordinal) {
+        (Some(name), _) => d.exports.iter().find(|e| e.name == name),
+        (None, Some(ordinal)) => ordinal.checked_sub(d.first_ordinal).and_then(|i| d.exports.get(usize::from(i))),
+        (None, None) => None,
+    };
+    match found.map(|e| e.kind) {
         Some(Kind::Host { .. }) => Status::Host,
         Some(Kind::Guest(_)) => Status::Guest,
         Some(Kind::Missing) => Status::Stub,
@@ -204,7 +209,7 @@ pub fn scan(bytes: &[u8], provided: &dyn Fn(&str) -> bool) -> Result<Report, Str
         .into_iter()
         .map(|(dll, name, ordinal, delayed)| {
             let target = api_set(&dll).map_or_else(|| folded(&dll), str::to_string);
-            let status = status(&target, name.as_deref(), pe.isa, provided);
+            let status = status(&target, name.as_deref(), ordinal, pe.isa, provided);
             Import { dll, target, name, ordinal, delayed, status }
         })
         .collect();
@@ -255,19 +260,21 @@ mod tests {
     #[test]
     fn imports_stand_as_atlas_declares_them() {
         let none = |_: &str| false;
-        assert_eq!(status("KERNEL32.dll", Some("CreateFileW"), Isa::X86_64, &none), Status::Host);
-        assert_eq!(status("kernel32", Some("HeapAlloc"), Isa::X86_64, &none), Status::Guest);
-        assert_eq!(status("kernel32.dll", Some("CreateFiber"), Isa::X86_64, &none), Status::Guest);
-        assert_eq!(status("user32.dll", Some("CreateWindowExA"), Isa::X86_64, &none), Status::Host);
-        assert_eq!(status("gdi32.dll", Some("BitBlt"), Isa::X86_64, &none), Status::Stub);
-        assert_eq!(status("kernel32.dll", Some("NoSuchFunction"), Isa::X86_64, &none), Status::Undeclared);
-        assert_eq!(status("comctl32.dll", Some("InitCommonControlsEx"), Isa::X86_64, &none), Status::NoDll);
-        assert_eq!(status("mylib.dll", Some("f"), Isa::X86_64, &|d| d == "mylib.dll"), Status::Program);
-        assert_eq!(status("user32.dll", None, Isa::X86_64, &none), Status::Undeclared);
+        assert_eq!(status("KERNEL32.dll", Some("CreateFileW"), None, Isa::X86_64, &none), Status::Host);
+        assert_eq!(status("kernel32", Some("HeapAlloc"), None, Isa::X86_64, &none), Status::Guest);
+        assert_eq!(status("kernel32.dll", Some("CreateFiber"), None, Isa::X86_64, &none), Status::Guest);
+        assert_eq!(status("user32.dll", Some("CreateWindowExA"), None, Isa::X86_64, &none), Status::Host);
+        assert_eq!(status("gdi32.dll", Some("BitBlt"), None, Isa::X86_64, &none), Status::Stub);
+        assert_eq!(status("kernel32.dll", Some("NoSuchFunction"), None, Isa::X86_64, &none), Status::Undeclared);
+        assert_eq!(status("comctl32.dll", Some("InitCommonControlsEx"), None, Isa::X86_64, &none), Status::Host);
+        assert_eq!(status("comctl32.dll", None, Some(17), Isa::X86_64, &none), Status::Host);
+        assert_eq!(status("nosuch.dll", Some("f"), None, Isa::X86_64, &none), Status::NoDll);
+        assert_eq!(status("mylib.dll", Some("f"), None, Isa::X86_64, &|d| d == "mylib.dll"), Status::Program);
+        assert_eq!(status("user32.dll", None, None, Isa::X86_64, &none), Status::Undeclared);
     }
 
-    /// A PE with no sections, its import tables in its headers: kernel32 (two by name), comctl32 (one by ordinal),
-    /// and ole32 delay-loaded.
+    /// A PE with no sections, its import tables in its headers: kernel32 (two by name), a DLL atlas hasn't (one by
+    /// ordinal), and another delay-loaded.
     fn image(wide: bool) -> Vec<u8> {
         let mut b = vec![0u8; 0x600];
         let mut put = |at: usize, v: &[u8]| b[at..at + v.len()].copy_from_slice(v);
@@ -298,7 +305,7 @@ mod tests {
                 if wide { put(at + i * 8, &e.to_le_bytes()) } else { put(at + i * 4, &(*e as u32).to_le_bytes()) }
             }
         }
-        for (at, s) in [(0x402, "CreateFileW"), (0x422, "CreateFiber"), (0x442, "CoCreateInstance"), (0x480, "KERNEL32.dll"), (0x490, "COMCTL32.dll"), (0x4a0, "ole32.dll")] {
+        for (at, s) in [(0x402, "CreateFileW"), (0x422, "CreateFiber"), (0x442, "CoCreateInstance"), (0x480, "KERNEL32.dll"), (0x490, "MISSING1.dll"), (0x4a0, "nope32.dll")] {
             put(at, s.as_bytes());
         }
         b
@@ -315,11 +322,11 @@ mod tests {
                 [
                     ("KERNEL32.dll", "CreateFileW".into(), false, Status::Host),
                     ("KERNEL32.dll", "CreateFiber".into(), false, Status::Guest),
-                    ("COMCTL32.dll", "#17".into(), false, Status::NoDll),
-                    ("ole32.dll", "CoCreateInstance".into(), true, Status::NoDll),
+                    ("MISSING1.dll", "#17".into(), false, Status::NoDll),
+                    ("nope32.dll", "CoCreateInstance".into(), true, Status::NoDll),
                 ]
             );
-            let brought = scan(&image(wide), &|d| d == "comctl32.dll").unwrap();
+            let brought = scan(&image(wide), &|d| d == "missing1.dll").unwrap();
             assert_eq!(brought.imports[2].status, Status::Program);
         }
     }

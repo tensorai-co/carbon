@@ -392,6 +392,34 @@ dll! {
     guest ConvertThreadToFiberEx => AtlasConvertThreadToFiberEx;
     guest ConvertFiberToThread => AtlasConvertFiberToThread;
     guest IsThreadAFiber => AtlasIsThreadAFiber;
+    // What installers call: string and number helpers, temporary names, .ini files and the error mode.
+    guest CompareFileTime => AtlasCompareFileTime;
+    host GetDiskFreeSpaceW(5) => get_disk_free_space_w;
+    host GetPrivateProfileStringW(6) => get_private_profile_string_w;
+    host GetShortPathNameW(3) => get_short_path_name_w;
+    host GetTempFileNameW(4) => get_temp_file_name_w;
+    guest MulDiv => AtlasMulDiv;
+    host SearchPathW(6) => search_path_w;
+    host SetErrorMode(1) => set_error_mode;
+    host WritePrivateProfileStringW(4) => write_private_profile_string_w;
+    guest lstrcatW => AtlasLstrcatW;
+    guest lstrcmpW => AtlasLstrcmpW;
+    guest lstrcmpiA => AtlasLstrcmpiA;
+    guest lstrcmpiW => AtlasLstrcmpiW;
+    guest lstrcpyA => AtlasLstrcpyA;
+    guest lstrcpyW => AtlasLstrcpyW;
+    guest lstrcpynW => AtlasLstrcpynW;
+    guest lstrlenA => AtlasLstrlenA;
+    guest lstrlenW => AtlasLstrlenW;
+    guest lstrcatA => AtlasLstrcatA;
+    guest lstrcmpA => AtlasLstrcmpA;
+    guest lstrcpynA => AtlasLstrcpynA;
+    guest lstrcpy => AtlasLstrcpyA;
+    guest lstrcat => AtlasLstrcatA;
+    guest lstrlen => AtlasLstrlenA;
+    guest lstrcmp => AtlasLstrcmpA;
+    guest lstrcmpi => AtlasLstrcmpiA;
+    guest lstrcpyn => AtlasLstrcpynA;
 }
 
 const TRUE: u64 = 1;

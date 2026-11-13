@@ -58,9 +58,9 @@ fn build(guest: &Path, out: &Path, arch: &str, linker: &str) -> Result<PathBuf, 
 }
 
 /// What the link needs: no entry point or C runtime, and the exports written in assembly (on x86, raising and unwinding
-/// too, which capture their caller's registers).
+/// too, which capture their caller's registers; and user32's C-variadic `wsprintf`).
 fn rustflags(arch: &str) -> String {
-    let mut exports = vec!["RtlCaptureContext", "AtlasSwitchToFiber"];
+    let mut exports = vec!["RtlCaptureContext", "AtlasSwitchToFiber", "AtlasWsprintfW", "AtlasWsprintfA"];
     if arch == "i686" {
         exports.extend(["RtlRaiseException", "RtlUnwind"]);
     }

@@ -2,12 +2,14 @@
 //! each DLL's image from its declaration (`images`), and nothing is ever a file of its own.
 
 pub mod advapi32;
+pub mod comctl32;
 pub mod fileapi;
 pub mod gdi32;
 pub mod ioapi;
 pub mod kernel32;
 pub mod memapi;
 pub mod nlsapi;
+pub mod ole32;
 pub mod pipeapi;
 pub mod procapi;
 pub mod resapi;
@@ -58,14 +60,23 @@ pub struct Dll {
     /// Its file name, as Windows has it.
     pub name: &'static str,
     pub exports: &'static [Export],
+    /// Its first export's ordinal, the rest following in order: 1, unless programs import its first by an ordinal of
+    /// Windows' own (comctl32's InitCommonControls is #17).
+    pub first_ordinal: u16,
 }
 
 /// Declares a DLL: each export is `host Name(args) => function`, `guest Name => NtdllName` (or just `guest Name`), or
-/// `missing Name`.
+/// `missing Name`. `"NAME.dll" @ 17;` numbers its exports from 17.
 macro_rules! dll {
-    ($file:literal; $($kind:ident $name:ident $(($args:literal))? $(=> $target:ident)?;)*) => {
-        pub static DLL: $crate::os::Dll = $crate::os::Dll { name: $file, exports: &[$(dll!(@export $kind $name $(($args))? $(=> $target)?)),*] };
+    ($file:literal $(@ $first:literal)?; $($kind:ident $name:ident $(($args:literal))? $(=> $target:ident)?;)*) => {
+        pub static DLL: $crate::os::Dll = $crate::os::Dll {
+            name: $file,
+            exports: &[$(dll!(@export $kind $name $(($args))? $(=> $target)?)),*],
+            first_ordinal: dll!(@first $($first)?),
+        };
     };
+    (@first) => { 1 };
+    (@first $first:literal) => { $first };
     (@export host $name:ident ($args:literal) => $run:ident) => {
         $crate::os::Export { name: stringify!($name), kind: $crate::os::Kind::Host { args: $args, run: $run } }
     };
@@ -82,7 +93,7 @@ macro_rules! dll {
 pub(crate) use dll;
 
 /// Every system DLL atlas has.
-pub static DLLS: &[&Dll] = &[&kernel32::DLL, &user32::DLL, &advapi32::DLL, &gdi32::DLL, &shell32::DLL, &version::DLL, &ucrtbase::DLL];
+pub static DLLS: &[&Dll] = &[&kernel32::DLL, &user32::DLL, &advapi32::DLL, &gdi32::DLL, &shell32::DLL, &version::DLL, &ucrtbase::DLL, &comctl32::DLL, &ole32::DLL];
 
 /// The DLL called `name` (`kernel32`, `KERNEL32.DLL`, …), by its index in [`DLLS`].
 pub fn find(name: &str) -> Option<usize> {

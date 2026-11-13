@@ -96,3 +96,8 @@ IsWindowUnicode
 SetWindowLongPtrA
 FindWindowA
 UnregisterClassA
+CharNextW
+CharPrevW
+wsprintfW
+wsprintfA
+wvsprintfW
