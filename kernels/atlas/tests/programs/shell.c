@@ -8,7 +8,9 @@
 // URL, a file that isn't there); SHGetFileInfoW's display and type names, attributes, the system image list, a
 // program's type, and a file named but not there; and SHBrowseForFolderW, its folder given by its callback
 // (BFFM_SETSELECTION, then BFFM_SELCHANGED) and taken with Enter, cancelled with Escape, and a path that isn't a
-// folder refused.
+// folder refused; and shortcuts: a shell link made through CoCreateInstance, set through IShellLinkW, saved as a .lnk
+// file through IPersistFile (its header read back), loaded into another and read through IShellLinkW and IShellLinkA,
+// its item ID list, QueryInterface for what it isn't, reference counts, and a class that isn't there.
 
 typedef void *HANDLE;
 typedef void *HWND;
@@ -72,6 +74,10 @@ K HANDLE __stdcall ShellExecuteW(HWND, const WCHAR *, const WCHAR *, const WCHAR
 K int __stdcall ShellExecuteExW(SHELLEXECUTEINFOW *);
 K __UINTPTR_TYPE__ __stdcall SHGetFileInfoW(const WCHAR *, DWORD, SHFILEINFOW *, UINT, UINT);
 K ITEMIDLIST *__stdcall SHBrowseForFolderW(BROWSEINFOW *);
+K int __stdcall ReadFile(HANDLE, void *, DWORD, DWORD *, void *);
+K HRESULT __stdcall CoInitialize(void *);
+typedef struct { DWORD a; WORD b, c; unsigned char d[8]; } GUID;
+K HRESULT __stdcall CoCreateInstance(const GUID *, void *, DWORD, const GUID *, void **);
 
 #define S_OK 0
 #define E_INVALIDARG ((HRESULT)0x80070057)
@@ -159,6 +165,24 @@ static int __stdcall browse_callback(HWND h, UINT m, LPARAM a, LPARAM data) {
     if (m == BFFM_SELCHANGED) SHGetPathFromIDListW((const ITEMIDLIST *)a, changed_to);
     return 0;
 }
+
+typedef struct { void **vt; } COM;
+#define VT(obj, n) (((COM *)(obj))->vt[n])
+typedef HRESULT (__stdcall *M0)(void *);
+typedef HRESULT (__stdcall *MP)(void *, const void *);
+typedef HRESULT (__stdcall *MPP)(void *, const void *, void *);
+typedef HRESULT (__stdcall *MPI)(void *, void *, int);
+typedef HRESULT (__stdcall *MPIP)(void *, void *, int, void *);
+typedef HRESULT (__stdcall *MPIPI)(void *, void *, int, void *, DWORD);
+typedef HRESULT (__stdcall *MI)(void *, __UINTPTR_TYPE__);
+static const GUID CLSID_ShellLink = {0x00021401, 0, 0, {0xc0, 0, 0, 0, 0, 0, 0, 0x46}};
+static const GUID IID_IShellLinkW = {0x000214f9, 0, 0, {0xc0, 0, 0, 0, 0, 0, 0, 0x46}};
+static const GUID IID_IShellLinkA = {0x000214ee, 0, 0, {0xc0, 0, 0, 0, 0, 0, 0, 0x46}};
+static const GUID IID_IPersistFile = {0x0000010b, 0, 0, {0xc0, 0, 0, 0, 0, 0, 0, 0x46}};
+static const GUID IID_IClassFactory = {0x00000001, 0, 0, {0xc0, 0, 0, 0, 0, 0, 0, 0x46}};
+static const GUID CLSID_Nothing = {0x12345678, 1, 2, {3, 4, 5, 6, 7, 8, 9, 10}};
+static unsigned char find_data[600];
+static char ansi[300];
 
 static WCHAR path[300], other[300], tmp[260], a[300], b[300], c[300], self[260], name[260];
 static SHFILEINFOW info;
@@ -267,6 +291,64 @@ void mainCRTStartup(void) {
     check(SHBrowseForFolderW(&bi) == 0, "cancelled: NULL");
     bi.lParam = 3;
     check(SHBrowseForFolderW(&bi) == 0, "a path that isn't a folder isn't taken");
+
+    // ---- Shortcuts ----
+    void *link = 0, *pf = 0, *linka = 0, *none = (void *)1;
+    WCHAR *cur = 0;
+    CoInitialize(0);
+    check(CoCreateInstance(&CLSID_ShellLink, 0, 1, &IID_IShellLinkW, &link) == S_OK && link, "CoCreateInstance: a shell link, through IShellLinkW");
+    ((MP)VT(link, 20))(link, self);
+    ((MP)VT(link, 11))(link, W(0, "child"));
+    ((MP)VT(link, 7))(link, W(1, "Runs the test"));
+    ((MP)VT(link, 9))(link, W(2, "C:\\Windows"));
+    ((MPI)VT(link, 17))(link, self, 1);
+    ((MI)VT(link, 15))(link, 7);
+    ((MI)VT(link, 13))(link, 0x0641);
+    check(((MPP)VT(link, 0))(link, &IID_IPersistFile, &pf) == S_OK && pf && pf != link, "QueryInterface: IPersistFile, another pointer");
+    check(((M0)VT(pf, 4))(pf) == S_OK, "IsDirty, once it's set");
+    const WCHAR *lnk = W(3, "C:\\Users\\carbon\\Desktop\\atlas test.lnk");
+    check(((MPI)VT(pf, 6))(pf, (void *)lnk, 1) == S_OK && exists(lnk) && ((M0)VT(pf, 4))(pf) == 1, "Save: a .lnk file, and not dirty after");
+    HANDLE h = CreateFileW(lnk, 0x80000000, 1, 0, 3, 0, 0);
+    unsigned char head[20] = {0};
+    DWORD got = 0;
+    ReadFile(h, head, 20, &got, 0);
+    CloseHandle(h);
+    check(got == 20 && head[0] == 0x4c && head[4] == 0x01 && head[5] == 0x14 && head[6] == 0x02 && head[12] == 0xc0 && head[19] == 0x46, "its header: its size, and the shell link's CLSID");
+    check(((MP)VT(pf, 8))(pf, &cur) == S_OK && cur && wweq(cur, lnk), "GetCurFile");
+    CoTaskMemFree(cur);
+    GUID id = {0};
+    check(((MP)VT(pf, 3))(pf, &id) == S_OK && id.a == 0x00021401 && id.d[7] == 0x46, "GetClassID");
+    check(((M0)VT(pf, 2))(pf) == 1 && ((M0)VT(link, 2))(link) == 0, "Release: one left, then none");
+
+    pf = 0;
+    check(CoCreateInstance(&CLSID_ShellLink, 0, 1, &IID_IPersistFile, &pf) == S_OK && ((MPI)VT(pf, 5))(pf, (void *)lnk, 0) == S_OK, "another, through IPersistFile, and Load");
+    link = 0;
+    ((MPP)VT(pf, 0))(pf, &IID_IShellLinkW, &link);
+    check(link && ((MPIPI)VT(link, 3))(link, path, 300, find_data, 0) == S_OK && wweq(path, self) && weq((WCHAR *)(find_data + 44), "shell.exe"),
+          "GetPath: the target, and WIN32_FIND_DATA's name");
+    ((MPI)VT(link, 10))(link, path, 300);
+    check(weq(path, "child"), "GetArguments");
+    ((MPI)VT(link, 6))(link, path, 300);
+    check(weq(path, "Runs the test"), "GetDescription");
+    ((MPI)VT(link, 8))(link, path, 300);
+    check(weq(path, "C:\\Windows"), "GetWorkingDirectory");
+    int index = 0, show = 0;
+    WORD key = 0;
+    ((MPIP)VT(link, 16))(link, path, 300, &index);
+    ((MP)VT(link, 14))(link, &show);
+    ((MP)VT(link, 12))(link, &key);
+    check(wweq(path, self) && index == 1 && show == 7 && key == 0x0641, "GetIconLocation, GetShowCmd and GetHotkey");
+    check(((MPP)VT(link, 0))(link, &IID_IShellLinkA, &linka) == S_OK && ((MPIPI)VT(linka, 3))(linka, ansi, 300, 0, 0) == S_OK && ansi[0] == 'C' && ansi[1] == ':',
+          "IShellLinkA: GetPath, in ANSI");
+    ITEMIDLIST *list = 0;
+    check(((MP)VT(link, 4))(link, &list) == S_OK && SHGetPathFromIDListW(list, path) && wweq(path, self), "GetIDList");
+    ILFree(list);
+    check(((MPP)VT(link, 0))(link, &IID_IClassFactory, &none) == (HRESULT)0x80004002 && none == 0, "QueryInterface for what it isn't: E_NOINTERFACE, and NULL");
+    ((M0)VT(linka, 2))(linka);
+    ((M0)VT(link, 2))(link);
+    check(((M0)VT(pf, 2))(pf) == 0, "and released");
+    void *nothing = (void *)1;
+    check(CoCreateInstance(&CLSID_Nothing, 0, 1, &IID_IShellLinkW, &nothing) == (HRESULT)0x80040154 && nothing == 0, "a class that isn't there: REGDB_E_CLASSNOTREG");
 
     ExitProcess(failures);
 }

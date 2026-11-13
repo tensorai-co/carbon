@@ -3,8 +3,8 @@
 // It checks: kernel32's and user32's string functions (lstrlen, lstrcpy(n), lstrcat, lstrcmp(i), CharNext/Prev),
 // MulDiv and CompareFileTime; wsprintf, C-variadic, so its arguments are found as each ISA passes them, past the
 // registers too, and cut at 1024 characters; wvsprintf with a va_list; temporary names, short names, disk space and
-// SearchPath; .ini files; the error mode; COM's start, its task allocator and CoCreateInstance with no class
-// registered; and SHGetFileInfo as installers first call it.
+// SearchPath; .ini files; the error mode; COM's start, its task allocator and CoCreateInstance for a class that
+// isn't there; and SHGetFileInfo as installers first call it.
 
 typedef void *HANDLE;
 typedef unsigned int DWORD;
@@ -205,9 +205,10 @@ void mainCRTStartup(void) {
     check(kept, "CoTaskMemRealloc keeps what was there");
     CoTaskMemFree(p);
     CoTaskMemFree(0);
-    GUID clsid = {0x00021401, 0, 0, {0xc0, 0, 0, 0, 0, 0, 0, 0x46}}, iid = {0x000214f9, 0, 0, {0xc0, 0, 0, 0, 0, 0, 0, 0x46}};
+    // A class no one has (the shell link's is shell.c's to check).
+    GUID clsid = {0x12345678, 1, 2, {3, 4, 5, 6, 7, 8, 9, 10}}, iid = {0x000214f9, 0, 0, {0xc0, 0, 0, 0, 0, 0, 0, 0x46}};
     void *object = (void *)1;
-    check(CoCreateInstance(&clsid, 0, 1, &iid, &object) == (long)0x80040154 && object == 0, "CoCreateInstance: no class registered, and no object");
+    check(CoCreateInstance(&clsid, 0, 1, &iid, &object) == (long)0x80040154 && object == 0, "CoCreateInstance: a class that isn't there, and no object");
     OleUninitialize();
     CoUninitialize();
 

@@ -2,6 +2,7 @@
 //! each DLL's image from its declaration (`images`), and nothing is ever a file of its own.
 
 pub mod advapi32;
+pub mod com;
 pub mod comctl32;
 pub mod fileapi;
 pub mod gdi32;

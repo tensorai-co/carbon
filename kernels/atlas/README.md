@@ -18,7 +18,7 @@ are shared as their opens say, with hard and symbolic links and times that can b
 program: work, timers and waits, on pools of their own or the process's. The registry tells watchers of changes, has
 WOW64's 32-bit view, and saves, restores, loads and unloads hives. Code pages convert as Windows' do, every `*A`
 function speaks Windows-1252, and ANSI windows get their messages' text in it. ucrtbase.dll is atlas's own C runtime, in the
-program, so MinGW-built C programs run. Nine DLLs declare 1,003 exports between them, 986 written and 17 stubs that say so, and ntdll has 300.
+program, so MinGW-built C programs run. Nine DLLs declare 1,041 exports between them, 1,024 written and 17 stubs that say so, and ntdll has 300.
 
 ## Layout
 
@@ -79,7 +79,7 @@ opening comment says what it checks. `crt.exe` (and `crt-mingw.exe`) want the ar
 | Program | What it covers |
 | --- | --- |
 | atlas, ARM64 native and x86-64 translated | The basics: the console, the command line, memory, an upcall, a message box, and ntdll's own exports |
-| atlas's `shell.c`, both ISAs and i686 | The shell: special folders' paths (Program Files as the program's ISA sees it), their item ID lists and the paths back, a virtual folder's, `ILCreateFromPath`; `SHFileOperation` copying a tree, a wildcard into a folder it makes, renaming, moving and deleting; `ShellExecuteEx` running a program and waiting for its exit code, `ShellExecute`, and what it can't open; `SHGetFileInfo`'s names, attributes, image list and program type; `SHBrowseForFolder` with its callback, accepted, cancelled, and refusing a path that isn't a folder |
+| atlas's `shell.c`, both ISAs and i686 | The shell: shortcuts (a shell link set through `IShellLinkW`, saved through `IPersistFile` as a `.lnk` file whose header is read back, loaded into another and read through `IShellLinkW` and `IShellLinkA`, its item ID list, `QueryInterface` for what it isn't, reference counts); special folders' paths (Program Files as the program's ISA sees it), their item ID lists and the paths back, a virtual folder's, `ILCreateFromPath`; `SHFileOperation` copying a tree, a wildcard into a folder it makes, renaming, moving and deleting; `ShellExecuteEx` running a program and waiting for its exit code, `ShellExecute`, and what it can't open; `SHGetFileInfo`'s names, attributes, image list and program type; `SHBrowseForFolder` with its callback, accepted, cancelled, and refusing a path that isn't a folder |
 | atlas's `comctl.c`, both ISAs and i686 | comctl32's controls in a dialog: a progress bar's range, position, delta, step, clamping and bar colour, and what it paints; a report list view's columns, items inserted where asked, their text in each column and their `lParam`, `LVM_GETITEM`, selection and the `LVN_ITEMCHANGED` its parent hears, single selection, the down arrow, a column sized to its text, `LVM_ENSUREVISIBLE`, deleting, its image lists and its procedure through `CallWindowProc`; image lists made, added to, counted, sized, removed from and destroyed |
 | atlas's `dialog.c`, both ISAs and i686, with `dialog.rc` | Dialogs: the dialog class as `GetClassInfoEx` gives it and a class of the program's own from it; templates in memory and a `DIALOGEX` resource, their controls, IDs and text; `WM_INITDIALOG` and the focus; `DWLP_DLGPROC`; `Get`/`SetDlgItemText` and `Int`; check boxes and an automatic radio group; `WM_COMMAND` and `EN_CHANGE`; `DM_GETDEFID`; Tab, Enter, Escape and typing through `IsDialogMessage`; `EnableWindow`; a control's procedure through `CallWindowProc`; what the controls paint, read with `GetPixel`, in a `WM_CTLCOLORSTATIC` brush; modal dialogs, their owner disabled, ended by Enter and by `WM_CLOSE` |
 | atlas's `windows.c`, both ISAs | Window classes, creation and its messages, painting and GDI, timers, and messages between threads |
@@ -203,8 +203,12 @@ moved to `r10` as Windows does) and traps; atlas reads the arguments by the ISA'
 the return value. A guest export forwards into ntdll, as Windows' own `kernel32!HeapAlloc` forwards to
 `ntdll!RtlAllocateHeap`. A missing one ends the process naming itself (`kernel32!CreateFiber`), so the next thing to
 write is obvious. An image is made the first time a process needs it for an ISA, then shared read-only by every
-process, the way the page cache shares a file. COM objects atlas implements will be host-side too: a vtable of trap
-stubs per interface, so `IStream::Read` traps into Rust like any `host` export.
+process, the way the page cache shares a file. COM objects atlas implements are host-side too (`os/com.rs`): an
+object is a block in the program's heap of interface pointers, each to its vtable of ole32's host exports, so a
+method traps into Rust like any `host` export with `this` first; what the object holds is the process's, by the
+block's address. `QueryInterface`, `AddRef` and `Release` are the same three exports in every vtable, and the last
+`Release` frees the block. `CoCreateInstance` makes atlas's classes (so far the shell link) and says any other isn't
+registered.
 
 **Upcalls.** A host export runs on the thread that owns the program's CPU, so it can run the program again, nested,
 from inside the same Rust function, as Windows' `win32k` calls a `WndProc` (`KeUserModeCallback`): `upcall` pushes a
@@ -658,6 +662,13 @@ hears as `BFFM_SELCHANGED`), a status line, and OK, which takes only a folder th
 yet. `SHGetFileInfo` gives a file's display and type names, attributes, the system image lists and a program's type,
 the icons being placeholders.
 
+**Shell links** (`os/com.rs`): `CLSID_ShellLink`'s objects, with `IShellLinkW`, `IShellLinkA` and `IPersistFile`. One
+keeps a target, arguments, working folder, description, relative path, icon and its index, show command and hot key,
+and gives the target as a path, a WIN32_FIND_DATA and an item ID list. `IPersistFile` saves it as a `.lnk` file in
+the Shell Link Binary File Format ([MS-SHLLINK]): the header (with the target's attributes and size), the target as
+`LinkInfo`'s local path in ANSI and UTF-16, and the strings in UTF-16; and loads one back, from `LinkInfo` in either
+form. `Resolve` takes the target as it is.
+
 comctl32's progress bar and list view are win32k's too (`win32k/comctl.rs`), their classes there from the start as if
 comctl32 had registered them as it loaded, and their procedures exported from comctl32 (`AtlasProgressWndProc`,
 `AtlasListViewWndProc`). A progress bar has its range (16- and 32-bit), position, delta, step (wrapping past the top
@@ -805,7 +816,8 @@ BITS, audio **[audio]**, WMI's common classes); and **the event log**.
   `SystemParametersInfo` and the system colours.
 - **The shell's core** (shell32, shlwapi, shcore): known folders by GUID (`SHGetKnownFolderPath`); `ShellExecute(Ex)`
   by association (documents, folders, URLs), with Explorer; `IFileOperation`, and `SHFileOperation`'s progress,
-  confirmations and recycle bin; shell links (COM's `IShellLink`, so installers' shortcuts are made); a tree of
+  confirmations and recycle bin; shell links' item ID lists as Windows makes them (a link with only those loads with
+  no target), and resolving a link whose target moved; a tree of
   folders in `SHBrowseForFolder`; icons and the system image list drawn; `CommandLineToArgvW`; shlwapi's path, string
   and registry helpers; shcore's DPI and stream helpers.
 
@@ -897,9 +909,8 @@ First `cmd.exe` (variables, `if`, `for`, `goto`, `call`, pipes, redirection, `.b
      what `GetClassInfo` gave for `#32770`): text, a group box, an edit with the install folder, the disk space, and
      its buttons, which work. Its Install button takes it to its progress page (a progress bar and a details list,
      comctl32's), where it extracts its files with each one shown, the bar filling as it goes, finds the start menu
-     and desktop folders for its shortcuts (which it skips, as COM has no shell link class yet), and finishes on its
-     own, its dialog ended and its temporary files removed. Still to do there, in order:
-     - **Shell links**, so its shortcuts are made: COM's `IShellLink` and `IPersistFile`.
+     and desktop folders, makes its shortcuts there (shell links saved as `.lnk` files), and finishes on its own, its
+     dialog ended and its temporary files removed. Still to do there, in order:
      - **Icons and bitmaps from resources:** `LoadImage` and `LoadBitmap` give a placeholder handle so far, so the
        header's picture is blank.
      - **Menus:** `CreatePopupMenu`, `AppendMenu`, `TrackPopupMenu` (the details list's context menu).

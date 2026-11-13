@@ -184,8 +184,8 @@ programs and how to build them are in [lambda's](kernels/lambda/README.md#runnin
   work over HTTPS. **atlas** runs Windows programs with its loader and SEH, threads, processes and objects, pipes,
   sections, asynchronous I/O, files, the registry, security, resources and system information, and windows on the
   desktop with input, dialogs and the basic controls, a progress bar and list view, and the shell's core (special
-  folders, file operations, running programs, choosing a folder), on ARM64, x86-64 and 32-bit x86. A real 32-bit
-  installer runs from its first page to the end.
+  folders, file operations, running programs, choosing a folder, shortcuts), on ARM64, x86-64 and 32-bit x86. A real
+  32-bit installer runs from its first page to the end, its shortcuts made.
 - **`carbon run debian:13 -- bash`** works on all three hosts, from an image pulled over HTTPS (trusting what the host
   trusts), with machines kept by name, stopped, frozen and started again.
 - **net** gives each machine its own network out through the host's sockets: `apt-get update` and `curl https://`
