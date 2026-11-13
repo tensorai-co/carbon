@@ -5,7 +5,7 @@ declaration made into a PE in memory, so a machine has no Windows files to insta
 has to run inside the program, ntdll, is a crate (`guest/`) that cargo builds for each ISA and embeds.
 
 **Where it stands.** Programs run on ARM64 natively and x86-64 translated, and 32-bit x86 programs run too (WoW64,
-translated on Apple silicon; phases 1 to 5 of its six, below, are done): 27 of the test programs pass every check as
+translated on Apple silicon; phases 1 to 5 of its six, below, are done): 28 of the test programs pass every check as
 32-bit programs, with x86's own SEH, PE32 images and 32-bit layouts throughout, and a real 32-bit installer starts,
 unpacks its data, runs its start-up script, shows its dialogs, installs its files with its progress shown, and finishes. They have the loader and SEH, threads and
 waits, processes, anonymous and named pipes, sections, asynchronous I/O and completion ports, files, the registry,
@@ -18,7 +18,7 @@ are shared as their opens say, with hard and symbolic links and times that can b
 program: work, timers and waits, on pools of their own or the process's. The registry tells watchers of changes, has
 WOW64's 32-bit view, and saves, restores, loads and unloads hives. Code pages convert as Windows' do, every `*A`
 function speaks Windows-1252, and ANSI windows get their messages' text in it. ucrtbase.dll is atlas's own C runtime, in the
-program, so MinGW-built C programs run. Nine DLLs declare 1,052 exports between them, 1,038 written and 14 stubs that say so, and ntdll has 300.
+program, so MinGW-built C programs run. Nine DLLs declare 1,085 exports between them, 1,074 written and 11 stubs that say so, and ntdll has 300.
 
 ## Layout
 
@@ -73,12 +73,13 @@ for all three Windows targets: with rustup, that needs `rustup component add rus
 prints every host export with its result, and each thread that gives its CPU up, waits for one, or takes one again.
 `cargo test -p atlas` runs the unit tests.
 
-On this Mac, through hvf, every test program passes, on ARM64 and x86-64, and the 27 built for i686 too. Each one's
+On this Mac, through hvf, every test program passes, on ARM64 and x86-64, and the 28 built for i686 too. Each one's
 opening comment says what it checks. `crt.exe` (and `crt-mingw.exe`) want the arguments `one "two words"`.
 
 | Program | What it covers |
 | --- | --- |
 | atlas, ARM64 native and x86-64 translated | The basics: the console, the command line, memory, an upcall, a message box, and ntdll's own exports |
+| atlas's `menus.c`, both ISAs and i686, with `menus.rc` | Menus: built with `AppendMenu` and read back by position and by command (into a submenu too); checks, radio checks, enabling, the default item; `InsertMenuItem`, `GetMenuItemInfo`, `SetMenuItemInfo`, `RemoveMenu`; `MENU` and `MENUEX` resources; `SetMenu` and `GetMenu`; `TrackPopupMenu` driven by another thread's `SendInput`: the arrows past a separator and Enter, Escape, an `&` letter, a submenu by its letter, a click, and `WM_COMMAND` without `TPM_RETURNCMD`; `WM_INITMENUPOPUP` |
 | atlas's `images.c`, both ISAs and i686, with `images.rc` (`images.bmp`, `images.ico`, `images.cur`) | Bitmaps and icons: `LoadBitmap` and `GetObject`; a memory DC with a bitmap selected, read and drawn into; `BitBlt` and `StretchBlt` between it and a window both ways, and `BLACKNESS`; `CreateCompatibleBitmap`; `LoadImage` choosing an icon's image by size and scaling one, and `DrawIconEx` and `DrawIcon` blending by alpha and by mask; `LoadCursor`; a bitmap from a file, scaled; what isn't there, and a system icon; statics showing an icon their template names and a bitmap `STM_SETIMAGE` gives; an image list cut from a bitmap with a colour key, an icon added, drawn |
 | atlas's `shell.c`, both ISAs and i686 | The shell: shortcuts (a shell link set through `IShellLinkW`, saved through `IPersistFile` as a `.lnk` file whose header is read back, loaded into another and read through `IShellLinkW` and `IShellLinkA`, its item ID list, `QueryInterface` for what it isn't, reference counts); special folders' paths (Program Files as the program's ISA sees it), their item ID lists and the paths back, a virtual folder's, `ILCreateFromPath`; `SHFileOperation` copying a tree, a wildcard into a folder it makes, renaming, moving and deleting; `ShellExecuteEx` running a program and waiting for its exit code, `ShellExecute`, and what it can't open; `SHGetFileInfo`'s names, attributes, image list and program type; `SHBrowseForFolder` with its callback, accepted, cancelled, and refusing a path that isn't a folder |
 | atlas's `comctl.c`, both ISAs and i686 | comctl32's controls in a dialog: a progress bar's range, position, delta, step, clamping and bar colour, and what it paints; a report list view's columns, items inserted where asked, their text in each column and their `lParam`, `LVM_GETITEM`, selection and the `LVN_ITEMCHANGED` its parent hears, single selection, the down arrow, a column sized to its text, `LVM_ENSUREVISIBLE`, deleting, its image lists and its procedure through `CallWindowProc`; image lists made, added to, counted, sized, removed from and destroyed |
@@ -665,6 +666,20 @@ hears as `BFFM_SELCHANGED`), a status line, and OK, which takes only a folder th
 yet. `SHGetFileInfo` gives a file's display and type names, attributes, the system image lists and a program's type,
 the icons being placeholders.
 
+**Menus** (`win32k/menu.rs`, `os/menuapi.rs`): menu objects, built (`CreateMenu`, `CreatePopupMenu`, `AppendMenu`,
+`InsertMenu`, `InsertMenuItem`, `ModifyMenu`, `SetMenuItemInfo`), read back (`GetMenuItemCount`, `GetMenuItemID`,
+`GetSubMenu`, `GetMenuState`, `GetMenuString`, `GetMenuItemInfo`), changed (`CheckMenuItem`, `CheckMenuRadioItem`,
+`EnableMenuItem`, the default item, `RemoveMenu`, `DeleteMenu`, `DestroyMenu` with its submenus) by position or by
+command (searching submenus, as Windows does), and loaded from `MENU` and `MENUEX` resources. A window keeps its menu
+(`SetMenu`, `GetMenu`); menu bars aren't drawn yet, a frame being the desktop's. `TrackPopupMenu(Ex)` sends
+`WM_INITMENUPOPUP` and shows the menu as a popup of the desktop's that grabs the keyboard and pointer, placed against
+the point as its flags align it and kept on the screen by the desktop's positioner, then runs the menu loop on the
+calling thread: the pointer lights items up and opens submenus as popups of their own, a click chooses, the arrows
+move (past separators) and open and close submenus, Enter chooses, Escape closes a level, an item's `&` letter
+chooses it, and a press outside dismisses them all. It gives the item's ID (`TPM_RETURNCMD`) or posts `WM_COMMAND`
+for it. Items are drawn with their text, accelerator, check or radio dot, a submenu's arrow, and greyed when they're
+disabled.
+
 **Shell links** (`os/com.rs`): `CLSID_ShellLink`'s objects, with `IShellLinkW`, `IShellLinkA` and `IPersistFile`. One
 keeps a target, arguments, working folder, description, relative path, icon and its index, show command and hot key,
 and gives the target as a path, a WIN32_FIND_DATA and an item ID list. `IPersistFile` saves it as a `.lnk` file in
@@ -772,7 +787,8 @@ By layer, bottom up. Items are host Rust unless marked **[guest]** (ntdll), or a
 ### 2. The window kernel
 
 - **NtUser:** the z-order of child windows; `WM_NCHITTEST` and frames a program draws itself; keyboard layouts
-  besides US; menus (`CreateMenu`, `SetMenu`, `TrackPopupMenu`, menu bars, accelerators, and the system menu shown);
+  besides US; menus' rest (menu bars drawn in a window's frame and their keyboard, accelerators, the system menu
+  shown, owner-drawn and bitmap items, `WM_MENUSELECT` and the other notifications);
   dialogs' rest (menus in templates, `DS_SETFOREGROUND` and the other `DS_*` styles, owner-drawn buttons' WM_DRAWITEM,
   icons and bitmaps in statics and buttons, keyboard mnemonics); the standard controls still to come (LISTBOX,
   COMBOBOX, SCROLLBAR, and an edit's scrolling, clipboard and undo); comctl32's others (tree view, tabs, trackbar,
@@ -914,7 +930,7 @@ First `cmd.exe` (variables, `if`, `for`, `goto`, `call`, pipes, redirection, `.b
      `carbon run` knows a 32-bit `.exe` (platform `windows/386`), and gives it x86's memory ordering.
   6. [ ] **Every test program for i686**, passing; then real installers. Every test program but `sysinfo.c` (whose
      checks are 64-bit offsets; `wow64.c` checks the same calls at 32 bits) builds for i686 and passes every check:
-     27 programs, 915 checks, with the loader's own DLLs, thread-local variables (`__tls_array`), `__try` through
+     28 programs, 937 checks, with the loader's own DLLs, thread-local variables (`__tls_array`), `__try` through
      `_except_handler3` (now in the i686 ntdll, with `_local_unwind2`), and the C runtime. `build.sh` makes each
      program's import libraries from what its object imports, `__imp_` or not. `installer.c` checks what installers
      call first, on all three ISAs: `wsprintf` is C-variadic, so each ISA's is a few lines of the guest's assembly
@@ -926,7 +942,6 @@ First `cmd.exe` (variables, `if`, `for`, `goto`, `call`, pipes, redirection, `.b
      comctl32's), where it extracts its files with each one shown, the bar filling as it goes, finds the start menu
      and desktop folders, makes its shortcuts there (shell links saved as `.lnk` files), and finishes on its own, its
      dialog ended and its temporary files removed. Still to do there, in order:
-     - **Menus:** `CreatePopupMenu`, `AppendMenu`, `TrackPopupMenu` (the details list's context menu).
      - **The rest:** `MessageBoxIndirect`, `SendMessageTimeout`, `SystemParametersInfo`, `GetMessagePos`,
        `ExitWindowsEx`, which its other paths reach (an error, a reboot, its uninstaller).
 - **ANSI and code pages:** each `*A` function still to come is the `*W` with 1252 strings, as those there are.

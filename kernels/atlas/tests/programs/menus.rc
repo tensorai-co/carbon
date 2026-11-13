@@ -1,0 +1,23 @@
+// menus.exe's resources: a MENU and a MENUEX. Built with llvm-rc, without the preprocessor, so types and states are
+// numbers: MFT_SEPARATOR 0x800, MFS_GRAYED 3.
+LANGUAGE 0, 0
+1 MENU
+BEGIN
+    POPUP "&File"
+    BEGIN
+        MENUITEM "&New", 100
+        MENUITEM SEPARATOR
+        MENUITEM "E&xit", 101
+    END
+    MENUITEM "&Help", 102
+END
+
+2 MENUEX
+BEGIN
+    POPUP "&Edit", 200
+    BEGIN
+        MENUITEM "&Copy", 201
+        MENUITEM "", 0, 0x800
+        MENUITEM "&Paste", 202, 0, 3
+    END
+END

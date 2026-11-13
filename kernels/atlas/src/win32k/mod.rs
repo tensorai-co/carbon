@@ -13,6 +13,7 @@ pub mod dialog;
 pub mod gdi;
 pub mod image;
 pub mod keys;
+pub mod menu;
 mod paint;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -465,6 +466,10 @@ pub struct Win32k {
     pub browsed: BTreeMap<u64, String>,
     /// The system image lists `SHGetFileInfo` gives: large and small.
     pub system_images: Option<(u64, u64)>,
+    /// Menus, by handle; the one being tracked, if one is; each window's menu (`SetMenu`).
+    pub menus: BTreeMap<u64, menu::Menu>,
+    pub tracking: Option<menu::Tracking>,
+    pub menu_bars: BTreeMap<u64, u64>,
 }
 
 /// A window's system menu's handle is this plus the window's.
@@ -568,6 +573,9 @@ impl Win32k {
             image_lists: BTreeMap::new(),
             browsed: BTreeMap::new(),
             system_images: None,
+            menus: BTreeMap::new(),
+            tracking: None,
+            menu_bars: BTreeMap::new(),
         };
         w.register_system_classes();
         w
@@ -727,6 +735,13 @@ impl Win32k {
 
     /// One of the desktop's events, as the messages Windows has for it.
     fn route(&mut self, event: Event, time: u32) {
+        // A menu being tracked takes its popups' events.
+        if let Some(t) = &self.tracking
+            && menu::window_of(&event).is_some_and(|w| t.levels.iter().any(|l| l.shown == w))
+        {
+            self.menu_event(event);
+            return;
+        }
         match event {
             Event::Configure { window, rect, states, .. } => {
                 const SIZE_MINIMIZED: u64 = 1;
@@ -1366,6 +1381,7 @@ impl Task {
             w.dialogs.remove(h);
             w.controls.remove(h);
             w.system_menus.remove(h);
+            w.menu_bars.remove(h);
             for q in w.queues.values_mut() {
                 q.posted.retain(|m| m.hwnd != *h);
                 q.timers.retain(|t| t.hwnd != *h);

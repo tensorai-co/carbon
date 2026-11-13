@@ -7,6 +7,7 @@ use kernels_core::thread::Cx;
 use kernels_core::user;
 
 use super::resapi::{load_string_a, load_string_w};
+use super::menuapi::*;
 use super::{Reply, dll};
 use crate::process::Task;
 use crate::win32k::{self, Class, DESKTOP, Filter, Msg, WM_GETTEXT, WM_GETTEXTLENGTH, WM_SETTEXT, dialog, gdi, keys};
@@ -196,19 +197,52 @@ dll! {
     host GetSystemMenu(2) => get_system_menu;
     host DestroyIcon(1) => destroy_icon;
     host EnableMenuItem(3) => enable_menu_item;
+    host CreateMenu(0) => create_menu;
+    host CreatePopupMenu(0) => create_menu;
+    host DestroyMenu(1) => destroy_menu;
+    host AppendMenuW(4) => append_menu_w;
+    host AppendMenuA(4) => append_menu_a;
+    host InsertMenuW(5) => insert_menu_w;
+    host InsertMenuA(5) => insert_menu_a;
+    host ModifyMenuW(5) => modify_menu_w;
+    host ModifyMenuA(5) => modify_menu_a;
+    host RemoveMenu(3) => remove_menu;
+    host DeleteMenu(3) => delete_menu;
+    host CheckMenuItem(3) => check_menu_item;
+    host CheckMenuRadioItem(5) => check_menu_radio_item;
+    host GetMenuItemCount(1) => get_menu_item_count;
+    host GetMenuItemID(2) => get_menu_item_id;
+    host GetSubMenu(2) => get_sub_menu;
+    host GetMenuState(3) => get_menu_state;
+    host GetMenuStringW(5) => get_menu_string_w;
+    host GetMenuStringA(5) => get_menu_string_a;
+    host SetMenuDefaultItem(3) => set_menu_default_item;
+    host GetMenuDefaultItem(3) => get_menu_default_item;
+    host InsertMenuItemW(4) => insert_menu_item_w;
+    host InsertMenuItemA(4) => insert_menu_item_a;
+    host SetMenuItemInfoW(4) => set_menu_item_info_w;
+    host SetMenuItemInfoA(4) => set_menu_item_info_a;
+    host GetMenuItemInfoW(4) => get_menu_item_info_w;
+    host GetMenuItemInfoA(4) => get_menu_item_info_a;
+    host LoadMenuW(2) => load_menu_w;
+    host LoadMenuA(2) => load_menu_a;
+    host LoadMenuIndirectW(1) => load_menu_indirect;
+    host LoadMenuIndirectA(1) => load_menu_indirect;
+    host SetMenu(2) => set_menu;
+    host GetMenu(1) => get_menu;
+    host DrawMenuBar(1) => draw_menu_bar;
+    host TrackPopupMenu(7) => track_popup_menu;
+    host TrackPopupMenuEx(6) => track_popup_menu_ex;
     // Not written yet: what installers import.
-    missing AppendMenuW;
     guest CharNextA => AtlasCharNextA;
     guest CharNextW => AtlasCharNextW;
     guest CharPrevW => AtlasCharPrevW;
     guest CharPrevA => AtlasCharPrevA;
-    missing CreatePopupMenu;
     missing ExitWindowsEx;
     missing GetMessagePos;
     missing MessageBoxIndirectW;
     missing SendMessageTimeoutW;
     missing SystemParametersInfoW;
-    missing TrackPopupMenu;
     guest wsprintfA => AtlasWsprintfA;
     guest wsprintfW => AtlasWsprintfW;
     guest wvsprintfA => AtlasWvsprintfA;
@@ -850,11 +884,14 @@ fn get_system_menu(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
     Reply::Value(win32k::SYSTEM_MENUS + top)
 }
 
-/// `EnableMenuItem(menu, item, flags)`: a system menu's command enabled, greyed or disabled (by command, or by
-/// position with MF_BYPOSITION); the state it had, or -1 if there's no such item. Other menus aren't there yet.
+/// `EnableMenuItem(menu, item, flags)`: an item enabled, greyed or disabled (by command, or by position with
+/// MF_BYPOSITION), in a menu of the program's or a system menu; the state it had, or -1 if there's no such item.
 fn enable_menu_item(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
     const MF_BYPOSITION: u32 = 0x400;
     const NONE: u64 = 0xffff_ffff;
+    if let Some(old) = super::menuapi::enable_item(task, a) {
+        return Reply::Value(old);
+    }
     let flags = a[2] as u32;
     let mut w = task.win32k();
     let Some(menu) = a[0].checked_sub(win32k::SYSTEM_MENUS).and_then(|top| w.system_menus.get_mut(&top)) else { return Reply::Value(NONE) };

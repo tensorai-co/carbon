@@ -9,6 +9,7 @@ pub mod gdi32;
 pub mod ioapi;
 pub mod kernel32;
 pub mod memapi;
+pub mod menuapi;
 pub mod nlsapi;
 pub mod ole32;
 pub mod pipeapi;

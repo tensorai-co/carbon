@@ -55,6 +55,9 @@ for arch in aarch64 x86_64; do
     "$llvm/llvm-rc" -no-preprocess -fo "$out/images-$arch.res" images.rc
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:windows images.c "$out/kernel32-$arch.lib" "$out/user32-$arch.lib" "$out/gdi32-$arch.lib" \
         "$out/comctl32-$arch.lib" -Wl,"$out/images-$arch.res" -o "$out/loader-$arch/images.exe"
+    "$llvm/llvm-rc" -no-preprocess -fo "$out/menus-$arch.res" menus.rc
+    $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:windows menus.c "$out/kernel32-$arch.lib" "$out/user32-$arch.lib" \
+        -Wl,"$out/menus-$arch.res" -o "$out/loader-$arch/menus.exe"
     "$llvm/llvm-rc" -no-preprocess -fo "$out/dialog-$arch.res" dialog.rc
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:windows dialog.c "$out/kernel32-$arch.lib" "$out/user32-$arch.lib" "$out/gdi32-$arch.lib" \
         -Wl,"$out/dialog-$arch.res" -o "$out/loader-$arch/dialog.exe"
@@ -141,5 +144,7 @@ i686 threads.c "$o/threads.exe" "$o/mylib.lib" || echo "i686: threads.c doesn't 
 i686 resources.c "$out/loader-i686/resources.exe" -Wl,"$out/resources-i686.res"
 "$llvm/llvm-rc" -no-preprocess -fo "$out/dialog-i686.res" dialog.rc
 i686 dialog.c "$out/loader-i686/dialog.exe" -Wl,"$out/dialog-i686.res"
+"$llvm/llvm-rc" -no-preprocess -fo "$out/menus-i686.res" menus.rc
+i686 menus.c "$out/loader-i686/menus.exe" -Wl,"$out/menus-i686.res"
 "$llvm/llvm-rc" -no-preprocess -fo "$out/images-i686.res" images.rc
 i686 images.c "$out/loader-i686/images.exe" -Wl,"$out/images-i686.res"
