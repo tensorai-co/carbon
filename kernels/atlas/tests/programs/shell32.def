@@ -5,3 +5,13 @@ DragQueryFileW
 DragQueryPoint
 DragFinish
 SHGetFileInfoW
+SHGetFolderPathW
+SHGetSpecialFolderPathW
+SHGetSpecialFolderLocation
+SHGetPathFromIDListW
+ILFree
+ILCreateFromPathW
+SHFileOperationW
+ShellExecuteW
+ShellExecuteExW
+SHBrowseForFolderW

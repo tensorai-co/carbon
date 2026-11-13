@@ -239,6 +239,8 @@ pub struct Dialog {
     pub focus: u64,
     /// What `EndDialog` gave, once it's been called.
     pub ended: Option<u64>,
+    /// `SHBrowseForFolder`'s, for the dialog it shows: shell32's own, with no dialog procedure.
+    pub browse: Option<crate::os::shellapi::Browse>,
 }
 
 /// `DWLP_MSGRESULT`, `DWLP_DLGPROC` and `DWLP_USER`: a pointer each, from the start of a dialog's extra bytes.
@@ -442,6 +444,13 @@ impl Task {
     /// message loop until `EndDialog`. What `EndDialog` gave, or -1 if it couldn't be made.
     #[allow(clippy::too_many_arguments)]
     pub fn dialog_box(&mut self, cx: &mut Cx<'_>, t: &Template, at: u64, instance: u64, owner: u64, proc: u64, param: u64) -> Result<u64, Reply> {
+        self.dialog_box_with(cx, t, at, instance, owner, proc, param, |_, _, _| Ok(()))
+    }
+
+    /// `dialog_box`, with `setup` run once the dialog's made, before its loop: what a dialog of the system's own does
+    /// before it's used.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dialog_box_with(&mut self, cx: &mut Cx<'_>, t: &Template, at: u64, instance: u64, owner: u64, proc: u64, param: u64, setup: impl FnOnce(&mut Task, &mut Cx<'_>, u64) -> Result<(), Reply>) -> Result<u64, Reply> {
         // The owner is the top-level window it's in.
         let owner = {
             let w = self.win32k();
@@ -458,6 +467,7 @@ impl Task {
             }
             return Ok(u64::MAX);
         }
+        setup(self, cx, hwnd)?;
         let all = super::Filter { hwnd: 0, min: 0, max: 0 };
         let result = loop {
             if let Some(result) = self.win32k().dialogs.get(&hwnd).map(|d| d.ended) {
@@ -496,7 +506,8 @@ impl Task {
         Ok(result)
     }
 
-    /// `EndDialog`: the dialog hidden, and its result kept for its loop. FALSE for a window that isn't a dialog.
+    /// `EndDialog`: the dialog hidden, its result kept for its loop, and the loop woken. FALSE for a window that
+    /// isn't there.
     pub fn end_dialog(&mut self, cx: &mut Cx<'_>, hwnd: u64, result: u64) -> Result<bool, Reply> {
         {
             let mut w = self.win32k();
@@ -506,6 +517,10 @@ impl Task {
             w.dialogs.entry(hwnd).or_default().ended = Some(result);
         }
         self.show_window(cx, hwnd, 0)?;
+        // WM_NULL wakes its loop, which may be waiting with nothing posted: EndDialog called while a message sent
+        // from another thread was being dealt with, inside that wait.
+        let tid = self.tid;
+        self.post_message(hwnd, tid, 0, 0, 0);
         Ok(true)
     }
 
@@ -714,6 +729,11 @@ impl Task {
             if !self.window_exists(hwnd) {
                 return Ok(0);
             }
+        }
+        if self.win32k().dialogs.get(&hwnd).is_some_and(|d| d.browse.is_some())
+            && let Some(r) = self.browse_message(cx, hwnd, message, wparam, lparam)?
+        {
+            return Ok(r);
         }
         match message {
             WM_ERASEBKGND => {

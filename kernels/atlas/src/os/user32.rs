@@ -189,6 +189,7 @@ dll! {
     host SetClassLongPtrW(3) => set_class_long;
     host SetClassLongPtrA(3) => set_class_long;
     host GetSystemMenu(2) => get_system_menu;
+    host DestroyIcon(1) => destroy_icon;
     host EnableMenuItem(3) => enable_menu_item;
     // Not written yet: what installers import.
     missing AppendMenuW;
@@ -752,6 +753,12 @@ fn get_class_info_ex_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 
 fn get_class_info_ex_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     class_info(task, cx, a, true, true)
+}
+
+/// `DestroyIcon`: icons aren't objects yet (`LoadIcon`'s and `SHGetFileInfo`'s are placeholders), so there's nothing
+/// to free.
+fn destroy_icon(_: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(u64::from(a[0] != 0))
 }
 
 // ---- System menus ----

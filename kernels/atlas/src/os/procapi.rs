@@ -32,7 +32,7 @@ const HANDLE_FLAG_INHERIT: u32 = 1;
 
 /// STARTUPINFO, by ISA: its size, where its flags are, and where its three standard handles start (each pointer-sized).
 /// A 32-bit one is 68 bytes, a 64-bit one 104.
-fn startup(isa: Isa) -> (u64, u64, u64) {
+pub(crate) fn startup(isa: Isa) -> (u64, u64, u64) {
     if isa == Isa::X86_32 { (68, 44, 56) } else { (104, 60, 80) }
 }
 

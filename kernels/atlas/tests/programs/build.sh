@@ -50,6 +50,8 @@ for arch in aarch64 x86_64; do
         -Wl,"$out/resources-$arch.res" -o "$out/loader-$arch/resources.exe"
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:windows comctl.c "$out/kernel32-$arch.lib" "$out/user32-$arch.lib" "$out/gdi32-$arch.lib" \
         "$out/comctl32-$arch.lib" -o "$out/loader-$arch/comctl.exe"
+    $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:windows shell.c "$out/kernel32-$arch.lib" "$out/user32-$arch.lib" "$out/shell32-$arch.lib" \
+        "$out/ole32-$arch.lib" -o "$out/loader-$arch/shell.exe"
     "$llvm/llvm-rc" -no-preprocess -fo "$out/dialog-$arch.res" dialog.rc
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:windows dialog.c "$out/kernel32-$arch.lib" "$out/user32-$arch.lib" "$out/gdi32-$arch.lib" \
         -Wl,"$out/dialog-$arch.res" -o "$out/loader-$arch/dialog.exe"
@@ -118,7 +120,7 @@ i686dll() {
     rm -rf "$tmp"
 }
 mkdir -p "$out/loader-i686"
-for prog in comctl installer wow64 files io pipes process sections registry links environment security pool windows desktop ansiwin exceptions fibers crt ansi hello; do
+for prog in shell comctl installer wow64 files io pipes process sections registry links environment security pool windows desktop ansiwin exceptions fibers crt ansi hello; do
     i686 $prog.c "$out/loader-i686/$prog.exe" || echo "i686: $prog.c doesn't build"
 done
 # The loader's DLLs, as the 64-bit ones are made.

@@ -453,6 +453,10 @@ pub struct Win32k {
     pub system_menus: BTreeMap<u64, BTreeMap<u64, u32>>,
     /// comctl32's image lists, by handle.
     pub image_lists: BTreeMap<u64, comctl::ImageList>,
+    /// The folder each thread's `SHBrowseForFolder` dialog took, until it returns it.
+    pub browsed: BTreeMap<u64, String>,
+    /// The system image lists `SHGetFileInfo` gives: large and small.
+    pub system_images: Option<(u64, u64)>,
 }
 
 /// A window's system menu's handle is this plus the window's.
@@ -554,6 +558,8 @@ impl Win32k {
             controls: BTreeMap::new(),
             system_menus: BTreeMap::new(),
             image_lists: BTreeMap::new(),
+            browsed: BTreeMap::new(),
+            system_images: None,
         };
         w.register_system_classes();
         w

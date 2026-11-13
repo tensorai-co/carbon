@@ -5,10 +5,9 @@ declaration made into a PE in memory, so a machine has no Windows files to insta
 has to run inside the program, ntdll, is a crate (`guest/`) that cargo builds for each ISA and embeds.
 
 **Where it stands.** Programs run on ARM64 natively and x86-64 translated, and 32-bit x86 programs run too (WoW64,
-translated on Apple silicon; phases 1 to 5 of its six, below, are done): 25 of the test programs pass every check as
+translated on Apple silicon; phases 1 to 5 of its six, below, are done): 26 of the test programs pass every check as
 32-bit programs, with x86's own SEH, PE32 images and 32-bit layouts throughout, and a real 32-bit installer starts,
-unpacks its data, runs its start-up script, shows its dialogs and installs its files with its progress shown, as far as
-making its shortcuts. They have the loader and SEH, threads and
+unpacks its data, runs its start-up script, shows its dialogs, installs its files with its progress shown, and finishes. They have the loader and SEH, threads and
 waits, processes, anonymous and named pipes, sections, asynchronous I/O and completion ports, files, the registry,
 security (tokens, descriptors, access checks, impersonation), resources and version information, the system's
 version and information, and windows on the desktop with input. The loader is Windows' own in all but manifests: the
@@ -19,7 +18,7 @@ are shared as their opens say, with hard and symbolic links and times that can b
 program: work, timers and waits, on pools of their own or the process's. The registry tells watchers of changes, has
 WOW64's 32-bit view, and saves, restores, loads and unloads hives. Code pages convert as Windows' do, every `*A`
 function speaks Windows-1252, and ANSI windows get their messages' text in it. ucrtbase.dll is atlas's own C runtime, in the
-program, so MinGW-built C programs run. Nine DLLs declare 989 exports between them, 967 written and 22 stubs that say so, and ntdll has 300.
+program, so MinGW-built C programs run. Nine DLLs declare 1,003 exports between them, 986 written and 17 stubs that say so, and ntdll has 300.
 
 ## Layout
 
@@ -74,12 +73,13 @@ for all three Windows targets: with rustup, that needs `rustup component add rus
 prints every host export with its result, and each thread that gives its CPU up, waits for one, or takes one again.
 `cargo test -p atlas` runs the unit tests.
 
-On this Mac, through hvf, every test program passes, on ARM64 and x86-64, and the 25 built for i686 too. Each one's
+On this Mac, through hvf, every test program passes, on ARM64 and x86-64, and the 26 built for i686 too. Each one's
 opening comment says what it checks. `crt.exe` (and `crt-mingw.exe`) want the arguments `one "two words"`.
 
 | Program | What it covers |
 | --- | --- |
 | atlas, ARM64 native and x86-64 translated | The basics: the console, the command line, memory, an upcall, a message box, and ntdll's own exports |
+| atlas's `shell.c`, both ISAs and i686 | The shell: special folders' paths (Program Files as the program's ISA sees it), their item ID lists and the paths back, a virtual folder's, `ILCreateFromPath`; `SHFileOperation` copying a tree, a wildcard into a folder it makes, renaming, moving and deleting; `ShellExecuteEx` running a program and waiting for its exit code, `ShellExecute`, and what it can't open; `SHGetFileInfo`'s names, attributes, image list and program type; `SHBrowseForFolder` with its callback, accepted, cancelled, and refusing a path that isn't a folder |
 | atlas's `comctl.c`, both ISAs and i686 | comctl32's controls in a dialog: a progress bar's range, position, delta, step, clamping and bar colour, and what it paints; a report list view's columns, items inserted where asked, their text in each column and their `lParam`, `LVM_GETITEM`, selection and the `LVN_ITEMCHANGED` its parent hears, single selection, the down arrow, a column sized to its text, `LVM_ENSUREVISIBLE`, deleting, its image lists and its procedure through `CallWindowProc`; image lists made, added to, counted, sized, removed from and destroyed |
 | atlas's `dialog.c`, both ISAs and i686, with `dialog.rc` | Dialogs: the dialog class as `GetClassInfoEx` gives it and a class of the program's own from it; templates in memory and a `DIALOGEX` resource, their controls, IDs and text; `WM_INITDIALOG` and the focus; `DWLP_DLGPROC`; `Get`/`SetDlgItemText` and `Int`; check boxes and an automatic radio group; `WM_COMMAND` and `EN_CHANGE`; `DM_GETDEFID`; Tab, Enter, Escape and typing through `IsDialogMessage`; `EnableWindow`; a control's procedure through `CallWindowProc`; what the controls paint, read with `GetPixel`, in a `WM_CTLCOLORSTATIC` brush; modal dialogs, their owner disabled, ended by Enter and by `WM_CLOSE` |
 | atlas's `windows.c`, both ISAs | Window classes, creation and its messages, painting and GDI, timers, and messages between threads |
@@ -642,6 +642,22 @@ lower-case edits, a limit, and the `EM_*` messages programs use most. Their pare
 `EN_CHANGE`, `EN_UPDATE`, `EN_SETFOCUS`, `EN_KILLFOCUS` and `EN_MAXTEXT`. Images (a static's icon or bitmap, a
 button's) are kept and not drawn yet, and an owner-drawn button is only its face.
 
+**The shell** (`os/shellapi.rs`, for shell32). Special folders (`SHGetFolderPath`, `SHGetSpecialFolderPath`,
+`SHGetSpecialFolderLocation`, `SHGetFolderLocation`) are the profile's, by CSIDL: `C:\Users\carbon` with its
+AppData and start menu, `C:\ProgramData` for everyone's, `C:\Users\Public`, and Windows' own, Program Files and
+System being the 32-bit ones for a 32-bit program; one asked for is made on the disk if it isn't there, as a profile
+has them all (a fresh disk has the common ones, and the registry's Shell Folders say the same). An item ID list is one
+item holding a full path (the desktop's is empty, and a virtual folder's has no path), allocated from the program's
+heap through ntdll's task allocator so `CoTaskMemFree` and `ILFree` free it. `SHFileOperation` copies, moves, renames
+and deletes files and whole folders, with wildcards, into a folder (made if it isn't there) or onto names, as its
+flags say. `ShellExecute(Ex)` runs a program through `CreateProcess` (`runas` too, as there's one user), giving the
+process with `SEE_MASK_NOCLOSEPROCESS`; documents, folders and URLs need associations and Explorer, so it says there's
+no association, as Windows does for what nothing opens. `SHBrowseForFolder` is a dialog of shell32's own on the
+dialog manager: the caller's text, the folder's path to type or have set (`BFFM_SETSELECTION`, which its callback
+hears as `BFFM_SELCHANGED`), a status line, and OK, which takes only a folder that's there; there's no tree of folders
+yet. `SHGetFileInfo` gives a file's display and type names, attributes, the system image lists and a program's type,
+the icons being placeholders.
+
 comctl32's progress bar and list view are win32k's too (`win32k/comctl.rs`), their classes there from the start as if
 comctl32 had registered them as it loaded, and their procedures exported from comctl32 (`AtlasProgressWndProc`,
 `AtlasListViewWndProc`). A progress bar has its range (16- and 32-bit), position, delta, step (wrapping past the top
@@ -787,9 +803,11 @@ BITS, audio **[audio]**, WMI's common classes); and **the event log**.
   controls' messages with text (`EM_REPLACESEL` from an ANSI caller, `LB_*`, `CB_*`); menu, icon, cursor and
   accelerator resources;
   `SystemParametersInfo` and the system colours.
-- **The shell's core** (shell32, shlwapi, shcore): known folders; `ShellExecute(Ex)` by association and `runas`;
-  `SHFileOperation` and `IFileOperation`; shell links; `SHBrowseForFolder`; icons and the system image list;
-  `CommandLineToArgvW`; shlwapi's path, string and registry helpers; shcore's DPI and stream helpers.
+- **The shell's core** (shell32, shlwapi, shcore): known folders by GUID (`SHGetKnownFolderPath`); `ShellExecute(Ex)`
+  by association (documents, folders, URLs), with Explorer; `IFileOperation`, and `SHFileOperation`'s progress,
+  confirmations and recycle bin; shell links (COM's `IShellLink`, so installers' shortcuts are made); a tree of
+  folders in `SHBrowseForFolder`; icons and the system image list drawn; `CommandLineToArgvW`; shlwapi's path, string
+  and registry helpers; shcore's DPI and stream helpers.
 
 ### 6. The runtimes
 
@@ -869,7 +887,7 @@ First `cmd.exe` (variables, `if`, `for`, `goto`, `call`, pipes, redirection, `.b
      `carbon run` knows a 32-bit `.exe` (platform `windows/386`), and gives it x86's memory ordering.
   6. [ ] **Every test program for i686**, passing; then real installers. Every test program but `sysinfo.c` (whose
      checks are 64-bit offsets; `wow64.c` checks the same calls at 32 bits) builds for i686 and passes every check:
-     25 programs, 841 checks, with the loader's own DLLs, thread-local variables (`__tls_array`), `__try` through
+     26 programs, 870 checks, with the loader's own DLLs, thread-local variables (`__tls_array`), `__try` through
      `_except_handler3` (now in the i686 ntdll, with `_local_unwind2`), and the C runtime. `build.sh` makes each
      program's import libraries from what its object imports, `__imp_` or not. `installer.c` checks what installers
      call first, on all three ISAs: `wsprintf` is C-variadic, so each ISA's is a few lines of the guest's assembly
@@ -878,18 +896,16 @@ First `cmd.exe` (variables, `if`, `for`, `goto`, `call`, pipes, redirection, `.b
      `.onInit`'s checks), and shows its main dialog with its first page (a child dialog of its own class, made from
      what `GetClassInfo` gave for `#32770`): text, a group box, an edit with the install folder, the disk space, and
      its buttons, which work. Its Install button takes it to its progress page (a progress bar and a details list,
-     comctl32's), where it extracts its files with each one shown, the bar filling as it goes; then it stops at
-     `SHGetSpecialFolderLocation`, as it makes its shortcuts. Still to do there, in order:
-     - **The shell:** `SHGetSpecialFolderLocation` and `SHGetPathFromIDList` (the shortcuts' folders),
-       `SHBrowseForFolder` (the Browse button), `SHFileOperation`, `ShellExecute` (running what it installed), and
-       `SHGetFileInfo`'s flags (it's only right with none).
+     comctl32's), where it extracts its files with each one shown, the bar filling as it goes, finds the start menu
+     and desktop folders for its shortcuts (which it skips, as COM has no shell link class yet), and finishes on its
+     own, its dialog ended and its temporary files removed. Still to do there, in order:
+     - **Shell links**, so its shortcuts are made: COM's `IShellLink` and `IPersistFile`.
      - **Icons and bitmaps from resources:** `LoadImage` and `LoadBitmap` give a placeholder handle so far, so the
        header's picture is blank.
      - **Menus:** `CreatePopupMenu`, `AppendMenu`, `TrackPopupMenu` (the details list's context menu).
      - **Image lists drawn**, with the bitmaps they're made from.
      - **The rest:** `MessageBoxIndirect`, `SendMessageTimeout`, `SystemParametersInfo`, `GetMessagePos`,
-       `ExitWindowsEx`. COM has no classes yet, so a shortcut an installer makes is skipped, as it is on Windows when
-       the class isn't there.
+       `ExitWindowsEx`, which its other paths reach (an error, a reboot, its uninstaller).
 - **ANSI and code pages:** each `*A` function still to come is the `*W` with 1252 strings, as those there are.
 - **Manifests:** side-by-side assemblies and activation contexts decide which comctl32 a program gets.
 - **API sets:** `ext-ms-*` sets, and the `api-ms-win-*` the map doesn't know yet, as programs ask.

@@ -60,7 +60,7 @@ const NOT_REDIRECTED: [&str; 6] = ["/catroot", "/catroot2", "/driverstore", "/dr
 fn under<'a>(lower: &'a str, folder: &str) -> Option<&'a str> {
     lower.strip_prefix(folder).filter(|rest| rest.is_empty() || rest.starts_with('/'))
 }
-const DIRECTORIES: [&str; 11] = [
+const DIRECTORIES: [&str; 17] = [
     "/Windows",
     "/Windows/System32",
     "/Windows/System32/config",
@@ -72,6 +72,13 @@ const DIRECTORIES: [&str; 11] = [
     "/Users/carbon/AppData/Roaming",
     "/Users/carbon/AppData/Local",
     "/Users/carbon/Documents",
+    // The shell's special folders a profile has (`os/shellapi.rs`).
+    "/Users/carbon/Desktop",
+    "/Users/carbon/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup",
+    "/ProgramData/Microsoft/Windows/Start Menu/Programs/Startup",
+    "/Users/Public/Desktop",
+    "/Users/Public/Documents",
+    "/Windows/Fonts",
 ];
 
 /// Puts the system layer's folders on a fresh disk.

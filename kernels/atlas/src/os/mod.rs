@@ -15,6 +15,7 @@ pub mod procapi;
 pub mod resapi;
 pub mod secapi;
 pub mod shell32;
+pub mod shellapi;
 pub mod synch;
 pub mod sysapi;
 pub mod ucrtbase;

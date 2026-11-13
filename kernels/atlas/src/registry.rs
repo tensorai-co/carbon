@@ -647,6 +647,17 @@ impl Registry {
             ("Local AppData", sz("C:\\Users\\carbon\\AppData\\Local")),
             ("Personal", sz("C:\\Users\\carbon\\Documents")),
             ("Desktop", sz("C:\\Users\\carbon\\Desktop")),
+            ("Programs", sz("C:\\Users\\carbon\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs")),
+            ("Start Menu", sz("C:\\Users\\carbon\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu")),
+            ("Startup", sz("C:\\Users\\carbon\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup")),
+        ]));
+        self.put(m, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders", &v(vec![
+            ("Common AppData", sz("C:\\ProgramData")),
+            ("Common Desktop", sz("C:\\Users\\Public\\Desktop")),
+            ("Common Documents", sz("C:\\Users\\Public\\Documents")),
+            ("Common Programs", sz("C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs")),
+            ("Common Start Menu", sz("C:\\ProgramData\\Microsoft\\Windows\\Start Menu")),
+            ("Common Startup", sz("C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Startup")),
         ]));
         self.put(u, &format!("{user}\\Environment"), &v(vec![("TEMP", expand_sz("%SystemRoot%\\TEMP")), ("TMP", expand_sz("%SystemRoot%\\TEMP"))]));
         self.put(u, &format!("{user}\\Control Panel\\International"), &v(vec![("LocaleName", sz("en-US")), ("sDecimal", sz(".")), ("sThousand", sz(","))]));
