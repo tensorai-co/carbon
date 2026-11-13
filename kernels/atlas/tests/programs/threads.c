@@ -6,6 +6,9 @@
 // condition variable; WaitOnAddress; InitOnceExecuteOnce from four threads; CREATE_SUSPENDED and ResumeThread;
 // QueueUserAPC and an alertable SleepEx; named events; TerminateThread; ExitThread; DuplicateHandle of a pseudo-handle
 
+typedef __INTPTR_TYPE__ LONG_PTR;
+typedef __UINTPTR_TYPE__ ULONG_PTR;
+typedef __SIZE_TYPE__ SIZE_T;
 typedef void *HANDLE;
 typedef unsigned int DWORD;
 typedef unsigned long long u64;
@@ -17,7 +20,7 @@ typedef DWORD (__stdcall *THREAD_START)(void *);
 K HANDLE __stdcall GetStdHandle(DWORD);
 K BOOL __stdcall WriteFile(HANDLE, const void *, DWORD, DWORD *, void *);
 K void __stdcall ExitProcess(unsigned);
-K HANDLE __stdcall CreateThread(void *, u64, THREAD_START, void *, DWORD, DWORD *);
+K HANDLE __stdcall CreateThread(void *, SIZE_T, THREAD_START, void *, DWORD, DWORD *);
 K void __stdcall ExitThread(DWORD);
 K BOOL __stdcall GetExitCodeThread(HANDLE, DWORD *);
 K DWORD __stdcall GetThreadId(HANDLE);
@@ -38,7 +41,7 @@ K DWORD __stdcall WaitForSingleObject(HANDLE, DWORD);
 K DWORD __stdcall WaitForMultipleObjects(DWORD, const HANDLE *, BOOL, DWORD);
 K void __stdcall Sleep(DWORD);
 K DWORD __stdcall SleepEx(DWORD, BOOL);
-K DWORD __stdcall QueueUserAPC(void (__stdcall *)(u64), HANDLE, u64);
+K DWORD __stdcall QueueUserAPC(void (__stdcall *)(ULONG_PTR), HANDLE, ULONG_PTR);
 K BOOL __stdcall DuplicateHandle(HANDLE, HANDLE, HANDLE, HANDLE *, DWORD, BOOL, DWORD);
 K BOOL __stdcall CloseHandle(HANDLE);
 K DWORD __stdcall GetLastError(void);
@@ -55,7 +58,7 @@ K void __stdcall InitializeConditionVariable(void **);
 K BOOL __stdcall SleepConditionVariableSRW(void **, void **, DWORD, DWORD);
 K void __stdcall WakeConditionVariable(void **);
 K void __stdcall WakeAllConditionVariable(void **);
-K BOOL __stdcall WaitOnAddress(volatile void *, void *, u64, DWORD);
+K BOOL __stdcall WaitOnAddress(volatile void *, void *, SIZE_T, DWORD);
 K void __stdcall WakeByAddressSingle(void *);
 K BOOL __stdcall InitOnceExecuteOnce(void **, BOOL (__stdcall *)(void **, void *, void **), void *, void **);
 K int thread_attached;
@@ -70,7 +73,7 @@ K int thread_attached;
 unsigned _tls_index;
 __attribute__((section(".tls"), used)) char _tls_start = 0;
 __attribute__((section(".tls$ZZZ"), used)) char _tls_end = 0;
-struct { u64 start, end, index, callbacks; DWORD zero_fill, flags; } const _tls_used = {(u64)&_tls_start, (u64)&_tls_end, (u64)&_tls_index, 0, 0, 0};
+struct { ULONG_PTR start, end, index, callbacks; DWORD zero_fill, flags; } const _tls_used = {(ULONG_PTR)&_tls_start, (ULONG_PTR)&_tls_end, (ULONG_PTR)&_tls_index, 0, 0, 0};
 __declspec(thread) int per_thread = 41;
 
 static HANDLE out;
@@ -158,8 +161,8 @@ static DWORD __stdcall once_user(void *arg) { (void)arg; InitOnceExecuteOnce(&on
 static volatile int started;
 static DWORD __stdcall marker(void *arg) { (void)arg; started = 1; return 0; }
 
-static volatile u64 apc_value;
-static void __stdcall apc(u64 value) { apc_value = value; }
+static volatile ULONG_PTR apc_value;
+static void __stdcall apc(ULONG_PTR value) { apc_value = value; }
 
 static DWORD __stdcall spinner(void *arg) { (void)arg; for (;;) { __asm__ volatile("" ::: "memory"); } }
 static DWORD __stdcall exiter(void *arg) { (void)arg; ExitThread(33); return 0; }

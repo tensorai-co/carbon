@@ -1,4 +1,4 @@
-// The environment block on atlas, for ARM64 and x86-64: no C runtime. tests/programs/build.sh builds it.
+// The environment block on atlas, for ARM64, x86-64 and x86: no C runtime. tests/programs/build.sh builds it.
 //
 // It checks: SystemRoot, PROCESSOR_ARCHITECTURE, Path from the registry expanded, USERNAME through the A version,
 // NUMBER_OF_PROCESSORS, TEMP; ERROR_ENVVAR_NOT_FOUND; set and get in another case; sizes when the buffer's short,
@@ -57,6 +57,9 @@ void mainCRTStartup(void) {
 #if defined(__aarch64__)
     say("the environment on atlas, arm64\n");
     const char *arch = "ARM64";
+#elif defined(__i386__)
+    say("the environment on atlas, x86 (WoW64)\n");
+    const char *arch = "x86";
 #else
     say("the environment on atlas, x86-64\n");
     const char *arch = "AMD64";

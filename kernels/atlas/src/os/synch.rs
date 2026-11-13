@@ -430,7 +430,7 @@ pub fn duplicate_handle(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
         lock(&from.state).handles.close(source);
     }
     if out != 0 {
-        let _ = task.mem(cx, true, |t| user::write_u64(&mut t.space(), out, new));
+        let _ = task.write_ptr(cx, out, new);
     }
     Reply::Value(TRUE)
 }

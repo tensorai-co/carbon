@@ -80,7 +80,9 @@ impl SharedData {
 pub fn shared_data(k: &Kernel, cx: &mut Cx<'_>) -> SharedData {
     let cpus = k.host.cpus() as u32;
     let cookie = (k.host.wall() as u32).wrapping_mul(0x9e37_79b9) ^ 0x5bd1_e995;
-    let frames = [Isa::Arm64, Isa::X86_64]
+    // A 32-bit (WoW64) process sees the machine it runs on as x64 Windows' WoW64 has it: native AMD64.
+    let native = |isa: Isa| if isa == Isa::X86_32 { Isa::X86_64 } else { isa };
+    let frames = [Isa::Arm64, Isa::X86_64, Isa::X86_32]
         .into_iter()
         .filter_map(|isa| {
             cx.turn(|t| {
@@ -89,15 +91,15 @@ pub fn shared_data(k: &Kernel, cx: &mut Cx<'_>) -> SharedData {
                 let mut page = vec![0u8; 0x1000];
                 let mut put = |at: usize, bytes: &[u8]| page[at..at + bytes.len()].copy_from_slice(bytes);
                 put(0x004, &0x0fa0_0000u32.to_le_bytes()); // TickCountMultiplier: 15.625 ms in 24 bits of fraction
-                put(0x02c, &machine(isa).to_le_bytes());
-                put(0x02e, &machine(isa).to_le_bytes());
+                put(0x02c, &machine(native(isa)).to_le_bytes());
+                put(0x02e, &machine(native(isa)).to_le_bytes());
                 let root: Vec<u8> = "C:\\Windows".encode_utf16().flat_map(u16::to_le_bytes).collect();
                 put(0x030, &root);
                 put(0x244, &0x20_0000u32.to_le_bytes()); // LargePageMinimum
                 put(0x260, &BUILD.to_le_bytes());
                 put(0x264, &1u32.to_le_bytes()); // NtProductType: a workstation
                 put(0x268, &[1]);
-                put(0x26a, &architecture(isa).to_le_bytes());
+                put(0x26a, &architecture(native(isa)).to_le_bytes());
                 put(0x26c, &MAJOR.to_le_bytes());
                 put(0x270, &MINOR.to_le_bytes());
                 put(0x274, &features(isa));

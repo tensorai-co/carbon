@@ -39,6 +39,8 @@ pub(crate) const PAGE_GUARD: u32 = 0x100;
 
 pub(crate) struct Process {
     pub pid: u64,
+    /// Its program's ISA, which says how its structures are laid out.
+    pub isa: Isa,
     pub state: Mutex<ProcState>,
     /// Set once its space is gone, under this lock, which other processes' threads hold while they write into it.
     pub remote: Mutex<bool>,
@@ -338,8 +340,25 @@ impl Task {
                 };
                 match export.kind {
                     Kind::Host { args, run } => {
-                        let a = self.args(cx, args);
+                        let wide = if self.isa == Isa::X86_32 { images::x86_wide(export.name) } else { None };
+                        let a = match wide {
+                            Some((slots, join)) => join(&self.args(cx, slots)),
+                            None => self.args(cx, args),
+                        };
                         let reply = run(self, cx, &a);
+                        // A 64-bit result's high half goes in edx on x86.
+                        if let Reply::Value(v) = reply
+                            && self.isa == Isa::X86_32
+                            && images::x86_returns_wide(export.name)
+                        {
+                            cx.turn(|t| {
+                                let mut regs = t.thread().regs();
+                                if let Regs::X86(r) = &mut regs {
+                                    r.gpr[RDX] = v >> 32;
+                                }
+                                t.thread().set_regs(&regs);
+                            });
+                        }
                         if trace {
                             let shown = match &reply {
                                 Reply::Value(v) => format!("{v:#x}"),
@@ -809,7 +828,7 @@ pub(crate) fn launch(k: &Arc<Kernel>, cx: &mut Cx<'_>, launch: Launch) -> Result
     let cwd = cwd.unwrap_or_else(|| format!("C:\\{}", exe_dir.trim_start_matches('/').replace('/', "\\")));
     let state = ProcState { space, dispatcher, thread_start, peb, threads, mapped, exe_dir, cwd, regions, handles, std_handles, command_line: command, exiting: None, windows10, parent, created: crate::files::filetime(k.host.wall()), image: windows_path.clone(), token };
     let object = Object::new(objects_mod::Kind::Process(pid), State::default());
-    let process = Arc::new(Process { pid, state: Mutex::new(state), remote: Mutex::new(false), object, ended: (Mutex::new(None), Condvar::new()) });
+    let process = Arc::new(Process { pid, isa, state: Mutex::new(state), remote: Mutex::new(false), object, ended: (Mutex::new(None), Condvar::new()) });
     k.started(&process);
     Ok(Task { k: k.clone(), process, tid, waiter, isa, depth: 0, nested: 0, control, ending: None })
 }

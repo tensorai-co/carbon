@@ -147,15 +147,17 @@ pub fn create_file_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     create_file(task, cx, a, false)
 }
 
-/// An OVERLAPPED's offset, for a read or write at a place of its own.
-/// An OVERLAPPED's offset and event (64-bit: `Internal`, `InternalHigh`, `Offset`, `OffsetHigh`, `hEvent`).
+/// An OVERLAPPED's offset and event, for a read or write at a place of its own (`Internal`, `InternalHigh`,
+/// `Offset`, `OffsetHigh`, `hEvent`, the first two and the last pointer-sized).
 fn overlapped(task: &mut Task, cx: &mut Cx<'_>, at: u64) -> Option<(u64, u64)> {
     if at == 0 {
         return None;
     }
+    let abi = task.abi();
     task.mem(cx, false, |t| {
-        let (lo, hi) = (user::read_u32(&t.space(), at + 16)?, user::read_u32(&t.space(), at + 20)?);
-        Ok((u64::from(hi) << 32 | u64::from(lo), user::read_u64(&t.space(), at + 24)?))
+        let offset = at + abi.overlapped_offset();
+        let (lo, hi) = (user::read_u32(&t.space(), offset)?, user::read_u32(&t.space(), offset + 4)?);
+        Ok((u64::from(hi) << 32 | u64::from(lo), user::read_ptr(&t.space(), at + abi.overlapped_event(), abi.width)?))
     })
     .ok()
 }
@@ -275,7 +277,7 @@ pub(crate) fn transfer(task: &mut Task, cx: &mut Cx<'_>, handle: u64, buffer: u6
     };
     let (data, n, error) = match outcome {
         Outcome::Pending => {
-            let pending = [u64::from(ports::STATUS_PENDING).to_le_bytes(), 0u64.to_le_bytes()].concat();
+            let pending = task.abi().overlapped_result(ports::STATUS_PENDING, 0);
             let _ = task.mem(cx, true, |t| user::write(&mut t.space(), ov, &pending));
             // `ReadFileEx` says it's under way by succeeding; `ReadFile`, by ERROR_IO_PENDING.
             return match notify {
@@ -286,6 +288,7 @@ pub(crate) fn transfer(task: &mut Task, cx: &mut Cx<'_>, handle: u64, buffer: u6
         Outcome::Done(data, n, error) => (data, n, error),
     };
     // What was read, the count, and the OVERLAPPED's status and count, whatever happened.
+    let result = task.abi().overlapped_result(ports::status(error), n as u64);
     let wrote = task.mem(cx, true, |t| {
         if !data.is_empty() {
             user::write(&mut t.space(), buffer, &data)?;
@@ -294,8 +297,7 @@ pub(crate) fn transfer(task: &mut Task, cx: &mut Cx<'_>, handle: u64, buffer: u6
             user::write_u32(&mut t.space(), done_out, n as u32)?;
         }
         if ov != 0 {
-            user::write_u64(&mut t.space(), ov, u64::from(ports::status(error)))?;
-            user::write_u64(&mut t.space(), ov + 8, n as u64)?;
+            user::write(&mut t.space(), ov, &result)?;
         }
         Ok(())
     });
@@ -863,7 +865,8 @@ fn get_full_path_name(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -
         let file_part = full.rfind('\\').map(|i| i + 1).filter(|&i| i < full.len());
         let units = |s: &str| if wide { s.encode_utf16().count() as u64 * 2 } else { crate::ansi::bytes(s).len() as u64 };
         let at = file_part.map_or(0, |i| a[2] + units(&full[..i]));
-        let _ = task.mem(cx, true, |t| user::write_u64(&mut t.space(), a[3], at));
+        // lpFilePart: a pointer.
+        let _ = task.write_ptr(cx, a[3], at);
     }
     reply
 }

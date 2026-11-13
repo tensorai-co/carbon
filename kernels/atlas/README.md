@@ -87,6 +87,7 @@ On this Mac, through hvf, every test program passes. Each one's opening comment 
 | atlas's `sections.c`, both ISAs | Sections and file mappings, `VirtualQuery`, and waitable timers |
 | atlas's `io.c`, both ISAs | Completion ports and overlapped I/O: events, packets, `ReadFileEx` routines |
 | atlas's `pipes.c`, both ISAs | Named pipes, byte and message, pending I/O, and a pipe between two processes |
+| atlas's `files.c`, `io.c`, `pipes.c`, `process.c`, `sections.c`, `registry.c`, `links.c`, `environment.c`, `security.c`, `pool.c`, `windows.c`, `desktop.c`, `ansiwin.c`, `resources.c` | Also built for 32-bit x86, where every check passes too |
 | atlas's `wow64.c`, 32-bit x86 | WoW64: the TEB through fs and the PEB; GetSystemInfo's 32-bit layout; memory below 2 GiB; the heap, the last error, TLS and critical sections; GetProcAddress; a thread; an upcall; fibers; RaiseException to a vectored handler; a frame of its own on the fs:[0] chain unwound by RtlUnwind; an access violation from atlas |
 | atlas's `sysinfo.c`, both ISAs, with and without a manifest | `KUSER_SHARED_DATA`, the version as a program is told it, the machine, time and time zones, `NtQuerySystemInformation` |
 | atlas's `security.c`, both ISAs | Tokens and privileges, SIDs, ACLs, descriptors and SDDL, descriptors kept and checked, `AccessCheck`, impersonation |
@@ -771,22 +772,31 @@ First `cmd.exe` (variables, `if`, `for`, `goto`, `call`, pipes, redirection, `.b
      `NtContinue` takes what the CONTEXT's flags say it has. A 32-bit call's arguments are read off its stack; -1 to
      -16 are widened as negative numbers, as WoW64 widens a handle, so pseudo-handles and INVALID_HANDLE_VALUE are
      what 64-bit code expects, and its result is cut to 32 bits. PE32 images were already read and relocated.
-  4. [ ] **System DLLs for i686**, half done: `images/make.rs` makes PE32 images whose host stubs are
-     `mov eax, nr; int 0x2e; ret 4*n`, popping the arguments stdcall's way (the `(n)` in each `host` declaration), and
-     `ret` alone for the cdecl ones (ucrtbase's, `wsprintf`, `DbgPrint`); upcalls push theirs. Still to do: every host
-     export that reads or writes a structure with a pointer, handle or SIZE_T in it (about 40 `read_u64`/`write_u64`s
-     and the structures built with `to_le_bytes`, `OVERLAPPED`, `STARTUPINFO`, `MSG`, `WNDCLASS` and the rest), by
-     the process's `Abi`; the few functions that take a 64-bit value by value, two stack slots on x86
-     (`SetFilePointerEx`'s LARGE_INTEGER); and checking each `(n)` is the true count, since a wrong one pops the
-     wrong amount.
+  4. [x] **System DLLs and host exports for i686**: `images/make.rs` makes PE32 images whose host stubs are
+     `mov eax, nr; int 0x2e; ret 4*n`, popping the arguments stdcall's way (the `(n)` in each `host` declaration, each
+     checked against Windows' signature), and `ret` alone for the cdecl ones (ucrtbase's, `wsprintf`, `DbgPrint`).
+     The four that take a 64-bit value by value (`SetFilePointerEx`, `VerifyVersionInfo`, `VerSetConditionMask`,
+     `WindowFromPoint`) read two slots for it (`images::x86_wide`), and `GetTickCount64` and `VerSetConditionMask`
+     return their high half in edx. Every structure a host export reads or writes with a pointer, handle or SIZE_T
+     in it follows the process's `Abi`: OVERLAPPED (written from another thread too, by the process's ISA) and
+     OVERLAPPED_ENTRY, completion keys, out-handles (keys, pipes, tokens, `DuplicateHandle`), STARTUPINFO and
+     PROCESS_INFORMATION, SECURITY_ATTRIBUTES, absolute security descriptors and the PSID and PACL outs, token
+     information (SID_AND_ATTRIBUTES, TOKEN_GROUPS and the pointer forms), MEMORY_BASIC_INFORMATION, MEMORYSTATUS,
+     the logical processor records, WNDCLASS(EX), MSG, CREATESTRUCT (and its ANSI copy), PAINTSTRUCT, INPUT,
+     FLASHWINFO, `LoadString`'s and `VerQueryValue`'s pointers, `GetFullPathName`'s file part, and
+     `NtQuerySystemInformation`'s basic information and process list. Its handle lists and the kernel's modules
+     answer that the class isn't there for a 32-bit program, for now. A 32-bit process has the shared data page
+     too, saying the machine is AMD64, as x64 Windows' WoW64 does.
   5. [ ] **WoW64 as programs see it**: `SysWOW64` for 32-bit processes, with `System32` redirected to it
      (`Wow64DisableWow64FsRedirection` and `Sysnative`); the registry's 32-bit view by default; `IsWow64Process(2)`,
      `GetNativeSystemInfo`, `PROCESSOR_ARCHITECTURE` and `PROCESSOR_ARCHITEW6432`; 32-bit and 64-bit processes
      starting each other.
   6. [ ] **Every test program for i686**, passing; then an NSIS installer built from source, then Steam's. `build.sh`
-     builds i686 programs with import libraries made from what each object imports (x86's `_Name@N` names); so far
-     `wow64.c`. The others declare SIZE_T as `unsigned long long`, which is two stack slots on x86, and need
-     declaring by size before they're built for it.
+     builds i686 programs with import libraries made from what each object imports (x86's `_Name@N` names). 15 run
+     and pass every check (538): `wow64.c`, files, io, pipes, process, sections, registry, links, environment,
+     security, pool, windows, desktop, ansiwin and resources, their pointer-sized types declared as such. Still to
+     come: threads and loader (`__tls_array` and their own DLLs for i686), fibers and exceptions (`__try` needs
+     `_except_handler3`, the C runtime's), crt, ansi, sysinfo and hello.
 - **ANSI and code pages:** each `*A` function still to come is the `*W` with 1252 strings, as those there are.
 - **Manifests:** side-by-side assemblies and activation contexts decide which comctl32 a program gets.
 - **API sets:** `ext-ms-*` sets, and the `api-ms-win-*` the map doesn't know yet, as programs ask.

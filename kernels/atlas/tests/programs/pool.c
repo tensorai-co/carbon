@@ -8,6 +8,9 @@
 // I/O objects, completing a file's read at once and a pipe's later, and BindIoCompletionCallback; and timer queues'
 // timers, once and every so often, changed and deleted.
 
+typedef __INTPTR_TYPE__ LONG_PTR;
+typedef __UINTPTR_TYPE__ ULONG_PTR;
+typedef __SIZE_TYPE__ SIZE_T;
 typedef void *HANDLE;
 typedef unsigned int DWORD;
 typedef unsigned long long u64;
@@ -169,7 +172,7 @@ static volatile int io_done;
 static volatile DWORD io_result;
 static volatile u64 io_bytes;
 static void *volatile io_overlapped;
-static void __stdcall on_io(void *inst, void *ctx, void *overlapped, DWORD result, u64 bytes, PTP io) {
+static void __stdcall on_io(void *inst, void *ctx, void *overlapped, DWORD result, ULONG_PTR bytes, PTP io) {
     (void)inst; (void)io;
     if (ctx != (void *)0x10) return;
     io_result = result;

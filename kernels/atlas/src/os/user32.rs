@@ -174,18 +174,20 @@ fn message_box_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 
 /// A WNDCLASS(EX)W (or, with `ansi`, A), from where its fields start (after `cbSize` and `style` for the EX form).
 fn register(task: &mut Task, cx: &mut Cx<'_>, at: u64, ex: bool, ansi: bool) -> Reply {
-    let size = if ex { 80 } else { 72 };
-    let Ok(b) = task.mem(cx, false, |t| user::read_vec(&t.space(), at, size)) else { return Reply::Value(0) };
-    let get = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap_or_default());
-    let get32 = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap_or_default());
     // WNDCLASSEXW: cbSize, style, lpfnWndProc, cbClsExtra, cbWndExtra, hInstance, hIcon, hCursor, hbrBackground,
-    // lpszMenuName, lpszClassName, hIconSm. WNDCLASSW is the same from `style`, with no cbSize and no hIconSm.
-    let (style, wndproc, extra, instance, background, name_at) = if ex {
-        (get32(4), get(8), get32(20), get(24), get(48), get(64))
-    } else {
-        (get32(0), get(8), get32(20), get(24), get(48), get(64))
-    };
-    let cursor = get(40);
+    // lpszMenuName, lpszClassName, hIconSm. WNDCLASSW is the same from `style`, with no cbSize and no hIconSm. Its
+    // pointers and handles are a pointer wide: 80 and 72 bytes, or 48 and 40 for a 32-bit program.
+    let abi = task.abi();
+    let w = abi.width as usize;
+    let start = if ex { 8 } else { w };
+    let size = start + 7 * w + 8 + if ex { w } else { 0 };
+    let Ok(b) = task.mem(cx, false, |t| user::read_vec(&t.space(), at, size)) else { return Reply::Value(0) };
+    let get = |o: usize| abi.ptr_at(&b, o);
+    let get32 = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap_or_default());
+    let style = get32(if ex { 4 } else { 0 });
+    let (wndproc, extra, instance) = (get(start), get32(start + w + 4), get(start + w + 8));
+    let handles = start + w + 8 + w;
+    let (cursor, background, name_at) = (get(handles + w), get(handles + 2 * w), get(handles + 4 * w));
     let name = if name_at < 0x1_0000 { format!("#{name_at}") } else { task.text_arg(cx, name_at, !ansi) };
     match task.register_class(Class { name, atom: 0, wndproc, style, extra: extra as usize, background, instance, cursor, ansi }) {
         Ok(atom) => Reply::Value(u64::from(atom)),
@@ -365,7 +367,8 @@ fn as_ansi(mut m: Msg) -> Msg {
 fn get_message(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], ansi: bool) -> Reply {
     match task.next_message(cx, filter(a), true, true) {
         Ok(Some(m)) => {
-            let bytes = if ansi { as_ansi(m).encode() } else { m.encode() };
+            let width = task.abi().width;
+            let bytes = if ansi { as_ansi(m).encode(width) } else { m.encode(width) };
             if task.mem(cx, true, |t| user::write(&mut t.space(), a[0], &bytes)).is_err() {
                 return Reply::Value(u64::from(u32::MAX));
             }
@@ -388,7 +391,8 @@ fn peek_message(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], ansi: bool) -> Repl
     const PM_REMOVE: u64 = 1;
     match task.next_message(cx, filter(a), a[4] & PM_REMOVE != 0, false) {
         Ok(Some(m)) => {
-            let bytes = if ansi { as_ansi(m).encode() } else { m.encode() };
+            let width = task.abi().width;
+            let bytes = if ansi { as_ansi(m).encode(width) } else { m.encode(width) };
             let _ = task.mem(cx, true, |t| user::write(&mut t.space(), a[0], &bytes));
             Reply::Value(TRUE)
         }
@@ -401,8 +405,9 @@ fn peek_message(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], ansi: bool) -> Repl
 /// `TranslateMessage`: for a key that types something, as the thread's key state has it, WM_CHAR (or WM_SYSCHAR),
 /// to be taken next. TRUE for any key-down message.
 fn translate_message(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Ok(b) = task.mem(cx, false, |t| user::read_vec(&t.space(), a[0], 48)) else { return Reply::Value(FALSE) };
-    let m = Msg::decode(&b);
+    let width = task.abi().width;
+    let Ok(b) = task.mem(cx, false, |t| user::read_vec(&t.space(), a[0], Msg::size(width))) else { return Reply::Value(FALSE) };
+    let m = Msg::decode(&b, width);
     if !matches!(m.message, win32k::WM_KEYDOWN | win32k::WM_SYSKEYDOWN) {
         return Reply::Value(FALSE);
     }
@@ -425,14 +430,16 @@ fn translate_message(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 }
 
 fn dispatch_message_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Ok(b) = task.mem(cx, false, |t| user::read_vec(&t.space(), a[0], 48)) else { return Reply::Value(0) };
-    value(task.dispatch(cx, Msg::decode(&b)))
+    let width = task.abi().width;
+    let Ok(b) = task.mem(cx, false, |t| user::read_vec(&t.space(), a[0], Msg::size(width))) else { return Reply::Value(0) };
+    value(task.dispatch(cx, Msg::decode(&b, width)))
 }
 
 /// `DispatchMessageA`: the message it's given in ANSI, as `GetMessageA` gave it.
 fn dispatch_message_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Ok(b) = task.mem(cx, false, |t| user::read_vec(&t.space(), a[0], 48)) else { return Reply::Value(0) };
-    let mut m = Msg::decode(&b);
+    let width = task.abi().width;
+    let Ok(b) = task.mem(cx, false, |t| user::read_vec(&t.space(), a[0], Msg::size(width))) else { return Reply::Value(0) };
+    let mut m = Msg::decode(&b, width);
     if is_char(m.message) {
         m.wparam = u64::from(atlas_abi::ansi::from_1252(m.wparam as u8));
     }
@@ -991,9 +998,12 @@ fn flash_window(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
 
 /// `FlashWindowEx`: a FLASHWINFO (cbSize, hwnd, dwFlags, uCount, dwTimeout); FLASHW_STOP (no flags) stops it.
 fn flash_window_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Ok(b) = task.mem(cx, false, |t| user::read_vec(&t.space(), a[0], 24)) else { return Reply::Value(FALSE) };
-    let hwnd = u64::from_le_bytes(b[8..16].try_into().unwrap_or_default());
-    let flags = u32::from_le_bytes(b[16..20].try_into().unwrap_or_default());
+    // FLASHWINFO: cbSize, then hwnd at a pointer's alignment, then its flags.
+    let abi = task.abi();
+    let w = abi.width as usize;
+    let Ok(b) = task.mem(cx, false, |t| user::read_vec(&t.space(), a[0], 2 * w + 12)) else { return Reply::Value(FALSE) };
+    let hwnd = abi.ptr_at(&b, w);
+    let flags = u32::from_le_bytes(b[2 * w..2 * w + 4].try_into().unwrap_or_default());
     let Some((shown, active)) = shown_and_active(task, hwnd) else { return Reply::Value(FALSE) };
     task.desktop(|d| d.set_attention(shown, flags != 0));
     Reply::Value(u64::from(active))
@@ -1053,15 +1063,20 @@ fn get_async_key_state(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
     key_state(task.win32k().keys[(a[0] & 0xff) as usize] & 0x80)
 }
 
-/// `SendInput`: mouse and keyboard input, onto the desktop as if from the user. INPUT is 40 bytes: its type, then a
-/// MOUSEINPUT (dx, dy, mouseData, dwFlags) or KEYBDINPUT (wVk, wScan, dwFlags) at 8.
+/// `SendInput`: mouse and keyboard input, onto the desktop as if from the user. INPUT is 40 bytes (28 for a 32-bit
+/// program): its type, then at a pointer's alignment a MOUSEINPUT (dx, dy, mouseData, dwFlags) or KEYBDINPUT (wVk,
+/// wScan, dwFlags), each ending in a pointer-sized dwExtraInfo.
 fn send_input(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let (count, at, size) = (a[0] as usize & 0xffff_ffff, a[1], a[2] as usize & 0xffff_ffff);
-    if size != 40 {
+    let w = task.abi().width as usize;
+    let input = if w == 8 { 40 } else { 28 };
+    if size != input {
         task.set_last_error(cx, 87);
         return Reply::Value(0);
     }
-    let Ok(b) = task.mem(cx, false, |t| user::read_vec(&t.space(), at, count * 40)) else { return Reply::Value(0) };
+    let Ok(raw) = task.mem(cx, false, |t| user::read_vec(&t.space(), at, count * input)) else { return Reply::Value(0) };
+    // Each as the 64-bit layout has it, so what follows reads one: the union moved to 8.
+    let b: Vec<u8> = raw.chunks(input).flat_map(|e| [&e[..4], &[0u8; 4][..], &e[w..]].concat().into_iter().chain(std::iter::repeat(0)).take(40)).collect();
     let shared = task.win32k().display.clone();
     let ((width, height), mut pointer) = {
         let d = dt::lock(&shared);

@@ -182,7 +182,7 @@ void mainCRTStartup(void) {
     HANDLE token = 0;
     check(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES, &token) && token, "OpenProcessToken");
     SetLastError(0);
-    check(!GetTokenInformation(token, TokenUser, info, 8, &got) && GetLastError() == ERROR_INSUFFICIENT_BUFFER && got == 16 + 28,
+    check(!GetTokenInformation(token, TokenUser, info, 8, &got) && GetLastError() == ERROR_INSUFFICIENT_BUFFER && got == 2 * sizeof(void *) + 28,
           "GetTokenInformation: TokenUser's size, first");
     check(GetTokenInformation(token, TokenUser, info, got, &got), "  then the user");
     static unsigned char user[68];

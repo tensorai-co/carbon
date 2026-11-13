@@ -78,16 +78,19 @@ impl Task {
         self.put(cx, at, &v.to_le_bytes())
     }
 
-    fn put_u64(&mut self, cx: &mut Cx<'_>, at: u64, v: u64) -> Result<(), u64> {
-        self.put(cx, at, &v.to_le_bytes())
+    /// A pointer-sized value: a pointer or a handle, as this process's ISA has them.
+    fn put_ptr(&mut self, cx: &mut Cx<'_>, at: u64, v: u64) -> Result<(), u64> {
+        let bytes = self.abi().ptr(v);
+        self.put(cx, at, &bytes)
     }
 
     fn get_u32(&mut self, cx: &mut Cx<'_>, at: u64) -> Result<u32, u64> {
         Ok(u32_at(&self.get(cx, at, 4)?, 0))
     }
 
-    fn get_u64(&mut self, cx: &mut Cx<'_>, at: u64) -> Result<u64, u64> {
-        Ok(u64_at(&self.get(cx, at, 8)?, 0))
+    fn get_ptr(&mut self, cx: &mut Cx<'_>, at: u64) -> Result<u64, u64> {
+        let abi = self.abi();
+        Ok(abi.ptr_at(&self.get(cx, at, abi.width as usize)?, 0))
     }
 
     fn read_sid(&mut self, cx: &mut Cx<'_>, at: u64) -> Result<Sid, u64> {
@@ -120,9 +123,12 @@ impl Task {
                 *p = if offset == 0 { 0 } else { at + u64::from(offset) };
             }
         } else {
-            let head = self.get(cx, at, 40)?;
+            // Absolute: the header, then four pointers from a pointer's size on.
+            let abi = self.abi();
+            let w = abi.width as usize;
+            let head = self.get(cx, at, 5 * w)?;
             for (i, p) in parts.iter_mut().enumerate() {
-                *p = u64_at(&head, 8 + 8 * i);
+                *p = abi.ptr_at(&head, w + w * i);
             }
         }
         Ok((control, parts))
@@ -187,7 +193,7 @@ impl Task {
         if block == 0 {
             return Err(self.failed(cx, 8)); // ERROR_NOT_ENOUGH_MEMORY
         }
-        self.put_u64(cx, out, block)?;
+        self.put_ptr(cx, out, block)?;
         Ok(TRUE)
     }
 }
@@ -196,11 +202,21 @@ impl Task {
 struct Blob {
     base: u64,
     bytes: Vec<u8>,
+    /// A pointer's size in the program it's for.
+    width: usize,
 }
 
 impl Blob {
-    fn new(base: u64, head: usize) -> Blob {
-        Blob { base, bytes: vec![0; head] }
+    fn new(base: u64, head: usize, width: u64) -> Blob {
+        Blob { base, bytes: vec![0; head], width: width as usize }
+    }
+    fn set_ptr(&mut self, at: usize, v: u64) {
+        let w = self.width;
+        self.bytes[at..at + w].copy_from_slice(&v.to_le_bytes()[..w]);
+    }
+    /// SID_AND_ATTRIBUTES' size: a pointer and a DWORD, padded to a pointer's size.
+    fn sid_and_attributes_size(width: u64) -> usize {
+        2 * width as usize
     }
     fn set_u32(&mut self, at: usize, v: u32) {
         self.bytes[at..at + 4].copy_from_slice(&v.to_le_bytes());
@@ -218,16 +234,18 @@ impl Blob {
     /// A `SID_AND_ATTRIBUTES` at `at`, its SID appended.
     fn sid_and_attributes(&mut self, at: usize, sid: &Sid, attributes: u32) {
         let p = self.append(&sid.to_bytes());
-        self.set_u64(at, p);
-        self.set_u32(at + 8, attributes);
+        self.set_ptr(at, p);
+        self.set_u32(at + self.width, attributes);
     }
 }
 
-fn groups_blob(base: u64, groups: &[(Sid, u32)]) -> Vec<u8> {
-    let mut b = Blob::new(base, 8 + 16 * groups.len());
+/// TOKEN_GROUPS: a count, then SID_AND_ATTRIBUTES from a pointer's size on.
+fn groups_blob(base: u64, groups: &[(Sid, u32)], width: u64) -> Vec<u8> {
+    let entry = Blob::sid_and_attributes_size(width);
+    let mut b = Blob::new(base, width as usize + entry * groups.len(), width);
     b.set_u32(0, groups.len() as u32);
     for (i, (sid, attributes)) in groups.iter().enumerate() {
-        b.sid_and_attributes(8 + 16 * i, sid, *attributes);
+        b.sid_and_attributes(width as usize + entry * i, sid, *attributes);
     }
     b.bytes
 }
@@ -243,11 +261,11 @@ fn privileges_blob(privileges: &[(u32, u32)]) -> Vec<u8> {
 }
 
 /// One pointer to a thing appended after it: `TOKEN_OWNER`, `TOKEN_PRIMARY_GROUP`, `TOKEN_DEFAULT_DACL`.
-fn pointer_blob(base: u64, data: Option<Vec<u8>>) -> Vec<u8> {
-    let mut b = Blob::new(base, 8);
+fn pointer_blob(base: u64, data: Option<Vec<u8>>, width: u64) -> Vec<u8> {
+    let mut b = Blob::new(base, width as usize, width);
     if let Some(data) = data {
         let p = b.append(&data);
-        b.set_u64(0, p);
+        b.set_ptr(0, p);
     }
     b.bytes
 }
@@ -260,7 +278,7 @@ pub fn open_process_token(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply 
         let Some(process) = task.process_of(a[0]) else { return Err(task.failed(cx, ERROR_INVALID_HANDLE)) };
         let token = lock(&process.state).token.clone();
         let handle = lock(&task.process.state).handles.add(Handle::Token(token));
-        task.put_u64(cx, a[2], handle)?;
+        task.put_ptr(cx, a[2], handle)?;
         Ok(TRUE)
     })();
     reply(r)
@@ -269,12 +287,12 @@ pub fn open_process_token(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply 
 /// `OpenThreadToken(thread, access, as self, &token)`: the token it's impersonating, or ERROR_NO_TOKEN.
 pub fn open_thread_token(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let r = (|| {
-        let _ = task.put_u64(cx, a[3], 0);
+        let _ = task.put_ptr(cx, a[3], 0);
         let Some(thread) = task.thread_of(a[0]) else { return Err(task.failed(cx, ERROR_INVALID_HANDLE)) };
         let token = lock(&thread.token).clone();
         let Some(token) = token else { return Err(task.failed(cx, ERROR_NO_TOKEN)) };
         let handle = lock(&task.process.state).handles.add(Handle::Token(token));
-        task.put_u64(cx, a[3], handle)?;
+        task.put_ptr(cx, a[3], handle)?;
         Ok(TRUE)
     })();
     reply(r)
@@ -287,17 +305,18 @@ pub fn get_token_information(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Rep
         let (class, buffer) = (a[1] as u32, a[2]);
         let s = lock(&token.state).clone();
         let u32s = |v: u32| v.to_le_bytes().to_vec();
+        let w = task.abi().width;
         let data = match class {
             1 => {
-                let mut b = Blob::new(buffer, 16);
+                let mut b = Blob::new(buffer, Blob::sid_and_attributes_size(w), w);
                 b.sid_and_attributes(0, &s.user, 0);
                 b.bytes
             }
-            2 => groups_blob(buffer, &s.groups),
+            2 => groups_blob(buffer, &s.groups, w),
             3 => privileges_blob(&s.privileges),
-            4 => pointer_blob(buffer, Some(s.owner.to_bytes())),
-            5 => pointer_blob(buffer, Some(s.primary_group.to_bytes())),
-            6 => pointer_blob(buffer, s.default_dacl.as_ref().map(Acl::to_bytes)),
+            4 => pointer_blob(buffer, Some(s.owner.to_bytes()), w),
+            5 => pointer_blob(buffer, Some(s.primary_group.to_bytes()), w),
+            6 => pointer_blob(buffer, s.default_dacl.as_ref().map(Acl::to_bytes), w),
             7 => {
                 let mut b = b"User32 \0".to_vec();
                 b.extend(0x1_0001u64.to_le_bytes());
@@ -306,7 +325,7 @@ pub fn get_token_information(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Rep
             8 => u32s(s.kind),
             9 if s.kind == 2 => u32s(s.level),
             10 => {
-                let mut b = Blob::new(buffer, 56);
+                let mut b = Blob::new(buffer, 56, w);
                 b.set_u64(0, token.id);
                 b.set_u64(8, LOGON);
                 b.set_u64(16, i64::MAX as u64);
@@ -319,7 +338,7 @@ pub fn get_token_information(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Rep
                 b.set_u64(48, s.modified);
                 b.bytes
             }
-            11 | 30 => groups_blob(buffer, &[]),
+            11 | 30 => groups_blob(buffer, &[], w),
             12 => u32s(s.session),
             17 => LOGON.to_le_bytes().to_vec(),
             18 => u32s(1),
@@ -327,12 +346,12 @@ pub fn get_token_information(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Rep
             20 => u32s(1),
             23 | 24 | 26 | 29 => u32s(0),
             25 => {
-                let mut b = Blob::new(buffer, 16);
+                let mut b = Blob::new(buffer, Blob::sid_and_attributes_size(w), w);
                 b.sid_and_attributes(0, &s.integrity(), SE_GROUP_INTEGRITY);
                 b.bytes
             }
             27 => u32s(3),
-            28 => groups_blob(buffer, &[(logon_sid(), GROUP_DEFAULT | SE_GROUP_LOGON_ID)]),
+            28 => groups_blob(buffer, &[(logon_sid(), GROUP_DEFAULT | SE_GROUP_LOGON_ID)], w),
             31 => vec![0; 8],
             _ => return Err(task.failed(cx, ERROR_INVALID_PARAMETER)),
         };
@@ -349,7 +368,7 @@ pub fn set_token_information(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Rep
         let (class, buffer) = (a[1] as u32, a[2]);
         match class {
             4 | 5 => {
-                let p = task.get_u64(cx, buffer)?;
+                let p = task.get_ptr(cx, buffer)?;
                 let sid = task.read_sid(cx, p)?;
                 let mut s = lock(&token.state);
                 if class == 4 {
@@ -370,14 +389,14 @@ pub fn set_token_information(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Rep
                 s.modified = new_luid();
             }
             6 => {
-                let p = task.get_u64(cx, buffer)?;
+                let p = task.get_ptr(cx, buffer)?;
                 let dacl = if p == 0 { None } else { Some(task.read_acl(cx, p)?) };
                 let mut s = lock(&token.state);
                 s.default_dacl = dacl;
                 s.modified = new_luid();
             }
             25 => {
-                let p = task.get_u64(cx, buffer)?;
+                let p = task.get_ptr(cx, buffer)?;
                 let sid = task.read_sid(cx, p)?;
                 let mut s = lock(&token.state);
                 let now = s.integrity();
@@ -482,7 +501,7 @@ pub fn duplicate_token_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply 
         }
         let inheritable = task.inheritable_by(cx, a[2]);
         let handle = task.new_token_handle(token.duplicate(kind, level), inheritable);
-        task.put_u64(cx, a[5], handle)?;
+        task.put_ptr(cx, a[5], handle)?;
         Ok(TRUE)
     })();
     reply(r)
@@ -515,7 +534,7 @@ fn lookup_privilege_value(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: boo
         task.mem(cx, false, |t| user::read_cstr(&t.space(), a[1], 256)).map(|b| crate::ansi::text(&b))
     };
     let Some(luid) = name.ok().as_deref().and_then(privilege_named) else { return Err(task.failed(cx, ERROR_NO_SUCH_PRIVILEGE)) };
-    task.put_u64(cx, a[2], u64::from(luid))?;
+    task.put(cx, a[2], &u64::from(luid).to_le_bytes())?;
     Ok(TRUE)
 }
 
@@ -539,7 +558,7 @@ pub fn lookup_privilege_name_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> R
 
 fn lookup_privilege_name(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], unicode: bool) -> Reply {
     let r = (|| {
-        let luid = task.get_u64(cx, a[1])?;
+        let luid = u64_at(&task.get(cx, a[1], 8)?, 0);
         let Some(name) = u32::try_from(luid).ok().and_then(privilege_name) else { return Err(task.failed(cx, ERROR_NO_SUCH_PRIVILEGE)) };
         let room = task.get_u32(cx, a[3])? as usize;
         if room <= name.len() || a[2] == 0 {
@@ -792,7 +811,8 @@ pub fn initialize_security_descriptor(task: &mut Task, cx: &mut Cx<'_>, a: &[u64
         if a[1] != 1 {
             return Err(task.failed(cx, 1305)); // ERROR_UNKNOWN_REVISION
         }
-        let mut b = vec![0u8; 40];
+        // The header and four pointers: 40 bytes, or 20 for a 32-bit program.
+        let mut b = vec![0u8; 5 * task.abi().width as usize];
         b[0] = 1;
         task.put(cx, a[0], &b)?;
         Ok(TRUE)
@@ -849,7 +869,8 @@ fn set_part(task: &mut Task, cx: &mut Cx<'_>, sd: u64, index: u64, pointer: u64,
     if control & SE_SELF_RELATIVE != 0 {
         return Err(task.failed(cx, ERROR_INVALID_SECURITY_DESCR));
     }
-    task.put_u64(cx, sd + 8 + 8 * index, pointer)?;
+    let w = task.abi().width;
+    task.put_ptr(cx, sd + w + w * index, pointer)?;
     task.put(cx, sd + 2, &(control & !clear | set).to_le_bytes())?;
     Ok(TRUE)
 }
@@ -882,7 +903,7 @@ pub fn set_security_descriptor_sacl(task: &mut Task, cx: &mut Cx<'_>, a: &[u64])
 /// `GetSecurityDescriptorOwner(sd, &sid, &defaulted)` and `Group`: pointers into it, in either form.
 fn get_sid_part(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], index: usize, defaulted: u16) -> R {
     let (control, parts) = task.descriptor_parts(cx, a[0])?;
-    task.put_u64(cx, a[1], parts[index])?;
+    task.put_ptr(cx, a[1], parts[index])?;
     task.put_u32(cx, a[2], u32::from(control & defaulted != 0))?;
     Ok(TRUE)
 }
@@ -901,7 +922,7 @@ fn get_acl_part(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], index: usize, prese
     let is = control & present != 0;
     task.put_u32(cx, a[1], u32::from(is))?;
     if is {
-        task.put_u64(cx, a[2], parts[index])?;
+        task.put_ptr(cx, a[2], parts[index])?;
         task.put_u32(cx, a[3], u32::from(control & defaulted != 0))?;
     }
     Ok(TRUE)
@@ -1041,7 +1062,7 @@ pub fn get_ace(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
             return Err(task.failed(cx, ERROR_INVALID_PARAMETER));
         }
         let offset = 8 + acl.aces[..index].iter().map(|ace| ace.to_bytes().len()).sum::<usize>();
-        task.put_u64(cx, a[2], a[0] + offset as u64)?;
+        task.put_ptr(cx, a[2], a[0] + offset as u64)?;
         Ok(TRUE)
     })();
     reply(r)
@@ -1175,7 +1196,8 @@ impl Task {
         if attributes == 0 {
             return None;
         }
-        let at = self.get_u64(cx, attributes + 8).ok().filter(|&p| p != 0)?;
+        // SECURITY_ATTRIBUTES: nLength, then the pointer, aligned to its size.
+        let at = self.get_ptr(cx, attributes + self.abi().width).ok().filter(|&p| p != 0)?;
         self.read_descriptor(cx, at).ok()
     }
 
@@ -1331,12 +1353,12 @@ impl Task {
         let offset = |at: usize| u64::from(u32_at(&bytes, at));
         let parts = [(out[0], offset(4)), (out[1], offset(8)), (out[2], offset(16)), (out[3], offset(12))];
         for (to, off) in parts {
-            if to != 0 && self.put_u64(cx, to, if off == 0 { 0 } else { block + off }).is_err() {
+            if to != 0 && self.put_ptr(cx, to, if off == 0 { 0 } else { block + off }).is_err() {
                 return 998;
             }
         }
         if out[4] != 0 {
-            if self.put_u64(cx, out[4], block).is_err() {
+            if self.put_ptr(cx, out[4], block).is_err() {
                 return 998;
             }
         } else {
@@ -1615,7 +1637,7 @@ pub fn revert_to_self(task: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
 /// `SetThreadToken(&thread or NULL, token or NULL)`: a thread acts as an impersonation token, or stops.
 pub fn set_thread_token(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let r = (|| {
-        let thread = if a[0] == 0 { Some(task.control.clone()) } else { task.get_u64(cx, a[0]).ok().and_then(|h| task.thread_of(h)) };
+        let thread = if a[0] == 0 { Some(task.control.clone()) } else { task.get_ptr(cx, a[0]).ok().and_then(|h| task.thread_of(h)) };
         let Some(thread) = thread else { return Err(task.failed(cx, ERROR_INVALID_HANDLE)) };
         let token = if a[1] == 0 { None } else { Some(task.token_of(cx, a[1])?) };
         if token.as_ref().is_some_and(|t| lock(&t.state).kind != 2) {

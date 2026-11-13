@@ -5,6 +5,9 @@
 // continue handlers; removing both; guard pages (PAGE_GUARD) raising STATUS_GUARD_PAGE_VIOLATION once, as VirtualQuery
 // and VirtualProtect see them; and a stack overflow caught with __try/__except, on the first thread and on another.
 
+typedef __INTPTR_TYPE__ LONG_PTR;
+typedef __UINTPTR_TYPE__ ULONG_PTR;
+typedef __SIZE_TYPE__ SIZE_T;
 typedef void *HANDLE;
 typedef unsigned int DWORD;
 typedef unsigned long long u64;
@@ -12,15 +15,15 @@ typedef unsigned long long u64;
 __declspec(dllimport) HANDLE __stdcall GetStdHandle(DWORD);
 __declspec(dllimport) int __stdcall WriteFile(HANDLE, const void *, DWORD, DWORD *, void *);
 __declspec(dllimport) void __stdcall ExitProcess(unsigned);
-__declspec(dllimport) void __stdcall RaiseException(DWORD, DWORD, DWORD, const u64 *);
+__declspec(dllimport) void __stdcall RaiseException(DWORD, DWORD, DWORD, const ULONG_PTR *);
 __declspec(dllimport) void *__stdcall AddVectoredExceptionHandler(DWORD, void *);
 __declspec(dllimport) DWORD __stdcall RemoveVectoredExceptionHandler(void *);
 __declspec(dllimport) void *__stdcall AddVectoredContinueHandler(DWORD, void *);
 __declspec(dllimport) DWORD __stdcall RemoveVectoredContinueHandler(void *);
-__declspec(dllimport) void *__stdcall VirtualAlloc(void *, u64, DWORD, DWORD);
-__declspec(dllimport) int __stdcall VirtualProtect(void *, u64, DWORD, DWORD *);
-__declspec(dllimport) u64 __stdcall VirtualQuery(const void *, void *, u64);
-__declspec(dllimport) HANDLE __stdcall CreateThread(void *, u64, DWORD (__stdcall *)(void *), void *, DWORD, DWORD *);
+__declspec(dllimport) void *__stdcall VirtualAlloc(void *, SIZE_T, DWORD, DWORD);
+__declspec(dllimport) int __stdcall VirtualProtect(void *, SIZE_T, DWORD, DWORD *);
+__declspec(dllimport) SIZE_T __stdcall VirtualQuery(const void *, void *, SIZE_T);
+__declspec(dllimport) HANDLE __stdcall CreateThread(void *, SIZE_T, DWORD (__stdcall *)(void *), void *, DWORD, DWORD *);
 __declspec(dllimport) DWORD __stdcall WaitForSingleObject(HANDLE, DWORD);
 __declspec(dllimport) int __stdcall GetExitCodeThread(HANDLE, DWORD *);
 

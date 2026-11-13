@@ -5,6 +5,9 @@
 // program (EnumSystemLocalesW, twice), MessageBoxW, and the guest exports: the heap, the last error and critical
 // sections, running inside the program in the embedded ntdll
 
+typedef __INTPTR_TYPE__ LONG_PTR;
+typedef __UINTPTR_TYPE__ ULONG_PTR;
+typedef __SIZE_TYPE__ SIZE_T;
 typedef void *HANDLE;
 typedef unsigned int DWORD;
 typedef int BOOL;
@@ -16,17 +19,17 @@ __declspec(dllimport) BOOL __stdcall WriteFile(HANDLE, const void *, DWORD, DWOR
 __declspec(dllimport) BOOL __stdcall WriteConsoleW(HANDLE, const WCHAR *, DWORD, DWORD *, void *);
 __declspec(dllimport) void __stdcall ExitProcess(unsigned);
 __declspec(dllimport) WCHAR *__stdcall GetCommandLineW(void);
-__declspec(dllimport) void *__stdcall VirtualAlloc(void *, unsigned long long, DWORD, DWORD);
+__declspec(dllimport) void *__stdcall VirtualAlloc(void *, SIZE_T, DWORD, DWORD);
 __declspec(dllimport) BOOL __stdcall EnumSystemLocalesW(LOCALE_ENUMPROCW, DWORD);
 __declspec(dllimport) unsigned long long __stdcall GetTickCount64(void);
 __declspec(dllimport) int __stdcall MessageBoxW(void *, const WCHAR *, const WCHAR *, unsigned);
 // Guest exports: these run in the program, in atlas-guest's ntdll.
 __declspec(dllimport) HANDLE __stdcall GetProcessHeap(void);
-__declspec(dllimport) void *__stdcall HeapAlloc(HANDLE, DWORD, unsigned long long);
+__declspec(dllimport) void *__stdcall HeapAlloc(HANDLE, DWORD, SIZE_T);
 __declspec(dllimport) BOOL __stdcall HeapFree(HANDLE, DWORD, void *);
 __declspec(dllimport) DWORD __stdcall GetLastError(void);
 __declspec(dllimport) void __stdcall SetLastError(DWORD);
-typedef struct { void *debug; int lock_count, recursion; HANDLE owner, semaphore; unsigned long long spin; } CRITICAL_SECTION;
+typedef struct { void *debug; int lock_count, recursion; HANDLE owner, semaphore; ULONG_PTR spin; } CRITICAL_SECTION;
 __declspec(dllimport) void __stdcall InitializeCriticalSection(CRITICAL_SECTION *);
 __declspec(dllimport) void __stdcall EnterCriticalSection(CRITICAL_SECTION *);
 __declspec(dllimport) void __stdcall LeaveCriticalSection(CRITICAL_SECTION *);

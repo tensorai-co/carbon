@@ -105,13 +105,42 @@ fn make_dll(isa: Isa, dll: usize, gate: bool) -> Vec<u8> {
                 Kind::Guest(target) if guest(isa).is_some() => Body::Forward(format!("ntdll.{target}")),
                 // x86's stubs pop a stdcall function's arguments: four bytes each, as atlas reads them. The C
                 // runtime's, and the functions that take a variable number, are cdecl: their caller pops.
-                Kind::Host { args, .. } if !cdecl(d.name, e.name) => Body::Trap { nr: number(dll, i), pop: 4 * args as u16 },
+                Kind::Host { args, .. } if !cdecl(d.name, e.name) => {
+                    let slots = x86_wide(e.name).map_or(args, |(slots, _)| slots);
+                    Body::Trap { nr: number(dll, i), pop: 4 * slots as u16 }
+                }
                 _ => Body::Trap { nr: number(dll, i), pop: 0 },
             };
             (e.name, body)
         })
         .collect();
     make::dll(isa, d.name, layout(isa).dll_base(dll), &exports, gate)
+}
+
+/// Makes the arguments atlas reads from the stack slots x86 passed.
+pub type Join = fn(&[u64]) -> Vec<u64>;
+
+/// The exports that take a 64-bit value by value, which is two stack slots on x86 where it's one register on the
+/// 64-bit ISAs: how many slots they take there, and how the slots make the arguments atlas reads (low half first).
+pub fn x86_wide(name: &str) -> Option<(usize, Join)> {
+    const LOW: u64 = 0xffff_ffff;
+    let joined: (usize, Join) = match name {
+        // (file, LARGE_INTEGER distance, &new, method)
+        "SetFilePointerEx" => (5, |s| vec![s[0], s[1] & LOW | (s[2] & LOW) << 32, s[3], s[4]]),
+        // (info, type mask, ULONGLONG condition mask)
+        "VerifyVersionInfoW" | "VerifyVersionInfoA" => (4, |s| vec![s[0], s[1], s[2] & LOW | (s[3] & LOW) << 32]),
+        // (ULONGLONG condition mask, type, condition)
+        "VerSetConditionMask" => (4, |s| vec![s[0] & LOW | (s[1] & LOW) << 32, s[2], s[3]]),
+        // (POINT): x and y, as one 64-bit value has them.
+        "WindowFromPoint" => (2, |s| vec![s[0] & LOW | (s[1] & LOW) << 32]),
+        _ => return None,
+    };
+    Some(joined)
+}
+
+/// The exports that return 64 bits, which x86 returns in edx:eax.
+pub fn x86_returns_wide(name: &str) -> bool {
+    matches!(name, "GetTickCount64" | "VerSetConditionMask")
 }
 
 /// Whether an export is cdecl on x86: the C runtime's, and those with a variable number of arguments.

@@ -236,7 +236,10 @@ pub fn flush_view_of_file(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply 
 
 /// `VirtualQuery(address, &info, size)`: MEMORY_BASIC_INFORMATION for the run of pages from there that are alike.
 pub fn virtual_query(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    if a[2] < 48 {
+    // MEMORY_BASIC_INFORMATION: 48 bytes, or 28 for a 32-bit program.
+    let abi = task.abi();
+    let size_of = if abi.width == 8 { 48 } else { 28 };
+    if a[2] < size_of {
         task.set_last_error(cx, 24); // ERROR_BAD_LENGTH
         return Reply::Value(0);
     }
@@ -274,19 +277,23 @@ pub fn virtual_query(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
         }
     };
     let (at, base, allocation_protect, size, state_bits, protect, kind) = info;
-    let mut b = [0u8; 48];
-    b[0..8].copy_from_slice(&at.to_le_bytes());
-    b[8..16].copy_from_slice(&base.to_le_bytes());
-    b[16..20].copy_from_slice(&allocation_protect.to_le_bytes());
-    b[24..32].copy_from_slice(&size.to_le_bytes());
-    b[32..36].copy_from_slice(&state_bits.to_le_bytes());
-    b[36..40].copy_from_slice(&protect.to_le_bytes());
-    b[40..44].copy_from_slice(&kind.to_le_bytes());
+    // BaseAddress, AllocationBase, AllocationProtect (and, on 64-bit, a PartitionId and padding), RegionSize, State,
+    // Protect, Type.
+    let mut b = Vec::with_capacity(48);
+    b.extend(abi.ptr(at));
+    b.extend(abi.ptr(base));
+    b.extend(allocation_protect.to_le_bytes());
+    b.resize(b.len().next_multiple_of(abi.width as usize), 0);
+    b.extend(abi.ptr(size));
+    b.extend(state_bits.to_le_bytes());
+    b.extend(protect.to_le_bytes());
+    b.extend(kind.to_le_bytes());
+    b.resize(size_of as usize, 0);
     if task.mem(cx, true, |t| user::write(&mut t.space(), a[1], &b)).is_err() {
         task.set_last_error(cx, 998);
         return Reply::Value(0);
     }
-    Reply::Value(48)
+    Reply::Value(size_of)
 }
 
 /// `GetSystemTimeAsFileTime(&time)` and its precise form: now, in 100 ns units since 1601.

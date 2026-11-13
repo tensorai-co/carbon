@@ -94,16 +94,17 @@ pub fn get_queued_completion_status(task: &mut Task, cx: &mut Cx<'_>, a: &[u64])
     match task.dequeue(cx, &port, 1, deadline(a[4] as u32), false) {
         Ok(packets) => {
             let p = packets[0];
+            let abi = task.abi();
             let _ = task.mem(cx, true, |t| {
                 user::write_u32(&mut t.space(), bytes_out, p.bytes)?;
-                user::write_u64(&mut t.space(), key_out, p.key)?;
-                user::write_u64(&mut t.space(), overlapped_out, p.overlapped)
+                user::write(&mut t.space(), key_out, &abi.ptr(p.key))?;
+                user::write(&mut t.space(), overlapped_out, &abi.ptr(p.overlapped))
             });
             if p.status != 0 { task.fail(cx, ports::error(p.status)) } else { Reply::Value(TRUE) }
         }
         Err(Empty::Ended) => Reply::Ended,
         Err(_) => {
-            let _ = task.mem(cx, true, |t| user::write_u64(&mut t.space(), overlapped_out, 0));
+            let _ = task.write_ptr(cx, overlapped_out, 0);
             task.fail(cx, ports::WAIT_TIMEOUT)
         }
     }
@@ -119,13 +120,15 @@ pub fn get_queued_completion_status_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u6
     }
     match task.dequeue(cx, &port, count, deadline(a[4] as u32), a[5] as u32 != 0) {
         Ok(packets) => {
-            let mut b = vec![0u8; packets.len() * 32];
-            for (i, p) in packets.iter().enumerate() {
-                let e = &mut b[i * 32..i * 32 + 32];
-                e[0..8].copy_from_slice(&p.key.to_le_bytes());
-                e[8..16].copy_from_slice(&p.overlapped.to_le_bytes());
-                e[16..24].copy_from_slice(&u64::from(p.status).to_le_bytes());
-                e[24..28].copy_from_slice(&p.bytes.to_le_bytes());
+            // OVERLAPPED_ENTRY: three pointer-sized fields and a DWORD, padded to a pointer's size.
+            let abi = task.abi();
+            let mut b = Vec::new();
+            for p in &packets {
+                b.extend(abi.ptr(p.key));
+                b.extend(abi.ptr(p.overlapped));
+                b.extend(abi.ptr(u64::from(p.status)));
+                b.extend(p.bytes.to_le_bytes());
+                b.resize(b.len().next_multiple_of(abi.width as usize), 0);
             }
             let n = packets.len() as u32;
             let _ = task.mem(cx, true, |t| {
@@ -152,7 +155,10 @@ pub fn get_overlapped_result_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> 
     let k = task.k.clone();
     k.drain(cx);
     let (ov, bytes_out, timeout, alertable) = (a[1], a[2], a[3] as u32, a[4] as u32 != 0);
-    let read = |task: &mut Task, cx: &mut Cx<'_>| task.mem(cx, false, |t| Ok((user::read_u64(&t.space(), ov)?, user::read_u64(&t.space(), ov + 8)?, user::read_u64(&t.space(), ov + 24)?))).ok();
+    let abi = task.abi();
+    let read = |task: &mut Task, cx: &mut Cx<'_>| {
+        task.mem(cx, false, |t| Ok((user::read_ptr(&t.space(), ov, abi.width)?, user::read_ptr(&t.space(), ov + abi.width, abi.width)?, user::read_ptr(&t.space(), ov + abi.overlapped_event(), abi.width)?))).ok()
+    };
     let Some((mut status, mut bytes, event)) = read(task, cx) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
     if status as u32 == ports::STATUS_PENDING {
         if timeout == 0 {

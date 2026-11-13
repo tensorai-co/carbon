@@ -293,7 +293,8 @@ pub fn load_string_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
         }
     };
     if room == 0 {
-        let _ = task.mem(cx, true, |t| user::write_u64(&mut t.space(), buffer, if units.is_empty() { 0 } else { at }));
+        // With no room, the buffer gets a pointer to the string itself.
+        let _ = task.write_ptr(cx, buffer, if units.is_empty() { 0 } else { at });
         return Reply::Value(units.len() as u64);
     }
     let n = units.len().min(room - 1);
@@ -432,7 +433,7 @@ fn ver_query_value(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> R
             return Reply::Value(FALSE);
         }
     }
-    let ok = task.mem(cx, true, |t| user::write_u64(&mut t.space(), a[2], value)).is_ok()
+    let ok = task.write_ptr(cx, a[2], value).is_ok()
         && task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[3], u32::from(len))).is_ok();
     Reply::Value(u64::from(ok))
 }

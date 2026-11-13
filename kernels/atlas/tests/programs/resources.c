@@ -7,11 +7,14 @@
 // - version information: this program's (GetFileVersionInfo(Size)W, VerQueryValueW's fixed information, strings and
 //   translation), and a system DLL's, from its file and from the module loaded.
 
+typedef __INTPTR_TYPE__ LONG_PTR;
+typedef __UINTPTR_TYPE__ ULONG_PTR;
+typedef __SIZE_TYPE__ SIZE_T;
 typedef void *HANDLE;
 typedef unsigned int DWORD;
 typedef unsigned short WORD;
 typedef unsigned short WCHAR;
-typedef unsigned long long u64;
+typedef ULONG_PTR u64; // pointer-sized everywhere here
 
 #define K __declspec(dllimport)
 K HANDLE __stdcall GetStdHandle(DWORD);
@@ -27,12 +30,12 @@ K HANDLE __stdcall FindResourceExW(HANDLE, const WCHAR *, const WCHAR *, WORD);
 K HANDLE __stdcall LoadResource(HANDLE, HANDLE);
 K void *__stdcall LockResource(HANDLE);
 K DWORD __stdcall SizeofResource(HANDLE, HANDLE);
-typedef int(__stdcall *TypeProc)(HANDLE, WCHAR *, long long);
-typedef int(__stdcall *NameProc)(HANDLE, WCHAR *, WCHAR *, long long);
-typedef int(__stdcall *LangProc)(HANDLE, WCHAR *, WCHAR *, WORD, long long);
-K int __stdcall EnumResourceTypesW(HANDLE, TypeProc, long long);
-K int __stdcall EnumResourceNamesW(HANDLE, const WCHAR *, NameProc, long long);
-K int __stdcall EnumResourceLanguagesW(HANDLE, const WCHAR *, const WCHAR *, LangProc, long long);
+typedef int(__stdcall *TypeProc)(HANDLE, WCHAR *, LONG_PTR);
+typedef int(__stdcall *NameProc)(HANDLE, WCHAR *, WCHAR *, LONG_PTR);
+typedef int(__stdcall *LangProc)(HANDLE, WCHAR *, WCHAR *, WORD, LONG_PTR);
+K int __stdcall EnumResourceTypesW(HANDLE, TypeProc, LONG_PTR);
+K int __stdcall EnumResourceNamesW(HANDLE, const WCHAR *, NameProc, LONG_PTR);
+K int __stdcall EnumResourceLanguagesW(HANDLE, const WCHAR *, const WCHAR *, LangProc, LONG_PTR);
 __declspec(dllimport) int __stdcall LoadStringW(HANDLE, DWORD, WCHAR *, int);
 __declspec(dllimport) int __stdcall LoadStringA(HANDLE, DWORD, char *, int);
 __declspec(dllimport) DWORD __stdcall GetFileVersionInfoSizeW(const WCHAR *, DWORD *);
@@ -68,7 +71,7 @@ static const char *bytes_of(HANDLE found, DWORD *size) {
 
 static int types_seen, named_type_first, ids_in_order;
 static u64 last_type;
-static int __stdcall on_type(HANDLE module, WCHAR *type, long long param) {
+static int __stdcall on_type(HANDLE module, WCHAR *type, LONG_PTR param) {
     if (types_seen == 0) named_type_first = (u64)type >> 16 && wsame(type, "MYTYPE") && param == 7;
     else {
         if ((u64)type <= last_type) ids_in_order = 0;
@@ -79,14 +82,14 @@ static int __stdcall on_type(HANDLE module, WCHAR *type, long long param) {
 }
 static int names_seen;
 static u64 names[8];
-static int __stdcall on_name(HANDLE module, WCHAR *type, WCHAR *name, long long param) {
+static int __stdcall on_name(HANDLE module, WCHAR *type, WCHAR *name, LONG_PTR param) {
     if (names_seen < 8 && (u64)type == RT_RCDATA) names[names_seen] = (u64)name;
     names_seen++;
     return param != 1;
 }
 static int langs_seen;
 static WORD langs[8];
-static int __stdcall on_lang(HANDLE module, WCHAR *type, WCHAR *name, WORD lang, long long param) {
+static int __stdcall on_lang(HANDLE module, WCHAR *type, WCHAR *name, WORD lang, LONG_PTR param) {
     if (langs_seen < 8 && (u64)name == 42) langs[langs_seen] = lang;
     langs_seen++;
     return 1;

@@ -9,21 +9,24 @@
 // - ReadFileEx and WriteFileEx's routines in an alertable wait;
 // - CancelIo and CancelIoEx with nothing under way.
 
+typedef __INTPTR_TYPE__ LONG_PTR;
+typedef __UINTPTR_TYPE__ ULONG_PTR;
+typedef __SIZE_TYPE__ SIZE_T;
 typedef void *HANDLE;
 typedef unsigned int DWORD;
 typedef unsigned short WCHAR;
 typedef unsigned long long u64;
 
 typedef struct {
-    u64 internal, internal_high;
+    ULONG_PTR internal, internal_high;
     DWORD offset, offset_high;
     HANDLE event;
 } OVERLAPPED;
 
 typedef struct {
-    u64 key;
+    ULONG_PTR key;
     OVERLAPPED *overlapped;
-    u64 internal;
+    ULONG_PTR internal;
     DWORD bytes;
 } OVERLAPPED_ENTRY;
 
@@ -40,9 +43,9 @@ K int __stdcall CloseHandle(HANDLE);
 K HANDLE __stdcall CreateFileW(const WCHAR *, DWORD, DWORD, void *, DWORD, DWORD, HANDLE);
 K DWORD __stdcall GetFileSize(HANDLE, DWORD *);
 K int __stdcall DeleteFileW(const WCHAR *);
-K HANDLE __stdcall CreateIoCompletionPort(HANDLE, HANDLE, u64, DWORD);
-K int __stdcall PostQueuedCompletionStatus(HANDLE, DWORD, u64, OVERLAPPED *);
-K int __stdcall GetQueuedCompletionStatus(HANDLE, DWORD *, u64 *, OVERLAPPED **, DWORD);
+K HANDLE __stdcall CreateIoCompletionPort(HANDLE, HANDLE, ULONG_PTR, DWORD);
+K int __stdcall PostQueuedCompletionStatus(HANDLE, DWORD, ULONG_PTR, OVERLAPPED *);
+K int __stdcall GetQueuedCompletionStatus(HANDLE, DWORD *, ULONG_PTR *, OVERLAPPED **, DWORD);
 K int __stdcall GetQueuedCompletionStatusEx(HANDLE, OVERLAPPED_ENTRY *, DWORD, DWORD *, DWORD, int);
 K int __stdcall GetOverlappedResult(HANDLE, OVERLAPPED *, DWORD *, int);
 K int __stdcall CancelIo(HANDLE);
@@ -51,8 +54,8 @@ K int __stdcall SetFileCompletionNotificationModes(HANDLE, unsigned char);
 K HANDLE __stdcall CreateEventW(void *, int, int, const WCHAR *);
 K DWORD __stdcall WaitForSingleObject(HANDLE, DWORD);
 K DWORD __stdcall WaitForMultipleObjects(DWORD, const HANDLE *, int, DWORD);
-K HANDLE __stdcall CreateThread(void *, u64, DWORD (*)(void *), void *, DWORD, DWORD *);
-K DWORD __stdcall QueueUserAPC(void (*)(u64), HANDLE, u64);
+K HANDLE __stdcall CreateThread(void *, SIZE_T, DWORD (*)(void *), void *, DWORD, DWORD *);
+K DWORD __stdcall QueueUserAPC(void (*)(ULONG_PTR), HANDLE, ULONG_PTR);
 K HANDLE __stdcall GetCurrentThread(void);
 K DWORD __stdcall SleepEx(DWORD, int);
 
@@ -85,7 +88,7 @@ static volatile u64 sums[4];
 static DWORD worker(void *which) {
     for (;;) {
         DWORD bytes;
-        u64 key;
+        ULONG_PTR key;
         OVERLAPPED *ov;
         if (!GetQueuedCompletionStatus(queue, &bytes, &key, &ov, 10000) || key == 0) return 0;
         sums[(u64)which] += bytes;
@@ -102,7 +105,7 @@ static void routine(DWORD error, DWORD bytes, OVERLAPPED *ov) {
     routines = routines + 1;
 }
 static volatile int apcs;
-static void apc(u64 x) { apcs = apcs + (int)x; }
+static void apc(ULONG_PTR x) { apcs = apcs + (int)x; }
 
 void mainCRTStartup(void) {
     out = GetStdHandle((DWORD)-11);
@@ -112,7 +115,7 @@ void mainCRTStartup(void) {
     say("asynchronous I/O on atlas, x86-64\n");
 #endif
     DWORD bytes = 0;
-    u64 key = 0;
+    ULONG_PTR key = 0;
     OVERLAPPED *ov = (OVERLAPPED *)1;
 
     // A work queue.

@@ -8,6 +8,9 @@
 // and not; the 32-bit view (KEY_WOW64_32KEY), redirected and shared; and hives saved, restored, loaded, written back
 // and unloaded, each needing its privilege
 
+typedef __INTPTR_TYPE__ LONG_PTR;
+typedef __UINTPTR_TYPE__ ULONG_PTR;
+typedef __SIZE_TYPE__ SIZE_T;
 typedef void *HANDLE;
 typedef void *HKEY;
 typedef unsigned int DWORD;
@@ -42,7 +45,7 @@ K LSTATUS __stdcall RegLoadKeyW(HKEY, const WCHAR *, const WCHAR *);
 K LSTATUS __stdcall RegUnLoadKeyW(HKEY, const WCHAR *);
 K HANDLE __stdcall CreateEventW(void *, int, int, const WCHAR *);
 K DWORD __stdcall WaitForSingleObject(HANDLE, DWORD);
-K HANDLE __stdcall CreateThread(void *, u64, DWORD (__stdcall *)(void *), void *, DWORD, DWORD *);
+K HANDLE __stdcall CreateThread(void *, SIZE_T, DWORD (__stdcall *)(void *), void *, DWORD, DWORD *);
 K void __stdcall Sleep(DWORD);
 K HANDLE __stdcall GetCurrentProcess(void);
 K int __stdcall DeleteFileW(const WCHAR *);

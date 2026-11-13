@@ -9,6 +9,9 @@
 // too; RaiseException with a filter; __finally during an unwind and on a normal exit; EXCEPTION_CONTINUE_EXECUTION;
 // integer divide by zero (x86-64); and, as it ends, DLL_PROCESS_DETACH
 
+typedef __INTPTR_TYPE__ LONG_PTR;
+typedef __UINTPTR_TYPE__ ULONG_PTR;
+typedef __SIZE_TYPE__ SIZE_T;
 typedef void *HANDLE;
 typedef unsigned int DWORD;
 typedef unsigned long long u64;
@@ -22,11 +25,11 @@ __declspec(dllimport) void *__stdcall GetProcAddress(HANDLE, const char *);
 __declspec(dllimport) HANDLE __stdcall GetModuleHandleA(const char *);
 __declspec(dllimport) DWORD __stdcall GetModuleFileNameW(HANDLE, WCHAR *, DWORD);
 __declspec(dllimport) DWORD __stdcall GetLastError(void);
-__declspec(dllimport) void __stdcall RaiseException(DWORD, DWORD, DWORD, const u64 *);
+__declspec(dllimport) void __stdcall RaiseException(DWORD, DWORD, DWORD, const ULONG_PTR *);
 __declspec(dllimport) HANDLE __stdcall GetProcessHeap(void);
 __declspec(dllimport) int __stdcall FreeLibrary(HANDLE);
 __declspec(dllimport) int __stdcall GetModuleHandleExA(DWORD, const char *, HANDLE *);
-__declspec(dllimport) HANDLE __stdcall CreateThread(void *, u64, DWORD (__stdcall *)(void *), void *, DWORD, DWORD *);
+__declspec(dllimport) HANDLE __stdcall CreateThread(void *, SIZE_T, DWORD (__stdcall *)(void *), void *, DWORD, DWORD *);
 __declspec(dllimport) DWORD __stdcall WaitForSingleObject(HANDLE, DWORD);
 __declspec(dllimport) int __stdcall CloseHandle(HANDLE);
 __declspec(dllimport) void *__stdcall ResolveDelayLoadedAPI(void *, const void *, void *, void *, void **, DWORD);
@@ -41,7 +44,7 @@ __declspec(dllimport) int __stdcall LdrUnregisterDllNotification(void *);
 __declspec(dllimport) int add(int, int);
 __declspec(dllimport) const char *word(int);
 __declspec(dllimport) int attached;
-__declspec(dllimport) void *heap_alloc(HANDLE, DWORD, u64);
+__declspec(dllimport) void *heap_alloc(HANDLE, DWORD, SIZE_T);
 __declspec(dllimport) int thread_attached, thread_detached, say_at_exit;
 __declspec(dllimport) int square(int);
 
@@ -105,8 +108,8 @@ static void __stdcall on_tls(void *m, DWORD reason, void *r) { (void)m; (void)r;
 __attribute__((section(".CRT$XLA"), used)) TLS_CALLBACK __xl_a = 0;
 __attribute__((section(".CRT$XLB"), used)) TLS_CALLBACK __xl_b = on_tls;
 __attribute__((section(".CRT$XLZ"), used)) TLS_CALLBACK __xl_z = 0;
-struct { u64 start, end, index, callbacks; DWORD zero_fill, flags; } const _tls_used = {
-    (u64)&_tls_start, (u64)&_tls_end, (u64)&_tls_index, (u64)(&__xl_a + 1), 0, 0};
+struct { ULONG_PTR start, end, index, callbacks; DWORD zero_fill, flags; } const _tls_used = {
+    (ULONG_PTR)&_tls_start, (ULONG_PTR)&_tls_end, (ULONG_PTR)&_tls_index, (ULONG_PTR)(&__xl_a + 1), 0, 0};
 __declspec(thread) int tls_counter = 41;
 
 static HANDLE out;

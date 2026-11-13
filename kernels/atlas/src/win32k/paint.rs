@@ -38,17 +38,20 @@ impl Task {
         };
         let hdc = self.win32k().gdi.new_dc(hwnd, invalid);
         let still_to_erase = erase && self.send_message(cx, hwnd, WM_ERASEBKGND, hdc, 0)? == 0;
-        // PAINTSTRUCT: hdc, fErase, rcPaint, fRestore, fIncUpdate, rgbReserved.
-        let mut b = vec![0u8; 72];
-        b[0..8].copy_from_slice(&hdc.to_le_bytes());
-        b[8..12].copy_from_slice(&u32::from(still_to_erase).to_le_bytes());
-        b[12..28].copy_from_slice(&rect_bytes(&invalid));
+        // PAINTSTRUCT: hdc (pointer-sized), fErase, rcPaint, fRestore, fIncUpdate, rgbReserved; 72 bytes, or 64.
+        let abi = self.abi();
+        let w = abi.width as usize;
+        let mut b = vec![0u8; if w == 8 { 72 } else { 64 }];
+        b[0..w].copy_from_slice(&abi.ptr(hdc));
+        b[w..w + 4].copy_from_slice(&u32::from(still_to_erase).to_le_bytes());
+        b[w + 4..w + 20].copy_from_slice(&rect_bytes(&invalid));
         let _ = self.mem(cx, true, |t| user::write(&mut t.space(), ps, &b));
         Ok(hdc)
     }
 
     pub fn end_paint(&mut self, cx: &mut Cx<'_>, ps: u64) -> bool {
-        let Ok(hdc) = self.mem(cx, false, |t| user::read_u64(&t.space(), ps)) else { return false };
+        let width = self.abi().width;
+        let Ok(hdc) = self.mem(cx, false, |t| user::read_ptr(&t.space(), ps, width)) else { return false };
         self.release_dc(hdc)
     }
 

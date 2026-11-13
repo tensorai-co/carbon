@@ -30,11 +30,10 @@ const CREATE_UNICODE_ENVIRONMENT: u32 = 0x400;
 const STARTF_USESTDHANDLES: u32 = 0x100;
 const HANDLE_FLAG_INHERIT: u32 = 1;
 
-/// STARTUPINFO, 64-bit: its size, its flags, and the standard handles.
-mod startup {
-    pub const SIZE: u64 = 104;
-    pub const FLAGS: u64 = 60;
-    pub const STD_INPUT: u64 = 80;
+/// STARTUPINFO, by ISA: its size, where its flags are, and where its three standard handles start (each pointer-sized).
+/// A 32-bit one is 68 bytes, a 64-bit one 104.
+fn startup(isa: Isa) -> (u64, u64, u64) {
+    if isa == Isa::X86_32 { (68, 44, 56) } else { (104, 60, 80) }
 }
 
 impl Task {
@@ -188,11 +187,12 @@ fn create_process(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Re
 
     // What it inherits, and its standard handles: STARTUPINFO's (which it has only if it inherited them, as on
     // Windows), else this process's, which share its console.
+    let ((_, flags_at, std_at), width) = (startup(task.isa), task.abi().width);
     let Ok((startup_flags, given)) = task.mem(cx, false, |t| {
-        let flags = user::read_u32(&t.space(), startup_info + startup::FLAGS)?;
+        let flags = user::read_u32(&t.space(), startup_info + flags_at)?;
         let mut given = [0u64; 3];
         for (i, h) in given.iter_mut().enumerate() {
-            *h = user::read_u64(&t.space(), startup_info + startup::STD_INPUT + i as u64 * 8)?;
+            *h = user::read_ptr(&t.space(), startup_info + std_at + i as u64 * width, width)?;
         }
         Ok((flags, given))
     }) else {
@@ -238,13 +238,9 @@ fn create_process(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Re
         (state.handles.add_with(Handle::Object(process.object.clone()), process_inherit), state.handles.add_with(Handle::Object(thread), thread_inherit))
     };
     // PROCESS_INFORMATION: the two handles, then the two IDs.
-    let wrote = task.mem(cx, true, |t| {
-        let mut space = t.space();
-        user::write_u64(&mut space, information, process_handle)?;
-        user::write_u64(&mut space, information + 8, thread_handle)?;
-        user::write_u32(&mut space, information + 16, process.pid as u32)?;
-        user::write_u32(&mut space, information + 20, tid as u32)
-    });
+    let abi = task.abi();
+    let info = [abi.ptr(process_handle), abi.ptr(thread_handle), (process.pid as u32).to_le_bytes().to_vec(), (tid as u32).to_le_bytes().to_vec()].concat();
+    let wrote = task.mem(cx, true, |t| user::write(&mut t.space(), information, &info));
     if wrote.is_err() {
         return task.fail(cx, ERROR_INVALID_PARAMETER);
     }
@@ -300,9 +296,10 @@ pub fn create_pipe(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
         let write = state.handles.add_with(Handle::File(Arc::new(File::device(Node::Pipe(writer), false, true))), inherit);
         (read, write)
     };
+    let abi = task.abi();
     let wrote = task.mem(cx, true, |t| {
-        user::write_u64(&mut t.space(), a[0], read)?;
-        user::write_u64(&mut t.space(), a[1], write)
+        user::write(&mut t.space(), a[0], &abi.ptr(read))?;
+        user::write(&mut t.space(), a[1], &abi.ptr(write))
     });
     if wrote.is_err() {
         let mut state = lock(&task.process.state);
@@ -368,8 +365,9 @@ pub fn set_handle_information(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Re
 
 /// `GetStartupInfoW`/`A`: the size, and nothing a parent asked for (atlas keeps none of it yet).
 pub fn get_startup_info(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let mut info = vec![0u8; startup::SIZE as usize];
-    info[..4].copy_from_slice(&(startup::SIZE as u32).to_le_bytes());
+    let (size, _, _) = startup(task.isa);
+    let mut info = vec![0u8; size as usize];
+    info[..4].copy_from_slice(&(size as u32).to_le_bytes());
     let _ = task.mem(cx, true, |t| user::write(&mut t.space(), a[0], &info));
     Reply::Value(0)
 }

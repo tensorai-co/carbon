@@ -5,6 +5,9 @@
 // fiber's own, its callbacks as a fiber's deleted, as FlsFree frees a slot, and as a thread ends; a fiber whose
 // routine returns, ending its thread; and a fiber back to a thread.
 
+typedef __INTPTR_TYPE__ LONG_PTR;
+typedef __UINTPTR_TYPE__ ULONG_PTR;
+typedef __SIZE_TYPE__ SIZE_T;
 typedef void *HANDLE;
 typedef unsigned int DWORD;
 typedef unsigned long long u64;
@@ -13,8 +16,8 @@ __declspec(dllimport) HANDLE __stdcall GetStdHandle(DWORD);
 __declspec(dllimport) int __stdcall WriteFile(HANDLE, const void *, DWORD, DWORD *, void *);
 __declspec(dllimport) void __stdcall ExitProcess(unsigned);
 __declspec(dllimport) DWORD __stdcall GetLastError(void);
-__declspec(dllimport) void __stdcall RaiseException(DWORD, DWORD, DWORD, const u64 *);
-__declspec(dllimport) void *__stdcall CreateFiber(u64, void (__stdcall *)(void *), void *);
+__declspec(dllimport) void __stdcall RaiseException(DWORD, DWORD, DWORD, const ULONG_PTR *);
+__declspec(dllimport) void *__stdcall CreateFiber(SIZE_T, void (__stdcall *)(void *), void *);
 __declspec(dllimport) void __stdcall DeleteFiber(void *);
 __declspec(dllimport) void __stdcall SwitchToFiber(void *);
 __declspec(dllimport) void *__stdcall ConvertThreadToFiber(void *);
@@ -24,7 +27,7 @@ __declspec(dllimport) DWORD __stdcall FlsAlloc(void (__stdcall *)(void *));
 __declspec(dllimport) int __stdcall FlsFree(DWORD);
 __declspec(dllimport) void *__stdcall FlsGetValue(DWORD);
 __declspec(dllimport) int __stdcall FlsSetValue(DWORD, void *);
-__declspec(dllimport) HANDLE __stdcall CreateThread(void *, u64, DWORD (__stdcall *)(void *), void *, DWORD, DWORD *);
+__declspec(dllimport) HANDLE __stdcall CreateThread(void *, SIZE_T, DWORD (__stdcall *)(void *), void *, DWORD, DWORD *);
 __declspec(dllimport) DWORD __stdcall WaitForSingleObject(HANDLE, DWORD);
 __declspec(dllimport) int __stdcall GetExitCodeThread(HANDLE, DWORD *);
 

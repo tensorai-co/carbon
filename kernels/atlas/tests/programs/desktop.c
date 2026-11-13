@@ -17,20 +17,23 @@
 // with HWND_BOTTOM and after another window, a topmost window's owned window above it and topmost, both moved to the
 // bottom together, and a WS_EX_NOACTIVATE window clicked without being activated or raised; SetForegroundWindow
 
+typedef __INTPTR_TYPE__ LONG_PTR;
+typedef __UINTPTR_TYPE__ ULONG_PTR;
+typedef __SIZE_TYPE__ SIZE_T;
 typedef void *HANDLE;
 typedef void *HWND;
 typedef unsigned int DWORD;
 typedef unsigned int UINT;
-typedef unsigned long long u64;
-typedef long long LRESULT;
+typedef ULONG_PTR u64; // pointer-sized everywhere here
+typedef LONG_PTR LRESULT;
 typedef int BOOL;
 typedef unsigned short WCHAR;
-typedef LRESULT (__stdcall *WNDPROC)(HWND, UINT, u64, long long);
+typedef LRESULT (__stdcall *WNDPROC)(HWND, UINT, u64, LONG_PTR);
 typedef struct { int left, top, right, bottom; } RECT;
 typedef struct { int x, y; } POINT;
-typedef struct { HWND hwnd; UINT message; u64 wParam; long long lParam; DWORD time; int x, y; DWORD priv; } MSG;
+typedef struct { HWND hwnd; UINT message; u64 wParam; LONG_PTR lParam; DWORD time; int x, y; DWORD priv; } MSG;
 typedef struct { UINT size, style; WNDPROC proc; int cls, wnd; HANDLE instance, icon, cursor, background; const WCHAR *menu, *name; HANDLE small; } WNDCLASSEXW;
-typedef struct { DWORD type; DWORD pad; union { struct { int dx, dy; DWORD data, flags, time; u64 extra; } mi; struct { unsigned short vk, scan; DWORD flags, time; u64 extra; } ki; }; } INPUT;
+typedef struct { DWORD type; union { struct { int dx, dy; DWORD data, flags, time; u64 extra; } mi; struct { unsigned short vk, scan; DWORD flags, time; u64 extra; } ki; }; } INPUT;
 
 #define K __declspec(dllimport)
 K HANDLE __stdcall GetStdHandle(DWORD);
@@ -38,7 +41,7 @@ K BOOL __stdcall WriteFile(HANDLE, const void *, DWORD, DWORD *, void *);
 K void __stdcall ExitProcess(unsigned);
 K unsigned short __stdcall RegisterClassExW(const WNDCLASSEXW *);
 K HWND __stdcall CreateWindowExW(DWORD, const WCHAR *, const WCHAR *, DWORD, int, int, int, int, HWND, HANDLE, HANDLE, void *);
-K LRESULT __stdcall DefWindowProcW(HWND, UINT, u64, long long);
+K LRESULT __stdcall DefWindowProcW(HWND, UINT, u64, LONG_PTR);
 K BOOL __stdcall PeekMessageW(MSG *, HWND, UINT, UINT, UINT);
 K BOOL __stdcall TranslateMessage(const MSG *);
 K LRESULT __stdcall DispatchMessageW(const MSG *);
@@ -60,13 +63,13 @@ K BOOL __stdcall ScreenToClient(HWND, POINT *);
 K HWND __stdcall WindowFromPoint(POINT);
 K int __stdcall GetSystemMetrics(int);
 K HANDLE __stdcall GetSysColorBrush(int);
-K LRESULT __stdcall SendMessageW(HWND, UINT, u64, long long);
+K LRESULT __stdcall SendMessageW(HWND, UINT, u64, LONG_PTR);
 K BOOL __stdcall IsZoomed(HWND);
 K HWND __stdcall SetCapture(HWND);
-K HANDLE __stdcall GlobalAlloc(UINT, unsigned long long);
+K HANDLE __stdcall GlobalAlloc(UINT, ULONG_PTR);
 K void *__stdcall GlobalLock(HANDLE);
 K BOOL __stdcall GlobalUnlock(HANDLE);
-K unsigned long long __stdcall GlobalSize(HANDLE);
+K ULONG_PTR __stdcall GlobalSize(HANDLE);
 K BOOL __stdcall OpenClipboard(HWND);
 K BOOL __stdcall CloseClipboard(void);
 K BOOL __stdcall EmptyClipboard(void);
@@ -86,12 +89,12 @@ typedef struct { UINT cbSize; HWND hwnd; DWORD dwFlags; UINT uCount; DWORD dwTim
 K BOOL __stdcall FlashWindowEx(FLASHWINFO *);
 K BOOL __stdcall ClipCursor(const RECT *);
 K BOOL __stdcall GetClipCursor(RECT *);
-K long long __stdcall GetWindowLongPtrW(HWND, int);
+K LONG_PTR __stdcall GetWindowLongPtrW(HWND, int);
 K BOOL __stdcall DestroyWindow(HWND);
 K BOOL __stdcall SetWindowPos(HWND, HWND, int, int, int, int, UINT);
 K HWND __stdcall GetWindow(HWND, UINT);
 K HWND __stdcall GetTopWindow(HWND);
-K BOOL __stdcall EnumWindows(BOOL(__stdcall *)(HWND, long long), long long);
+K BOOL __stdcall EnumWindows(BOOL(__stdcall *)(HWND, LONG_PTR), LONG_PTR);
 K void __stdcall DragAcceptFiles(HWND, BOOL);
 K UINT __stdcall DragQueryFileW(HANDLE, UINT, WCHAR *, UINT);
 
@@ -142,17 +145,17 @@ static const WCHAR *W(int i, const char *s) { int n = 0; for (; s[n]; n++) wbuf[
 static HWND a, b, c, child;
 // What each window saw.
 static int activated[3], deactivated[3], focused[3], unfocused[3], closed[3], moves, sizes;
-static long long down_at, down_wparam, wheel, hwheel;
+static LONG_PTR down_at, down_wparam, wheel, hwheel;
 static int clipboard_lost;
 static int r_downs, r_first_repeat, r_then_repeat;
 static HWND enumerated_first;
-static BOOL __stdcall first_window(HWND h, long long lp) { (void)lp; enumerated_first = h; return 0; }
+static BOOL __stdcall first_window(HWND h, LONG_PTR lp) { (void)lp; enumerated_first = h; return 0; }
 static int down_window_ok, shift_seen_down, moved_x, moved_y, size_w, size_h;
 static char typed[16];
 static int ntyped;
 static int which(HWND h) { return h == a ? 0 : h == b ? 1 : 2; }
 
-static LRESULT __stdcall wndproc(HWND hwnd, UINT msg, u64 wp, long long lp) {
+static LRESULT __stdcall wndproc(HWND hwnd, UINT msg, u64 wp, LONG_PTR lp) {
     int i = which(hwnd);
     switch (msg) {
     case WM_ACTIVATE: if (wp & 0xffff) activated[i]++; else deactivated[i]++; break;
@@ -164,15 +167,15 @@ static LRESULT __stdcall wndproc(HWND hwnd, UINT msg, u64 wp, long long lp) {
     // The popup draws its own title bar: a press on it is one, so it asks to be moved, as such programs do.
     case WM_LBUTTONDOWN:
         if (hwnd == c) { SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0); return 0; }
-        down_at = lp; down_wparam = (long long)wp; down_window_ok = hwnd == a; break;
+        down_at = lp; down_wparam = (LONG_PTR)wp; down_window_ok = hwnd == a; break;
     case WM_KEYDOWN:
         if (wp == 'A') shift_seen_down = GetKeyState(0x10) < 0;
         // Bit 30: the key was down already, so this is its repeat.
         if (wp == 'R') { if (r_downs++ == 0) r_first_repeat = (int)((lp >> 30) & 1); else r_then_repeat = (int)((lp >> 30) & 1); }
         break;
     case WM_CHAR: if (ntyped < 15) typed[ntyped++] = (char)wp; return 0;
-    case WM_MOUSEWHEEL: wheel = (long long)wp; return 0;
-    case WM_MOUSEHWHEEL: hwheel = (long long)wp; return 0;
+    case WM_MOUSEWHEEL: wheel = (LONG_PTR)wp; return 0;
+    case WM_MOUSEHWHEEL: hwheel = (LONG_PTR)wp; return 0;
     case 0x307: if (hwnd == a) clipboard_lost++; return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);

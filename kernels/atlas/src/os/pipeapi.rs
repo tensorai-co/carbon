@@ -212,7 +212,8 @@ pub fn connect_named_pipe(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply 
     }
     let ov = a[1];
     if file.overlapped && ov != 0 {
-        let event = task.mem(cx, false, |t| user::read_u64(&t.space(), ov + 24)).ok().filter(|&e| e != 0).and_then(|e| task.object(e));
+        let abi = task.abi();
+        let event = task.mem(cx, false, |t| user::read_ptr(&t.space(), ov + abi.overlapped_event(), abi.width)).ok().filter(|&e| e != 0).and_then(|e| task.object(e));
         if let Some(event) = &event {
             task.k.objects.signal(event, |s| s.set = false);
         }
@@ -225,7 +226,7 @@ pub fn connect_named_pipe(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply 
             port: lock(&file.port).clone(),
             routine: None,
         });
-        let pending = [u64::from(ports::STATUS_PENDING).to_le_bytes(), 0u64.to_le_bytes()].concat();
+        let pending = task.abi().overlapped_result(ports::STATUS_PENDING, 0);
         let _ = task.mem(cx, true, |t| user::write(&mut t.space(), ov, &pending));
         let mut s = lock(&instance.state);
         if s.phase == Phase::Listening {

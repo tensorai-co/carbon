@@ -97,6 +97,31 @@ impl Abi {
         s
     }
 
+    /// Reads a pointer-sized value from bytes a program gave, at `at`.
+    pub fn ptr_at(&self, bytes: &[u8], at: usize) -> u64 {
+        let mut word = [0u8; 8];
+        let n = self.width as usize;
+        if let Some(b) = bytes.get(at..at + n) {
+            word[..n].copy_from_slice(b);
+        }
+        u64::from_le_bytes(word)
+    }
+
+    /// OVERLAPPED: `Internal` (an NTSTATUS) and `InternalHigh` (the count) are pointer-sized, then `Offset` and
+    /// `OffsetHigh`, then `hEvent`.
+    pub fn overlapped_offset(&self) -> u64 {
+        2 * self.width
+    }
+
+    pub fn overlapped_event(&self) -> u64 {
+        2 * self.width + 8
+    }
+
+    /// An OVERLAPPED's first two fields: a status and a count.
+    pub fn overlapped_result(&self, status: u32, count: u64) -> Vec<u8> {
+        [self.ptr(u64::from(status)), self.ptr(count)].concat()
+    }
+
     /// A new thread's TEB fields: its stack (top, the bottom of what's mapped, and the bottom of the reservation),
     /// itself, its IDs and the PEB. A 32-bit TEB's chain of SEH frames starts empty (-1).
     #[allow(clippy::too_many_arguments)]

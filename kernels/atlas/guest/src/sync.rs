@@ -71,7 +71,7 @@ pub struct CriticalSection {
 
 fn thread_id() -> usize {
     // SAFETY: CLIENT_ID.UniqueThread, in this thread's TEB.
-    unsafe { crate::teb().add(teb::CLIENT_ID as usize + 8).cast::<usize>().read_volatile() }
+    unsafe { crate::teb().add(teb::CLIENT_ID as usize + size_of::<usize>()).cast::<usize>().read_volatile() }
 }
 
 fn process_id() -> usize {

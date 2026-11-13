@@ -80,8 +80,10 @@ fn signal(word: &AtomicU32, all: bool) {
     call4(call::WAKE_ADDRESS, word as *const _ as u64, u64::from(all), 0, 0);
 }
 
-fn spawn(start: extern "system" fn(u64) -> u32, parameter: u64) -> bool {
-    call4(call::CREATE_THREAD, start as *const () as u64, parameter, 0, 0) != 0
+/// Starts one of the pool's own threads at `start(parameter)`. Its parameter is pointer-sized, as every thread
+/// routine's is (a u64 would be two stack slots on x86).
+fn spawn(start: extern "system" fn(usize) -> u32, parameter: u64) -> bool {
+    call4(call::CREATE_THREAD, start as *const () as usize as u64, parameter, 0, 0) != 0
 }
 
 // ---- kernel32's host exports, by number ----
@@ -463,7 +465,8 @@ fn close(object: *mut Object) {
 
 /// A pool's worker: runs what's queued, and waits for more, until it's been idle a while (above the pool's minimum)
 /// or the pool's closed.
-extern "system" fn AtlasPoolWorker(pool: u64) -> u32 {
+extern "system" fn AtlasPoolWorker(pool: usize) -> u32 {
+    let pool = pool as u64;
     let pool = pool as *mut Pool;
     loop {
         // SAFETY: the pool, which stays while it has workers, under the lock.
@@ -818,7 +821,7 @@ pub extern "system" fn AtlasCloseThreadpoolTimer(timer: usize) {
 }
 
 /// The timer thread: queues each timer as it comes due, and sleeps until the next one is.
-extern "system" fn AtlasPoolTimers(_: u64) -> u32 {
+extern "system" fn AtlasPoolTimers(_: usize) -> u32 {
     loop {
         let (next, seen) = with(|s| {
             let at = now();
@@ -924,7 +927,8 @@ pub extern "system" fn AtlasCloseThreadpoolWait(wait: usize) {
 
 /// A wait's thread: waits on its handle and its event, queuing its callback as the handle's signalled or the time's
 /// up, and taking its changes as they come, until it's closed.
-extern "system" fn AtlasPoolWaiter(wait: u64) -> u32 {
+extern "system" fn AtlasPoolWaiter(wait: usize) -> u32 {
+    let wait = wait as u64;
     let wait = wait as *mut Object;
     loop {
         // SAFETY: the wait, which can't go while this thread holds it, under the lock.
@@ -950,7 +954,8 @@ extern "system" fn AtlasPoolWaiter(wait: u64) -> u32 {
                 continue;
             }
         };
-        let handles = [handle, changed];
+        // HANDLEs: pointer-sized.
+        let handles = [handle as usize, changed as usize];
         let ms = if timeout == 0 { INFINITE } else { ms_until(timeout) };
         let r = wait_for_multiple(2, handles.as_ptr() as u64, 0, u64::from(ms)) as u32;
         // SAFETY: as above.
@@ -1066,11 +1071,13 @@ fn io_port() -> u64 {
 }
 
 /// The I/O thread: each completion on the port is its object's callback, queued on its pool.
-extern "system" fn AtlasPoolIo(port: u64) -> u32 {
+extern "system" fn AtlasPoolIo(port: usize) -> u32 {
+    let port = port as u64;
     const ERROR_ABANDONED_WAIT_0: u32 = 735;
     loop {
-        let (mut bytes, mut key, mut overlapped) = (0u32, 0u64, 0u64);
-        let ok = get_queued_completion_status(port, (&raw mut bytes) as u64, (&raw mut key) as u64, (&raw mut overlapped) as u64, u64::from(INFINITE)) != 0;
+        let (mut bytes, mut key, mut overlapped) = (0u32, 0usize, 0usize);
+        let ok = get_queued_completion_status(port, (&raw mut bytes) as usize as u64, (&raw mut key) as usize as u64, (&raw mut overlapped) as usize as u64, u64::from(INFINITE)) != 0;
+        let (key, overlapped) = (key as u64, overlapped as u64);
         let error = if ok { 0 } else { crate::RtlGetLastWin32Error() };
         if !ok && overlapped == 0 {
             if error == ERROR_ABANDONED_WAIT_0 {

@@ -70,16 +70,22 @@ impl Task {
     /// `NtQuerySystemInformation(class, buffer, length, &return length)`: an NTSTATUS.
     pub fn query_system_information(&mut self, cx: &mut Cx<'_>, class: u32, buffer: u64, length: u64, returned: u64) -> u32 {
         let length = length as u32 as usize;
+        // A 32-bit program gets the classes with pointers in them in its own layout; the kernel's module list and
+        // the handle lists aren't written for it yet.
+        let x32 = self.isa == exec::Isa::X86_32;
         let data = match class {
             0 | 0x3e => Some(self.basic(cx)),
             1 | 0x3f => Some(self.processor()),
             2 => Some(self.performance(cx)),
             3 => Some(self.time_of_day()),
+            5 if x32 => Some(self.processes32(buffer)),
             5 => Some(self.processes(buffer)),
             8 => Some(self.processor_times(length)),
+            11 | 16 | 64 if x32 => None,
             11 => Some(modules()),
             16 => Some(self.handle_list(false)),
             35 => Some(vec![0, 1]),
+            50 if x32 => Some(0x8000_0000u32.to_le_bytes().to_vec()),
             50 => Some(SYSTEM_RANGE_START.to_le_bytes().to_vec()),
             64 => Some(self.handle_list(true)),
             _ => None,
@@ -115,21 +121,25 @@ impl Task {
         self.k.host.monotonic() / 100
     }
 
-    /// `SYSTEM_BASIC_INFORMATION`.
+    /// `SYSTEM_BASIC_INFORMATION`: 64 bytes, or 44 for a 32-bit program, whose two addresses and mask are 4 bytes.
     fn basic(&self, cx: &mut Cx<'_>) -> Vec<u8> {
         let pages = cx.turn(|t| t.memory().size().limit) / 4096;
-        let cpus = self.cpus();
-        let mut o = Out::new(64);
+        let abi = self.abi();
+        let cpus = self.cpus().min(abi.width as u32 * 8);
+        let mut o = Out::new(if abi.width == 8 { 64 } else { 44 });
         o.u32(4, 156_250); // the timer's resolution, 15.625 ms
         o.u32(8, 4096);
         o.u32(12, pages as u32);
         o.u32(16, 1);
         o.u32(20, pages as u32);
         o.u32(24, GRANULE as u32);
-        o.u64(32, GRANULE);
-        o.u64(40, self.layout().alloc.end - GRANULE - 1);
-        o.u64(48, u64::MAX >> (64 - cpus));
-        o.u8(56, cpus as u8);
+        let addresses = if abi.width == 8 { 32 } else { 28 };
+        let w = abi.width as usize;
+        for (i, v) in [GRANULE, self.layout().alloc.end - GRANULE - 1, u64::MAX >> (64 - cpus)].into_iter().enumerate() {
+            let at = addresses + i * w;
+            o.0[at..at + w].copy_from_slice(&abi.ptr(v));
+        }
+        o.u8(addresses + 3 * w, cpus as u8);
         o.0
     }
 
@@ -270,6 +280,74 @@ impl Task {
                 let running = tid == self.tid && p.pid == self.process.pid;
                 o.u32(t + 0x44, if running { 2 } else { 5 });
                 o.u32(t + 0x48, if running { 0 } else { 6 });
+            }
+            out.extend(o.0);
+        }
+        out
+    }
+
+    /// The same, for a 32-bit program: `SYSTEM_PROCESS_INFORMATION` is 0xb8 bytes, with its handles, sizes and name's
+    /// pointer 4 bytes each, and `SYSTEM_THREAD_INFORMATION` 0x40.
+    fn processes32(&self, base: u64) -> Vec<u8> {
+        const PROCESS: usize = 0xb8;
+        const THREAD: usize = 0x40;
+        let up = self.uptime();
+        let booted = crate::files::filetime(self.k.host.wall()) - up;
+        let cpus = self.cpus() as usize;
+        let small = |v: u64| v.min(u64::from(u32::MAX)) as u32;
+        let mut out: Vec<u8> = Vec::new();
+        let mut entries: Vec<(Snapshot, bool)> = vec![(
+            Snapshot { pid: 0, parent: 0, created: 0, name: String::new(), threads: vec![0; cpus], thread_start: 0, handles: Vec::new(), virtual_size: 0, committed: 0 },
+            true,
+        )];
+        entries.extend(self.snapshot().into_iter().map(|s| (s, false)));
+        let last = entries.len() - 1;
+        for (index, (p, idle)) in entries.into_iter().enumerate() {
+            let start = out.len();
+            let name: Vec<u8> = p.name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            let size = (PROCESS + THREAD * p.threads.len() + name.len() + 2).next_multiple_of(8);
+            let mut o = Out::new(size);
+            if index != last {
+                o.u32(0, size as u32);
+            }
+            o.u32(4, p.threads.len() as u32);
+            o.u64(0x20, if idle { 0 } else { p.created });
+            if idle {
+                o.u64(0x30, up * cpus as u64);
+            }
+            if !name.is_empty() {
+                let at = PROCESS + THREAD * p.threads.len();
+                o.u16(0x38, name.len() as u16);
+                o.u16(0x3a, name.len() as u16 + 2);
+                o.u32(0x3c, (base + (start + at) as u64) as u32);
+                o.0[at..at + name.len()].copy_from_slice(&name);
+            }
+            o.u32(0x40, if idle { 0 } else { 8 });
+            o.u32(0x44, p.pid as u32);
+            o.u32(0x48, p.parent as u32);
+            o.u32(0x4c, p.handles.len() as u32);
+            o.u32(0x50, if idle { 0 } else { 1 });
+            o.u32(0x54, p.pid as u32);
+            for at in [0x58, 0x5c] {
+                o.u32(at, small(p.virtual_size));
+            }
+            for at in [0x64, 0x68, 0x7c, 0x80, 0x84, 0x08] {
+                o.u32(at, small(p.committed));
+            }
+            for (i, &tid) in p.threads.iter().enumerate() {
+                let t = PROCESS + THREAD * i;
+                if idle {
+                    o.u64(t, up);
+                }
+                o.u64(t + 0x10, if idle { booted } else { p.created });
+                o.u32(t + 0x1c, p.thread_start as u32);
+                o.u32(t + 0x20, p.pid as u32);
+                o.u32(t + 0x24, tid as u32);
+                o.u32(t + 0x28, if idle { 0 } else { 8 });
+                o.u32(t + 0x2c, if idle { 0 } else { 8 });
+                let running = tid == self.tid && p.pid == self.process.pid;
+                o.u32(t + 0x34, if running { 2 } else { 5 });
+                o.u32(t + 0x38, if running { 0 } else { 6 });
             }
             out.extend(o.0);
         }

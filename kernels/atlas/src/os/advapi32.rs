@@ -256,7 +256,7 @@ fn open_key(task: &mut Task, cx: &mut Cx<'_>, base: u64, subkey: u64, out: u64, 
         Ok(id) if !task.key_allows(id, access) => error(5),
         Ok(id) => {
             let handle = task.new_key_handle(id);
-            let _ = task.mem(cx, true, |t| user::write_u64(&mut t.space(), out, handle));
+            let _ = task.write_ptr(cx, out, handle);
             Reply::Value(SUCCESS)
         }
         Err(e) => error(e),
@@ -291,7 +291,7 @@ fn create_key(task: &mut Task, cx: &mut Cx<'_>, base: u64, subkey: u64, options:
     match made {
         Ok((id, created)) => {
             let handle = task.new_key_handle(id);
-            let _ = task.mem(cx, true, |t| user::write_u64(&mut t.space(), out, handle));
+            let _ = task.write_ptr(cx, out, handle);
             task.write_out_u32(cx, disposition, if created { 1 } else { 2 });
             Reply::Value(SUCCESS)
         }

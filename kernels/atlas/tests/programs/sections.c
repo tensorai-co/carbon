@@ -11,6 +11,9 @@
 // Waitable timers: notification and synchronization, relative and absolute, periodic and cancelled, an APC routine,
 // and opened by name.
 
+typedef __INTPTR_TYPE__ LONG_PTR;
+typedef __UINTPTR_TYPE__ ULONG_PTR;
+typedef __SIZE_TYPE__ SIZE_T;
 typedef void *HANDLE;
 typedef unsigned int DWORD;
 typedef unsigned short WCHAR;
@@ -20,8 +23,10 @@ typedef long long i64;
 typedef struct {
     void *base, *allocation_base;
     DWORD allocation_protect;
+#if __SIZEOF_POINTER__ == 8
     unsigned short partition;
-    u64 size;
+#endif
+    SIZE_T size;
     DWORD state, protect, type;
 } MEMORY_BASIC_INFORMATION;
 
@@ -59,12 +64,12 @@ K DWORD __stdcall SetFilePointer(HANDLE, long, long *, DWORD);
 K int __stdcall DeleteFileW(const WCHAR *);
 K HANDLE __stdcall CreateFileMappingW(HANDLE, SECURITY_ATTRIBUTES *, DWORD, DWORD, DWORD, const WCHAR *);
 K HANDLE __stdcall OpenFileMappingW(DWORD, int, const WCHAR *);
-K void *__stdcall MapViewOfFile(HANDLE, DWORD, DWORD, DWORD, u64);
-K void *__stdcall MapViewOfFileEx(HANDLE, DWORD, DWORD, DWORD, u64, void *);
+K void *__stdcall MapViewOfFile(HANDLE, DWORD, DWORD, DWORD, SIZE_T);
+K void *__stdcall MapViewOfFileEx(HANDLE, DWORD, DWORD, DWORD, SIZE_T, void *);
 K int __stdcall UnmapViewOfFile(void *);
-K int __stdcall FlushViewOfFile(void *, u64);
-K u64 __stdcall VirtualQuery(const void *, MEMORY_BASIC_INFORMATION *, u64);
-K void *__stdcall VirtualAlloc(void *, u64, DWORD, DWORD);
+K int __stdcall FlushViewOfFile(void *, SIZE_T);
+K SIZE_T __stdcall VirtualQuery(const void *, MEMORY_BASIC_INFORMATION *, SIZE_T);
+K void *__stdcall VirtualAlloc(void *, SIZE_T, DWORD, DWORD);
 K HANDLE __stdcall GetModuleHandleW(const WCHAR *);
 K int __stdcall CreateProcessW(const WCHAR *, WCHAR *, SECURITY_ATTRIBUTES *, SECURITY_ATTRIBUTES *, int, DWORD, void *,
                                const WCHAR *, STARTUPINFOW *, PROCESS_INFORMATION *);

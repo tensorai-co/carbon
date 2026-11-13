@@ -216,20 +216,33 @@ pub struct Msg {
 }
 
 impl Msg {
-    /// MSG, 64-bit: 48 bytes.
-    pub fn encode(&self) -> Vec<u8> {
-        let mut b = vec![0u8; 48];
-        b[0..8].copy_from_slice(&self.hwnd.to_le_bytes());
-        b[8..12].copy_from_slice(&self.message.to_le_bytes());
-        b[16..24].copy_from_slice(&self.wparam.to_le_bytes());
-        b[24..32].copy_from_slice(&self.lparam.to_le_bytes());
-        b[32..36].copy_from_slice(&self.time.to_le_bytes());
+    /// MSG's size for a program whose pointers are `width` bytes: 48, or 28 for a 32-bit one.
+    pub fn size(width: u64) -> usize {
+        if width == 8 { 48 } else { 28 }
+    }
+
+    /// MSG: hwnd, message, wParam and lParam (pointer-sized but the message), time, pt.
+    pub fn encode(&self, width: u64) -> Vec<u8> {
+        let w = width as usize;
+        let mut b = vec![0u8; Self::size(width)];
+        b[0..w].copy_from_slice(&self.hwnd.to_le_bytes()[..w]);
+        b[w..w + 4].copy_from_slice(&self.message.to_le_bytes());
+        b[2 * w..3 * w].copy_from_slice(&self.wparam.to_le_bytes()[..w]);
+        b[3 * w..4 * w].copy_from_slice(&self.lparam.to_le_bytes()[..w]);
+        b[4 * w..4 * w + 4].copy_from_slice(&self.time.to_le_bytes());
         b
     }
 
-    pub fn decode(b: &[u8]) -> Msg {
-        let at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap_or_default());
-        Msg { hwnd: at(0), message: at(8) as u32, wparam: at(16), lparam: at(24), time: at(32) as u32 }
+    pub fn decode(b: &[u8], width: u64) -> Msg {
+        let w = width as usize;
+        let at = |o: usize| {
+            let mut word = [0u8; 8];
+            if let Some(s) = b.get(o..o + w) {
+                word[..w].copy_from_slice(s);
+            }
+            u64::from_le_bytes(word)
+        };
+        Msg { hwnd: at(0), message: at(w) as u32, wparam: at(2 * w), lparam: at(3 * w), time: at(4 * w) as u32 }
     }
 }
 
@@ -1057,15 +1070,21 @@ impl Task {
         // The class's name as the program wrote it, not as win32k keys it.
         let class_text = if ansi && class_at >= 0x1_0000 { self.text_arg(cx, class_at, false) } else { String::new() };
         let (name_w, class_w) = if ansi { (wide(&text), if class_at < 0x1_0000 { Vec::new() } else { wide(&class_text) }) } else { (Vec::new(), Vec::new()) };
-        let len = 80 + name_w.len() + class_w.len();
+        // 80 bytes, or 48 for a 32-bit program: four pointers, five ints, two pointers and an int.
+        let w = self.abi().width as usize;
+        let head = if w == 8 { 80 } else { 48 };
+        let len = head + name_w.len() + class_w.len();
         let cs = |at: u64| -> Vec<u8> {
-            let mut cs = vec![0u8; 80];
-            let name_ptr = if ansi && name_at != 0 { at + 80 } else { name_at };
-            let class_ptr = if ansi && class_at >= 0x1_0000 { at + 80 + name_w.len() as u64 } else { class_at };
-            for (o, v) in [(0, param), (8, instance), (16, menu), (24, if parent == DESKTOP { 0 } else { parent }), (56, name_ptr), (64, class_ptr)] {
-                cs[o..o + 8].copy_from_slice(&v.to_le_bytes());
+            let mut cs = vec![0u8; head];
+            let name_ptr = if ansi && name_at != 0 { at + head as u64 } else { name_at };
+            let class_ptr = if ansi && class_at >= 0x1_0000 { at + head as u64 + name_w.len() as u64 } else { class_at };
+            // The ints after the four pointers; the names after them, aligned to a pointer.
+            let ints = 4 * w;
+            let names = (ints + 20).next_multiple_of(w);
+            for (o, v) in [(0, param), (w, instance), (2 * w, menu), (3 * w, if parent == DESKTOP { 0 } else { parent }), (names, name_ptr), (names + w, class_ptr)] {
+                cs[o..o + w].copy_from_slice(&v.to_le_bytes()[..w]);
             }
-            for (o, v) in [(32, rect[3]), (36, rect[2]), (40, rect[1]), (44, rect[0]), (48, style as i32), (72, ex_style as i32)] {
+            for (o, v) in [(ints, rect[3]), (ints + 4, rect[2]), (ints + 8, rect[1]), (ints + 12, rect[0]), (ints + 16, style as i32), (names + 2 * w, ex_style as i32)] {
                 cs[o..o + 4].copy_from_slice(&v.to_le_bytes());
             }
             cs.extend(&name_w);
@@ -1295,19 +1314,23 @@ impl Task {
                 })
             }
             WM_NCCREATE | WM_CREATE if lparam != 0 => {
-                let Ok(cs) = self.mem(cx, false, |t| user::read_vec(&t.space(), lparam, 80)) else { return Ok(0) };
-                let ptr = |o: usize| u64::from_le_bytes(cs[o..o + 8].try_into().unwrap_or_default());
+                // CREATESTRUCT: 80 bytes with its names' pointers at 56 and 64, or 48 with them at 36 and 40.
+                let abi = self.abi();
+                let w = abi.width as usize;
+                let head = if w == 8 { 80 } else { 48 };
+                let names = (4 * w + 20).next_multiple_of(w);
+                let Ok(cs) = self.mem(cx, false, |t| user::read_vec(&t.space(), lparam, head)) else { return Ok(0) };
                 let to_ansi = |task: &mut Task, cx: &mut Cx<'_>, at: u64| -> Option<Vec<u8>> {
                     (at >= 0x1_0000).then(|| crate::ansi::bytes(&task.wstr(cx, at)).into_iter().chain([0]).collect())
                 };
-                let (name, class) = (to_ansi(self, cx, ptr(56)), to_ansi(self, cx, ptr(64)));
-                let len = 80 + name.as_ref().map_or(0, Vec::len) + class.as_ref().map_or(0, Vec::len);
+                let (name, class) = (to_ansi(self, cx, abi.ptr_at(&cs, names)), to_ansi(self, cx, abi.ptr_at(&cs, names + w)));
+                let len = head + name.as_ref().map_or(0, Vec::len) + class.as_ref().map_or(0, Vec::len);
                 let build = |at: u64| {
                     let mut out = cs.clone();
                     let mut tail: Vec<u8> = Vec::new();
-                    for (o, s) in [(56, &name), (64, &class)] {
+                    for (o, s) in [(names, &name), (names + w, &class)] {
                         if let Some(s) = s {
-                            out[o..o + 8].copy_from_slice(&(at + 80 + tail.len() as u64).to_le_bytes());
+                            out[o..o + w].copy_from_slice(&abi.ptr(at + head as u64 + tail.len() as u64));
                             tail.extend(s);
                         }
                     }

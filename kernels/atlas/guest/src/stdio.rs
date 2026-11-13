@@ -17,7 +17,20 @@ host!(write_file, b"WriteFile", (handle, buffer, count, written, overlapped));
 host!(read_file, b"ReadFile", (handle, buffer, count, read, overlapped));
 host!(create_file_a, b"CreateFileA", (name, access, share, attributes, disposition, flags, template));
 host!(close_handle, b"CloseHandle", (handle));
+#[cfg(not(target_arch = "x86"))]
 host!(set_file_pointer_ex, b"SetFilePointerEx", (handle, distance, new, method));
+// On x86 its LARGE_INTEGER distance is two stack slots, low half first.
+#[cfg(target_arch = "x86")]
+host!(set_file_pointer_ex, b"SetFilePointerEx", (handle, low, high, new, method));
+
+/// `SetFilePointerEx(handle, distance, &new, method)`.
+fn seek(handle: u64, distance: i64, new: u64, method: u64) -> u64 {
+    #[cfg(not(target_arch = "x86"))]
+    let r = set_file_pointer_ex(handle, distance as u64, new, method);
+    #[cfg(target_arch = "x86")]
+    let r = set_file_pointer_ex(handle, distance as u64 & 0xffff_ffff, distance as u64 >> 32, new, method);
+    r
+}
 
 const EOF: i32 = -1;
 const BUFFER: usize = 4096;
@@ -80,7 +93,7 @@ fn put(f: &mut File, bytes: &[u8]) -> bool {
         }
         if f.append {
             let mut end = 0i64;
-            set_file_pointer_ex(handle, 0, (&raw mut end) as u64, 2);
+            seek(handle, 0, (&raw mut end) as usize as u64, 2);
         }
         write_file(handle, chunk.as_ptr() as u64, chunk.len() as u64, (&raw mut written) as u64, 0) != 0
     };
@@ -378,7 +391,7 @@ pub extern "C" fn AtlasCrtFseeki64(f: *mut File, offset: i64, whence: i32) -> i3
     file.have = 0;
     file.eof = false;
     let handle = file.handle();
-    if set_file_pointer_ex(handle, offset as u64, 0, whence as u64) == 0 {
+    if seek(handle, offset, 0, whence as u64) == 0 {
         crate::crt::set_errno(22);
         return -1;
     }
@@ -395,7 +408,7 @@ pub extern "C" fn AtlasCrtFtelli64(f: *mut File) -> i64 {
     let Some(file) = stream(f) else { return -1 };
     let mut at = 0i64;
     let handle = file.handle();
-    if set_file_pointer_ex(handle, 0, (&raw mut at) as u64, 1) == 0 {
+    if seek(handle, 0, (&raw mut at) as usize as u64, 1) == 0 {
         return -1;
     }
     at - (file.have - file.at) as i64

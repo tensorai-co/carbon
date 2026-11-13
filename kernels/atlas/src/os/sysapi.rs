@@ -247,11 +247,15 @@ pub fn global_memory_status(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Repl
     let (total, free) = physical(cx);
     let virt = task.layout().alloc.end - GRANULE;
     let load = ((total - free) * 100).checked_div(total).unwrap_or(0) as u32;
+    // MEMORYSTATUS: its length and load, then six SIZE_Ts, which a 32-bit program's can't hold more than 4 GiB in
+    // (Windows says 4 GiB less a byte then, as here).
+    let abi = task.abi();
+    let most = if abi.width == 4 { u64::from(u32::MAX) } else { u64::MAX };
     let mut b = Vec::with_capacity(56);
-    b.extend(56u32.to_le_bytes());
+    b.extend((8 + 6 * abi.width as u32).to_le_bytes());
     b.extend(load.to_le_bytes());
     for v in [total, free, total, free, virt, virt] {
-        b.extend(v.to_le_bytes());
+        b.extend(abi.ptr(v.min(most)));
     }
     let _ = task.put(cx, a[0], &b);
     Reply::Value(0)
@@ -307,13 +311,17 @@ fn caches(isa: exec::Isa) -> [(u8, u16, u32, u32, bool); 3] {
 /// `GetLogicalProcessorInformation(buffer, &length)`: 32-byte records, a core for each processor, its caches, the
 /// package and the one NUMA node.
 pub fn get_logical_processor_information(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let cpus = task.cpus();
+    let abi = task.abi();
+    let w = abi.width as usize;
+    let cpus = task.cpus().min(abi.width as u32 * 8);
     let all = u64::MAX >> (64 - cpus);
+    // SYSTEM_LOGICAL_PROCESSOR_INFORMATION: a processor mask (pointer-sized), the relationship, and a 16-byte union
+    // aligned to 8: 32 bytes, or 24 for a 32-bit program.
     let record = |mask: u64, relation: u32, rest: &[u8]| {
-        let mut r = [0u8; 32];
-        r[0..8].copy_from_slice(&mask.to_le_bytes());
-        r[8..12].copy_from_slice(&relation.to_le_bytes());
-        r[16..16 + rest.len()].copy_from_slice(rest);
+        let mut r = vec![0u8; w + 8 + 16];
+        r[0..w].copy_from_slice(&abi.ptr(mask));
+        r[w..w + 4].copy_from_slice(&relation.to_le_bytes());
+        r[w + 8..w + 8 + rest.len()].copy_from_slice(rest);
         r
     };
     let cache = |level: u8, line: u16, size: u32, kind: u32| {
@@ -348,11 +356,14 @@ pub fn get_logical_processor_information(task: &mut Task, cx: &mut Cx<'_>, a: &[
 /// (0xffff all): cores, NUMA nodes, caches, the package and processor groups.
 pub fn get_logical_processor_information_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let relation = a[0] as u32;
-    let cpus = task.cpus();
+    let abi = task.abi();
+    let w = abi.width as usize;
+    let cpus = task.cpus().min(abi.width as u32 * 8);
     let all = u64::MAX >> (64 - cpus);
+    // GROUP_AFFINITY: a KAFFINITY (pointer-sized), the group and three reserved words: 16 bytes, or 12.
     let group_affinity = |mask: u64| {
-        let mut g = [0u8; 16];
-        g[0..8].copy_from_slice(&mask.to_le_bytes());
+        let mut g = vec![0u8; w + 8];
+        g[0..w].copy_from_slice(&abi.ptr(mask));
         g
     };
     let record = |relation: u32, body: Vec<u8>| {
@@ -400,12 +411,13 @@ pub fn get_logical_processor_information_ex(task: &mut Task, cx: &mut Cx<'_>, a:
         out.extend(record(3, with_group(&[], all)));
     }
     if wants(4) {
-        let mut b = vec![0u8; 24 + 48];
+        // GROUP_RELATIONSHIP, then one PROCESSOR_GROUP_INFO with its KAFFINITY at 40.
+        let mut b = vec![0u8; 24 + 40 + w];
         b[0..2].copy_from_slice(&1u16.to_le_bytes());
         b[2..4].copy_from_slice(&1u16.to_le_bytes());
         b[24] = cpus as u8;
         b[25] = cpus as u8;
-        b[64..72].copy_from_slice(&all.to_le_bytes());
+        b[64..64 + w].copy_from_slice(&abi.ptr(all));
         out.extend(record(4, b));
     }
     reply(put_sized(task, cx, a[1], a[2], &out, 4))

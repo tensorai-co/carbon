@@ -64,6 +64,7 @@ fi
 i686() {
     src=$1
     exe=$2
+    shift 2
     tmp=$(mktemp -d)
     cc32="$llvm/clang --target=i686-pc-windows-msvc -nostdlib -ffreestanding -fno-builtin -fno-stack-protector -O2 -fuse-ld=lld"
     $cc32 -c "$src" -o "$tmp/prog.o"
@@ -83,8 +84,12 @@ i686() {
         libs="$libs ${def%.def}.lib"
     done
     # shellcheck disable=SC2086
-    $cc32 "$tmp/prog.o" $libs -Wl,/entry:mainCRTStartup -Wl,/subsystem:console -o "$exe"
+    $cc32 "$tmp/prog.o" $libs -Wl,/entry:mainCRTStartup -Wl,/subsystem:console "$@" -o "$exe"
     rm -rf "$tmp"
 }
 mkdir -p "$out/loader-i686"
-i686 wow64.c "$out/loader-i686/wow64.exe"
+for prog in wow64 files io pipes process sections registry links environment security pool windows desktop ansiwin; do
+    i686 $prog.c "$out/loader-i686/$prog.exe" || echo "i686: $prog.c doesn't build"
+done
+"$llvm/llvm-rc" -no-preprocess -fo "$out/resources-i686.res" resources.rc
+i686 resources.c "$out/loader-i686/resources.exe" -Wl,"$out/resources-i686.res"

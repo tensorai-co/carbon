@@ -8,18 +8,21 @@
 // SendMessageW and PostMessageW from another thread into a GetMessageW loop; timers; PeekMessageW; WM_CLOSE destroying
 // a window and its child; PostQuitMessage
 
+typedef __INTPTR_TYPE__ LONG_PTR;
+typedef __UINTPTR_TYPE__ ULONG_PTR;
+typedef __SIZE_TYPE__ SIZE_T;
 typedef void *HANDLE;
 typedef void *HWND;
 typedef void *HDC;
 typedef unsigned int DWORD;
 typedef unsigned int UINT;
-typedef unsigned long long u64;
-typedef long long LRESULT;
+typedef ULONG_PTR u64; // pointer-sized everywhere here
+typedef LONG_PTR LRESULT;
 typedef int BOOL;
 typedef unsigned short WCHAR;
-typedef LRESULT (__stdcall *WNDPROC)(HWND, UINT, u64, long long);
+typedef LRESULT (__stdcall *WNDPROC)(HWND, UINT, u64, LONG_PTR);
 typedef struct { int left, top, right, bottom; } RECT;
-typedef struct { HWND hwnd; UINT message; u64 wParam; long long lParam; DWORD time; int x, y; DWORD priv; } MSG;
+typedef struct { HWND hwnd; UINT message; u64 wParam; LONG_PTR lParam; DWORD time; int x, y; DWORD priv; } MSG;
 typedef struct { HDC hdc; BOOL erase; RECT paint; BOOL restore, update; unsigned char reserved[32]; } PAINTSTRUCT;
 typedef struct { UINT size, style; WNDPROC proc; int cls, wnd; HANDLE instance, icon, cursor, background; const WCHAR *menu, *name; HANDLE small; } WNDCLASSEXW;
 typedef struct { void *params; HANDLE instance, menu; HWND parent; int cy, cx, y, x; long style; const WCHAR *name, *cls; DWORD ex; } CREATESTRUCTW;
@@ -34,21 +37,21 @@ K void __stdcall Sleep(DWORD);
 K unsigned short __stdcall RegisterClassExW(const WNDCLASSEXW *);
 K HWND __stdcall CreateWindowExW(DWORD, const WCHAR *, const WCHAR *, DWORD, int, int, int, int, HWND, HANDLE, HANDLE, void *);
 K BOOL __stdcall DestroyWindow(HWND);
-K LRESULT __stdcall DefWindowProcW(HWND, UINT, u64, long long);
-K LRESULT __stdcall CallWindowProcW(WNDPROC, HWND, UINT, u64, long long);
+K LRESULT __stdcall DefWindowProcW(HWND, UINT, u64, LONG_PTR);
+K LRESULT __stdcall CallWindowProcW(WNDPROC, HWND, UINT, u64, LONG_PTR);
 K BOOL __stdcall ShowWindow(HWND, int);
 K BOOL __stdcall UpdateWindow(HWND);
 K BOOL __stdcall GetMessageW(MSG *, HWND, UINT, UINT);
 K BOOL __stdcall PeekMessageW(MSG *, HWND, UINT, UINT, UINT);
 K BOOL __stdcall TranslateMessage(const MSG *);
 K LRESULT __stdcall DispatchMessageW(const MSG *);
-K LRESULT __stdcall SendMessageW(HWND, UINT, u64, long long);
-K BOOL __stdcall PostMessageW(HWND, UINT, u64, long long);
+K LRESULT __stdcall SendMessageW(HWND, UINT, u64, LONG_PTR);
+K BOOL __stdcall PostMessageW(HWND, UINT, u64, LONG_PTR);
 K void __stdcall PostQuitMessage(int);
 K BOOL __stdcall SetWindowTextW(HWND, const WCHAR *);
 K int __stdcall GetWindowTextW(HWND, WCHAR *, int);
-K long long __stdcall GetWindowLongPtrW(HWND, int);
-K long long __stdcall SetWindowLongPtrW(HWND, int, long long);
+K LONG_PTR __stdcall GetWindowLongPtrW(HWND, int);
+K LONG_PTR __stdcall SetWindowLongPtrW(HWND, int, LONG_PTR);
 K u64 __stdcall GetClassLongPtrW(HWND, int);
 K BOOL __stdcall GetClientRect(HWND, RECT *);
 K BOOL __stdcall AdjustWindowRectEx(RECT *, DWORD, BOOL, DWORD);
@@ -57,8 +60,8 @@ K BOOL __stdcall IsWindow(HWND);
 K BOOL __stdcall IsWindowVisible(HWND);
 K HWND __stdcall GetParent(HWND);
 K HWND __stdcall FindWindowW(const WCHAR *, const WCHAR *);
-K BOOL __stdcall EnumWindows(BOOL (__stdcall *)(HWND, long long), long long);
-K BOOL __stdcall EnumChildWindows(HWND, BOOL (__stdcall *)(HWND, long long), long long);
+K BOOL __stdcall EnumWindows(BOOL (__stdcall *)(HWND, LONG_PTR), LONG_PTR);
+K BOOL __stdcall EnumChildWindows(HWND, BOOL (__stdcall *)(HWND, LONG_PTR), LONG_PTR);
 K u64 __stdcall SetTimer(HWND, u64, UINT, void *);
 K BOOL __stdcall KillTimer(HWND, u64);
 K BOOL __stdcall InvalidateRect(HWND, const RECT *, BOOL);
@@ -119,7 +122,7 @@ static void *create_param;
 static int sized_w, sized_h, paints, erases, timers, destroyed, nc_destroyed, user_sent, closed;
 static DWORD sender_result;
 
-static LRESULT __stdcall wndproc(HWND hwnd, UINT msg, u64 wp, long long lp) {
+static LRESULT __stdcall wndproc(HWND hwnd, UINT msg, u64 wp, LONG_PTR lp) {
     if (nseen < 64) seen[nseen++] = msg;
     switch (msg) {
     case WM_CREATE: create_param = ((CREATESTRUCTW *)lp)->params; return 0;
@@ -162,7 +165,7 @@ static LRESULT __stdcall wndproc(HWND hwnd, UINT msg, u64 wp, long long lp) {
 
 static WNDPROC original;
 static int subclassed;
-static LRESULT __stdcall subclass(HWND hwnd, UINT msg, u64 wp, long long lp) {
+static LRESULT __stdcall subclass(HWND hwnd, UINT msg, u64 wp, LONG_PTR lp) {
     if (msg == WM_USER) { subclassed++; return CallWindowProcW(original, hwnd, msg, wp * 10, lp); }
     return CallWindowProcW(original, hwnd, msg, wp, lp);
 }
@@ -176,7 +179,7 @@ static DWORD __stdcall sender(void *arg) {
 }
 
 static int counted;
-static BOOL __stdcall count(HWND hwnd, long long lp) { (void)hwnd; counted += (int)lp; return 1; }
+static BOOL __stdcall count(HWND hwnd, LONG_PTR lp) { (void)hwnd; counted += (int)lp; return 1; }
 
 void mainCRTStartup(void) {
     out = GetStdHandle((DWORD)-11);
@@ -208,9 +211,9 @@ void mainCRTStartup(void) {
     SetWindowLongPtrW(main_window, -21, 1234);
     SetWindowLongPtrW(main_window, 8, 5678);
     check(GetWindowLongPtrW(main_window, -21) == 1234 && GetWindowLongPtrW(main_window, 8) == 5678 && GetClassLongPtrW(main_window, -32) == atom, "window and class longs: user data, extra bytes, the atom");
-    original = (WNDPROC)SetWindowLongPtrW(main_window, -4, (long long)subclass);
+    original = (WNDPROC)SetWindowLongPtrW(main_window, -4, (LONG_PTR)subclass);
     check(original == wndproc && SendMessageW(main_window, WM_USER, 2, 3) == 23 && subclassed == 1, "subclassing with GWLP_WNDPROC and CallWindowProcW");
-    SetWindowLongPtrW(main_window, -4, (long long)original);
+    SetWindowLongPtrW(main_window, -4, (LONG_PTR)original);
 
     HWND child = CreateWindowExW(0, W(0, "CarbonWindow"), W(2, "child"), WS_CHILD | WS_VISIBLE, 10, 150, 100, 50, main_window, (HANDLE)7, 0, 0);
     counted = 0;

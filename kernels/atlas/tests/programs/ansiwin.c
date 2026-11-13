@@ -6,42 +6,45 @@
 // GetWindowTextA, SendMessageA); GetMessageA and DispatchMessageA with a character; PostMessageA's made UTF-16; a
 // WndProc set by SetWindowLongPtrA and SetWindowLongPtrW; FindWindowA; and UnregisterClassA.
 
+typedef __INTPTR_TYPE__ LONG_PTR;
+typedef __UINTPTR_TYPE__ ULONG_PTR;
+typedef __SIZE_TYPE__ SIZE_T;
 typedef void *HANDLE;
 typedef void *HWND;
 typedef unsigned int DWORD;
-typedef unsigned long long u64;
+typedef ULONG_PTR u64; // pointer-sized everywhere here
 typedef unsigned short WCHAR;
-typedef long long LRESULT;
+typedef LONG_PTR LRESULT;
 
 #define K __declspec(dllimport)
 K HANDLE __stdcall GetStdHandle(DWORD);
 K int __stdcall WriteFile(HANDLE, const void *, DWORD, DWORD *, void *);
 K void __stdcall ExitProcess(unsigned);
-typedef LRESULT (__stdcall *WNDPROC)(HWND, unsigned, u64, long long);
+typedef LRESULT (__stdcall *WNDPROC)(HWND, unsigned, u64, LONG_PTR);
 typedef struct { unsigned size, style; WNDPROC proc; int cls_extra, wnd_extra; HANDLE instance, icon, cursor, background; const void *menu, *name; HANDLE small; } WNDCLASSEX;
-typedef struct { HWND hwnd; unsigned message; u64 wparam; long long lparam; DWORD time; long x, y; DWORD private_; } MSG;
+typedef struct { HWND hwnd; unsigned message; u64 wparam; LONG_PTR lparam; DWORD time; long x, y; DWORD private_; } MSG;
 typedef struct { void *params; HANDLE instance, menu; HWND parent; int cy, cx, y, x; long style; const void *name, *cls; DWORD ex; } CREATESTRUCT;
 K unsigned short __stdcall RegisterClassExA(const WNDCLASSEX *);
 K unsigned short __stdcall RegisterClassExW(const WNDCLASSEX *);
 K HWND __stdcall CreateWindowExA(DWORD, const char *, const char *, DWORD, int, int, int, int, HWND, HANDLE, HANDLE, void *);
 K HWND __stdcall CreateWindowExW(DWORD, const WCHAR *, const WCHAR *, DWORD, int, int, int, int, HWND, HANDLE, HANDLE, void *);
-K LRESULT __stdcall DefWindowProcA(HWND, unsigned, u64, long long);
-K LRESULT __stdcall DefWindowProcW(HWND, unsigned, u64, long long);
+K LRESULT __stdcall DefWindowProcA(HWND, unsigned, u64, LONG_PTR);
+K LRESULT __stdcall DefWindowProcW(HWND, unsigned, u64, LONG_PTR);
 K int __stdcall GetMessageA(MSG *, HWND, unsigned, unsigned);
 K int __stdcall GetMessageW(MSG *, HWND, unsigned, unsigned);
 K LRESULT __stdcall DispatchMessageA(const MSG *);
-K LRESULT __stdcall SendMessageA(HWND, unsigned, u64, long long);
-K LRESULT __stdcall SendMessageW(HWND, unsigned, u64, long long);
-K int __stdcall PostMessageA(HWND, unsigned, u64, long long);
-K int __stdcall PostMessageW(HWND, unsigned, u64, long long);
+K LRESULT __stdcall SendMessageA(HWND, unsigned, u64, LONG_PTR);
+K LRESULT __stdcall SendMessageW(HWND, unsigned, u64, LONG_PTR);
+K int __stdcall PostMessageA(HWND, unsigned, u64, LONG_PTR);
+K int __stdcall PostMessageW(HWND, unsigned, u64, LONG_PTR);
 K int __stdcall SetWindowTextA(HWND, const char *);
 K int __stdcall SetWindowTextW(HWND, const WCHAR *);
 K int __stdcall GetWindowTextA(HWND, char *, int);
 K int __stdcall GetWindowTextW(HWND, WCHAR *, int);
 K int __stdcall GetWindowTextLengthA(HWND);
 K int __stdcall IsWindowUnicode(HWND);
-K long long __stdcall SetWindowLongPtrA(HWND, int, long long);
-K long long __stdcall SetWindowLongPtrW(HWND, int, long long);
+K LONG_PTR __stdcall SetWindowLongPtrA(HWND, int, LONG_PTR);
+K LONG_PTR __stdcall SetWindowLongPtrW(HWND, int, LONG_PTR);
 K HWND __stdcall FindWindowA(const char *, const char *);
 K int __stdcall DestroyWindow(HWND);
 K int __stdcall UnregisterClassA(const char *, HANDLE);
@@ -72,7 +75,7 @@ static char created_name[32], created_class[32], set_text[32];
 static int nccreate_seen;
 static unsigned chars[8];
 static int char_count;
-static LRESULT __stdcall ansi_proc(HWND h, unsigned m, u64 w, long long l) {
+static LRESULT __stdcall ansi_proc(HWND h, unsigned m, u64 w, LONG_PTR l) {
     if (m == WM_NCCREATE) {
         const CREATESTRUCT *cs = (const CREATESTRUCT *)l;
         copy(created_name, cs->name, 32);
@@ -87,7 +90,7 @@ static LRESULT __stdcall ansi_proc(HWND h, unsigned m, u64 w, long long l) {
 // What the Unicode WndProc saw.
 static WCHAR wide_text[32];
 static unsigned wide_char;
-static LRESULT __stdcall wide_proc(HWND h, unsigned m, u64 w, long long l) {
+static LRESULT __stdcall wide_proc(HWND h, unsigned m, u64 w, LONG_PTR l) {
     if (m == WM_SETTEXT) wcopy(wide_text, (const WCHAR *)l, 32);
     if (m == WM_CHAR) wide_char = (unsigned)w;
     return DefWindowProcW(h, m, w, l);
@@ -135,12 +138,12 @@ void mainCRTStartup(void) {
     SetWindowTextA(u, "Caf\xe9");
     check(wsame(wide_text, cafe), "SetWindowTextA to it: its WndProc's WM_SETTEXT is UTF-16");
     check(GetWindowTextA(u, t, 32) == 4 && same(t, "Caf\xe9"), "GetWindowTextA from it");
-    check(SendMessageA(u, WM_GETTEXT, 3, (long long)t) == 2 && same(t, "Ca"), "SendMessageA's WM_GETTEXT, cut to fit");
+    check(SendMessageA(u, WM_GETTEXT, 3, (LONG_PTR)t) == 2 && same(t, "Ca"), "SendMessageA's WM_GETTEXT, cut to fit");
     SendMessageA(u, WM_CHAR, 0xe9, 0);
     check(wide_char == 0xe9, "SendMessageA's character, in UTF-16 to it");
-    SetWindowLongPtrA(u, -4, (long long)ansi_proc);
+    SetWindowLongPtrA(u, -4, (LONG_PTR)ansi_proc);
     check(!IsWindowUnicode(u), "SetWindowLongPtrA's WndProc takes ANSI");
-    SetWindowLongPtrW(u, -4, (long long)wide_proc);
+    SetWindowLongPtrW(u, -4, (LONG_PTR)wide_proc);
     check(IsWindowUnicode(u), "  and SetWindowLongPtrW's UTF-16");
 
     DestroyWindow(u);

@@ -180,7 +180,7 @@ impl Kernel {
     /// OVERLAPPED, then its event, its port's packet and its routine.
     pub(crate) fn complete(&self, cx: &mut kernels_core::thread::Cx<'_>, c: Completion) {
         if let Some(process) = c.op.process.upgrade() {
-            let fields = [u64::from(status(c.error)).to_le_bytes(), (c.data.len() as u64).to_le_bytes()].concat();
+            let fields = crate::abi::Abi::of(process.isa).overlapped_result(status(c.error), c.data.len() as u64);
             let mut writes: Vec<(u64, &[u8])> = Vec::new();
             if !c.data.is_empty() {
                 writes.push((c.op.buffer, &c.data));
@@ -203,7 +203,7 @@ impl Kernel {
         let list = std::mem::take(&mut *lock(&self.deferred));
         for c in list {
             if let Some(process) = c.op.process.upgrade() {
-                let fields = [u64::from(status(c.error)).to_le_bytes(), 0u64.to_le_bytes()].concat();
+                let fields = crate::abi::Abi::of(process.isa).overlapped_result(status(c.error), 0);
                 write_remote(self, cx, &process, &[(c.op.overlapped, &fields)]);
             }
         }
