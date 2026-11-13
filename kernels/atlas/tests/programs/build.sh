@@ -7,7 +7,7 @@ out="${1:-.}"
 llvm="${LLVM:-/opt/homebrew/opt/llvm/bin}"
 for arch in aarch64 x86_64; do
     machine=$([ $arch = aarch64 ] && echo arm64 || echo i386:x86-64)
-    for dll in kernel32 user32 ntdll advapi32 gdi32 shell32 version; do
+    for dll in kernel32 user32 ntdll advapi32 gdi32 shell32 version ucrtbase; do
         "$llvm/llvm-dlltool" -m "$machine" -d $dll.def -l "$out/$dll-$arch.lib"
     done
     # Unwind tables for every function, as MSVC makes them: SEH walks the stack by them.
@@ -17,10 +17,21 @@ for arch in aarch64 x86_64; do
     # mylib.dll goes at the program's own base, so the loader has to move it.
     $cc -shared -Wl,/entry:DllMain -Wl,/base:0x140000000 -Wl,/def:mylib.def mylib.c "$out/kernel32-$arch.lib" -o "$out/loader-$arch/mylib.dll"
     $cc -shared -Wl,/entry:DllMain -Wl,/def:mylib2.def mylib2.c -o "$out/loader-$arch/mylib2.dll"
-    $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console loader.c "$out/loader-$arch/mylib.lib" "$out/kernel32-$arch.lib" "$out/ntdll-$arch.lib" \
-        -o "$out/loader-$arch/loader.exe"
+    $cc -shared -Wl,/entry:DllMain -Wl,/def:mylib3.def mylib3.c "$out/loader-$arch/mylib2.lib" -o "$out/loader-$arch/mylib3.dll"
+    $cc -shared -Wl,/entry:DllMain -Wl,/def:mylib4.def mylib4.c -o "$out/loader-$arch/mylib4.dll"
+    # mylib4 is delay-loaded, through the program's own __delayLoadHelper2.
+    $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console -Wl,/delayload:mylib4.dll loader.c "$out/loader-$arch/mylib.lib" \
+        "$out/loader-$arch/mylib4.lib" "$out/kernel32-$arch.lib" "$out/ntdll-$arch.lib" -o "$out/loader-$arch/loader.exe"
+    $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console exceptions.c "$out/kernel32-$arch.lib" "$out/ntdll-$arch.lib" -o "$out/loader-$arch/exceptions.exe"
+    $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console fibers.c "$out/kernel32-$arch.lib" "$out/ntdll-$arch.lib" -o "$out/loader-$arch/fibers.exe"
+    $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console pool.c "$out/kernel32-$arch.lib" -o "$out/loader-$arch/pool.exe"
+    $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console ansi.c "$out/kernel32-$arch.lib" "$out/advapi32-$arch.lib" "$out/version-$arch.lib" \
+        -o "$out/loader-$arch/ansi.exe"
+    $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console ansiwin.c "$out/kernel32-$arch.lib" "$out/user32-$arch.lib" -o "$out/loader-$arch/ansiwin.exe"
+    $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console crt.c "$out/ucrtbase-$arch.lib" "$out/kernel32-$arch.lib" -o "$out/loader-$arch/crt.exe"
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console threads.c "$out/loader-$arch/mylib.lib" "$out/kernel32-$arch.lib" \
         -o "$out/loader-$arch/threads.exe"
+    $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console links.c "$out/kernel32-$arch.lib" -o "$out/loader-$arch/links.exe"
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console files.c "$out/kernel32-$arch.lib" -o "$out/loader-$arch/files.exe"
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console registry.c "$out/kernel32-$arch.lib" "$out/advapi32-$arch.lib" \
         -o "$out/loader-$arch/registry.exe"
@@ -42,3 +53,7 @@ for arch in aarch64 x86_64; do
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:windows windows.c "$out/kernel32-$arch.lib" "$out/user32-$arch.lib" "$out/gdi32-$arch.lib" \
         -o "$out/loader-$arch/windows.exe"
 done
+# The same C runtime test as an ordinary C program, built by MinGW-w64 against the UCRT, if it's there.
+if command -v x86_64-w64-mingw32-gcc >/dev/null; then
+    x86_64-w64-mingw32-gcc -O2 crt.c -o "$out/loader-x86_64/crt-mingw.exe"
+fi

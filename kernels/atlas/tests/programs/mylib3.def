@@ -1,0 +1,4 @@
+LIBRARY mylib3.dll
+EXPORTS
+watch
+triple

@@ -18,6 +18,76 @@ pub fn call4(nr: u64, a: u64, b: u64, c: u64, d: u64) -> u64 {
     result
 }
 
+/// A call with up to eight arguments: past the fourth they go where a Windows call has them, in `x4` to `x7` on
+/// ARM64 and on the stack, past the home space, on x86-64. How ntdll calls a host export that takes more than four.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub fn call8(nr: u64, a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, h: u64) -> u64 {
+    let result: u64;
+    // SAFETY: a trap into atlas, as `call4`; on x86-64, the stack is put back as it was.
+    unsafe {
+        #[cfg(target_arch = "aarch64")]
+        core::arch::asm!("svc #0", in("x8") nr, inlateout("x0") a => result, in("x1") b, in("x2") c, in("x3") d, in("x4") e, in("x5") f, in("x6") g, in("x7") h, options(nostack));
+        #[cfg(target_arch = "x86_64")]
+        {
+            let rest = [e, f, g, h];
+            core::arch::asm!(
+                "sub rsp, 0x48",
+                "mov rax, [{rest}]",
+                "mov [rsp + 0x20], rax",
+                "mov rax, [{rest} + 8]",
+                "mov [rsp + 0x28], rax",
+                "mov rax, [{rest} + 16]",
+                "mov [rsp + 0x30], rax",
+                "mov rax, [{rest} + 24]",
+                "mov [rsp + 0x38], rax",
+                "mov rax, {nr}",
+                "call r11",
+                "add rsp, 0x48",
+                rest = in(reg) rest.as_ptr(),
+                nr = in(reg) nr,
+                out("rax") result, in("r10") a, in("rdx") b, in("r8") c, in("r9") d,
+                inlateout("r11") call::TRAP_AT => _, lateout("rcx") _,
+            );
+        }
+    }
+    result
+}
+
+/// A kernel32 host export's call number, found by name the first time it's wanted (`EXPORT_NUMBER`).
+pub fn export(slot: &core::sync::atomic::AtomicU64, name: &[u8]) -> u64 {
+    use core::sync::atomic::Ordering;
+    let n = slot.load(Ordering::Relaxed);
+    if n != 0 {
+        return n;
+    }
+    let n = call4(call::EXPORT_NUMBER, name.as_ptr() as u64, name.len() as u64, 0, 0);
+    slot.store(n, Ordering::Relaxed);
+    n
+}
+
+/// Declares a function calling one of kernel32's host exports by number, as a program's stub would: 0 if atlas has
+/// no such export.
+macro_rules! host {
+    ($name:ident, $export:literal, ($($arg:ident),*)) => {
+        #[allow(clippy::too_many_arguments)]
+        fn $name($($arg: u64),*) -> u64 {
+            static NUMBER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+            let n = $crate::sys::export(&NUMBER, $export);
+            if n == 0 {
+                return 0;
+            }
+            $crate::sys::host!(@call n $(, $arg)*)
+        }
+    };
+    (@call $n:ident $(, $arg:ident)*) => { $crate::sys::host!(@pad $n, [$($arg),*]) };
+    (@pad $n:ident, [$($arg:ident),*]) => {{
+        let a: [u64; 8] = { let mut a = [0u64; 8]; let given = [$($arg),*]; let mut i = 0; while i < given.len() { a[i] = given[i]; i += 1; } a };
+        $crate::sys::call8($n, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7])
+    }};
+}
+pub(crate) use host;
+
 pub fn terminate(status: u32) -> ! {
     call4(call::TERMINATE_PROCESS, u64::MAX, u64::from(status), 0, 0);
     // atlas never comes back from ending the process.

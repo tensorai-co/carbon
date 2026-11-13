@@ -30,6 +30,25 @@ impl Task {
         self.upcall_data(cx, target, data, |at| [at].into_iter().chain(args.iter().copied()).collect())
     }
 
+    /// Runs `body` with `len` bytes of the program's stack as scratch, made by `build` from where they go: below the
+    /// stack pointer the thread came in with, which is lowered meanwhile so nothing nested (an upcall, a message sent
+    /// while it waits) overwrites them. How a host export hands the program a string it converted.
+    pub fn with_scratch<R>(&mut self, cx: &mut Cx<'_>, len: usize, build: impl FnOnce(u64) -> Vec<u8>, body: impl FnOnce(&mut Task, &mut Cx<'_>, u64) -> Result<R, Reply>) -> Result<R, Reply> {
+        let mut regs = cx.turn(|t| t.thread().regs());
+        let old = regs.sp();
+        let at = (((old - LEAVE) & !15) - len.max(16) as u64) & !15;
+        let data = build(at);
+        debug_assert!(data.len() <= len.max(16));
+        self.mem(cx, true, |t| user::write(&mut t.space(), at, &data)).map_err(|_| Reply::ExitProcess(status::ACCESS_VIOLATION))?;
+        regs.set_sp(at);
+        cx.turn(|t| t.thread().set_regs(&regs));
+        let result = body(self, cx, at);
+        let mut regs = cx.turn(|t| t.thread().regs());
+        regs.set_sp(old);
+        cx.turn(|t| t.thread().set_regs(&regs));
+        result
+    }
+
     /// Like `upcall`, first copying `data` onto the program's stack: `args` makes the arguments from where it went.
     pub fn upcall_data(&mut self, cx: &mut Cx<'_>, target: u64, data: &[u8], args: impl FnOnce(u64) -> Vec<u64>) -> Result<u64, Reply> {
         if self.depth >= MOST_UPCALLS {

@@ -4,4 +4,6 @@ add
 word
 attached DATA
 thread_attached DATA
+thread_detached DATA
+say_at_exit DATA
 heap_alloc=KERNEL32.HeapAlloc

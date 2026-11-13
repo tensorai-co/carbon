@@ -21,12 +21,14 @@ dll! {
     host SetBkColor(2) => set_bk_color;
     host SetBkMode(2) => set_bk_mode;
     host TextOutW(5) => text_out_w;
+    host TextOutA(5) => text_out_a;
     host Rectangle(5) => rectangle;
     host MoveToEx(4) => move_to_ex;
     host LineTo(3) => line_to;
     host SetPixel(4) => set_pixel;
     host GetPixel(3) => get_pixel;
     host GetTextExtentPoint32W(4) => get_text_extent_point32_w;
+    host GetTextExtentPoint32A(4) => get_text_extent_point32_w;
     host GetDeviceCaps(2) => get_device_caps;
     missing BitBlt;
     missing CreateCompatibleDC;
@@ -91,6 +93,13 @@ fn text(task: &mut Task, cx: &mut Cx<'_>, at: u64, count: u64) -> String {
 
 fn text_out_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let s = text(task, cx, a[3], a[4]);
+    Reply::Value(u64::from(task.win32k().text_out(a[0], a[1] as i32, a[2] as i32, &s)))
+}
+
+/// `TextOutA`: its count is of bytes, in the ANSI code page.
+fn text_out_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let raw = task.mem(cx, false, |t| user::read_vec(&t.space(), a[3], (a[4] as u32 as usize).min(4096))).unwrap_or_default();
+    let s = crate::ansi::text(&raw);
     Reply::Value(u64::from(task.win32k().text_out(a[0], a[1] as i32, a[2] as i32, &s)))
 }
 

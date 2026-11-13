@@ -327,6 +327,11 @@ impl Asm {
     pub fn str(&mut self, bits: u8, rt: u8, rn: u8) {
         self.put(0x3900_0000 | size_code(bits) << 30 | r(rn) << 5 | r(rt));
     }
+    /// A store of `bits` at `[rn, #offset]`, with `rn` left as it is (`stur`, offset -256 to 255).
+    pub fn stur(&mut self, bits: u8, rt: u8, rn: u8, offset: i16) {
+        debug_assert!((-256..256).contains(&offset));
+        self.put(0x3800_0000 | size_code(bits) << 30 | ((offset as u32) & 0x1ff) << 12 | r(rn) << 5 | r(rt));
+    }
     /// `ldr xt, [xn, xm, lsl #3]`.
     pub fn ldr_index(&mut self, rt: u8, rn: u8, rm: u8) {
         self.put(0xF860_7800 | r(rm) << 16 | r(rn) << 5 | r(rt));
@@ -497,6 +502,10 @@ impl Asm {
         self.put(0x6E04_0400 | r(vn) << 5 | r(vd));
     }
     /// `vd.d[1] = vn.d[0]`.
+    /// `dup vd.2d, vn.d[0]`: lane 0 in both.
+    pub fn dup_d0(&mut self, vd: u8, vn: u8) {
+        self.put(0x4E08_0400 | r(vn) << 5 | r(vd));
+    }
     pub fn ins_d1_d0(&mut self, vd: u8, vn: u8) {
         self.put(0x6E18_0400 | r(vn) << 5 | r(vd));
     }
@@ -652,6 +661,11 @@ pub mod vec {
     pub const MUL: u32 = 0x4E20_9C00;
     pub const URHADD: u32 = 0x6E20_1400;
     pub const ZIP1: u32 = 0x4E00_3800;
+    /// The even-numbered elements of `vn` then of `vm`.
+    pub const UZP1: u32 = 0x4E00_1800;
+    /// Each even-numbered element of `vn` with the one after it from `vm`'s (`TRN1`), or each odd one (`TRN2`).
+    pub const TRN1: u32 = 0x4E00_2800;
+    pub const TRN2: u32 = 0x4E00_6800;
     /// The odd-numbered elements of `vn` then of `vm`.
     pub const UZP2: u32 = 0x4E00_5800;
     /// Adjacent pairs of `vn`'s elements, then of `vm`'s, added.
@@ -666,6 +680,8 @@ pub mod vec {
     /// Floating point: pass size 0 for singles and 1 for doubles. Bit 22 is the precision, and bit 23 is part of
     /// these opcodes (set in `FSUB`, `FCMGT` and `FSQRT`), so a size of 2 or 3 would change the instruction.
     pub const FADD: u32 = 0x4E20_D400;
+    /// Adjacent pairs of `vn`'s elements, then of `vm`'s, added.
+    pub const FADDP: u32 = 0x6E20_D400;
     pub const FSUB: u32 = 0x4EA0_D400;
     pub const FMUL: u32 = 0x6E20_DC00;
     pub const FDIV: u32 = 0x6E20_FC00;

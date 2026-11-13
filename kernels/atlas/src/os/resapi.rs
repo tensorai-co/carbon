@@ -55,7 +55,7 @@ impl Task {
         let s = if wide {
             self.mem(cx, false, |t| user::read_wstr(&t.space(), at, 1024)).ok()?
         } else {
-            String::from_utf8_lossy(&self.mem(cx, false, |t| user::read_cstr(&t.space(), at, 1024)).ok()?).into_owned()
+            crate::ansi::text(&self.mem(cx, false, |t| user::read_cstr(&t.space(), at, 1024)).ok()?)
         };
         Some(Id::named(&s))
     }
@@ -71,7 +71,7 @@ impl Task {
 
     /// A file's bytes, whether it's on the disk or one of atlas's own DLLs.
     fn file_bytes(&mut self, name: &str) -> Result<Vec<u8>, u32> {
-        let (file, _) = self.open_file(name, 0x8000_0000, 3, 0)?;
+        let (file, _) = self.open_file(name, 0x8000_0000, crate::files::FILE_SHARE_ALL, 3, 0)?;
         match &file.node {
             Node::File(ino) => kernels_core::lock(&self.k.disk).contents(*ino).map(|c| c.to_vec()).map_err(|_| 5),
             Node::System(image) => Ok(image.to_vec()),
@@ -80,8 +80,13 @@ impl Task {
     }
 
     /// A file's version information (`RT_VERSION` 1), found through its sections as they are in the file.
-    fn version_block(&mut self, cx: &mut Cx<'_>, at: u64) -> Result<Vec<u8>, u32> {
-        let name = self.mem(cx, false, |t| user::read_wstr(&t.space(), at, 32768)).map_err(|_| ERROR_NOACCESS)?;
+    fn version_block(&mut self, cx: &mut Cx<'_>, at: u64, wide: bool) -> Result<Vec<u8>, u32> {
+        let name = if wide {
+            self.mem(cx, false, |t| user::read_wstr(&t.space(), at, 32768))
+        } else {
+            self.mem(cx, false, |t| user::read_cstr(&t.space(), at, 32768)).map(|b| crate::ansi::text(&b))
+        }
+        .map_err(|_| ERROR_NOACCESS)?;
         let bytes = self.file_bytes(&name)?;
         let pe = Pe::parse(&bytes).map_err(|_| 193u32)?; // ERROR_BAD_EXE_FORMAT
         let (root, _) = pe.directory(2).ok_or(resources::ERROR_RESOURCE_DATA_NOT_FOUND)?;
@@ -166,10 +171,11 @@ pub fn sizeof_resource(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 
 /// Calls an enumeration's callback with `before`, then an ID (a number, or a string on the stack), then `after`:
 /// Ok(false) if it said to stop.
-fn call_with_id(task: &mut Task, cx: &mut Cx<'_>, callback: u64, before: &[u64], id: &Id, after: &[u64]) -> Result<bool, Reply> {
+fn call_with_id(task: &mut Task, cx: &mut Cx<'_>, callback: u64, before: &[u64], id: &Id, after: &[u64], wide: bool) -> Result<bool, Reply> {
     let (data, number) = match id {
         Id::Num(n) => (Vec::new(), Some(u64::from(*n))),
-        Id::Name(s) => (s.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect(), None),
+        Id::Name(s) if wide => (s.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect(), None),
+        Id::Name(s) => (crate::ansi::bytes(s).into_iter().chain([0]).collect(), None),
     };
     let args = |at: u64| before.iter().copied().chain([number.unwrap_or(at)]).chain(after.iter().copied()).collect();
     task.upcall_data(cx, callback, &data, args).map(|r| r as u32 != 0)
@@ -213,22 +219,46 @@ fn listing(task: &mut Task, cx: &mut Cx<'_>, module: u64, kind: Option<&Id>, nam
 
 /// `EnumResourceTypesW(module, callback(module, type, param), param)`.
 pub fn enum_resource_types_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    enum_resource_types(task, cx, a, true)
+}
+
+pub fn enum_resource_types_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    enum_resource_types(task, cx, a, false)
+}
+
+fn enum_resource_types(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
     let ids = listing(task, cx, a[0], None, None);
     let (module, callback, param) = (a[0], a[1], a[2]);
-    enumerate(task, cx, ids, |task, cx, id| call_with_id(task, cx, callback, &[module], id, &[param]))
+    enumerate(task, cx, ids, |task, cx, id| call_with_id(task, cx, callback, &[module], id, &[param], wide))
 }
 
 /// `EnumResourceNamesW(module, type, callback(module, type, name, param), param)`: the type as the program gave it.
 pub fn enum_resource_names_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(kind) = task.resource_id(cx, a[1], true) else { return Reply::Value(FALSE) };
+    enum_resource_names(task, cx, a, true)
+}
+
+pub fn enum_resource_names_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    enum_resource_names(task, cx, a, false)
+}
+
+fn enum_resource_names(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let Some(kind) = task.resource_id(cx, a[1], wide) else { return Reply::Value(FALSE) };
     let ids = listing(task, cx, a[0], Some(&kind), None);
     let (module, kind_arg, callback, param) = (a[0], a[1], a[2], a[3]);
-    enumerate(task, cx, ids, |task, cx, id| call_with_id(task, cx, callback, &[module, kind_arg], id, &[param]))
+    enumerate(task, cx, ids, |task, cx, id| call_with_id(task, cx, callback, &[module, kind_arg], id, &[param], wide))
 }
 
 /// `EnumResourceLanguagesW(module, type, name, callback(module, type, name, language, param), param)`.
 pub fn enum_resource_languages_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let (Some(kind), Some(name)) = (task.resource_id(cx, a[1], true), task.resource_id(cx, a[2], true)) else { return Reply::Value(FALSE) };
+    enum_resource_languages(task, cx, a, true)
+}
+
+pub fn enum_resource_languages_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    enum_resource_languages(task, cx, a, false)
+}
+
+fn enum_resource_languages(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let (Some(kind), Some(name)) = (task.resource_id(cx, a[1], wide), task.resource_id(cx, a[2], wide)) else { return Reply::Value(FALSE) };
     let ids = listing(task, cx, a[0], Some(&kind), Some(&name));
     let (module, kind_arg, name_arg, callback, param) = (a[0], a[1], a[2], a[3], a[4]);
     enumerate(task, cx, ids, |task, cx, id| {
@@ -285,8 +315,9 @@ pub fn load_string_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
             return Reply::Value(0);
         }
     };
-    let n = text.len().min(room - 1);
-    let mut bytes = text.as_bytes()[..n].to_vec();
+    let ansi = crate::ansi::bytes(&text);
+    let n = ansi.len().min(room - 1);
+    let mut bytes = ansi[..n].to_vec();
     bytes.push(0);
     let _ = task.mem(cx, true, |t| user::write(&mut t.space(), buffer, &bytes));
     Reply::Value(n as u64)
@@ -296,10 +327,24 @@ pub fn load_string_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 
 /// `GetFileVersionInfoSizeW(file, &handle)`: room for its version information, with space to spare as Windows gives.
 pub fn get_file_version_info_size_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    version_info_size(task, cx, a, true)
+}
+
+pub fn get_file_version_info_size_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    version_info_size(task, cx, a, false)
+}
+
+pub fn get_file_version_info_size_ex_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    version_info_size(task, cx, &a[1..], false)
+}
+
+/// The room asked for is twice the block's and more: the half after it is where `VerQueryValueA` puts strings it
+/// converts.
+fn version_info_size(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
     if a[1] != 0 {
         let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[1], 0));
     }
-    match task.version_block(cx, a[0]) {
+    match task.version_block(cx, a[0], wide) {
         Ok(block) => Reply::Value(block.len() as u64 * 2 + 4),
         Err(e) => {
             task.set_last_error(cx, e);
@@ -315,7 +360,19 @@ pub fn get_file_version_info_size_ex_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u6
 
 /// `GetFileVersionInfoW(file, handle, size, buffer)`: its version information, as much as fits.
 pub fn get_file_version_info_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let block = match task.version_block(cx, a[0]) {
+    version_info(task, cx, a, true)
+}
+
+pub fn get_file_version_info_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    version_info(task, cx, a, false)
+}
+
+pub fn get_file_version_info_ex_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    version_info(task, cx, &a[1..], false)
+}
+
+fn version_info(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let block = match task.version_block(cx, a[0], wide) {
         Ok(block) => block,
         Err(e) => {
             task.set_last_error(cx, e);
@@ -338,17 +395,43 @@ pub fn get_file_version_info_ex_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -
 /// `VerQueryValueW(block, path, &value, &length)`: where a value is in the block, and its length (bytes for binary
 /// values, characters for strings).
 pub fn ver_query_value_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    ver_query_value(task, cx, a, true)
+}
+
+pub fn ver_query_value_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    ver_query_value(task, cx, a, false)
+}
+
+/// For `VerQueryValueA`, a string value (under `\StringFileInfo`) is converted to ANSI, in the room after the block,
+/// at half its own offset, so each has a place of its own.
+fn ver_query_value(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
     let found = (|| {
         let len = task.read_module(cx, a[0], 2)?;
         let block = task.read_module(cx, a[0], usize::from(u16::from_le_bytes([len[0], len[1]])))?;
-        let path = task.mem(cx, false, |t| user::read_wstr(&t.space(), a[1], 1024)).ok()?;
-        resources::query(&block, &path)
+        let path = if wide {
+            task.mem(cx, false, |t| user::read_wstr(&t.space(), a[1], 1024)).ok()?
+        } else {
+            crate::ansi::text(&task.mem(cx, false, |t| user::read_cstr(&t.space(), a[1], 1024)).ok()?)
+        };
+        let (at, len) = resources::query(&block, &path)?;
+        let string = path.trim_start_matches('\\').to_ascii_lowercase().starts_with("stringfileinfo\\");
+        Some((at, len, block, string))
     })();
-    let Some((at, len)) = found else {
+    let Some((at, len, block, string)) = found else {
         task.set_last_error(cx, resources::ERROR_RESOURCE_TYPE_NOT_FOUND);
         return Reply::Value(FALSE);
     };
-    let ok = task.mem(cx, true, |t| user::write_u64(&mut t.space(), a[2], a[0] + at as u64)).is_ok()
+    let mut value = a[0] + at as u64;
+    if !wide && string {
+        let units: Vec<u16> = block.get(at..at + usize::from(len) * 2).unwrap_or_default().as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
+        let ansi = crate::ansi::encode(crate::ansi::ACP, &units, b'?', false).map(|(b, _)| b).unwrap_or_default();
+        value = a[0] + block.len() as u64 + at as u64 / 2;
+        if task.mem(cx, true, |t| user::write(&mut t.space(), value, &ansi)).is_err() {
+            task.set_last_error(cx, ERROR_NOACCESS);
+            return Reply::Value(FALSE);
+        }
+    }
+    let ok = task.mem(cx, true, |t| user::write_u64(&mut t.space(), a[2], value)).is_ok()
         && task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[3], u32::from(len))).is_ok();
     Reply::Value(u64::from(ok))
 }

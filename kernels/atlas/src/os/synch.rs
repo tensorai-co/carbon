@@ -58,7 +58,7 @@ impl Task {
         if wide {
             self.mem(cx, false, |t| user::read_wstr(&t.space(), at, 260)).ok()
         } else {
-            self.mem(cx, false, |t| user::read_cstr(&t.space(), at, 260)).ok().map(|b| String::from_utf8_lossy(&b).into_owned())
+            self.mem(cx, false, |t| user::read_cstr(&t.space(), at, 260)).ok().map(|b| crate::ansi::text(&b))
         }
     }
 
@@ -84,7 +84,12 @@ impl Task {
 
     /// Opens a named object, if its descriptor allows `access`.
     fn open_object(&mut self, cx: &mut Cx<'_>, access: u64, name: u64, kind: fn(&Kind) -> bool, mapping: &crate::security::Mapping) -> Reply {
-        let found = self.name(cx, name, true).and_then(|n| self.k.objects.named(&n)).filter(|o| kind(&o.kind));
+        self.open_named(cx, access, name, true, kind, mapping)
+    }
+
+    /// `Open*`, by a UTF-16 name or an ANSI one.
+    fn open_named(&mut self, cx: &mut Cx<'_>, access: u64, name: u64, wide: bool, kind: fn(&Kind) -> bool, mapping: &crate::security::Mapping) -> Reply {
+        let found = self.name(cx, name, wide).and_then(|n| self.k.objects.named(&n)).filter(|o| kind(&o.kind));
         match found {
             Some(object) if !self.allows(&object.security, access as u32, mapping) => {
                 self.set_last_error(cx, 5); // ERROR_ACCESS_DENIED
@@ -227,6 +232,10 @@ pub fn open_event_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     task.open_object(cx, a[0], a[2], |k| matches!(k, Kind::Event { .. }), &crate::security::EVENT)
 }
 
+pub fn open_event_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    task.open_named(cx, a[0], a[2], false, |k| matches!(k, Kind::Event { .. }), &crate::security::EVENT)
+}
+
 fn change_event(task: &mut Task, cx: &mut Cx<'_>, handle: u64, set: bool) -> Reply {
     match task.object(handle).filter(|o| matches!(o.kind, Kind::Event { .. })) {
         Some(event) => {
@@ -269,6 +278,10 @@ pub fn create_mutex_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 
 pub fn open_mutex_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     task.open_object(cx, a[0], a[2], |k| *k == Kind::Mutant, &crate::security::MUTANT)
+}
+
+pub fn open_mutex_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    task.open_named(cx, a[0], a[2], false, |k| *k == Kind::Mutant, &crate::security::MUTANT)
 }
 
 pub fn release_mutex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
@@ -442,8 +455,17 @@ pub fn create_waitable_timer_ex_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -
     task.create_object(cx, a[0], name, Kind::Timer { manual: a[2] as u32 & 1 != 0 }, State::default())
 }
 
+pub fn create_waitable_timer_ex_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let name = task.name(cx, a[1], false);
+    task.create_object(cx, a[0], name, Kind::Timer { manual: a[2] as u32 & 1 != 0 }, State::default())
+}
+
 pub fn open_waitable_timer_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     task.open_object(cx, a[0], a[2], |k| matches!(k, Kind::Timer { .. }), &crate::security::TIMER)
+}
+
+pub fn open_waitable_timer_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    task.open_named(cx, a[0], a[2], false, |k| matches!(k, Kind::Timer { .. }), &crate::security::TIMER)
 }
 
 /// Arms a timer's expiry at `when`, for setting number `generation`: it sets the timer, queues its APC, and arms the

@@ -56,7 +56,7 @@ impl Task {
         let name = if wide {
             self.mem(cx, false, |t| user::read_wstr(&t.space(), at, 260)).ok()
         } else {
-            self.mem(cx, false, |t| user::read_cstr(&t.space(), at, 260)).ok().map(|b| String::from_utf8_lossy(&b).into_owned())
+            self.mem(cx, false, |t| user::read_cstr(&t.space(), at, 260)).ok().map(|b| crate::ansi::text(&b))
         };
         // `Local\` is the session's, and atlas has one session.
         name.map(|n| n.strip_prefix("Local\\").or_else(|| n.strip_prefix("Global\\")).map(str::to_string).unwrap_or(n))
@@ -192,7 +192,7 @@ pub fn map_view_of_file_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply
         drop(state);
         return task.null(cx, ERROR_INVALID_ADDRESS);
     };
-    state.regions.insert(base..base + size, Area { prot, kind: AreaKind::View, base, view: Some(View { section, offset, copy }) });
+    state.regions.insert(base..base + size, Area { prot, kind: AreaKind::View, base, view: Some(View { section, offset, copy }), guard: false });
     drop(state);
     Reply::Value(base)
 }
@@ -249,7 +249,7 @@ pub fn virtual_query(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
                 (page, 0, 0, next.saturating_sub(page), MEM_FREE, 0, 0)
             }
             Some((range, area)) => {
-                let alike = |a: &Area, b: &Area| a.kind == b.kind && a.prot == b.prot && a.base == b.base;
+                let alike = |a: &Area, b: &Area| a.kind == b.kind && a.prot == b.prot && a.base == b.base && a.guard == b.guard;
                 let mut end = range.end;
                 while let Some((next, b)) = state.regions.find(end) {
                     if !alike(area, b) {
@@ -260,7 +260,7 @@ pub fn virtual_query(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
                 let base = if area.base != 0 { area.base } else { range.start };
                 let (state_bits, protect) = match area.kind {
                     AreaKind::Reserved | AreaKind::Kept => (MEM_RESERVE, 0),
-                    _ => (MEM_COMMIT, prot_to_page(area.prot)),
+                    _ => (MEM_COMMIT, prot_to_page(area.prot) | if area.guard { crate::process::PAGE_GUARD } else { 0 }),
                 };
                 let kind = match area.kind {
                     AreaKind::Image => MEM_IMAGE,

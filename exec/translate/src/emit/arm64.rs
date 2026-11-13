@@ -15,6 +15,11 @@
 //! compare (`ucomisd` and its kin), which leaves OF clear: there it's in V, so `jp`, `setp` and `cmovp` read V. After
 //! an integer instruction they read OF instead, which compiled code doesn't do.
 //!
+//! DF is known while translating, not kept: clear at a block's start, as the ABI has it at every call and return,
+//! set by `std` and cleared by `cld`, so a string instruction between them (`std; rep movsb; cld`, as a backward
+//! `memmove` does) steps down. A block that would end with it set ends at that instruction as UNSUPPORTED instead, so
+//! nothing runs with the wrong direction.
+//!
 //! # Leaving a block
 //!
 //! Every way out is `brk #kind`, which the runtime turns into a translation, a system call or a stop. Most never get
@@ -127,7 +132,7 @@ pub struct Translation {
 
 /// Translates the block at `start`, whose bytes as far as they can be read are `bytes`, up to `most` instructions.
 pub fn translate(start: u64, bytes: &[u8], most: usize) -> Translation {
-    let mut e = Emitter { asm: Asm::new() };
+    let mut e = Emitter { asm: Asm::new(), df: false };
     let mut map = Vec::new();
     let mut pc = start;
     let mut cacheable = true;
@@ -135,7 +140,11 @@ pub fn translate(start: u64, bytes: &[u8], most: usize) -> Translation {
     for count in 0.. {
         let offset = (e.asm.len() * 4) as u32;
         if count == most {
-            e.jump(pc);
+            if e.df {
+                e.exit(exit::UNSUPPORTED, pc);
+            } else {
+                e.jump(pc);
+            }
             break;
         }
         map.push((offset, pc));
@@ -158,6 +167,11 @@ pub fn translate(start: u64, bytes: &[u8], most: usize) -> Translation {
         let mark = e.asm.len();
         match e.lower(&inst) {
             Ok(Next::Continue) => pc = inst.next(),
+            Ok(Next::End) if e.df => {
+                e.asm.truncate(mark);
+                e.exit(exit::UNSUPPORTED, pc);
+                break;
+            }
             Ok(Next::End) => break,
             Err(Unsupported) => {
                 e.asm.truncate(mark);
@@ -231,6 +245,8 @@ fn cond(cc: u8) -> Option<Cond> {
 
 struct Emitter {
     asm: Asm,
+    /// DF, as `std` and `cld` have left it in this block.
+    df: bool,
 }
 
 impl Emitter {
@@ -477,9 +493,12 @@ impl Emitter {
 
     // ---- The stack ----
 
+    /// The store first, then rsp: if the store faults (a guard page, a stack overflow), the program's registers are
+    /// as they were before the instruction, as x86's are, and the exception is precise. (`push rsp` pushes rsp's old
+    /// value, too, as x86 does.)
     fn push(&mut self, value: u8) {
+        self.asm.stur(64, value, RSP, -8);
         self.asm.sub_imm(true, RSP, RSP, 8);
-        self.asm.str(64, value, RSP);
     }
 
     fn pop(&mut self, into: u8) {
@@ -767,6 +786,11 @@ impl Emitter {
                 Ok(Next::End)
             }
             0xF6 | 0xF7 => self.group3(inst, if op == 0xF6 { 8 } else { v }),
+            // cld and std: DF, as the rest of the block knows it.
+            0xFC | 0xFD => {
+                self.df = op == 0xFD;
+                Ok(Next::Continue)
+            }
             // clc and stc: CF cleared or set; cmc: flipped (ARM's C is CF's inverse, so flipping one flips the other).
             0xF8 => {
                 self.set_carry(ZR);
@@ -844,11 +868,12 @@ impl Emitter {
         Ok(Next::End)
     }
 
-    /// `movs` and `stos`, once or with `rep`, forwards only (DF clear).
+    /// `movs` and `stos`, once or with `rep`: up, or down with DF set.
     fn string(&mut self, inst: &Inst, op: u8) -> Lowered {
         let size = if op & 1 == 0 { 8 } else { inst.size_v() };
         let step = u16::from(size / 8);
         let moving = op < 0xA8;
+        let down = self.df;
         let a = &mut self.asm;
         let top = a.len();
         let done = if inst.rep {
@@ -860,11 +885,19 @@ impl Emitter {
         if moving {
             a.ldr(size, S0, RSI);
             a.str(size, S0, RDI);
-            a.add_imm(true, RSI, RSI, step);
+            if down {
+                a.sub_imm(true, RSI, RSI, step);
+            } else {
+                a.add_imm(true, RSI, RSI, step);
+            }
         } else {
             a.str(size, RAX, RDI);
         }
-        a.add_imm(true, RDI, RDI, step);
+        if down {
+            a.sub_imm(true, RDI, RDI, step);
+        } else {
+            a.add_imm(true, RDI, RDI, step);
+        }
         if let Some(done) = done {
             a.sub_imm(true, RCX, RCX, 1);
             let back = a.len();

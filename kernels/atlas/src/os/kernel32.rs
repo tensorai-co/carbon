@@ -9,6 +9,7 @@ use kernels_core::user;
 use super::fileapi::*;
 use super::ioapi::*;
 use super::memapi::*;
+use super::nlsapi::*;
 use super::pipeapi::*;
 use super::procapi::*;
 use super::resapi::*;
@@ -24,6 +25,22 @@ dll! {
     host WriteFile(5) => write_file;
     host WriteConsoleA(5) => write_console_a;
     host WriteConsoleW(5) => write_console_w;
+    host MultiByteToWideChar(6) => multi_byte_to_wide_char;
+    host WideCharToMultiByte(8) => wide_char_to_multi_byte;
+    host GetACP(0) => get_acp;
+    host GetOEMCP(0) => get_oem_cp;
+    host IsValidCodePage(1) => is_valid_code_page;
+    host GetCPInfo(2) => get_cp_info;
+    host GetCPInfoExW(3) => get_cp_info_ex_w;
+    host IsDBCSLeadByte(1) => is_dbcs_lead_byte;
+    host IsDBCSLeadByteEx(2) => is_dbcs_lead_byte;
+    host AreFileApisANSI(0) => are_file_apis_ansi;
+    host SetFileApisToANSI(0) => set_file_apis;
+    host SetFileApisToOEM(0) => set_file_apis;
+    host GetConsoleCP(0) => get_console_cp;
+    host GetConsoleOutputCP(0) => get_console_cp;
+    host SetConsoleCP(1) => set_console_cp;
+    host SetConsoleOutputCP(1) => set_console_cp;
     host ReadFile(5) => read_file;
     host ReadFileEx(5) => read_file_ex;
     host WriteFileEx(5) => write_file_ex;
@@ -62,16 +79,28 @@ dll! {
     host GetFileAttributesW(1) => get_file_attributes_w;
     host GetFileAttributesA(1) => get_file_attributes_a;
     host GetFileAttributesExW(3) => get_file_attributes_ex_w;
+    host GetFileAttributesExA(3) => get_file_attributes_ex_a;
     host SetFileAttributesW(2) => set_file_attributes_w;
+    host SetFileAttributesA(2) => set_file_attributes_a;
     host GetFileInformationByHandle(2) => get_file_information_by_handle;
     host DeleteFileW(1) => delete_file_w;
     host DeleteFileA(1) => delete_file_a;
     host CreateDirectoryW(2) => create_directory_w;
     host CreateDirectoryA(2) => create_directory_a;
     host RemoveDirectoryW(1) => remove_directory_w;
+    host RemoveDirectoryA(1) => remove_directory_a;
     host MoveFileExW(3) => move_file_ex_w;
+    host MoveFileExA(3) => move_file_ex_a;
     host MoveFileW(2) => move_file_w;
+    host MoveFileA(2) => move_file_a;
     host CopyFileW(3) => copy_file_w;
+    host CopyFileA(3) => copy_file_a;
+    host CreateHardLinkW(3) => create_hard_link_w;
+    host CreateHardLinkA(3) => create_hard_link_a;
+    host CreateSymbolicLinkW(3) => create_symbolic_link_w;
+    host CreateSymbolicLinkA(3) => create_symbolic_link_a;
+    host GetFileTime(4) => get_file_time;
+    host SetFileTime(4) => set_file_time;
     host FindFirstFileW(2) => find_first_file_w;
     host FindFirstFileA(2) => find_first_file_a;
     host FindNextFileW(2) => find_next_file_w;
@@ -80,14 +109,21 @@ dll! {
     host GetCurrentDirectoryW(2) => get_current_directory_w;
     host GetCurrentDirectoryA(2) => get_current_directory_a;
     host SetCurrentDirectoryW(1) => set_current_directory_w;
+    host SetCurrentDirectoryA(1) => set_current_directory_a;
     host GetFullPathNameW(4) => get_full_path_name_w;
+    host GetFullPathNameA(4) => get_full_path_name_a;
     host GetLongPathNameW(3) => get_long_path_name_w;
+    host GetLongPathNameA(3) => get_long_path_name_a;
     host GetTempPathW(2) => get_temp_path_w;
+    host GetTempPathA(2) => get_temp_path_a;
     host GetFinalPathNameByHandleW(4) => get_final_path_name_by_handle_w;
+    host GetFinalPathNameByHandleA(4) => get_final_path_name_by_handle_a;
     host GetWindowsDirectoryW(2) => get_windows_directory_w;
+    host GetWindowsDirectoryA(2) => get_windows_directory_a;
     host GetSystemDirectoryW(2) => get_system_directory_w;
+    host GetSystemDirectoryA(2) => get_system_directory_a;
     host CloseHandle(1) => close_handle;
-    host ExitProcess(1) => exit_process;
+    guest ExitProcess => RtlExitUserProcess;
     host GetCommandLineA(0) => get_command_line_a;
     host GetCommandLineW(0) => get_command_line_w;
     guest GetModuleHandleW => AtlasGetModuleHandleW;
@@ -98,9 +134,19 @@ dll! {
     guest LoadLibraryExW => AtlasLoadLibraryExW;
     guest GetProcAddress => AtlasGetProcAddress;
     guest FreeLibrary => AtlasFreeLibrary;
+    guest FreeLibraryAndExitThread => AtlasFreeLibraryAndExitThread;
+    guest DisableThreadLibraryCalls => AtlasDisableThreadLibraryCalls;
+    guest GetModuleHandleExA => AtlasGetModuleHandleExA;
+    guest GetModuleHandleExW => AtlasGetModuleHandleExW;
+    guest ResolveDelayLoadedAPI => LdrResolveDelayLoadedAPI;
     guest GetModuleFileNameW => AtlasGetModuleFileNameW;
+    guest GetModuleFileNameA => AtlasGetModuleFileNameA;
     guest RaiseException => AtlasRaiseException;
     guest SetUnhandledExceptionFilter => AtlasSetUnhandledExceptionFilter;
+    guest AddVectoredExceptionHandler => RtlAddVectoredExceptionHandler;
+    guest RemoveVectoredExceptionHandler => RtlRemoveVectoredExceptionHandler;
+    guest AddVectoredContinueHandler => RtlAddVectoredContinueHandler;
+    guest RemoveVectoredContinueHandler => RtlRemoveVectoredContinueHandler;
     guest RtlCaptureContext;
     guest RtlLookupFunctionEntry;
     guest RtlVirtualUnwind;
@@ -136,11 +182,13 @@ dll! {
     host CreateEventW(4) => create_event_w;
     host CreateEventA(4) => create_event_a;
     host OpenEventW(3) => open_event_w;
+    host OpenEventA(3) => open_event_a;
     host SetEvent(1) => set_event;
     host ResetEvent(1) => reset_event;
     host CreateMutexW(3) => create_mutex_w;
     host CreateMutexA(3) => create_mutex_a;
     host OpenMutexW(3) => open_mutex_w;
+    host OpenMutexA(3) => open_mutex_a;
     host ReleaseMutex(1) => release_mutex;
     host CreateSemaphoreW(4) => create_semaphore_w;
     host CreateSemaphoreA(4) => create_semaphore_a;
@@ -230,8 +278,11 @@ dll! {
     host FreeResource(1) => free_resource;
     host SizeofResource(2) => sizeof_resource;
     host EnumResourceTypesW(3) => enum_resource_types_w;
+    host EnumResourceTypesA(3) => enum_resource_types_a;
     host EnumResourceNamesW(4) => enum_resource_names_w;
+    host EnumResourceNamesA(4) => enum_resource_names_a;
     host EnumResourceLanguagesW(5) => enum_resource_languages_w;
+    host EnumResourceLanguagesA(5) => enum_resource_languages_a;
     host GetActiveProcessorCount(1) => get_active_processor_count;
     host GetMaximumProcessorCount(1) => get_active_processor_count;
     host GetActiveProcessorGroupCount(0) => get_active_processor_group_count;
@@ -255,7 +306,9 @@ dll! {
     host CreateWaitableTimerW(3) => create_waitable_timer_w;
     host CreateWaitableTimerA(3) => create_waitable_timer_a;
     host CreateWaitableTimerExW(4) => create_waitable_timer_ex_w;
+    host CreateWaitableTimerExA(4) => create_waitable_timer_ex_a;
     host OpenWaitableTimerW(3) => open_waitable_timer_w;
+    host OpenWaitableTimerA(3) => open_waitable_timer_a;
     host SetWaitableTimer(6) => set_waitable_timer;
     host SetWaitableTimerEx(7) => set_waitable_timer_ex;
     host CancelWaitableTimer(1) => cancel_waitable_timer;
@@ -273,6 +326,7 @@ dll! {
     host LocalFree(1) => global_free;
     host LocalHandle(1) => global_lock;
     host EnumSystemLocalesW(2) => enum_system_locales_w;
+    host EnumSystemLocalesA(2) => enum_system_locales_a;
     guest GetLastError => RtlGetLastWin32Error;
     guest SetLastError => RtlSetLastWin32Error;
     guest GetProcessHeap => RtlGetProcessHeap;
@@ -281,7 +335,58 @@ dll! {
     guest EnterCriticalSection => RtlEnterCriticalSection;
     guest LeaveCriticalSection => RtlLeaveCriticalSection;
     guest InitializeCriticalSection => RtlInitializeCriticalSection;
-    missing CreateFiber;
+    guest CreateThreadpool => AtlasCreateThreadpool;
+    guest CloseThreadpool => AtlasCloseThreadpool;
+    guest SetThreadpoolThreadMaximum => AtlasSetThreadpoolThreadMaximum;
+    guest SetThreadpoolThreadMinimum => AtlasSetThreadpoolThreadMinimum;
+    guest CreateThreadpoolWork => AtlasCreateThreadpoolWork;
+    guest SubmitThreadpoolWork => AtlasSubmitThreadpoolWork;
+    guest WaitForThreadpoolWorkCallbacks => AtlasWaitForThreadpoolWorkCallbacks;
+    guest CloseThreadpoolWork => AtlasCloseThreadpoolWork;
+    guest TrySubmitThreadpoolCallback => AtlasTrySubmitThreadpoolCallback;
+    guest QueueUserWorkItem => AtlasQueueUserWorkItem;
+    guest CreateThreadpoolTimer => AtlasCreateThreadpoolTimer;
+    guest SetThreadpoolTimer => AtlasSetThreadpoolTimer;
+    guest IsThreadpoolTimerSet => AtlasIsThreadpoolTimerSet;
+    guest WaitForThreadpoolTimerCallbacks => AtlasWaitForThreadpoolTimerCallbacks;
+    guest CloseThreadpoolTimer => AtlasCloseThreadpoolTimer;
+    guest CreateThreadpoolWait => AtlasCreateThreadpoolWait;
+    guest SetThreadpoolWait => AtlasSetThreadpoolWait;
+    guest WaitForThreadpoolWaitCallbacks => AtlasWaitForThreadpoolWaitCallbacks;
+    guest CloseThreadpoolWait => AtlasCloseThreadpoolWait;
+    guest RegisterWaitForSingleObject => AtlasRegisterWaitForSingleObject;
+    guest UnregisterWait => AtlasUnregisterWait;
+    guest UnregisterWaitEx => AtlasUnregisterWaitEx;
+    guest CreateThreadpoolCleanupGroup => AtlasCreateThreadpoolCleanupGroup;
+    guest CloseThreadpoolCleanupGroupMembers => AtlasCloseThreadpoolCleanupGroupMembers;
+    guest CloseThreadpoolCleanupGroup => AtlasCloseThreadpoolCleanupGroup;
+    guest SetEventWhenCallbackReturns => AtlasSetEventWhenCallbackReturns;
+    guest ReleaseSemaphoreWhenCallbackReturns => AtlasReleaseSemaphoreWhenCallbackReturns;
+    guest ReleaseMutexWhenCallbackReturns => AtlasReleaseMutexWhenCallbackReturns;
+    guest LeaveCriticalSectionWhenCallbackReturns => AtlasLeaveCriticalSectionWhenCallbackReturns;
+    guest FreeLibraryWhenCallbackReturns => AtlasFreeLibraryWhenCallbackReturns;
+    guest CallbackMayRunLong => AtlasCallbackMayRunLong;
+    guest DisassociateCurrentThreadFromCallback => AtlasDisassociateCurrentThreadFromCallback;
+    guest CreateThreadpoolIo => AtlasCreateThreadpoolIo;
+    guest StartThreadpoolIo => AtlasStartThreadpoolIo;
+    guest CancelThreadpoolIo => AtlasCancelThreadpoolIo;
+    guest WaitForThreadpoolIoCallbacks => AtlasWaitForThreadpoolIoCallbacks;
+    guest CloseThreadpoolIo => AtlasCloseThreadpoolIo;
+    guest BindIoCompletionCallback => AtlasBindIoCompletionCallback;
+    guest CreateTimerQueue => AtlasCreateTimerQueue;
+    guest CreateTimerQueueTimer => AtlasCreateTimerQueueTimer;
+    guest ChangeTimerQueueTimer => AtlasChangeTimerQueueTimer;
+    guest DeleteTimerQueueTimer => AtlasDeleteTimerQueueTimer;
+    guest DeleteTimerQueueEx => AtlasDeleteTimerQueueEx;
+    guest DeleteTimerQueue => AtlasDeleteTimerQueue;
+    guest CreateFiber => AtlasCreateFiber;
+    guest CreateFiberEx => AtlasCreateFiberEx;
+    guest DeleteFiber => AtlasDeleteFiber;
+    guest SwitchToFiber => AtlasSwitchToFiber;
+    guest ConvertThreadToFiber => AtlasConvertThreadToFiber;
+    guest ConvertThreadToFiberEx => AtlasConvertThreadToFiberEx;
+    guest ConvertFiberToThread => AtlasConvertFiberToThread;
+    guest IsThreadAFiber => AtlasIsThreadAFiber;
 }
 
 const TRUE: u64 = 1;
@@ -314,8 +419,20 @@ fn write_to(task: &mut Task, handle: u64, data: &[u8]) -> Option<usize> {
     }
 }
 
+/// `WriteConsoleA`: its bytes are in the console's output code page (437, unless it's been set), shown as text.
 fn write_console_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    write_file(task, cx, &[a[0], a[1], a[2], a[3], 0])
+    let cp = task.k.console_cp.load(std::sync::atomic::Ordering::Relaxed);
+    if cp == crate::ansi::UTF8 {
+        return write_file(task, cx, &[a[0], a[1], a[2], a[3], 0]);
+    }
+    let count = a[2] as u32 as usize;
+    let Ok(raw) = task.mem(cx, false, |t| user::read_vec(&t.space(), a[1], count)) else { return Reply::Value(FALSE) };
+    let text = String::from_utf16_lossy(&crate::ansi::decode(cp, &raw, false).unwrap_or_default());
+    let Some(_) = write_to(task, a[0], text.as_bytes()) else { return Reply::Value(FALSE) };
+    if a[3] != 0 && task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[3], count as u32)).is_err() {
+        return Reply::Value(FALSE);
+    }
+    Reply::Value(TRUE)
 }
 
 fn write_console_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
@@ -328,10 +445,6 @@ fn write_console_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
         return Reply::Value(FALSE);
     }
     Reply::Value(TRUE)
-}
-
-fn exit_process(_: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
-    Reply::ExitProcess(a[0] as u32)
 }
 
 fn get_command_line_a(task: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
@@ -433,9 +546,18 @@ fn global_free(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 
 /// Calls the program's callback with each locale's name, until it returns FALSE: an upcall per locale.
 fn enum_system_locales_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    enum_system_locales(task, cx, a, true)
+}
+
+fn enum_system_locales_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    enum_system_locales(task, cx, a, false)
+}
+
+/// `EnumSystemLocales(callback, flags)`: each locale's ID, as text, to the callback until it says to stop.
+fn enum_system_locales(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
     let callback = a[0];
     for locale in ["00000409", "00000809", "0000040C"] {
-        let text: Vec<u8> = locale.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+        let text: Vec<u8> = if wide { locale.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect() } else { locale.bytes().chain([0]).collect() };
         match task.upcall_with_data(cx, callback, &text, &[]) {
             Ok(0) => break,
             Ok(_) => {}

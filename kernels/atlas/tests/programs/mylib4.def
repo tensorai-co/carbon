@@ -1,0 +1,3 @@
+LIBRARY mylib4.dll
+EXPORTS
+square

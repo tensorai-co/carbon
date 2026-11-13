@@ -384,9 +384,10 @@ it, in more detail. When an item is done it's ticked here, with what it took.
       tests on memory with a register's bit number, which can reach past the operand; `stc`, `clc`, `cmc`; and SSE2's
       `pmuludq`, `pmulhw`, `pmulhuw`, `pmaddwd`, `psadbw`, and shifts by a register's count. `sse.c` and lambda's
       `x86.c` check them.
-- [ ] SSE3 and later, and AVX.
-- [ ] `pushf`, `popf`; the parity flag beyond `ucomis*` and `fcomi`; string instructions beyond `movs` and `stos`, with the
-      direction flag; exact flags after `mul` and `imul` (CF and OF are; SF, ZF and PF aren't); `rcl`, `rcr`; signed
+- [x] SSE3's horizontal adds and subtracts, `movddup`, `movsldup`, `movshdup`, `lddqu` (Windows' compilers use them).
+- [ ] SSE3's `addsub`, SSSE3 and later, and AVX.
+- [ ] `pushf`, `popf`; the parity flag beyond `ucomis*` and `fcomi`; string instructions beyond `movs` and `stos` (which step down
+      with DF set, as `std` and `cld` leave it within a block); exact flags after `mul` and `imul` (CF and OF are; SF, ZF and PF aren't); `rcl`, `rcr`; signed
       128-bit divides (unsigned ones are done); `cmpxchg16b`; `lock adc`/`sbb`; `syscall`'s `r11`.
 
 ### 3. Speed

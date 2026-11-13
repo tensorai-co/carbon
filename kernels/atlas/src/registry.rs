@@ -18,10 +18,21 @@ pub const ERROR_FILE_NOT_FOUND: u32 = 2;
 pub const ERROR_ACCESS_DENIED: u32 = 5;
 pub const ERROR_INVALID_PARAMETER: u32 = 87;
 pub const ERROR_KEY_DELETED: u32 = 1018;
+pub const ERROR_ALREADY_EXISTS: u32 = 183;
+/// A hive file that isn't one.
+pub const ERROR_BADDB: u32 = 1009;
+
+/// `REG_NOTIFY_CHANGE_*`: what a change was, as a watch asks for it.
+pub const CHANGE_NAME: u32 = 1;
+pub const CHANGE_ATTRIBUTES: u32 = 2;
+pub const CHANGE_LAST_SET: u32 = 4;
+pub const CHANGE_SECURITY: u32 = 8;
 
 /// Where the registry is saved on the machine's disk.
 pub const SAVED: &str = "/Windows/System32/config/REGISTRY";
 const MAGIC: &[u8] = b"atlas registry 1\n";
+/// A key and what's under it, as `RegSaveKey` writes it.
+const HIVE_MAGIC: &[u8] = b"atlas hive 1\n";
 /// The user's SID, under `HKEY_USERS`.
 pub const USER: &str = "S-1-5-21-0-0-0-1000";
 
@@ -45,6 +56,24 @@ pub struct Key {
     /// Nanoseconds since 1970.
     pub modified: u64,
     pub deleted: bool,
+    /// A hive `RegLoadKey` put here: the file it came from, which it's written back to. It isn't saved with the
+    /// machine's registry.
+    pub hive: Option<String>,
+}
+
+/// A `RegNotifyChangeKeyValue` waiting: its key, whether its subkeys count, what it asks for, and its event.
+pub struct Watch {
+    pub key: u64,
+    pub subtree: bool,
+    pub filter: u32,
+    pub event: std::sync::Arc<crate::objects::Object>,
+}
+
+impl Watch {
+    /// Whether a change (`what`, to the first key of `chain`, whose ancestors follow) is one this watch hears.
+    pub fn matches(&self, chain: &[u64], what: u32) -> bool {
+        self.filter & what != 0 && (chain.first() == Some(&self.key) || self.subtree && chain[1..].contains(&self.key))
+    }
 }
 
 /// The predefined keys a program reaches the rest by.
@@ -80,6 +109,8 @@ pub struct Registry {
     next: u64,
     machine: u64,
     users: u64,
+    /// What's changed since it was last asked: each key, and a `CHANGE_*`.
+    changes: Vec<(u64, u32)>,
 }
 
 fn fold(name: &str) -> String {
@@ -148,19 +179,44 @@ pub fn expand(s: &str) -> String {
 impl Registry {
     /// A fresh machine's registry.
     pub fn new() -> Registry {
-        let mut r = Registry { keys: HashMap::new(), next: 1, machine: 0, users: 0 };
+        let mut r = Registry { keys: HashMap::new(), next: 1, machine: 0, users: 0, changes: Vec::new() };
         r.machine = r.add(0, "HKEY_LOCAL_MACHINE", false, 0);
         r.users = r.add(0, "HKEY_USERS", false, 0);
         r.defaults();
+        r.changes.clear();
         r
+    }
+
+    /// What's changed since this was last called, with each key's ancestors (itself first), for watches to match.
+    pub fn take_changes(&mut self) -> Vec<(Vec<u64>, u32)> {
+        std::mem::take(&mut self.changes)
+            .into_iter()
+            .map(|(id, what)| {
+                let mut chain = vec![id];
+                let mut at = id;
+                while let Some(k) = self.keys.get(&at)
+                    && k.parent != 0
+                {
+                    chain.push(k.parent);
+                    at = k.parent;
+                }
+                (chain, what)
+            })
+            .collect()
+    }
+
+    /// Says a key's changed in a way the registry doesn't see itself: its security.
+    pub fn changed(&mut self, id: u64, what: u32) {
+        self.changes.push((id, what));
     }
 
     fn add(&mut self, parent: u64, name: &str, volatile: bool, now: u64) -> u64 {
         let id = self.next;
         self.next += 1;
-        self.keys.insert(id, Key { name: name.to_string(), parent, subkeys: BTreeMap::new(), values: BTreeMap::new(), volatile, modified: now, deleted: false });
+        self.keys.insert(id, Key { name: name.to_string(), parent, subkeys: BTreeMap::new(), values: BTreeMap::new(), volatile, modified: now, deleted: false, hive: None });
         if let Some(p) = self.keys.get_mut(&parent) {
             p.subkeys.insert(fold(name), id);
+            self.changes.push((parent, CHANGE_NAME));
         }
         id
     }
@@ -236,6 +292,7 @@ impl Registry {
         let k = self.key_mut(key)?;
         k.values.insert(fold(name), Value { name: name.to_string(), kind, data });
         k.modified = now;
+        self.changes.push((key, CHANGE_LAST_SET));
         Ok(())
     }
 
@@ -243,6 +300,7 @@ impl Registry {
         let k = self.key_mut(key)?;
         k.values.remove(&fold(name)).ok_or(ERROR_FILE_NOT_FOUND)?;
         k.modified = now;
+        self.changes.push((key, CHANGE_LAST_SET));
         Ok(())
     }
 
@@ -267,6 +325,7 @@ impl Registry {
             self.remove(sub);
         }
         self.key_mut(id)?.values.clear();
+        self.changes.push((id, CHANGE_LAST_SET));
         Ok(())
     }
 
@@ -280,6 +339,9 @@ impl Registry {
         if let Some(p) = self.keys.get_mut(&parent) {
             p.subkeys.remove(&name);
         }
+        // A watch on a key that's deleted hears it, whatever it asked for, as one on its parent does.
+        self.changes.push((id, CHANGE_NAME | CHANGE_ATTRIBUTES | CHANGE_LAST_SET | CHANGE_SECURITY));
+        self.changes.push((parent, CHANGE_NAME));
     }
 
     /// Lets go of a deleted key once nothing has it open.
@@ -287,6 +349,61 @@ impl Registry {
         if self.keys.get(&id).is_some_and(|k| k.deleted) {
             self.keys.remove(&id);
         }
+    }
+
+    /// Where a key opened in the 32-bit view (KEY_WOW64_32KEY) really is: under `HKLM\SOFTWARE`, a key that isn't
+    /// shared between the views is `SOFTWARE\WOW6432Node`'s, as WOW64 redirects it, and some of `SOFTWARE\Classes`'
+    /// are `Classes\WOW6432Node`'s. A base and a path from it, to open or make.
+    pub fn view32(&self, base: u64, path: &str) -> (u64, String) {
+        // The whole path, from HKEY_LOCAL_MACHINE, if that's where it is.
+        let mut parts: Vec<String> = Vec::new();
+        let mut at = base;
+        while let Some(k) = self.keys.get(&at) {
+            if at == self.machine {
+                break;
+            }
+            if k.parent == 0 {
+                return (base, path.to_string());
+            }
+            parts.push(k.name.clone());
+            at = k.parent;
+        }
+        if at != self.machine {
+            return (base, path.to_string());
+        }
+        parts.reverse();
+        parts.extend(Registry::parts(path).map(str::to_string));
+        let is = |i: usize, name: &str| parts.get(i).is_some_and(|p| p.eq_ignore_ascii_case(name));
+        if !is(0, "SOFTWARE") || is(1, "WOW6432Node") {
+            return (base, path.to_string());
+        }
+        // Shared by both views.
+        const SHARED: &[&[&str]] = &[
+            &["Clients"],
+            &["Policies"],
+            &["Microsoft", "COM3"],
+            &["Microsoft", "Cryptography", "Calais"],
+            &["Microsoft", "EventSystem"],
+            &["Microsoft", "RAS"],
+            &["Microsoft", "Tracing"],
+            &["Microsoft", "Windows", "CurrentVersion", "Group Policy"],
+            &["Microsoft", "Windows NT", "CurrentVersion", "Time Zones"],
+        ];
+        // Of Classes, these are redirected; the rest is shared.
+        const CLASSES: &[&str] = &["CLSID", "AppID", "Interface", "TypeLib", "DirectShow", "Media Type", "MediaFoundation"];
+        let starts = |prefix: &[&str]| prefix.iter().enumerate().all(|(i, p)| is(i + 1, p));
+        let at = if is(1, "Classes") {
+            if !CLASSES.iter().any(|c| is(2, c)) || is(2, "WOW6432Node") {
+                return (base, path.to_string());
+            }
+            2
+        } else if SHARED.iter().any(|s| starts(s)) {
+            return (base, path.to_string());
+        } else {
+            1
+        };
+        parts.insert(at, "WOW6432Node".to_string());
+        (self.machine, parts.join("\\"))
     }
 
     /// A key's full path, from its hive's root.
@@ -312,7 +429,7 @@ impl Registry {
         let mut stack = vec![self.machine, self.users];
         while let Some(id) = stack.pop() {
             let Ok(key) = self.key(id) else { continue };
-            if key.volatile {
+            if key.volatile || key.hive.is_some() {
                 continue;
             }
             put(self.path(id).as_bytes());
@@ -336,7 +453,7 @@ impl Registry {
             at = rest;
             Some(field)
         };
-        let mut r = Registry { keys: HashMap::new(), next: 1, machine: 0, users: 0 };
+        let mut r = Registry { keys: HashMap::new(), next: 1, machine: 0, users: 0, changes: Vec::new() };
         r.machine = r.add(0, "HKEY_LOCAL_MACHINE", false, 0);
         r.users = r.add(0, "HKEY_USERS", false, 0);
         while let Some(path) = take() {
@@ -352,7 +469,114 @@ impl Registry {
                 r.set_value(id, &name, kind, data, 0).ok()?;
             }
         }
+        r.changes.clear();
         Some(r)
+    }
+
+    /// A key and everything under it that lasts, in a file of its own (`RegSaveKey`): each key's path from it, then
+    /// its values.
+    pub fn save_tree(&self, id: u64) -> Result<Vec<u8>, u32> {
+        self.key(id)?;
+        let mut out = HIVE_MAGIC.to_vec();
+        let mut put = |bytes: &[u8]| {
+            out.extend((bytes.len() as u32).to_le_bytes());
+            out.extend(bytes);
+        };
+        let mut stack = vec![(id, String::new())];
+        while let Some((at, path)) = stack.pop() {
+            let Ok(key) = self.key(at) else { continue };
+            if key.volatile {
+                continue;
+            }
+            put(path.as_bytes());
+            put(&(key.values.len() as u32).to_le_bytes());
+            for v in key.values.values() {
+                put(v.name.as_bytes());
+                put(&v.kind.to_le_bytes());
+                put(&v.data);
+            }
+            for &sub in key.subkeys.values().rev() {
+                let name = &self.keys[&sub].name;
+                stack.push((sub, if path.is_empty() { name.clone() } else { format!("{path}\\{name}") }));
+            }
+        }
+        Ok(out)
+    }
+
+    /// What `save_tree` wrote, put under `id` (`RegRestoreKey`, `RegLoadKey`).
+    pub fn load_tree(&mut self, id: u64, bytes: &[u8], now: u64) -> Result<(), u32> {
+        let mut at = bytes.strip_prefix(HIVE_MAGIC).ok_or(ERROR_BADDB)?;
+        let mut take = || -> Result<&[u8], u32> {
+            let len = u32::from_le_bytes(at.get(..4).ok_or(ERROR_BADDB)?.try_into().map_err(|_| ERROR_BADDB)?) as usize;
+            let (field, rest) = at.get(4..).ok_or(ERROR_BADDB)?.split_at_checked(len).ok_or(ERROR_BADDB)?;
+            at = rest;
+            Ok(field)
+        };
+        while let Ok(path) = take() {
+            let path = String::from_utf8_lossy(path).into_owned();
+            let (key, _) = self.create(id, &path, false, now)?;
+            let count = u32::from_le_bytes(take()?.try_into().map_err(|_| ERROR_BADDB)?);
+            for _ in 0..count {
+                let name = String::from_utf8_lossy(take()?).into_owned();
+                let kind = u32::from_le_bytes(take()?.try_into().map_err(|_| ERROR_BADDB)?);
+                let data = take()?.to_vec();
+                self.set_value(key, &name, kind, data, now)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `RegLoadKey`: a hive from `file`, as a new key `name` under one of the roots.
+    pub fn mount(&mut self, root: u64, name: &str, bytes: &[u8], file: &str, now: u64) -> Result<(), u32> {
+        if self.key(root)?.subkeys.contains_key(&fold(name)) {
+            return Err(ERROR_ALREADY_EXISTS);
+        }
+        if name.is_empty() || name.contains('\\') {
+            return Err(ERROR_INVALID_PARAMETER);
+        }
+        let id = self.add(root, name, false, now);
+        if let Err(e) = self.load_tree(id, bytes, now) {
+            self.remove(id);
+            return Err(e);
+        }
+        if let Some(k) = self.keys.get_mut(&id) {
+            k.hive = Some(file.to_string());
+        }
+        Ok(())
+    }
+
+    /// The hive a key is in, if `RegLoadKey` put it there: its root and its file.
+    pub fn hive_of(&self, mut id: u64) -> Option<(u64, String)> {
+        loop {
+            let k = self.keys.get(&id)?;
+            if let Some(file) = &k.hive {
+                return Some((id, file.clone()));
+            }
+            id = k.parent;
+        }
+    }
+
+    /// `RegUnLoadKey`: the hive at `name` under a root, taken away. Its contents and file, to write back.
+    pub fn unmount(&mut self, root: u64, name: &str) -> Result<(Vec<u8>, String), u32> {
+        let id = *self.key(root)?.subkeys.get(&fold(name)).ok_or(ERROR_FILE_NOT_FOUND)?;
+        let file = self.key(id)?.hive.clone().ok_or(ERROR_INVALID_PARAMETER)?;
+        let bytes = self.save_tree(id)?;
+        self.remove(id);
+        Ok((bytes, file))
+    }
+
+    /// `RegRestoreKey`: a key's subkeys and values, all replaced by a file's.
+    pub fn restore(&mut self, id: u64, bytes: &[u8], now: u64) -> Result<(), u32> {
+        if !bytes.starts_with(HIVE_MAGIC) {
+            return Err(ERROR_BADDB);
+        }
+        self.clear(id)?;
+        self.load_tree(id, bytes, now)
+    }
+
+    /// Whether this is `HKEY_LOCAL_MACHINE` or `HKEY_USERS`, where hives are loaded.
+    pub fn is_root(&self, id: u64) -> bool {
+        id == self.machine || id == self.users
     }
 
     // ---- A fresh machine's ----
@@ -371,27 +595,30 @@ impl Registry {
         let dword = |v: u32| (REG_DWORD, v.to_le_bytes().to_vec());
         let m = self.machine;
         let v = |pairs: Vec<(&'static str, (u32, Vec<u8>))>| pairs.into_iter().map(|(n, (k, d))| (n, k, d)).collect::<Vec<_>>();
-        self.put(m, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", &v(vec![
-            ("ProductName", sz("Windows 10 Pro")),
-            ("EditionID", sz("Professional")),
-            ("InstallationType", sz("Client")),
-            ("CurrentVersion", sz("6.3")),
-            ("CurrentBuild", sz(&crate::system::BUILD.to_string())),
-            ("CurrentBuildNumber", sz(&crate::system::BUILD.to_string())),
-            ("CurrentMajorVersionNumber", dword(crate::system::MAJOR)),
-            ("CurrentMinorVersionNumber", dword(crate::system::MINOR)),
-            ("DisplayVersion", sz("22H2")),
-            ("SystemRoot", sz("C:\\Windows")),
-            ("RegisteredOwner", sz("carbon")),
-        ]));
-        self.put(m, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion", &v(vec![
-            ("ProgramFilesDir", sz("C:\\Program Files")),
-            ("ProgramFilesDir (x86)", sz("C:\\Program Files (x86)")),
-            ("CommonFilesDir", sz("C:\\Program Files\\Common Files")),
-            ("ProgramFilesPath", expand_sz("%ProgramFiles%")),
-        ]));
-        self.put(m, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall", &[]);
-        self.put(m, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths", &[]);
+        // Each in both views: the 64-bit one, and WOW6432Node's, as a 32-bit program finds them.
+        for (software, program_files) in [("SOFTWARE", "C:\\Program Files"), ("SOFTWARE\\WOW6432Node", "C:\\Program Files (x86)")] {
+            self.put(m, &format!("{software}\\Microsoft\\Windows NT\\CurrentVersion"), &v(vec![
+                ("ProductName", sz("Windows 10 Pro")),
+                ("EditionID", sz("Professional")),
+                ("InstallationType", sz("Client")),
+                ("CurrentVersion", sz("6.3")),
+                ("CurrentBuild", sz(&crate::system::BUILD.to_string())),
+                ("CurrentBuildNumber", sz(&crate::system::BUILD.to_string())),
+                ("CurrentMajorVersionNumber", dword(crate::system::MAJOR)),
+                ("CurrentMinorVersionNumber", dword(crate::system::MINOR)),
+                ("DisplayVersion", sz("22H2")),
+                ("SystemRoot", sz("C:\\Windows")),
+                ("RegisteredOwner", sz("carbon")),
+            ]));
+            self.put(m, &format!("{software}\\Microsoft\\Windows\\CurrentVersion"), &v(vec![
+                ("ProgramFilesDir", sz(program_files)),
+                ("ProgramFilesDir (x86)", sz("C:\\Program Files (x86)")),
+                ("CommonFilesDir", sz("C:\\Program Files\\Common Files")),
+                ("ProgramFilesPath", expand_sz("%ProgramFiles%")),
+            ]));
+            self.put(m, &format!("{software}\\Microsoft\\Windows\\CurrentVersion\\Uninstall"), &[]);
+            self.put(m, &format!("{software}\\Microsoft\\Windows\\CurrentVersion\\App Paths"), &[]);
+        }
         self.put(m, "SOFTWARE\\Classes", &[]);
         self.put(m, "SOFTWARE\\WOW6432Node", &[]);
         self.put(m, "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment", &v(vec![
@@ -436,6 +663,67 @@ impl Default for Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_32_bit_view() {
+        let mut r = Registry::new();
+        let machine = r.root(Root::LocalMachine);
+        let user = r.root(Root::CurrentUser);
+        assert_eq!(r.view32(machine, "SOFTWARE\\App"), (machine, "SOFTWARE\\WOW6432Node\\App".to_string()));
+        assert_eq!(r.view32(machine, "software"), (machine, "software\\WOW6432Node".to_string()));
+        assert_eq!(r.view32(machine, "SOFTWARE\\WOW6432Node\\App"), (machine, "SOFTWARE\\WOW6432Node\\App".to_string()));
+        assert_eq!(r.view32(machine, "SOFTWARE\\Policies\\X"), (machine, "SOFTWARE\\Policies\\X".to_string()));
+        assert_eq!(r.view32(machine, "SOFTWARE\\Classes\\.txt"), (machine, "SOFTWARE\\Classes\\.txt".to_string()));
+        assert_eq!(r.view32(machine, "SOFTWARE\\Classes\\CLSID\\{x}"), (machine, "SOFTWARE\\Classes\\WOW6432Node\\CLSID\\{x}".to_string()));
+        assert_eq!(r.view32(machine, "SYSTEM\\X"), (machine, "SYSTEM\\X".to_string()));
+        assert_eq!(r.view32(user, "Software\\X"), (user, "Software\\X".to_string()));
+        // From a key below the root: the whole path counts.
+        let software = r.open(machine, "SOFTWARE").unwrap();
+        assert_eq!(r.view32(software, "Microsoft"), (machine, "SOFTWARE\\WOW6432Node\\Microsoft".to_string()));
+    }
+
+    #[test]
+    fn hives_saved_and_loaded() {
+        let mut r = Registry::new();
+        let user = r.root(Root::CurrentUser);
+        let (key, _) = r.create(user, "Software\\Saved\\Deep", false, 1).unwrap();
+        r.set_value(key, "n", REG_DWORD, vec![5, 0, 0, 0], 1).unwrap();
+        let saved_root = r.open(user, "Software\\Saved").unwrap();
+        let bytes = r.save_tree(saved_root).unwrap();
+        let machine = r.root(Root::LocalMachine);
+        r.mount(machine, "Loaded", &bytes, "C:\\h", 2).unwrap();
+        let deep = r.open(machine, "Loaded\\Deep").unwrap();
+        assert_eq!(r.value(deep, "n").unwrap().data, vec![5, 0, 0, 0]);
+        assert_eq!(r.hive_of(deep).map(|(_, f)| f), Some("C:\\h".to_string()));
+        // A loaded hive isn't saved with the machine's registry.
+        let back = Registry::load(&r.save()).unwrap();
+        assert_eq!(back.open(back.machine, "Loaded"), Err(ERROR_FILE_NOT_FOUND));
+        assert_eq!(r.mount(machine, "loaded", &bytes, "C:\\h", 2), Err(ERROR_ALREADY_EXISTS));
+        let (again, file) = r.unmount(machine, "Loaded").unwrap();
+        assert_eq!((again, file.as_str()), (bytes, "C:\\h"));
+        assert_eq!(r.restore(user, b"not a hive", 3), Err(ERROR_BADDB));
+    }
+
+    #[test]
+    fn changes_for_watches() {
+        let mut r = Registry::new();
+        let user = r.root(Root::CurrentUser);
+        let (key, _) = r.create(user, "Software\\W", false, 1).unwrap();
+        r.take_changes();
+        r.set_value(key, "v", REG_DWORD, vec![1, 0, 0, 0], 2).unwrap();
+        let (child, _) = r.create(key, "Child", false, 2).unwrap();
+        let changes = r.take_changes();
+        assert_eq!(changes[0].0[0], key);
+        assert_eq!(changes[0].1, CHANGE_LAST_SET);
+        assert_eq!((changes[1].0[0], changes[1].1), (key, CHANGE_NAME));
+        assert!(changes[1].0.contains(&user));
+        let watch = |subtree, filter| Watch { key: user, subtree, filter, event: crate::objects::Object::new(crate::objects::Kind::Event { manual: true }, crate::objects::State::default()) };
+        assert!(!watch(false, CHANGE_LAST_SET).matches(&changes[0].0, CHANGE_LAST_SET));
+        assert!(watch(true, CHANGE_LAST_SET).matches(&changes[0].0, CHANGE_LAST_SET));
+        assert!(!watch(true, CHANGE_NAME).matches(&changes[0].0, CHANGE_LAST_SET));
+        r.delete_key(key, "Child", false).unwrap();
+        assert!(r.take_changes().iter().any(|(chain, what)| chain[0] == child && what & CHANGE_LAST_SET != 0));
+    }
 
     #[test]
     fn keys_values_and_saving() {

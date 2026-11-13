@@ -257,7 +257,9 @@ mod tests {
         let none = |_: &str| false;
         assert_eq!(status("KERNEL32.dll", Some("CreateFileW"), Isa::X86_64, &none), Status::Host);
         assert_eq!(status("kernel32", Some("HeapAlloc"), Isa::X86_64, &none), Status::Guest);
-        assert_eq!(status("kernel32.dll", Some("CreateFiber"), Isa::X86_64, &none), Status::Stub);
+        assert_eq!(status("kernel32.dll", Some("CreateFiber"), Isa::X86_64, &none), Status::Guest);
+        assert_eq!(status("user32.dll", Some("CreateWindowExA"), Isa::X86_64, &none), Status::Host);
+        assert_eq!(status("gdi32.dll", Some("BitBlt"), Isa::X86_64, &none), Status::Stub);
         assert_eq!(status("kernel32.dll", Some("NoSuchFunction"), Isa::X86_64, &none), Status::Undeclared);
         assert_eq!(status("comctl32.dll", Some("InitCommonControlsEx"), Isa::X86_64, &none), Status::NoDll);
         assert_eq!(status("mylib.dll", Some("f"), Isa::X86_64, &|d| d == "mylib.dll"), Status::Program);
@@ -312,7 +314,7 @@ mod tests {
                 got,
                 [
                     ("KERNEL32.dll", "CreateFileW".into(), false, Status::Host),
-                    ("KERNEL32.dll", "CreateFiber".into(), false, Status::Stub),
+                    ("KERNEL32.dll", "CreateFiber".into(), false, Status::Guest),
                     ("COMCTL32.dll", "#17".into(), false, Status::NoDll),
                     ("ole32.dll", "CoCreateInstance".into(), true, Status::NoDll),
                 ]

@@ -4,3 +4,7 @@ __C_specific_handler
 RtlGetVersion
 RtlGetNtVersionNumbers
 NtQuerySystemInformation
+LdrGetDllHandle
+LdrGetProcedureAddress
+LdrRegisterDllNotification
+LdrUnregisterDllNotification

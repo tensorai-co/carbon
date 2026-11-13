@@ -63,7 +63,7 @@ impl Task {
         if wide {
             self.mem(cx, false, |t| user::read_wstr(&t.space(), at, 32767)).ok()
         } else {
-            self.mem(cx, false, |t| user::read_cstr(&t.space(), at, 32767)).ok().map(|b| String::from_utf8_lossy(&b).into_owned())
+            self.mem(cx, false, |t| user::read_cstr(&t.space(), at, 32767)).ok().map(|b| crate::ansi::text(&b))
         }
     }
 
@@ -93,7 +93,7 @@ impl Task {
                 break;
             }
             at += s.len() as u64 + 1;
-            units.extend(String::from_utf8_lossy(&s).encode_utf16());
+            units.extend(crate::ansi::text(&s).encode_utf16());
             units.push(0);
         }
         units.push(0);

@@ -42,6 +42,11 @@ dll! {
     host GetWindowLongW(2) => get_window_long_ptr_w;
     host SetWindowLongW(3) => set_window_long_ptr_w;
     host GetClassLongPtrW(2) => get_class_long_ptr_w;
+    host GetWindowLongPtrA(2) => get_window_long_ptr_w;
+    host SetWindowLongPtrA(3) => set_window_long_ptr_a;
+    host GetWindowLongA(2) => get_window_long_ptr_w;
+    host SetWindowLongA(3) => set_window_long_ptr_a;
+    host GetClassLongPtrA(2) => get_class_long_ptr_w;
     host GetClientRect(2) => get_client_rect;
     host GetWindowRect(2) => get_window_rect;
     host MoveWindow(6) => move_window;
@@ -55,6 +60,7 @@ dll! {
     host GetParent(1) => get_parent;
     host GetDesktopWindow(0) => get_desktop_window;
     host FindWindowW(2) => find_window_w;
+    host FindWindowA(2) => find_window_a;
     host EnumWindows(2) => enum_windows;
     host GetWindow(2) => get_window;
     host GetTopWindow(1) => get_top_window;
@@ -71,11 +77,14 @@ dll! {
     host FillRect(3) => fill_rect;
     host FrameRect(3) => frame_rect;
     host DrawTextW(5) => draw_text_w;
+    host DrawTextA(5) => draw_text_a;
     host GetSysColor(1) => get_sys_color;
     host GetSysColorBrush(1) => get_sys_color_brush;
     host GetSystemMetrics(1) => get_system_metrics;
     host LoadCursorW(2) => load_resource;
     host LoadIconW(2) => load_resource;
+    host LoadCursorA(2) => load_resource;
+    host LoadIconA(2) => load_resource;
     host SetCursor(1) => set_cursor;
     host GetCursor(0) => get_cursor;
     host GetFocus(0) => get_focus;
@@ -89,6 +98,7 @@ dll! {
     host EnumClipboardFormats(1) => enum_clipboard_formats;
     host GetClipboardOwner(0) => get_clipboard_owner;
     host RegisterClipboardFormatW(1) => register_clipboard_format_w;
+    host RegisterClipboardFormatA(1) => register_clipboard_format_a;
     host GetDpiForWindow(1) => get_dpi;
     host GetDpiForSystem(0) => get_dpi;
     host SetCapture(1) => set_capture;
@@ -112,11 +122,22 @@ dll! {
     host ClientToScreen(2) => client_to_screen;
     host ScreenToClient(2) => screen_to_client;
     host WindowFromPoint(1) => window_from_point;
-    missing CreateWindowExA;
-    missing RegisterClassExA;
-    missing DefWindowProcA;
-    missing GetMessageA;
-    missing DispatchMessageA;
+    host CreateWindowExA(12) => create_window_ex_a;
+    host RegisterClassExA(1) => register_class_ex_a;
+    host RegisterClassA(1) => register_class_a;
+    host UnregisterClassA(2) => unregister_class_a;
+    host DefWindowProcA(4) => def_window_proc_a;
+    host CallWindowProcA(5) => call_window_proc_w;
+    host GetMessageA(4) => get_message_a;
+    host PeekMessageA(5) => peek_message_a;
+    host DispatchMessageA(1) => dispatch_message_a;
+    host SendMessageA(4) => send_message_a;
+    host PostMessageA(4) => post_message_a;
+    host PostThreadMessageA(4) => post_thread_message_a;
+    host SetWindowTextA(2) => set_window_text_a;
+    host GetWindowTextA(3) => get_window_text_a;
+    host GetWindowTextLengthA(1) => get_window_text_length_a;
+    host IsWindowUnicode(1) => is_window_unicode;
 }
 
 const TRUE: u64 = 1;
@@ -144,15 +165,15 @@ fn message_box_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 }
 
 fn message_box_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let read = |task: &mut Task, cx: &mut Cx<'_>, at: u64| task.mem(cx, false, |t| user::read_cstr(&t.space(), at, 4096)).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+    let read = |task: &mut Task, cx: &mut Cx<'_>, at: u64| task.mem(cx, false, |t| user::read_cstr(&t.space(), at, 4096)).map(|b| crate::ansi::text(&b)).unwrap_or_default();
     let text = read(task, cx, a[1]);
     let title = if a[2] == 0 { "Error".to_string() } else { read(task, cx, a[2]) };
     task.k.host.write(host::Stream::Err, format!("[message box] {title}: {text}\n").as_bytes());
     Reply::Value(1)
 }
 
-/// A WNDCLASS(EX)W, from where its fields start (after `cbSize` and `style` for the EX form).
-fn register(task: &mut Task, cx: &mut Cx<'_>, at: u64, ex: bool) -> Reply {
+/// A WNDCLASS(EX)W (or, with `ansi`, A), from where its fields start (after `cbSize` and `style` for the EX form).
+fn register(task: &mut Task, cx: &mut Cx<'_>, at: u64, ex: bool, ansi: bool) -> Reply {
     let size = if ex { 80 } else { 72 };
     let Ok(b) = task.mem(cx, false, |t| user::read_vec(&t.space(), at, size)) else { return Reply::Value(0) };
     let get = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap_or_default());
@@ -165,8 +186,8 @@ fn register(task: &mut Task, cx: &mut Cx<'_>, at: u64, ex: bool) -> Reply {
         (get32(0), get(8), get32(20), get(24), get(48), get(64))
     };
     let cursor = get(40);
-    let name = if name_at < 0x1_0000 { format!("#{name_at}") } else { task.wstr(cx, name_at) };
-    match task.register_class(Class { name, atom: 0, wndproc, style, extra: extra as usize, background, instance, cursor }) {
+    let name = if name_at < 0x1_0000 { format!("#{name_at}") } else { task.text_arg(cx, name_at, !ansi) };
+    match task.register_class(Class { name, atom: 0, wndproc, style, extra: extra as usize, background, instance, cursor, ansi }) {
         Ok(atom) => Reply::Value(u64::from(atom)),
         Err(e) => {
             task.set_last_error(cx, e);
@@ -176,11 +197,19 @@ fn register(task: &mut Task, cx: &mut Cx<'_>, at: u64, ex: bool) -> Reply {
 }
 
 fn register_class_ex_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    register(task, cx, a[0], true)
+    register(task, cx, a[0], true, false)
 }
 
 fn register_class_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    register(task, cx, a[0], false)
+    register(task, cx, a[0], false, false)
+}
+
+fn register_class_ex_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    register(task, cx, a[0], true, true)
+}
+
+fn register_class_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    register(task, cx, a[0], false, true)
 }
 
 fn unregister_class_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
@@ -188,8 +217,92 @@ fn unregister_class_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     Reply::Value(u64::from(task.unregister_class(&name)))
 }
 
+fn unregister_class_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let name = task.class_named_as(cx, a[0], false).unwrap_or_default();
+    Reply::Value(u64::from(task.unregister_class(&name)))
+}
+
 fn create_window_ex_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    value(task.create_window(cx, a))
+    value(task.create_window(cx, a, false))
+}
+
+fn create_window_ex_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    value(task.create_window(cx, a, true))
+}
+
+/// `IsWindowUnicode`: whether its `WndProc` takes UTF-16.
+fn is_window_unicode(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(u64::from(task.win32k().windows.get(&a[0]).is_some_and(|w| !w.ansi)))
+}
+
+/// The messages whose `wParam` is a character.
+fn is_char(message: u32) -> bool {
+    matches!(message, win32k::WM_CHAR | win32k::WM_SYSCHAR | win32k::WM_DEADCHAR | win32k::WM_SYSDEADCHAR)
+}
+
+/// A message in ANSI, as an `*A` function was given it, made UTF-16 as win32k has every message: a character's
+/// `wParam`, or WM_SETTEXT's text (copied to scratch), then `send`. For WM_GETTEXT, the UTF-16 it gets back is
+/// converted into the caller's buffer, and the count is of its bytes.
+fn from_ansi(task: &mut Task, cx: &mut Cx<'_>, message: u32, wparam: u64, lparam: u64, send: impl FnOnce(&mut Task, &mut Cx<'_>, u64, u64) -> Result<u64, Reply>) -> Result<u64, Reply> {
+    match message {
+        m if is_char(m) => send(task, cx, u64::from(atlas_abi::ansi::from_1252(wparam as u8)), lparam),
+        WM_SETTEXT if lparam != 0 => {
+            let text = task.text_arg(cx, lparam, false);
+            let wide: Vec<u8> = text.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+            task.with_scratch(cx, wide.len(), |_| wide.clone(), |task, cx, at| send(task, cx, wparam, at))
+        }
+        WM_GETTEXT if lparam != 0 && wparam != 0 => {
+            let room = (wparam as u32 as usize).min(1 << 16);
+            task.with_scratch(cx, room * 2, |_| vec![0; room * 2], |task, cx, at| {
+                send(task, cx, room as u64, at)?;
+                let text = task.wstr(cx, at);
+                let ansi: Vec<u8> = crate::ansi::bytes(&text).into_iter().take(room - 1).collect();
+                let bytes: Vec<u8> = ansi.iter().copied().chain([0]).collect();
+                let _ = task.mem(cx, true, |t| user::write(&mut t.space(), lparam, &bytes));
+                Ok(ansi.len() as u64)
+            })
+        }
+        _ => send(task, cx, wparam, lparam),
+    }
+}
+
+fn send_message_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (hwnd, message) = (a[0], a[1] as u32);
+    value(from_ansi(task, cx, message, a[2], a[3], |task, cx, w, l| task.send_message(cx, hwnd, message, w, l)))
+}
+
+fn set_window_text_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    send_message_a(task, cx, &[a[0], u64::from(WM_SETTEXT), 0, a[1]])
+}
+
+fn get_window_text_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    send_message_a(task, cx, &[a[0], u64::from(WM_GETTEXT), a[2] & 0xffff_ffff, a[1]])
+}
+
+/// `GetWindowTextLengthA`: in bytes of the ANSI code page, which for 1252 is characters.
+fn get_window_text_length_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    value(task.send_message(cx, a[0], WM_GETTEXTLENGTH, 0, 0))
+}
+
+/// `DefWindowProcA`: as `DefWindowProcW`, with the message's text in ANSI.
+fn def_window_proc_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (hwnd, message) = (a[0], a[1] as u32);
+    if message == WM_GETTEXTLENGTH {
+        let text = task.win32k().windows.get(&hwnd).map(|w| w.text.clone()).unwrap_or_default();
+        return Reply::Value(crate::ansi::bytes(&text).len() as u64);
+    }
+    value(from_ansi(task, cx, message, a[2], a[3], |task, cx, w, l| task.def_window_proc(cx, hwnd, message, w, l)))
+}
+
+/// `SetWindowLongPtrA`: as the W, and a `WndProc` set this way takes ANSI.
+fn set_window_long_ptr_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let reply = set_window_long_ptr_w(task, cx, a);
+    if a[1] as i32 == GWLP_WNDPROC
+        && let Some(w) = task.win32k().windows.get_mut(&a[0])
+    {
+        w.ansi = true;
+    }
+    reply
 }
 
 fn destroy_window(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
@@ -234,9 +347,25 @@ fn filter(a: &[u64]) -> Filter {
 }
 
 fn get_message_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    get_message(task, cx, a, false)
+}
+
+fn get_message_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    get_message(task, cx, a, true)
+}
+
+/// A message as an `*A` function gives it: a character in ANSI.
+fn as_ansi(mut m: Msg) -> Msg {
+    if is_char(m.message) {
+        m.wparam = u64::from(atlas_abi::ansi::to_1252(m.wparam as u16).unwrap_or(b'?'));
+    }
+    m
+}
+
+fn get_message(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], ansi: bool) -> Reply {
     match task.next_message(cx, filter(a), true, true) {
         Ok(Some(m)) => {
-            let bytes = m.encode();
+            let bytes = if ansi { as_ansi(m).encode() } else { m.encode() };
             if task.mem(cx, true, |t| user::write(&mut t.space(), a[0], &bytes)).is_err() {
                 return Reply::Value(u64::from(u32::MAX));
             }
@@ -248,10 +377,18 @@ fn get_message_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 }
 
 fn peek_message_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    peek_message(task, cx, a, false)
+}
+
+fn peek_message_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    peek_message(task, cx, a, true)
+}
+
+fn peek_message(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], ansi: bool) -> Reply {
     const PM_REMOVE: u64 = 1;
     match task.next_message(cx, filter(a), a[4] & PM_REMOVE != 0, false) {
         Ok(Some(m)) => {
-            let bytes = m.encode();
+            let bytes = if ansi { as_ansi(m).encode() } else { m.encode() };
             let _ = task.mem(cx, true, |t| user::write(&mut t.space(), a[0], &bytes));
             Reply::Value(TRUE)
         }
@@ -292,6 +429,16 @@ fn dispatch_message_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     value(task.dispatch(cx, Msg::decode(&b)))
 }
 
+/// `DispatchMessageA`: the message it's given in ANSI, as `GetMessageA` gave it.
+fn dispatch_message_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Ok(b) = task.mem(cx, false, |t| user::read_vec(&t.space(), a[0], 48)) else { return Reply::Value(0) };
+    let mut m = Msg::decode(&b);
+    if is_char(m.message) {
+        m.wparam = u64::from(atlas_abi::ansi::from_1252(m.wparam as u8));
+    }
+    value(task.dispatch(cx, m))
+}
+
 fn send_message_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     value(task.send_message(cx, a[0], a[1] as u32, a[2], a[3]))
 }
@@ -303,6 +450,17 @@ fn post_message_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     }
     let tid = task.tid;
     Reply::Value(u64::from(task.post_message(a[0], tid, a[1] as u32, a[2], a[3])))
+}
+
+/// `PostMessageA`: a character posted is made UTF-16, as win32k keeps messages.
+fn post_message_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let wparam = if is_char(a[1] as u32) { u64::from(atlas_abi::ansi::from_1252(a[2] as u8)) } else { a[2] };
+    post_message_w(task, cx, &[a[0], a[1], wparam, a[3]])
+}
+
+fn post_thread_message_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let wparam = if is_char(a[1] as u32) { u64::from(atlas_abi::ansi::from_1252(a[2] as u8)) } else { a[2] };
+    post_thread_message_w(task, cx, &[a[0], a[1], wparam, a[3]])
 }
 
 fn post_thread_message_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
@@ -374,7 +532,11 @@ fn set_window_long_ptr_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     };
     let new = a[2];
     let old = match a[1] as i32 {
-        GWLP_WNDPROC => std::mem::replace(&mut win.wndproc, new),
+        GWLP_WNDPROC => {
+            // A `WndProc` set by the W function takes UTF-16 (the A one says otherwise after).
+            win.ansi = false;
+            std::mem::replace(&mut win.wndproc, new)
+        }
         GWLP_HINSTANCE => std::mem::replace(&mut win.instance, new),
         GWLP_ID => std::mem::replace(&mut win.id, new),
         GWL_STYLE => u64::from(std::mem::replace(&mut win.style, new as u32 & !0x1000_0000)),
@@ -531,8 +693,16 @@ fn get_desktop_window(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
 }
 
 fn find_window_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let class = if a[0] == 0 { None } else { task.class_named(cx, a[0]) };
-    let title = (a[1] != 0).then(|| task.wstr(cx, a[1]));
+    find_window(task, cx, a, true)
+}
+
+fn find_window_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    find_window(task, cx, a, false)
+}
+
+fn find_window(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let class = if a[0] == 0 { None } else { task.class_named_as(cx, a[0], wide) };
+    let title = (a[1] != 0).then(|| task.text_arg(cx, a[1], wide));
     let w = task.win32k();
     let found = w.windows.iter().find(|(_, win)| {
         win.parent == DESKTOP && class.as_ref().is_none_or(|c| *c == win.class) && title.as_ref().is_none_or(|t| *t == win.text)
@@ -675,12 +845,22 @@ fn frame_rect(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 }
 
 fn draw_text_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    draw_text(task, cx, a, true)
+}
+
+fn draw_text_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    draw_text(task, cx, a, false)
+}
+
+fn draw_text(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
     let len = a[2] as i32;
     let text = if len < 0 {
-        task.wstr(cx, a[1])
-    } else {
+        task.text_arg(cx, a[1], wide)
+    } else if wide {
         let raw = task.mem(cx, false, |t| user::read_vec(&t.space(), a[1], len as usize * 2)).unwrap_or_default();
         String::from_utf16_lossy(&raw.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>())
+    } else {
+        crate::ansi::text(&task.mem(cx, false, |t| user::read_vec(&t.space(), a[1], len as usize)).unwrap_or_default())
     };
     let Some(mut rect) = task.read_rect(cx, a[3]) else { return Reply::Value(0) };
     let height = task.win32k().draw_text(a[0], &text, &mut rect, a[4] as u32);
@@ -1042,25 +1222,29 @@ fn shown_of(task: &mut Task, hwnd: u64) -> Option<u64> {
     w.top_level_of(hwnd).and_then(|t| w.windows.get(&t)).map(|t| t.shown).filter(|&s| s != 0)
 }
 
-/// Text from a format's bytes: UTF-16 for CF_UNICODETEXT, one byte to a character (Latin-1) for the others, to the
-/// first NUL.
+/// Text from a format's bytes: UTF-16 for CF_UNICODETEXT, the ANSI code page for CF_TEXT and the OEM one for
+/// CF_OEMTEXT, to the first NUL.
 fn text_from(format: u32, bytes: &[u8]) -> Vec<u8> {
     let text: String = if format == CF_UNICODETEXT {
         let units: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|u| u16::from_le_bytes(*u)).take_while(|&u| u != 0).collect();
         String::from_utf16_lossy(&units)
     } else {
-        bytes.iter().take_while(|&&b| b != 0).map(|&b| b as char).collect()
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        let cp = if format == CF_OEMTEXT { crate::ansi::OEMCP } else { crate::ansi::ACP };
+        String::from_utf16_lossy(&crate::ansi::decode(cp, &bytes[..end], false).unwrap_or_default())
     };
     text.into_bytes()
 }
 
-/// A format's bytes from text, with its NUL: a character Latin-1 hasn't is `?` in CF_TEXT and CF_OEMTEXT.
+/// A format's bytes from text, with its NUL: a character the code page hasn't is `?` in CF_TEXT and CF_OEMTEXT.
 fn text_as(format: u32, utf8: &[u8]) -> Vec<u8> {
     let text = String::from_utf8_lossy(utf8);
     if format == CF_UNICODETEXT {
         text.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect()
     } else {
-        text.chars().map(|c| if (c as u32) < 256 { c as u8 } else { b'?' }).chain([0]).collect()
+        let cp = if format == CF_OEMTEXT { crate::ansi::OEMCP } else { crate::ansi::ACP };
+        let units: Vec<u16> = text.encode_utf16().collect();
+        crate::ansi::encode(cp, &units, b'?', false).map(|(b, _)| b).unwrap_or_default().into_iter().chain([0]).collect()
     }
 }
 
@@ -1188,7 +1372,15 @@ fn get_clipboard_owner(task: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
 }
 
 fn register_clipboard_format_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let name = task.wstr(cx, a[0]);
+    register_clipboard_format(task, cx, a, true)
+}
+
+fn register_clipboard_format_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    register_clipboard_format(task, cx, a, false)
+}
+
+fn register_clipboard_format(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let name = task.text_arg(cx, a[0], wide);
     if name.is_empty() {
         return Reply::Value(0);
     }

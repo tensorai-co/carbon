@@ -32,6 +32,11 @@ pub(crate) const ALLOC: std::ops::Range<u64> = 0x1_0000_0000..images::SYSTEM_BAS
 pub(crate) const GRANULE: u64 = 0x1_0000;
 const STACK: u64 = 1 << 20;
 const STACK_MAPPED: u64 = 64 << 10;
+/// The guard pages at the bottom of every thread's stack: touched, they're the program's to handle its stack
+/// overflow with.
+pub(crate) const STACK_GUARD: u64 = 16 << 10;
+/// PAGE_GUARD, a modifier of any protection.
+pub(crate) const PAGE_GUARD: u32 = 0x100;
 
 pub(crate) struct Process {
     pub pid: u64,
@@ -86,11 +91,14 @@ pub(crate) struct Area {
     pub base: u64,
     /// A view's section, and where in it this region starts.
     pub view: Option<crate::sections::View>,
+    /// PAGE_GUARD: the first touch raises STATUS_GUARD_PAGE_VIOLATION (or, at the bottom of a thread's stack,
+    /// STATUS_STACK_OVERFLOW), and takes the guard away. exec maps it with no access while it's guarded.
+    pub guard: bool,
 }
 
 impl Area {
     pub fn of(prot: Prot, kind: AreaKind) -> Area {
-        Area { prot, kind, base: 0, view: None }
+        Area { prot, kind, base: 0, view: None, guard: false }
     }
 }
 
@@ -169,6 +177,11 @@ impl Task {
             None | Some(Stop::Preempted) => Flow::Run,
             Some(Stop::Syscall { nr, .. }) => self.call(cx, nr),
             Some(Stop::Fault { addr, access, pc }) => {
+                if let Some(code) = self.guard_hit(cx, addr) {
+                    let mut raised = Raised::access_violation(pc, addr, access);
+                    raised.code = code;
+                    return self.raise(cx, raised, &format!("a guard page at {addr:#x}, at {pc:#x}"));
+                }
                 if self.fault(cx, addr, access) {
                     Flow::Run
                 } else {
@@ -238,8 +251,35 @@ impl Task {
             }
             call::UPCALL_RETURN => self.die(status::INVALID_PARAMETER, "returned to an upcall that isn't waiting"),
             call::TERMINATE_PROCESS => {
-                let code = self.args(cx, 2)[1];
-                self.end(code as u32)
+                let a = self.args(cx, 2);
+                if a[0] == 0 {
+                    self.end_other_threads(a[1] as u32);
+                    return self.answer(cx, 0);
+                }
+                self.end(a[1] as u32)
+            }
+            call::LAST_THREAD => {
+                let last = lock(&self.process.state).threads.len() <= 1;
+                self.answer(cx, u64::from(last))
+            }
+            call::CREATE_THREAD => {
+                let a = self.args(cx, 2);
+                let made = self.create_thread(cx, 0, a[0], a[1], 0).is_ok();
+                self.answer(cx, u64::from(made))
+            }
+            call::EXPORT_NUMBER => {
+                let a = self.args(cx, 2);
+                let name = self.mem(cx, false, |t| user::read_vec(&t.space(), a[0], a[1].min(64) as usize)).unwrap_or_default();
+                let name = String::from_utf8_lossy(&name);
+                let number = os::find("kernel32.dll")
+                    .and_then(|dll| os::DLLS[dll].exports.iter().position(|e| e.name == name && matches!(e.kind, Kind::Host { .. })).map(|i| os::number(dll, i)))
+                    .unwrap_or(0);
+                self.answer(cx, number)
+            }
+            call::UNMAP_IMAGE => {
+                let a = self.args(cx, 2);
+                let code = self.unmap_image(cx, a[0], a[1]);
+                self.answer(cx, u64::from(code))
             }
             call::ALLOCATE_VIRTUAL_MEMORY => {
                 let a = self.args(cx, 4);
@@ -297,6 +337,10 @@ impl Task {
                         if !lock(&self.k.deferred).is_empty() {
                             let k = self.k.clone();
                             k.drain(cx);
+                        }
+                        // What a registry function changed, for the watches on it.
+                        if dll.name == "ADVAPI32.dll" {
+                            self.k.registry_changed();
                         }
                         self.reply(cx, reply)
                     }
@@ -363,6 +407,33 @@ impl Task {
         user::with_faults(cx, write, |cx, addr, access| self.fault(cx, addr, access), copy)
     }
 
+    /// A touch of a guard page: it isn't one any more, and the exception it raises. At the bottom of this thread's
+    /// stack, it's a stack overflow, and every guard page left there goes too, for the handler to run in.
+    fn guard_hit(&mut self, cx: &mut Cx<'_>, addr: u64) -> Option<u32> {
+        let page = addr & !(PAGE - 1);
+        let (range, prot) = {
+            let state = lock(&self.process.state);
+            let (_, area) = state.regions.find(addr)?;
+            if !area.guard {
+                return None;
+            }
+            (page..page + PAGE, area.prot)
+        };
+        let teb_at = self.control.teb;
+        let stack = self.mem(cx, false, |t| Ok((user::read_u64(&t.space(), teb_at + teb::DEALLOCATION_STACK)?, user::read_u64(&t.space(), teb_at + teb::STACK_BASE)?))).ok();
+        let (range, code) = match stack {
+            Some((bottom, top)) if bottom != 0 && addr >= bottom && addr < top => (bottom..range.end, status::STACK_OVERFLOW),
+            _ => (range, status::GUARD_PAGE_VIOLATION),
+        };
+        lock(&self.process.state).regions.update(range.clone(), |a| a.guard = false);
+        cx.turn(|t| t.space().protect(range.clone(), prot));
+        if code == status::STACK_OVERFLOW {
+            // As Windows has it, the stack's limit is the lowest page it may use now.
+            let _ = self.mem(cx, true, |t| user::write_u64(&mut t.space(), teb_at + teb::STACK_LIMIT, range.start));
+        }
+        Some(code)
+    }
+
     /// The program touched a page exec hasn't mapped: zeros, if it's committed memory it may touch that way.
     fn fault(&mut self, cx: &mut Cx<'_>, addr: u64, access: Prot) -> bool {
         fault_in(&self.k, &self.process, cx, addr, access)
@@ -378,7 +449,8 @@ impl Task {
         }
         let mut state = lock(&self.process.state);
         let commit = kind & MEM_COMMIT != 0;
-        let area = Area::of(prot, if commit { AreaKind::Committed } else { AreaKind::Reserved });
+        let guard = commit && protect & PAGE_GUARD != 0;
+        let area = Area { guard, ..Area::of(prot, if commit { AreaKind::Committed } else { AreaKind::Reserved }) };
         if addr == 0 || kind & MEM_RESERVE != 0 {
             let size = size.next_multiple_of(GRANULE);
             let base = if addr == 0 {
@@ -406,8 +478,9 @@ impl Task {
         state.regions.update(range.clone(), |a| {
             a.prot = area.prot;
             a.kind = area.kind;
+            a.guard = guard;
         });
-        cx.turn(|t| t.space().protect(range.clone(), prot));
+        cx.turn(|t| t.space().protect(range.clone(), if guard { Prot::NONE } else { prot }));
         Some(range.start)
     }
 
@@ -459,7 +532,7 @@ pub(crate) fn fault_in(k: &Kernel, process: &Process, cx: &mut Cx<'_>, addr: u64
         }
         return crate::sections::fault_view(k, cx, &view, page, prot, access.write());
     }
-    if area.kind != AreaKind::Committed || !area.prot.contains(access) {
+    if area.kind != AreaKind::Committed || area.guard || !area.prot.contains(access) {
         return false;
     }
     let prot = area.prot;
@@ -626,7 +699,7 @@ pub(crate) fn launch(k: &Arc<Kernel>, cx: &mut Cx<'_>, launch: Launch) -> Result
                 teb_at = at;
             }
             let wide = utf16z(&line);
-            let ansi: Vec<u8> = line.bytes().chain([0]).collect();
+            let ansi: Vec<u8> = crate::ansi::bytes(&line).into_iter().chain([0]).collect();
             let image_path = utf16z(&windows_path);
             let (wide_at, ansi_at) = (strings_at, strings_at + wide.len() as u64 + 16);
             let path_at = ansi_at + ansi.len() as u64 + 16;
@@ -671,11 +744,13 @@ pub(crate) fn launch(k: &Arc<Kernel>, cx: &mut Cx<'_>, launch: Launch) -> Result
             let stack = regions.free_above(ALLOC, STACK, GRANULE).ok_or("no room for the stack")?;
             let stack_top = stack + STACK;
             regions.insert(stack..stack_top, Area::of(Prot::RW, AreaKind::Committed));
+            regions.update(stack..stack + STACK_GUARD, |a| a.guard = true);
             t.space().map(stack_top - STACK_MAPPED..stack_top, Prot::RW).zeroed().map_err(|_| "no memory")?;
             let mut memory = t.space();
             let mut put = |at: u64, bytes: &[u8]| user::write(&mut memory, at, bytes).map_err(|_| "writing the TEB".to_string());
             put(teb_at + teb::STACK_BASE, &stack_top.to_le_bytes())?;
             put(teb_at + teb::STACK_LIMIT, &(stack_top - STACK_MAPPED).to_le_bytes())?;
+            put(teb_at + teb::DEALLOCATION_STACK, &stack.to_le_bytes())?;
             put(teb_at + teb::SELF, &teb_at.to_le_bytes())?;
             put(teb_at + teb::CLIENT_ID, &pid.to_le_bytes())?;
             put(teb_at + teb::CLIENT_ID + 8, &tid.to_le_bytes())?;

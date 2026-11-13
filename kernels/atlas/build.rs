@@ -44,7 +44,8 @@ fn build(guest: &Path, out: &Path, arch: &str, linker: &str) -> Result<PathBuf, 
         .args(["build", "--release", "--quiet", "--target", &target, "--target-dir"])
         .arg(&target_dir)
         .env(format!("CARGO_TARGET_{}_LINKER", target.to_uppercase().replace('-', "_")), linker)
-        .env("RUSTFLAGS", "-C link-arg=/NOENTRY -C link-arg=/NODEFAULTLIB")
+        // Exports written in assembly, which rustc doesn't export by itself.
+        .env("RUSTFLAGS", "-C link-arg=/NOENTRY -C link-arg=/NODEFAULTLIB -C link-arg=/EXPORT:RtlCaptureContext -C link-arg=/EXPORT:AtlasSwitchToFiber")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .env_remove("RUSTC_WORKSPACE_WRAPPER");
     command.env("RUSTC_BOOTSTRAP", "1").args(["-Zbuild-std=core,compiler_builtins", "-Zbuild-std-features=compiler-builtins-mem"]);

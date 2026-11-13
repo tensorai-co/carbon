@@ -47,7 +47,7 @@ fn encodings_match_llvm() {
 /// The vector and floating-point encodings SSE is lowered to, each checked against `llvm-mc`.
 #[test]
 fn sse_encodings_match_llvm() {
-    let cases: [(u32, u32, &str); 73] = [
+    let cases: [(u32, u32, &str); 80] = [
         (0x4e238441, { let mut a = Asm::new(); a.v3(vec::ADD, 0, 1, 2, 3); a.code[0] }, "add v1.16b, v2.16b, v3.16b"),
         (0x6ee38441, { let mut a = Asm::new(); a.v3(vec::SUB, 3, 1, 2, 3); a.code[0] }, "sub v1.2d, v2.2d, v3.2d"),
         (0x6e668ca4, { let mut a = Asm::new(); a.v3(vec::CMEQ, 1, 4, 5, 6); a.code[0] }, "cmeq v4.8h, v5.8h, v6.8h"),
@@ -65,6 +65,13 @@ fn sse_encodings_match_llvm() {
         (0x4e033841, { let mut a = Asm::new(); a.v3(vec::ZIP1, 0, 1, 2, 3); a.code[0] }, "zip1 v1.16b, v2.16b, v3.16b"),
         (0x4ec37841, { let mut a = Asm::new(); a.v3(vec::ZIP2, 3, 1, 2, 3); a.code[0] }, "zip2 v1.2d, v2.2d, v3.2d"),
         (0x4e23d441, { let mut a = Asm::new(); a.v3(vec::FADD, 0, 1, 2, 3); a.code[0] }, "fadd v1.4s, v2.4s, v3.4s"),
+        (0x6e23d441, { let mut a = Asm::new(); a.v3(vec::FADDP, 0, 1, 2, 3); a.code[0] }, "faddp v1.4s, v2.4s, v3.4s"),
+        (0x6e63d441, { let mut a = Asm::new(); a.v3(vec::FADDP, 1, 1, 2, 3); a.code[0] }, "faddp v1.2d, v2.2d, v3.2d"),
+        (0x4ec31841, { let mut a = Asm::new(); a.v3(vec::UZP1, 3, 1, 2, 3); a.code[0] }, "uzp1 v1.2d, v2.2d, v3.2d"),
+        (0x4e835841, { let mut a = Asm::new(); a.v3(vec::UZP2, 2, 1, 2, 3); a.code[0] }, "uzp2 v1.4s, v2.4s, v3.4s"),
+        (0x4e832841, { let mut a = Asm::new(); a.v3(vec::TRN1, 2, 1, 2, 3); a.code[0] }, "trn1 v1.4s, v2.4s, v3.4s"),
+        (0x4e836841, { let mut a = Asm::new(); a.v3(vec::TRN2, 2, 1, 2, 3); a.code[0] }, "trn2 v1.4s, v2.4s, v3.4s"),
+        (0x4e080441, { let mut a = Asm::new(); a.dup_d0(1, 2); a.code[0] }, "dup v1.2d, v2.d[0]"),
         (0x4ee3d441, { let mut a = Asm::new(); a.v3(vec::FSUB, 1, 1, 2, 3); a.code[0] }, "fsub v1.2d, v2.2d, v3.2d"),
         (0x6e23dc41, { let mut a = Asm::new(); a.v3(vec::FMUL, 0, 1, 2, 3); a.code[0] }, "fmul v1.4s, v2.4s, v3.4s"),
         (0x6e63fc41, { let mut a = Asm::new(); a.v3(vec::FDIV, 1, 1, 2, 3); a.code[0] }, "fdiv v1.2d, v2.2d, v3.2d"),
@@ -270,4 +277,19 @@ fn code_that_runs_out_is_a_fetch_exit() {
     assert!(!t.cacheable);
     let last = u32::from_le_bytes(t.code[t.code.len() - 4..].try_into().unwrap());
     assert_eq!(last, 0xD420_0000 | u32::from(exit::FETCH) << 5);
+}
+
+#[test]
+fn the_direction_flag_lasts_its_block() {
+    let words = |t: &crate::emit::arm64::Translation| -> Vec<u32> { t.code.chunks(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect() };
+    let unsupported = 0xD420_0000 | u32::from(exit::UNSUPPORTED) << 5;
+    // std; rep movsb; cld; ret: down, then up again before the block ends.
+    let t = translate(0x40_0000, &[0xfd, 0xf3, 0xa4, 0xfc, 0xc3], 64);
+    let w = words(&t);
+    assert!(!w.contains(&unsupported));
+    // rsi and rdi step down: sub x6, x6, #1 and sub x7, x7, #1.
+    assert!(w.contains(&0xD100_04C6) && w.contains(&0xD100_04E7));
+    // std; ret: a block can't end with DF set, so it stops at the ret.
+    let t = translate(0x40_0000, &[0xfd, 0xc3], 64);
+    assert_eq!(*words(&t).last().unwrap(), unsupported);
 }

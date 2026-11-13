@@ -12,6 +12,7 @@ dll! {
     "SHELL32.dll";
     host DragAcceptFiles(2) => drag_accept_files;
     host DragQueryFileW(4) => drag_query_file_w;
+    host DragQueryFileA(4) => drag_query_file_a;
     host DragQueryPoint(2) => drag_query_point;
     host DragFinish(1) => drag_finish;
 }
@@ -31,6 +32,14 @@ fn drag_accept_files(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
 /// `DragQueryFileW(hDrop, iFile, lpszFile, cch)`: with `iFile` 0xFFFFFFFF, how many files; with no buffer, a file's
 /// length in characters; else the file, cut to fit `cch` with its NUL, and how many characters were copied.
 fn drag_query_file_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    drag_query_file(task, cx, a, true)
+}
+
+fn drag_query_file_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    drag_query_file(task, cx, a, false)
+}
+
+fn drag_query_file(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
     let (index, buffer, cch) = (a[1] as u32, a[2], a[3] as u32 as usize);
     let file = {
         let w = task.win32k();
@@ -39,7 +48,7 @@ fn drag_query_file_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
             return Reply::Value(drop.files.len() as u64);
         }
         let Some(file) = drop.files.get(index as usize) else { return Reply::Value(0) };
-        file.encode_utf16().collect::<Vec<u16>>()
+        if wide { file.encode_utf16().collect::<Vec<u16>>() } else { crate::ansi::bytes(file).into_iter().map(u16::from).collect() }
     };
     if buffer == 0 {
         return Reply::Value(file.len() as u64);
@@ -48,7 +57,7 @@ fn drag_query_file_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
         return Reply::Value(0);
     }
     let n = file.len().min(cch - 1);
-    let bytes: Vec<u8> = file[..n].iter().chain(&[0]).flat_map(|u| u.to_le_bytes()).collect();
+    let bytes: Vec<u8> = if wide { file[..n].iter().chain(&[0]).flat_map(|u| u.to_le_bytes()).collect() } else { file[..n].iter().map(|&b| b as u8).chain([0]).collect() };
     match task.mem(cx, true, |t| user::write(&mut t.space(), buffer, &bytes)) {
         Ok(_) => Reply::Value(n as u64),
         Err(_) => Reply::Value(0),

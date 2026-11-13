@@ -80,6 +80,18 @@ impl Image {
         u64::from(unsafe { u32_at(self.optional() + 56) })
     }
 
+    /// The linker's timestamp, from the file header.
+    pub fn time_date_stamp(self) -> u32 {
+        // SAFETY: as above.
+        unsafe { u32_at(self.optional() - 16) }
+    }
+
+    /// The base it was linked for (PE32+).
+    pub fn preferred_base(self) -> u64 {
+        // SAFETY: as above.
+        unsafe { u64_at(self.optional() + 24) }
+    }
+
     /// A data directory, as an address and size, if the image has it.
     pub fn dir(self, index: usize) -> Option<(u64, u64)> {
         let opt = self.optional();

@@ -9,12 +9,16 @@
 #![allow(non_snake_case)]
 
 mod arch;
+mod crt;
 mod env;
 mod exception;
+mod fiber;
 mod heap;
 mod loader;
 mod pe;
+mod pool;
 mod strings;
+mod stdio;
 mod sync;
 mod sys;
 mod unwind;

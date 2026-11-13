@@ -30,7 +30,7 @@ impl Task {
         if wide {
             self.mem(cx, false, |t| user::read_wstr(&t.space(), at, 32767)).ok()
         } else {
-            self.mem(cx, false, |t| user::read_cstr(&t.space(), at, 32767)).ok().map(|b| String::from_utf8_lossy(&b).into_owned())
+            self.mem(cx, false, |t| user::read_cstr(&t.space(), at, 32767)).ok().map(|b| crate::ansi::text(&b))
         }
     }
 
@@ -64,8 +64,14 @@ impl Task {
         }
     }
 
-    fn put_ansi(&mut self, cx: &mut Cx<'_>, buffer: u64, size: u64, s: &str) -> Reply {
-        let bytes = s.as_bytes();
+    /// A string written back as a `*W` (UTF-16) or `*A` (ANSI) function does.
+    pub(crate) fn put_text(&mut self, cx: &mut Cx<'_>, buffer: u64, size: u64, s: &str, wide: bool) -> Reply {
+        if wide { self.put_wide(cx, buffer, size, s) } else { self.put_ansi(cx, buffer, size, s) }
+    }
+
+    /// The same, in the ANSI code page.
+    pub(crate) fn put_ansi(&mut self, cx: &mut Cx<'_>, buffer: u64, size: u64, s: &str) -> Reply {
+        let bytes = &crate::ansi::bytes(s)[..];
         if (bytes.len() as u64) < size && buffer != 0 {
             let mut z = bytes.to_vec();
             z.push(0);
@@ -79,10 +85,10 @@ impl Task {
     }
 }
 
-fn times(b: &mut [u8], at: usize, modified: u64) {
-    let t = filetime(modified);
-    for o in [at, at + 8, at + 16] {
-        b[o..o + 8].copy_from_slice(&t.to_le_bytes());
+/// Three FILETIMEs in a row, as Windows' structures have them: made, last read, last written.
+fn times(b: &mut [u8], at: usize, created: u64, accessed: u64, modified: u64) {
+    for (o, t) in [(at, created), (at + 8, accessed), (at + 16, modified)] {
+        b[o..o + 8].copy_from_slice(&filetime(t).to_le_bytes());
     }
 }
 
@@ -114,7 +120,7 @@ fn create_file(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply
         task.set_last_error(cx, 5); // ERROR_ACCESS_DENIED
         return Reply::Value(INVALID_HANDLE_VALUE);
     }
-    match task.open_file(&name, a[1] as u32, a[4] as u32, a[5] as u32) {
+    match task.open_file(&name, a[1] as u32, a[2] as u32, a[4] as u32, a[5] as u32) {
         Ok((file, existed)) => {
             if !existed && let Some(d) = task.attributes_descriptor(cx, a[3]) {
                 let d = d.filled(&lock(&task.effective_token().state)).mapped(&crate::security::FILE);
@@ -503,14 +509,22 @@ pub fn get_file_attributes_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Rep
 fn attribute_data(info: &Info) -> Vec<u8> {
     let mut b = vec![0u8; 36];
     b[0..4].copy_from_slice(&info.attributes.to_le_bytes());
-    times(&mut b, 4, info.modified);
+    times(&mut b, 4, info.created, info.accessed, info.modified);
     b[28..32].copy_from_slice(&((info.size >> 32) as u32).to_le_bytes());
     b[32..36].copy_from_slice(&(info.size as u32).to_le_bytes());
     b
 }
 
 pub fn get_file_attributes_ex_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(path) = task.path_arg(cx, a[0], true) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
+    get_file_attributes_ex(task, cx, a, true)
+}
+
+pub fn get_file_attributes_ex_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    get_file_attributes_ex(task, cx, a, false)
+}
+
+fn get_file_attributes_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let Some(path) = task.path_arg(cx, a[0], wide) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
     match task.path_info(&path) {
         Ok(info) => {
             let b = attribute_data(&info);
@@ -521,7 +535,15 @@ pub fn get_file_attributes_ex_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> 
 }
 
 pub fn set_file_attributes_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(path) = task.path_arg(cx, a[0], true) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
+    set_file_attributes(task, cx, a, true)
+}
+
+pub fn set_file_attributes_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    set_file_attributes(task, cx, a, false)
+}
+
+fn set_file_attributes(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let Some(path) = task.path_arg(cx, a[0], wide) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
     let found = task.resolve(&path).and_then(|(_, disk_path)| {
         let mut disk = lock(&task.k.disk);
         let ino = disk.resolve(layers::ROOT, &disk_path, true).map_err(|_| files::ERROR_FILE_NOT_FOUND)?;
@@ -541,7 +563,7 @@ pub fn get_file_information_by_handle(task: &mut Task, cx: &mut Cx<'_>, a: &[u64
         Ok(info) => {
             let mut b = vec![0u8; 52];
             b[0..4].copy_from_slice(&info.attributes.to_le_bytes());
-            times(&mut b, 4, info.modified);
+            times(&mut b, 4, info.created, info.accessed, info.modified);
             b[28..32].copy_from_slice(&0xca4b_0c00u32.to_le_bytes()); // the volume's serial number
             b[32..36].copy_from_slice(&((info.size >> 32) as u32).to_le_bytes());
             b[36..40].copy_from_slice(&(info.size as u32).to_le_bytes());
@@ -591,14 +613,34 @@ pub fn create_directory_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply 
 }
 
 pub fn remove_directory_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let path = task.path_arg(cx, a[0], true);
-    let done = path_op(task, cx, a[0], true, Task::remove_directory);
+    remove_directory(task, cx, a, true)
+}
+
+pub fn remove_directory_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    remove_directory(task, cx, a, false)
+}
+
+fn remove_directory(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let path = task.path_arg(cx, a[0], wide);
+    let done = path_op(task, cx, a[0], wide, Task::remove_directory);
     task.forget_security(path.as_deref(), done);
     done
 }
 
 pub fn move_file_ex_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let (Some(from), Some(to)) = (task.path_arg(cx, a[0], true), task.path_arg(cx, a[1], true)) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
+    move_file(task, cx, a, true)
+}
+
+pub fn move_file_ex_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    move_file(task, cx, a, false)
+}
+
+pub fn move_file_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    move_file(task, cx, &[a[0], a[1], 0], false)
+}
+
+fn move_file(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let (Some(from), Some(to)) = (task.path_arg(cx, a[0], wide), task.path_arg(cx, a[1], wide)) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
     match task.move_file(&from, &to, a[2] & 1 != 0) {
         Ok(()) => Reply::Value(TRUE),
         Err(e) => task.fail(cx, e),
@@ -609,8 +651,88 @@ pub fn move_file_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     move_file_ex_w(task, cx, &[a[0], a[1], 0])
 }
 
+/// `CreateHardLink(new, existing, attributes)`.
+fn create_hard_link(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let (Some(new), Some(existing)) = (task.path_arg(cx, a[0], wide), task.path_arg(cx, a[1], wide)) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
+    match task.create_hard_link(&new, &existing) {
+        Ok(()) => Reply::Value(TRUE),
+        Err(e) => task.fail(cx, e),
+    }
+}
+
+pub fn create_hard_link_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    create_hard_link(task, cx, a, true)
+}
+
+pub fn create_hard_link_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    create_hard_link(task, cx, a, false)
+}
+
+/// `CreateSymbolicLink(link, target, flags)`: SYMBOLIC_LINK_FLAG_DIRECTORY (1) for a folder's.
+fn create_symbolic_link(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let (Some(link), Some(target)) = (task.path_arg(cx, a[0], wide), task.path_arg(cx, a[1], wide)) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
+    if a[2] as u32 & !3 != 0 {
+        return task.fail(cx, ERROR_INVALID_PARAMETER);
+    }
+    match task.create_symbolic_link(&link, &target, a[2] as u32 & 1 != 0) {
+        Ok(()) => Reply::Value(TRUE),
+        Err(e) => task.fail(cx, e),
+    }
+}
+
+pub fn create_symbolic_link_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    create_symbolic_link(task, cx, a, true)
+}
+
+pub fn create_symbolic_link_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    create_symbolic_link(task, cx, a, false)
+}
+
+/// `GetFileTime(file, &created, &accessed, &written)`: any it's given somewhere to put.
+pub fn get_file_time(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let info = task.file_handle(a[0]).ok_or(ERROR_INVALID_HANDLE).and_then(|f| task.file_info(&f));
+    match info {
+        Ok(info) => {
+            for (at, t) in [(a[1], info.created), (a[2], info.accessed), (a[3], info.modified)] {
+                if at != 0 && task.mem(cx, true, |t2| user::write_u64(&mut t2.space(), at, filetime(t))).is_err() {
+                    return task.fail(cx, 998);
+                }
+            }
+            Reply::Value(TRUE)
+        }
+        Err(e) => task.fail(cx, e),
+    }
+}
+
+/// `SetFileTime(file, &created, &accessed, &written)`: each that isn't null, or 0, or -1 (which only stops Windows
+/// changing it itself).
+pub fn set_file_time(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(file) = task.file_handle(a[0]) else { return task.fail(cx, ERROR_INVALID_HANDLE) };
+    let mut times = [None; 3];
+    for (i, at) in a[1..4].iter().enumerate() {
+        if *at != 0 {
+            let Ok(ft) = task.mem(cx, false, |t| user::read_u64(&t.space(), *at)) else { return task.fail(cx, 998) };
+            if ft != 0 && ft != u64::MAX {
+                times[i] = Some(files::from_filetime(ft));
+            }
+        }
+    }
+    match task.set_file_times(&file, times[0], times[1], times[2]) {
+        Ok(()) => Reply::Value(TRUE),
+        Err(e) => task.fail(cx, e),
+    }
+}
+
 pub fn copy_file_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let (Some(from), Some(to)) = (task.path_arg(cx, a[0], true), task.path_arg(cx, a[1], true)) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
+    copy_file(task, cx, a, true)
+}
+
+pub fn copy_file_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    copy_file(task, cx, a, false)
+}
+
+fn copy_file(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let (Some(from), Some(to)) = (task.path_arg(cx, a[0], wide), task.path_arg(cx, a[1], wide)) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
     match task.copy_file(&from, &to, a[2] as u32 != 0) {
         Ok(()) => Reply::Value(TRUE),
         Err(e) => task.fail(cx, e),
@@ -621,15 +743,19 @@ pub fn copy_file_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 fn find_data(found: &Found, wide: bool) -> Vec<u8> {
     let mut b = vec![0u8; if wide { 592 } else { 320 }];
     b[0..4].copy_from_slice(&found.attributes.to_le_bytes());
-    times(&mut b, 4, found.modified);
+    times(&mut b, 4, found.created, found.accessed, found.modified);
     b[28..32].copy_from_slice(&((found.size >> 32) as u32).to_le_bytes());
     b[32..36].copy_from_slice(&(found.size as u32).to_le_bytes());
+    // dwReserved0: a reparse point's tag.
+    if found.attributes & files::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        b[36..40].copy_from_slice(&files::IO_REPARSE_TAG_SYMLINK.to_le_bytes());
+    }
     if wide {
         for (i, unit) in found.name.encode_utf16().take(259).enumerate() {
             b[44 + i * 2..46 + i * 2].copy_from_slice(&unit.to_le_bytes());
         }
     } else {
-        for (i, byte) in found.name.bytes().take(259).enumerate() {
+        for (i, byte) in crate::ansi::bytes(&found.name).into_iter().take(259).enumerate() {
             b[44 + i] = byte;
         }
     }
@@ -708,34 +834,55 @@ pub fn set_current_directory_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> R
     path_op(task, cx, a[0], true, Task::set_current_directory)
 }
 
+pub fn set_current_directory_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    path_op(task, cx, a[0], false, Task::set_current_directory)
+}
+
 /// `GetFullPathNameW`: the full path, and where its file name starts.
 pub fn get_full_path_name_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(name) = task.path_arg(cx, a[0], true) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
+    get_full_path_name(task, cx, a, true)
+}
+
+pub fn get_full_path_name_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    get_full_path_name(task, cx, a, false)
+}
+
+fn get_full_path_name(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let Some(name) = task.path_arg(cx, a[0], wide) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
     let full = match task.resolve(&name) {
         Ok((full, _)) => full,
         Err(e) => return task.fail(cx, e),
     };
     // A trailing separator stays: "C:\dir\" names the folder.
     let full = if name.ends_with(['\\', '/']) && !full.ends_with('\\') { format!("{full}\\") } else { full };
-    let reply = task.put_wide(cx, a[2], a[1] & 0xffff_ffff, &full);
+    let reply = task.put_text(cx, a[2], a[1] & 0xffff_ffff, &full, wide);
     if let Reply::Value(n) = reply
         && n < a[1] & 0xffff_ffff
         && a[3] != 0
     {
         let file_part = full.rfind('\\').map(|i| i + 1).filter(|&i| i < full.len());
-        let at = file_part.map_or(0, |i| a[2] + full[..i].encode_utf16().count() as u64 * 2);
+        let units = |s: &str| if wide { s.encode_utf16().count() as u64 * 2 } else { crate::ansi::bytes(s).len() as u64 };
+        let at = file_part.map_or(0, |i| a[2] + units(&full[..i]));
         let _ = task.mem(cx, true, |t| user::write_u64(&mut t.space(), a[3], at));
     }
     reply
 }
 
 pub fn get_long_path_name_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(name) = task.path_arg(cx, a[0], true) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
+    get_long_path_name(task, cx, a, true)
+}
+
+pub fn get_long_path_name_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    get_long_path_name(task, cx, a, false)
+}
+
+fn get_long_path_name(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let Some(name) = task.path_arg(cx, a[0], wide) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
     if let Err(e) = task.path_info(&name) {
         task.set_last_error(cx, e);
         return Reply::Value(0);
     }
-    task.put_wide(cx, a[1], a[2] & 0xffff_ffff, &name)
+    task.put_text(cx, a[1], a[2] & 0xffff_ffff, &name, wide)
 }
 
 /// `GetFinalPathNameByHandleW`: the file's full path, as `\\?\C:\...`.
@@ -748,14 +895,35 @@ pub fn get_final_path_name_by_handle_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u6
     task.put_wide(cx, a[1], a[2] & 0xffff_ffff, &path)
 }
 
+pub fn get_final_path_name_by_handle_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(file) = task.file_handle(a[0]).filter(|f| !f.path.is_empty()) else {
+        task.set_last_error(cx, ERROR_INVALID_HANDLE);
+        return Reply::Value(0);
+    };
+    let path = format!("\\\\?\\{}", file.path);
+    task.put_ansi(cx, a[1], a[2] & 0xffff_ffff, &path)
+}
+
 pub fn get_temp_path_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     task.put_wide(cx, a[1], a[0] & 0xffff_ffff, "C:\\Windows\\Temp\\")
+}
+
+pub fn get_temp_path_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    task.put_ansi(cx, a[1], a[0] & 0xffff_ffff, "C:\\Windows\\Temp\\")
 }
 
 pub fn get_windows_directory_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     task.put_wide(cx, a[0], a[1] & 0xffff_ffff, "C:\\Windows")
 }
 
+pub fn get_windows_directory_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    task.put_ansi(cx, a[0], a[1] & 0xffff_ffff, "C:\\Windows")
+}
+
 pub fn get_system_directory_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     task.put_wide(cx, a[0], a[1] & 0xffff_ffff, "C:\\Windows\\System32")
+}
+
+pub fn get_system_directory_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    task.put_ansi(cx, a[0], a[1] & 0xffff_ffff, "C:\\Windows\\System32")
 }

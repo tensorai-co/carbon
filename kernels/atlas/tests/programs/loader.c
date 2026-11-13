@@ -3,8 +3,11 @@
 // It checks: an app's own DLL, imported and relocated off a base the program has; its DllMain; a forwarder chain
 // (mylib!heap_alloc → kernel32!HeapAlloc → ntdll!RtlAllocateHeap); LoadLibraryA and GetProcAddress by name and by
 // ordinal; ERROR_MOD_NOT_FOUND and ERROR_PROC_NOT_FOUND; GetModuleFileNameW; static TLS and a TLS callback;
-// __try/__except catching an access violation, from three calls down too; RaiseException with a filter; __finally
-// during an unwind and on a normal exit; EXCEPTION_CONTINUE_EXECUTION; integer divide by zero (x86-64)
+// the PEB's three module lists; GetModuleHandleExA; FreeLibrary counting references and unloading, with DllMain
+// told and a DLL notification, and what only it held unloaded too; DLL_THREAD_DETACH; an API set; LdrGetDllHandle
+// and LdrGetProcedureAddress; a delay-loaded DLL; __try/__except catching an access violation, from three calls down
+// too; RaiseException with a filter; __finally during an unwind and on a normal exit; EXCEPTION_CONTINUE_EXECUTION;
+// integer divide by zero (x86-64); and, as it ends, DLL_PROCESS_DETACH
 
 typedef void *HANDLE;
 typedef unsigned int DWORD;
@@ -21,11 +24,76 @@ __declspec(dllimport) DWORD __stdcall GetModuleFileNameW(HANDLE, WCHAR *, DWORD)
 __declspec(dllimport) DWORD __stdcall GetLastError(void);
 __declspec(dllimport) void __stdcall RaiseException(DWORD, DWORD, DWORD, const u64 *);
 __declspec(dllimport) HANDLE __stdcall GetProcessHeap(void);
+__declspec(dllimport) int __stdcall FreeLibrary(HANDLE);
+__declspec(dllimport) int __stdcall GetModuleHandleExA(DWORD, const char *, HANDLE *);
+__declspec(dllimport) HANDLE __stdcall CreateThread(void *, u64, DWORD (__stdcall *)(void *), void *, DWORD, DWORD *);
+__declspec(dllimport) DWORD __stdcall WaitForSingleObject(HANDLE, DWORD);
+__declspec(dllimport) int __stdcall CloseHandle(HANDLE);
+__declspec(dllimport) void *__stdcall ResolveDelayLoadedAPI(void *, const void *, void *, void *, void **, DWORD);
+
+typedef struct { unsigned short length, max; unsigned pad; const WCHAR *buffer; } USTR;
+typedef struct { unsigned short length, max; unsigned pad; const char *buffer; } ASTR;
+__declspec(dllimport) int __stdcall LdrGetDllHandle(void *, void *, const USTR *, HANDLE *);
+__declspec(dllimport) int __stdcall LdrGetProcedureAddress(HANDLE, const ASTR *, DWORD, void **);
+__declspec(dllimport) int __stdcall LdrRegisterDllNotification(DWORD, void *, void *, void **);
+__declspec(dllimport) int __stdcall LdrUnregisterDllNotification(void *);
 
 __declspec(dllimport) int add(int, int);
 __declspec(dllimport) const char *word(int);
 __declspec(dllimport) int attached;
 __declspec(dllimport) void *heap_alloc(HANDLE, DWORD, u64);
+__declspec(dllimport) int thread_attached, thread_detached, say_at_exit;
+__declspec(dllimport) int square(int);
+
+// The delay-load helper MSVC's delayimp.lib has, as Windows' own DLLs have it: everything is ResolveDelayLoadedAPI.
+extern char __ImageBase;
+void *__delayLoadHelper2(const void *descriptor, void **thunk) { return ResolveDelayLoadedAPI(&__ImageBase, descriptor, 0, 0, thunk, 0); }
+
+// The PEB's lists: an LDR_DATA_TABLE_ENTRY's three links, then its base, entry point, size and names.
+typedef struct LIST { struct LIST *next, *prev; } LIST;
+typedef struct { LIST load, memory, init; void *base, *entry; DWORD size, pad; USTR full, name; } ENTRY;
+static LIST *ldr_list(int which) {
+    char *teb;
+#if defined(__aarch64__)
+    __asm__ volatile("mov %0, x18" : "=r"(teb));
+#else
+    __asm__ volatile("mov %%gs:0x30, %0" : "=r"(teb));
+#endif
+    char *peb = *(char **)(teb + 0x60), *ldr = *(char **)(peb + 0x18);
+    return (LIST *)(ldr + 0x10 + which * 0x10);
+}
+static ENTRY *entry_of(LIST *links, int which) { return (ENTRY *)((char *)links - which * 0x10); }
+static int named(const USTR *s, const char *want) {
+    unsigned n = s->length / 2, i = 0;
+    for (; i < n && want[i]; i++) {
+        WCHAR c = s->buffer[i];
+        if (c >= 'A' && c <= 'Z') c += 32;
+        if (c != (WCHAR)want[i]) return 0;
+    }
+    return i == n && !want[i];
+}
+static ENTRY *nth(int which, int index) {
+    LIST *head = ldr_list(which), *at = head->next;
+    for (int i = 0; at != head; at = at->next, i++)
+        if (i == index) return entry_of(at, which);
+    return 0;
+}
+static int listed(int which, HANDLE base) {
+    LIST *head = ldr_list(which);
+    for (LIST *at = head->next; at != head; at = at->next)
+        if (entry_of(at, which)->base == base) return 1;
+    return 0;
+}
+static int count_of(int which) { int n = 0; LIST *head = ldr_list(which); for (LIST *at = head->next; at != head; at = at->next) n++; return n; }
+
+static int loads, unloads;
+typedef struct { DWORD flags; const USTR *full, *name; void *base; DWORD size; } NOTIFIED;
+static void __stdcall on_dll(DWORD reason, const NOTIFIED *data, void *context) {
+    if (context != (void *)&loads || !named(data->name, "mylib3.dll")) return;
+    if (reason == 1) loads = loads + 1;
+    if (reason == 2) unloads = unloads + 1;
+}
+static DWORD __stdcall nothing(void *p) { (void)p; return 7; }
 
 // Static TLS, as the C runtime's tlssup sets it up: a template between .tls and .tls$ZZZ, and callbacks in .CRT$XL*.
 typedef void (__stdcall *TLS_CALLBACK)(void *, DWORD, void *);
@@ -89,6 +157,56 @@ void mainCRTStartup(void) {
     DWORD n = GetModuleFileNameW(two, path, 260);
     check(n > 10 && path[n - 1] == 'l' && path[n - 10] == 'm', "GetModuleFileNameW");
 
+    // The PEB's lists: load order is the program, ntdll and kernel32 first; initialization order starts at ntdll.
+    ENTRY *first = nth(0, 0), *second = nth(0, 1), *third = nth(0, 2), *init = nth(2, 0);
+    check(first && first->base == self && second && named(&second->name, "ntdll.dll") && third && named(&third->name, "kernel32.dll"),
+          "the PEB's load order list: the program, ntdll, kernel32");
+    check(init && named(&init->name, "ntdll.dll") && listed(2, lib) && !listed(2, self), "its initialization order list: ntdll first, DLLs only");
+    check(count_of(0) == count_of(1) && listed(1, two) && first->size > 0, "its memory order list has the same modules");
+
+    HANDLE found = 0;
+    check(GetModuleHandleExA(4 | 2, (const char *)(void *)add, &found) && found == lib, "GetModuleHandleExA, from an address in the module");
+
+    void *cookie = 0;
+    check(LdrRegisterDllNotification(0, (void *)on_dll, &loads, &cookie) == 0 && cookie, "LdrRegisterDllNotification");
+    HANDLE three = LoadLibraryA("mylib3.dll");
+    void (*watch)(int *) = (void (*)(int *))GetProcAddress(three, "watch");
+    int (*triple)(int) = (int (*)(int))GetProcAddress(three, "triple");
+    int detached = 0;
+    if (watch) watch(&detached);
+    check(three && triple && triple(5) == 15 && loads == 1, "a DLL that imports another, loaded, and its notification");
+    check(FreeLibrary(three) && detached == 1 && unloads == 1, "FreeLibrary of its last reference: DLL_PROCESS_DETACH, then a notification");
+    check(GetModuleHandleA("mylib3.dll") == 0 && !listed(0, three) && !listed(2, three), "and it's gone, from the lists too");
+    LdrUnregisterDllNotification(cookie);
+    // mylib2 was loaded twice, and mylib3 held it a third time.
+    check(GetModuleHandleA("mylib2.dll") == two && FreeLibrary(two), "what it imported stays while others hold it");
+    check(GetModuleHandleA("mylib2.dll") == two && FreeLibrary(two) && GetModuleHandleA("mylib2.dll") == 0, "and goes with its last reference");
+    two = LoadLibraryA("mylib2.dll");
+    mul = (int (*)(int, int))GetProcAddress(two, "mul");
+    check(two && mul && mul(4, 5) == 20, "a DLL unloaded loads again");
+    check(FreeLibrary((HANDLE)0x1234) == 0 && GetLastError() == 126, "FreeLibrary of something that isn't a module fails");
+
+    int before = thread_detached;
+    HANDLE t = CreateThread(0, 0, nothing, 0, 0, 0);
+    WaitForSingleObject(t, 0xffffffff);
+    CloseHandle(t);
+    check(thread_attached >= 1 && thread_detached == before + 1, "a thread ending: DLL_THREAD_DETACH");
+
+    HANDLE set = LoadLibraryA("api-ms-win-core-synch-l1-2-0.dll");
+    check(set && set == GetModuleHandleA("kernel32.dll") && GetProcAddress(set, "Sleep"), "an API set is its DLL");
+
+    static const WCHAR wide[] = {'M', 'y', 'L', 'i', 'b', '.', 'd', 'l', 'l'};
+    USTR lib_name = {sizeof wide, sizeof wide, 0, wide};
+    ASTR add_name = {3, 3, 0, "addXX"};
+    HANDLE by_ldr = 0;
+    void *add_at = 0;
+    check(LdrGetDllHandle(0, 0, &lib_name, &by_ldr) == 0 && by_ldr == lib, "LdrGetDllHandle");
+    check(LdrGetProcedureAddress(lib, &add_name, 0, &add_at) == 0 && add_at == GetProcAddress(lib, "add"), "LdrGetProcedureAddress, by a counted name");
+    check(LdrGetProcedureAddress(two, 0, 5, &add_at) == 0 && add_at == (void *)mul, "and by ordinal");
+
+    check(GetModuleHandleA("mylib4.dll") == 0, "a delay-loaded DLL isn't loaded at first");
+    check(square(9) == 81 && GetModuleHandleA("mylib4.dll") != 0 && square(4) == 16, "and is the first time it's called");
+
     check(callback_ran && tls_counter == 41, "static TLS: its template, and its callback ran first");
     tls_counter = tls_counter + 1;
     check(tls_counter == 42, "and it's this thread's to change");
@@ -125,5 +243,6 @@ void mainCRTStartup(void) {
     check(code == 0xC0000094, "integer divide by zero");
 #endif
 
+    say_at_exit = 1;
     ExitProcess(failures);
 }

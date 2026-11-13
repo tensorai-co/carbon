@@ -68,6 +68,7 @@ impl Task {
             state.regions.insert(teb_at..teb_at + GRANULE, Area::of(Prot::RW, AreaKind::Committed));
             let stack = state.regions.free_above(ALLOC, size, GRANULE).ok_or(atlas_abi::status::NO_MEMORY)?;
             state.regions.insert(stack..stack + size, Area::of(Prot::RW, AreaKind::Committed));
+            state.regions.update(stack..stack + crate::process::STACK_GUARD, |a| a.guard = true);
             (teb_at, stack, state.peb, state.thread_start)
         };
         let top = stack + size;
@@ -77,7 +78,7 @@ impl Task {
             t.space().map(teb_at..teb_at + GRANULE, Prot::RW).zeroed().map_err(nomem)?;
             t.space().map(top - STACK_MAPPED..top, Prot::RW).zeroed().map_err(nomem)?;
             let mut memory = t.space();
-            for (at, value) in [(teb::STACK_BASE, top), (teb::STACK_LIMIT, top - STACK_MAPPED), (teb::SELF, teb_at), (teb::CLIENT_ID, pid), (teb::CLIENT_ID + 8, tid), (teb::PEB, peb)] {
+            for (at, value) in [(teb::STACK_BASE, top), (teb::STACK_LIMIT, top - STACK_MAPPED), (teb::DEALLOCATION_STACK, stack), (teb::SELF, teb_at), (teb::CLIENT_ID, pid), (teb::CLIENT_ID + 8, tid), (teb::PEB, peb)] {
                 user::write_u64(&mut memory, teb_at + at, value).map_err(|_| atlas_abi::status::NO_MEMORY)?;
             }
             Ok(())
@@ -130,6 +131,21 @@ impl Task {
             if self.waiter.wait(None) == Woke::Interrupted && self.ending() {
                 return false;
             }
+        }
+    }
+
+    /// Ends every thread of the process but this one, with `code`, as `NtTerminateProcess(NULL, code)` does before
+    /// the loader tells DLLs the process is ending, and waits (a while) for them to be gone.
+    pub fn end_other_threads(&mut self, code: u32) {
+        let others: Vec<_> = lock(&self.process.state).threads.values().filter(|c| c.tid != self.tid).cloned().collect();
+        for control in &others {
+            lock(&control.killed).get_or_insert(code);
+            control.waiter.interrupt();
+            control.cpu.preempt();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while lock(&self.process.state).threads.len() > 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
 

@@ -108,14 +108,14 @@ unsafe fn widen(at: *const u8) -> (*mut u16, usize) {
             return (out, 0);
         }
         for i in 0..=n {
-            *out.add(i) = u16::from(*at.add(i));
+            *out.add(i) = atlas_abi::ansi::from_1252(*at.add(i));
         }
         (out, n)
     }
 }
 
 fn narrow(u: u16) -> u8 {
-    if u < 0x80 { u as u8 } else { b'?' }
+    atlas_abi::ansi::to_1252(u).unwrap_or(b'?')
 }
 
 /// Copies `value` and a NUL into a buffer of `size` units, as `GetEnvironmentVariable` does: its length without the

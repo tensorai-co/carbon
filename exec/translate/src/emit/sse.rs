@@ -3,8 +3,10 @@
 //! What's covered is what C compilers and glibc's baseline (x86-64-v1) code use: moves of every width and half,
 //! logic, packed integer arithmetic and compares, shifts by an immediate, unpacks, packs and shuffles, the
 //! `movmsk`s, scalar and packed floating point with x86's own `min`/`max` and conversion results, compares into masks
-//! and into flags, and MXCSR's rounding and flush-to-zero (as FPCR's). MMX (the same opcodes without `66`), SSE3 and
-//! later, and shifts by a register count are still unsupported stops.
+//! and into flags, and MXCSR's rounding and flush-to-zero (as FPCR's). Of SSE3, which every Windows 10 x86-64 CPU has
+//! and Windows' compilers use: the horizontal adds and subtracts, `movddup`, `movsldup`, `movshdup` and `lddqu`. MMX
+//! (the same opcodes without `66`), SSE3's `addsub`, SSSE3 and later, and shifts by a register count are still
+//! unsupported stops.
 //!
 //! x86's scalar operations keep the rest of the destination register; ARM's zero it. So a scalar result is made in a
 //! scratch register and put into lane 0.
@@ -289,6 +291,30 @@ impl Emitter {
                 self.asm.umov(1, d, n, (inst.imm & 7) as u8);
             }
             (0xC6, P::None | P::P66) => self.shufp(inst, p == P::P66)?,
+            (0x7C | 0x7D, P::P66 | P::F2) => {
+                // haddpd, haddps, hsubpd, hsubps: each operand's adjacent pairs, added (faddp), or the even ones less
+                // the odd ones (uzp1, uzp2, fsub).
+                let s = self.src128(inst)?;
+                let double = p == P::P66;
+                if op == 0x7C {
+                    self.asm.v3(vec::FADDP, u8::from(double), d, d, s);
+                } else {
+                    let lanes = if double { 3 } else { 2 };
+                    self.asm.v3(vec::UZP1, lanes, V0, d, s);
+                    self.asm.v3(vec::UZP2, lanes, V1, d, s);
+                    self.asm.v3(vec::FSUB, u8::from(double), d, V0, V1);
+                }
+            }
+            (0x12, P::F2) => {
+                // movddup: the low double in both halves.
+                let s = self.src_scalar(inst, true)?;
+                self.asm.dup_d0(d, s);
+            }
+            (0x12 | 0x16, P::F3) => {
+                // movsldup and movshdup: each even (odd) single in its pair.
+                let s = self.src128(inst)?;
+                self.asm.v3(if op == 0x12 { vec::TRN1 } else { vec::TRN2 }, 2, d, s, s);
+            }
             (0xF0, P::F2) => {
                 // lddqu
                 let Some(Rm::Mem(mem)) = inst.rm else { return Err(Unsupported) };

@@ -9,6 +9,7 @@
 //! Each export is `host` (host Rust), `guest` (forwarded to `atlas-guest`'s ntdll) or `missing` (a stub that names
 //! itself, so the next thing to write is obvious). Host code can call the program back with an upcall.
 
+pub mod ansi;
 mod environment;
 mod exceptions;
 mod files;
@@ -133,6 +134,9 @@ pub fn boot(exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&str]
         deferred: Mutex::new(Vec::new()),
         shared: std::sync::OnceLock::new(),
         named_pipes: Mutex::new(HashMap::new()),
+        open_files: Mutex::new(HashMap::new()),
+        reg_watches: Mutex::new(Vec::new()),
+        console_cp: std::sync::atomic::AtomicU32::new(ansi::OEMCP),
         file_security: Mutex::new(HashMap::new()),
         key_security: Mutex::new(HashMap::new()),
         live: (Mutex::new(0), Condvar::new()),
@@ -203,6 +207,12 @@ pub(crate) struct Kernel {
     /// Descriptors set on files (by full Windows path, lower case) and registry keys (by ID). Others have the default.
     file_security: Mutex<HashMap<String, security::Descriptor>>,
     key_security: Mutex<HashMap<u64, security::Descriptor>>,
+    /// The console's code page: the OEM one, unless a program sets another.
+    console_cp: std::sync::atomic::AtomicU32,
+    /// `RegNotifyChangeKeyValue`'s watches, each set once as a change it asks for comes.
+    reg_watches: Mutex<Vec<registry::Watch>>,
+    /// Every file open on the disk, by its inode, for sharing modes to check against.
+    open_files: Mutex<HashMap<layers::Ino, files::Opens>>,
     /// Named pipes by name (lower case, without `\\.\pipe\`).
     named_pipes: Mutex<HashMap<String, Weak<named_pipes::Server>>>,
     options: Options,
@@ -218,6 +228,23 @@ impl Kernel {
         if let Ok(ino) = disk.put(registry::SAVED, layers::New::File, &[], Meta { attributes: 0x20 }, dir) {
             let _ = disk.truncate(ino, 0, now);
             let _ = disk.write(ino, 0, &bytes, now);
+        }
+    }
+
+    /// Sets the event of each watch a change in the registry since it was last looked at matches, once.
+    fn registry_changed(&self) {
+        let changes = lock(&self.registry).take_changes();
+        if changes.is_empty() {
+            return;
+        }
+        let fired: Vec<_> = {
+            let mut watches = lock(&self.reg_watches);
+            let (fired, kept) = std::mem::take(&mut *watches).into_iter().partition::<Vec<_>, _>(|w| changes.iter().any(|(chain, what)| w.matches(chain, *what)));
+            *watches = kept;
+            fired
+        };
+        for watch in fired {
+            self.objects.signal(&watch.event, |s| s.set = true);
         }
     }
 

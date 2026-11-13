@@ -362,16 +362,104 @@ fn tls_slot(slot: u32) -> *mut u64 {
     unsafe { crate::teb().add(teb::TLS_SLOTS as usize).cast::<u64>().add(slot as usize) }
 }
 
-/// This thread's FLS slots, made the first time they're wanted.
+/// An FLS block: two links into the list of every block (so `FlsFree` can reach every thread's and fiber's value),
+/// then 64 slots. A thread's, or a fiber's, is made the first time it's wanted.
+const FLS_LINKS: usize = 2;
+const FLS_BLOCK: usize = (FLS_LINKS + 64) * 8;
+
+/// Each slot's callback, run with a value as its thread or fiber ends, or the slot is freed.
+static FLS_CALLBACKS: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+/// The list of blocks: its head's links, and the lock that guards the list.
+static FLS_HEAD: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static FLS_LOCK: AtomicU32 = AtomicU32::new(0);
+
+fn with_fls_list<R>(f: impl FnOnce(u64) -> R) -> R {
+    while FLS_LOCK.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+    let head = (&raw const FLS_HEAD) as u64;
+    // An empty list points at itself.
+    if FLS_HEAD[0].load(Ordering::Relaxed) == 0 {
+        FLS_HEAD[0].store(head, Ordering::Relaxed);
+        FLS_HEAD[1].store(head, Ordering::Relaxed);
+    }
+    let result = f(head);
+    FLS_LOCK.store(0, Ordering::Release);
+    result
+}
+
+/// Word `i` of a block's, or the head's, links and slots.
+fn link(at: u64, i: u64) -> *mut u64 {
+    (at + i * 8) as *mut u64
+}
+
+/// A new FLS block, on the list: its slots' address, which is what FlsData points at.
+fn new_fls_block() -> *mut u64 {
+    let block = crate::heap::allocate(FLS_BLOCK, true) as u64;
+    if block == 0 {
+        return core::ptr::null_mut();
+    }
+    with_fls_list(|head| {
+        // SAFETY: the new block's links and the list's, under the list's lock.
+        unsafe {
+            let last = *link(head, 1);
+            *link(block, 0) = head;
+            *link(block, 1) = last;
+            *link(last, 0) = block;
+            *link(head, 1) = block;
+        }
+    });
+    (block + FLS_LINKS as u64 * 8) as *mut u64
+}
+
+/// This thread's (or fiber's) FLS slots, made the first time they're wanted.
 fn fls_slot(slot: u32) -> *mut u64 {
     // SAFETY: FlsData in this thread's TEB, and the block it points at.
     unsafe {
         let data = crate::teb().add(teb::FLS_DATA as usize).cast::<*mut u64>();
         if (*data).is_null() {
-            *data = crate::heap::allocate(64 * 8, true).cast();
+            *data = new_fls_block();
         }
         (*data).add(slot as usize)
     }
+}
+
+/// An FLS block that's over, as its thread or fiber ends: each slot with a value and a callback has it called, then
+/// the block goes.
+pub fn release_fls(slots: *mut u64) {
+    if slots.is_null() {
+        return;
+    }
+    let block = slots as u64 - FLS_LINKS as u64 * 8;
+    with_fls_list(|_| {
+        // SAFETY: a block on the list, under its lock.
+        unsafe {
+            let (next, prev) = (*link(block, 0), *link(block, 1));
+            *link(prev, 0) = next;
+            *link(next, 1) = prev;
+        }
+    });
+    for (i, callback) in FLS_CALLBACKS.iter().enumerate() {
+        // SAFETY: the block's slots, which nothing else can reach now.
+        let value = unsafe { slots.add(i).read() };
+        let callback = callback.load(Ordering::Acquire);
+        if value != 0 && callback != 0 && FLS_USED.load(Ordering::Acquire) & 1 << i != 0 {
+            // SAFETY: the program's callback, as Windows calls it.
+            let callback: extern "system" fn(u64) = unsafe { core::mem::transmute(callback) };
+            callback(value);
+        }
+    }
+    crate::heap::free(block as *mut u8);
+}
+
+/// This thread's FLS, as it ends: its callbacks run, and FlsData is null again.
+pub fn release_thread_fls() {
+    // SAFETY: FlsData in this thread's TEB.
+    let slots = unsafe {
+        let data = crate::teb().add(teb::FLS_DATA as usize).cast::<*mut u64>();
+        core::mem::take(&mut *data)
+    };
+    release_fls(slots);
 }
 
 #[unsafe(no_mangle)]
@@ -407,20 +495,67 @@ pub extern "system" fn AtlasTlsSetValue(slot: u32, value: u64) -> i32 {
     1
 }
 
-/// FLS: TLS by another name, here. Its callbacks, run as fibers and threads end, aren't yet.
+/// `FlsAlloc(callback)`: a slot, every thread's and fiber's value 0, with a callback for each value left as a thread
+/// or fiber ends, or the slot is freed.
 #[unsafe(no_mangle)]
-pub extern "system" fn AtlasFlsAlloc(_callback: u64) -> u32 {
-    alloc_slot(&FLS_USED)
+pub extern "system" fn AtlasFlsAlloc(callback: u64) -> u32 {
+    let slot = alloc_slot(&FLS_USED);
+    if slot != OUT_OF_INDEXES {
+        FLS_CALLBACKS[slot as usize].store(callback, Ordering::Release);
+        // A slot used before starts at 0 everywhere.
+        with_fls_list(|head| {
+            // SAFETY: every block on the list, under its lock.
+            unsafe {
+                let mut at = *link(head, 0);
+                while at != head {
+                    *link(at, FLS_LINKS as u64 + u64::from(slot)) = 0;
+                    at = *link(at, 0);
+                }
+            }
+        });
+    }
+    slot
 }
 
+/// `FlsFree(slot)`: its callback has each thread's and fiber's value that isn't 0, then the slot is free.
 #[unsafe(no_mangle)]
 pub extern "system" fn AtlasFlsFree(slot: u32) -> i32 {
+    if slot >= 64 || FLS_USED.load(Ordering::Acquire) & 1 << slot == 0 {
+        crate::RtlSetLastWin32Error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let callback = FLS_CALLBACKS[slot as usize].swap(0, Ordering::AcqRel);
+    // The values, taken out under the list's lock; the callbacks run outside it, since they may use FLS themselves.
+    loop {
+        let value = with_fls_list(|head| {
+            // SAFETY: as in `AtlasFlsAlloc`.
+            unsafe {
+                let mut at = *link(head, 0);
+                while at != head {
+                    let v = core::mem::replace(&mut *link(at, FLS_LINKS as u64 + u64::from(slot)), 0);
+                    if v != 0 {
+                        return v;
+                    }
+                    at = *link(at, 0);
+                }
+            }
+            0
+        });
+        if value == 0 {
+            break;
+        }
+        if callback != 0 {
+            // SAFETY: the program's callback.
+            let callback: extern "system" fn(u64) = unsafe { core::mem::transmute(callback) };
+            callback(value);
+        }
+    }
     free_slot(&FLS_USED, slot)
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn AtlasFlsGetValue(slot: u32) -> u64 {
-    if slot >= 64 {
+    if slot >= 64 || FLS_USED.load(Ordering::Acquire) & 1 << slot == 0 {
         crate::RtlSetLastWin32Error(ERROR_INVALID_PARAMETER);
         return 0;
     }
@@ -431,7 +566,7 @@ pub extern "system" fn AtlasFlsGetValue(slot: u32) -> u64 {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn AtlasFlsSetValue(slot: u32, value: u64) -> i32 {
-    if slot >= 64 {
+    if slot >= 64 || FLS_USED.load(Ordering::Acquire) & 1 << slot == 0 {
         crate::RtlSetLastWin32Error(ERROR_INVALID_PARAMETER);
         return 0;
     }

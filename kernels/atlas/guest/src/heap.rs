@@ -84,6 +84,16 @@ pub fn allocate(size: usize, zero: bool) -> *mut u8 {
     }
 }
 
+/// How many bytes a block from `allocate` has room for.
+pub fn usable(ptr: *mut u8) -> usize {
+    if ptr.is_null() {
+        return 0;
+    }
+    // SAFETY: `ptr` came from `allocate`, so its header is just before it.
+    let class = unsafe { ptr.sub(HEADER).cast::<usize>().read() };
+    if class >= CLASSES { 0 } else { (1 << class) - HEADER }
+}
+
 pub fn free(ptr: *mut u8) {
     if ptr.is_null() {
         return;

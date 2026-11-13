@@ -51,6 +51,8 @@ pub const WM_CHAR: u32 = 0x102;
 pub const WM_SYSKEYDOWN: u32 = 0x104;
 pub const WM_SYSKEYUP: u32 = 0x105;
 pub const WM_SYSCHAR: u32 = 0x106;
+pub const WM_DEADCHAR: u32 = 0x103;
+pub const WM_SYSDEADCHAR: u32 = 0x107;
 pub const WM_SYSCOMMAND: u32 = 0x112;
 pub const WM_NCLBUTTONDOWN: u32 = 0xa1;
 pub const WM_TIMER: u32 = 0x113;
@@ -96,6 +98,8 @@ pub struct Class {
     pub instance: u64,
     /// `hCursor`: what the pointer looks like over its windows' client areas, or 0 for what the program sets.
     pub cursor: u64,
+    /// Registered with `RegisterClass(Ex)A`: its windows' `WndProc` takes text in the ANSI code page.
+    pub ansi: bool,
 }
 
 pub struct Window {
@@ -126,6 +130,10 @@ pub struct Window {
     pub destroying: bool,
     /// WM_SIZE's kind as it was last sent: `SIZE_RESTORED`, `SIZE_MINIMIZED` or `SIZE_MAXIMIZED`.
     pub size_kind: u64,
+    /// Its `WndProc` takes ANSI text (`IsWindowUnicode` is FALSE): its class's was registered with the `*A`
+    /// functions, or `SetWindowLongPtrA` gave it its `WndProc`. Messages with text are converted on the way in, and
+    /// what it gives back on the way out.
+    pub ansi: bool,
 }
 
 /// The clipboard, as win32k keeps it.
@@ -845,6 +853,14 @@ impl Task {
         if at == 0 { String::new() } else { self.mem(cx, false, |t| user::read_wstr(&t.space(), at, 32767)).unwrap_or_default() }
     }
 
+    /// A string the program passed: UTF-16, or (not `wide`) in the ANSI code page.
+    pub fn text_arg(&mut self, cx: &mut Cx<'_>, at: u64, wide: bool) -> String {
+        if wide || at == 0 {
+            return self.wstr(cx, at);
+        }
+        self.mem(cx, false, |t| user::read_cstr(&t.space(), at, 32767)).map(|b| crate::ansi::text(&b)).unwrap_or_default()
+    }
+
     fn now_ms(&self) -> u32 {
         (self.k.host.monotonic() / 1_000_000) as u32
     }
@@ -932,25 +948,31 @@ impl Task {
 
     /// A class named by a string, or by its atom (a "pointer" below 64 KiB).
     pub fn class_named(&mut self, cx: &mut Cx<'_>, at: u64) -> Option<String> {
+        self.class_named_as(cx, at, true)
+    }
+
+    /// A class by its atom, or its name as UTF-16 or ANSI.
+    pub fn class_named_as(&mut self, cx: &mut Cx<'_>, at: u64, wide: bool) -> Option<String> {
         if at < 0x1_0000 {
             let w = self.win32k();
             return w.classes.values().find(|c| u64::from(c.atom) == at).map(|c| c.name.to_lowercase());
         }
-        Some(self.wstr(cx, at).to_lowercase())
+        Some(self.text_arg(cx, at, wide).to_lowercase())
     }
 
     // ---- Windows ----
 
-    /// `CreateWindowExW`: a window, its WM_NCCREATE and WM_CREATE, and showing it if it's WS_VISIBLE.
-    pub fn create_window(&mut self, cx: &mut Cx<'_>, a: &[u64]) -> Result<u64, Reply> {
+    /// `CreateWindowExW` (or, with `ansi`, `CreateWindowExA`): a window, its WM_NCCREATE and WM_CREATE, and showing
+    /// it if it's WS_VISIBLE.
+    pub fn create_window(&mut self, cx: &mut Cx<'_>, a: &[u64], ansi: bool) -> Result<u64, Reply> {
         let (ex_style, class_at, name_at, style) = (a[0] as u32, a[1], a[2], a[3] as u32);
         let mut rect = [a[4] as i32, a[5] as i32, a[6] as i32, a[7] as i32];
         let (parent, menu, instance, param) = (a[8], a[9], a[10], a[11]);
-        let Some(class_name) = self.class_named(cx, class_at) else {
+        let Some(class_name) = self.class_named_as(cx, class_at, !ansi) else {
             self.set_last_error(cx, ERROR_CANNOT_FIND_WND_CLASS);
             return Ok(0);
         };
-        let text = self.wstr(cx, name_at);
+        let text = self.text_arg(cx, name_at, !ansi);
         let child = style & WS_CHILD != 0;
         let style = if !child && style & WS_POPUP == 0 { style | WS_CAPTION | WS_CLIPSIBLINGS } else { style };
         if rect[0] == CW_USEDEFAULT {
@@ -1022,22 +1044,39 @@ impl Task {
                 framed,
                 destroying: false,
                 size_kind: 0,
+                ansi: class.ansi,
             };
             w.windows.insert(hwnd, window);
             w.queue(self.tid, &self.waiter.clone());
             hwnd
         };
         // CREATESTRUCTW: lpCreateParams, hInstance, hMenu, hwndParent, cy, cx, y, x, style, lpszName, lpszClass,
-        // dwExStyle.
-        let mut cs = vec![0u8; 80];
-        for (at, v) in [(0, param), (8, instance), (16, menu), (24, if parent == DESKTOP { 0 } else { parent }), (56, name_at), (64, class_at)] {
-            cs[at..at + 8].copy_from_slice(&v.to_le_bytes());
-        }
-        for (at, v) in [(32, rect[3]), (36, rect[2]), (40, rect[1]), (44, rect[0]), (48, style as i32), (72, ex_style as i32)] {
-            cs[at..at + 4].copy_from_slice(&v.to_le_bytes());
-        }
-        let ok = self.call_wndproc_data(cx, hwnd, WM_NCCREATE, 0, &cs)?;
-        if ok == 0 || self.call_wndproc_data(cx, hwnd, WM_CREATE, 0, &cs)? as i64 == -1 {
+        // dwExStyle. From CreateWindowExA, its strings are UTF-16 copies after it, as every message's are inside
+        // win32k; a window that takes ANSI gets them back as ANSI.
+        let wide = |s: &str| -> Vec<u8> { s.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect() };
+        // The class's name as the program wrote it, not as win32k keys it.
+        let class_text = if ansi && class_at >= 0x1_0000 { self.text_arg(cx, class_at, false) } else { String::new() };
+        let (name_w, class_w) = if ansi { (wide(&text), if class_at < 0x1_0000 { Vec::new() } else { wide(&class_text) }) } else { (Vec::new(), Vec::new()) };
+        let len = 80 + name_w.len() + class_w.len();
+        let cs = |at: u64| -> Vec<u8> {
+            let mut cs = vec![0u8; 80];
+            let name_ptr = if ansi && name_at != 0 { at + 80 } else { name_at };
+            let class_ptr = if ansi && class_at >= 0x1_0000 { at + 80 + name_w.len() as u64 } else { class_at };
+            for (o, v) in [(0, param), (8, instance), (16, menu), (24, if parent == DESKTOP { 0 } else { parent }), (56, name_ptr), (64, class_ptr)] {
+                cs[o..o + 8].copy_from_slice(&v.to_le_bytes());
+            }
+            for (o, v) in [(32, rect[3]), (36, rect[2]), (40, rect[1]), (44, rect[0]), (48, style as i32), (72, ex_style as i32)] {
+                cs[o..o + 4].copy_from_slice(&v.to_le_bytes());
+            }
+            cs.extend(&name_w);
+            cs.extend(&class_w);
+            cs
+        };
+        let created = self.with_scratch(cx, len, cs, |task, cx, at| {
+            let ok = task.call_wndproc(cx, hwnd, WM_NCCREATE, 0, at)?;
+            Ok(ok != 0 && task.call_wndproc(cx, hwnd, WM_CREATE, 0, at)? as i64 != -1)
+        })?;
+        if !created {
             self.destroy_window(cx, hwnd)?;
             return Ok(0);
         }
@@ -1223,22 +1262,66 @@ impl Task {
 
     // ---- Messages ----
 
-    /// Calls a window's `WndProc` on this thread.
+    /// Calls a window's `WndProc` on this thread, with the message as win32k has every message (text in UTF-16):
+    /// converted to ANSI first for a window that takes it.
     pub fn call_wndproc(&mut self, cx: &mut Cx<'_>, hwnd: u64, message: u32, wparam: u64, lparam: u64) -> Result<u64, Reply> {
-        let wndproc = self.win32k().windows.get(&hwnd).map(|w| w.wndproc);
+        let wndproc = self.win32k().windows.get(&hwnd).map(|w| (w.wndproc, w.ansi));
         match wndproc {
-            Some(f) if f != 0 => self.upcall(cx, f, &[hwnd, u64::from(message), wparam, lparam]),
+            Some((f, true)) if f != 0 => self.call_ansi(cx, f, hwnd, message, wparam, lparam),
+            Some((f, false)) if f != 0 => self.upcall(cx, f, &[hwnd, u64::from(message), wparam, lparam]),
             _ => Ok(0),
         }
     }
 
-    /// Calls a window's `WndProc` with `data` on the stack as `lParam`.
-    fn call_wndproc_data(&mut self, cx: &mut Cx<'_>, hwnd: u64, message: u32, wparam: u64, data: &[u8]) -> Result<u64, Reply> {
-        let wndproc = self.win32k().windows.get(&hwnd).map(|w| w.wndproc).unwrap_or(0);
-        if wndproc == 0 {
-            return Ok(0);
+    /// Calls a `WndProc` that takes ANSI with a message in UTF-16: its text converted on the way in (WM_SETTEXT,
+    /// CREATESTRUCT's names, a typed character) and what it writes converted on the way out (WM_GETTEXT).
+    fn call_ansi(&mut self, cx: &mut Cx<'_>, f: u64, hwnd: u64, message: u32, wparam: u64, lparam: u64) -> Result<u64, Reply> {
+        let msg = u64::from(message);
+        match message {
+            WM_SETTEXT if lparam != 0 => {
+                let text = crate::ansi::bytes(&self.wstr(cx, lparam)).into_iter().chain([0]).collect::<Vec<u8>>();
+                self.with_scratch(cx, text.len(), |_| text.clone(), |task, cx, at| task.upcall(cx, f, &[hwnd, msg, wparam, at]))
+            }
+            WM_GETTEXT if lparam != 0 && wparam != 0 => {
+                let room = (wparam as u32 as usize).min(1 << 16);
+                self.with_scratch(cx, room, |_| vec![0; room], |task, cx, at| {
+                    task.upcall(cx, f, &[hwnd, msg, room as u64, at])?;
+                    let ansi = task.mem(cx, false, |t| user::read_vec(&t.space(), at, room)).unwrap_or_default();
+                    let end = ansi.iter().position(|&b| b == 0).unwrap_or(room.saturating_sub(1));
+                    let units: Vec<u16> = crate::ansi::decode(crate::ansi::ACP, &ansi[..end], false).unwrap_or_default().into_iter().take(room - 1).collect();
+                    let bytes: Vec<u8> = units.iter().chain([&0]).flat_map(|u| u.to_le_bytes()).collect();
+                    let _ = task.mem(cx, true, |t| user::write(&mut t.space(), lparam, &bytes));
+                    Ok(units.len() as u64)
+                })
+            }
+            WM_NCCREATE | WM_CREATE if lparam != 0 => {
+                let Ok(cs) = self.mem(cx, false, |t| user::read_vec(&t.space(), lparam, 80)) else { return Ok(0) };
+                let ptr = |o: usize| u64::from_le_bytes(cs[o..o + 8].try_into().unwrap_or_default());
+                let to_ansi = |task: &mut Task, cx: &mut Cx<'_>, at: u64| -> Option<Vec<u8>> {
+                    (at >= 0x1_0000).then(|| crate::ansi::bytes(&task.wstr(cx, at)).into_iter().chain([0]).collect())
+                };
+                let (name, class) = (to_ansi(self, cx, ptr(56)), to_ansi(self, cx, ptr(64)));
+                let len = 80 + name.as_ref().map_or(0, Vec::len) + class.as_ref().map_or(0, Vec::len);
+                let build = |at: u64| {
+                    let mut out = cs.clone();
+                    let mut tail: Vec<u8> = Vec::new();
+                    for (o, s) in [(56, &name), (64, &class)] {
+                        if let Some(s) = s {
+                            out[o..o + 8].copy_from_slice(&(at + 80 + tail.len() as u64).to_le_bytes());
+                            tail.extend(s);
+                        }
+                    }
+                    out.extend(tail);
+                    out
+                };
+                self.with_scratch(cx, len, build, |task, cx, at| task.upcall(cx, f, &[hwnd, msg, wparam, at]))
+            }
+            WM_CHAR | WM_SYSCHAR | WM_DEADCHAR | WM_SYSDEADCHAR => {
+                let c = atlas_abi::ansi::to_1252(wparam as u16).unwrap_or(b'?');
+                self.upcall(cx, f, &[hwnd, msg, u64::from(c), lparam])
+            }
+            _ => self.upcall(cx, f, &[hwnd, msg, wparam, lparam]),
         }
-        self.upcall_data(cx, wndproc, data, |at| vec![hwnd, u64::from(message), wparam, at])
     }
 
     /// `SendMessageW`: the `WndProc`'s result. From another thread, it waits for the window's thread to take it,

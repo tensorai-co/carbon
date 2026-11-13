@@ -58,6 +58,16 @@ fn wide(s: &str) -> Vec<u8> {
     s.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect()
 }
 
+/// A string as a `*W` function gives it (UTF-16) or an `*A` one (ANSI), with its NUL.
+fn text(s: &str, unicode: bool) -> Vec<u8> {
+    if unicode { wide(s) } else { crate::ansi::bytes(s).into_iter().chain([0]).collect() }
+}
+
+/// A string the program passed, UTF-16 or ANSI.
+fn read_text(space: &exec::Space<'_>, at: u64, most: usize, unicode: bool) -> Result<String, kernels_core::user::Fault> {
+    if unicode { user::read_wstr(space, at, most) } else { user::read_cstr(space, at, most).map(|b| crate::ansi::text(&b)) }
+}
+
 impl Task {
     fn failed(&mut self, cx: &mut Cx<'_>, error: u32) -> u64 {
         self.set_last_error(cx, error);
@@ -502,7 +512,7 @@ fn lookup_privilege_value(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: boo
     let name = if wide {
         task.mem(cx, false, |t| user::read_wstr(&t.space(), a[1], 256))
     } else {
-        task.mem(cx, false, |t| user::read_cstr(&t.space(), a[1], 256)).map(|b| String::from_utf8_lossy(&b).into_owned())
+        task.mem(cx, false, |t| user::read_cstr(&t.space(), a[1], 256)).map(|b| crate::ansi::text(&b))
     };
     let Some(luid) = name.ok().as_deref().and_then(privilege_named) else { return Err(task.failed(cx, ERROR_NO_SUCH_PRIVILEGE)) };
     task.put_u64(cx, a[2], u64::from(luid))?;
@@ -520,6 +530,14 @@ pub fn lookup_privilege_value_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> 
 
 /// `LookupPrivilegeNameW(system, &luid, name, &length)`.
 pub fn lookup_privilege_name_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    lookup_privilege_name(task, cx, a, true)
+}
+
+pub fn lookup_privilege_name_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    lookup_privilege_name(task, cx, a, false)
+}
+
+fn lookup_privilege_name(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], unicode: bool) -> Reply {
     let r = (|| {
         let luid = task.get_u64(cx, a[1])?;
         let Some(name) = u32::try_from(luid).ok().and_then(privilege_name) else { return Err(task.failed(cx, ERROR_NO_SUCH_PRIVILEGE)) };
@@ -528,7 +546,7 @@ pub fn lookup_privilege_name_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> R
             task.put_u32(cx, a[3], name.len() as u32 + 1)?;
             return Err(task.failed(cx, ERROR_INSUFFICIENT_BUFFER));
         }
-        task.put(cx, a[2], &wide(name))?;
+        task.put(cx, a[2], &text(name, unicode))?;
         task.put_u32(cx, a[3], name.len() as u32)?;
         Ok(TRUE)
     })();
@@ -658,17 +676,33 @@ pub fn is_well_known_sid(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 
 /// `ConvertSidToStringSidW(sid, &string)`: `S-1-…`, in `LocalAlloc` memory.
 pub fn convert_sid_to_string_sid_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    convert_sid_to_string_sid(task, cx, a, true)
+}
+
+pub fn convert_sid_to_string_sid_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    convert_sid_to_string_sid(task, cx, a, false)
+}
+
+fn convert_sid_to_string_sid(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], unicode: bool) -> Reply {
     let r = (|| {
         let sid = task.read_sid(cx, a[0])?;
-        task.put_allocated(cx, a[1], &wide(&sid.to_string()))
+        task.put_allocated(cx, a[1], &text(&sid.to_string(), unicode))
     })();
     reply(r)
 }
 
 /// `ConvertStringSidToSidW(string, &sid)`: `S-1-…` or an SDDL alias.
 pub fn convert_string_sid_to_sid_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    convert_string_sid_to_sid(task, cx, a, true)
+}
+
+pub fn convert_string_sid_to_sid_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    convert_string_sid_to_sid(task, cx, a, false)
+}
+
+fn convert_string_sid_to_sid(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], unicode: bool) -> Reply {
     let r = (|| {
-        let s = task.mem(cx, false, |t| user::read_wstr(&t.space(), a[0], 512)).map_err(|_| task.failed(cx, 998))?;
+        let s = task.mem(cx, false, |t| read_text(&t.space(), a[0], 512, unicode)).map_err(|_| task.failed(cx, 998))?;
         let Some(sid) = sid_from_sddl(&s) else { return Err(task.failed(cx, ERROR_INVALID_SID)) };
         task.put_allocated(cx, a[1], &sid.to_bytes())
     })();
@@ -676,20 +710,29 @@ pub fn convert_string_sid_to_sid_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) 
 }
 
 /// Writes a name into a buffer of `*length` characters: TRUE if it fits; else the length it needs, with its NUL.
-fn put_name(task: &mut Task, cx: &mut Cx<'_>, buffer: u64, length: u64, name: &str) -> Result<bool, u64> {
+fn put_name(task: &mut Task, cx: &mut Cx<'_>, buffer: u64, length: u64, name: &str, unicode: bool) -> Result<bool, u64> {
     let room = task.get_u32(cx, length)? as usize;
-    let len = name.encode_utf16().count();
+    let bytes = text(name, unicode);
+    let len = bytes.len() / if unicode { 2 } else { 1 } - 1;
     if room <= len || buffer == 0 {
         task.put_u32(cx, length, len as u32 + 1)?;
         return Ok(false);
     }
-    task.put(cx, buffer, &wide(name))?;
+    task.put(cx, buffer, &bytes)?;
     task.put_u32(cx, length, len as u32)?;
     Ok(true)
 }
 
 /// `LookupAccountSidW(system, sid, name, &length, domain, &length, &use)`.
 pub fn lookup_account_sid_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    lookup_account_sid(task, cx, a, true)
+}
+
+pub fn lookup_account_sid_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    lookup_account_sid(task, cx, a, false)
+}
+
+fn lookup_account_sid(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], unicode: bool) -> Reply {
     let r = (|| {
         let sid = task.read_sid(cx, a[1])?;
         let Some((_, domain, name, kind)) = accounts().into_iter().find(|(s, _, _, _)| *s == sid) else {
@@ -702,8 +745,8 @@ pub fn lookup_account_sid_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Repl
             task.put_u32(cx, a[5], domain.len() as u32 + 1)?;
             return Err(task.failed(cx, ERROR_INSUFFICIENT_BUFFER));
         }
-        put_name(task, cx, a[2], a[3], name)?;
-        put_name(task, cx, a[4], a[5], domain)?;
+        put_name(task, cx, a[2], a[3], name, unicode)?;
+        put_name(task, cx, a[4], a[5], domain, unicode)?;
         task.put_u32(cx, a[6], kind)?;
         Ok(TRUE)
     })();
@@ -712,8 +755,16 @@ pub fn lookup_account_sid_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Repl
 
 /// `LookupAccountNameW(system, name, sid, &size, domain, &length, &use)`: a name, or `DOMAIN\name`.
 pub fn lookup_account_name_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    lookup_account_name(task, cx, a, true)
+}
+
+pub fn lookup_account_name_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    lookup_account_name(task, cx, a, false)
+}
+
+fn lookup_account_name(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], unicode: bool) -> Reply {
     let r = (|| {
-        let full = task.mem(cx, false, |t| user::read_wstr(&t.space(), a[1], 512)).map_err(|_| task.failed(cx, 998))?;
+        let full = task.mem(cx, false, |t| read_text(&t.space(), a[1], 512, unicode)).map_err(|_| task.failed(cx, 998))?;
         let (want_domain, want_name) = full.rsplit_once('\\').map_or((None, full.as_str()), |(d, n)| (Some(d), n));
         let found = accounts().into_iter().find(|(_, d, n, _)| n.eq_ignore_ascii_case(want_name) && want_domain.is_none_or(|w| w.eq_ignore_ascii_case(d)));
         let Some((sid, domain, _, kind)) = found else { return Err(task.failed(cx, ERROR_NONE_MAPPED)) };
@@ -726,7 +777,7 @@ pub fn lookup_account_name_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Rep
         }
         task.put(cx, a[2], &bytes)?;
         task.put_u32(cx, a[3], bytes.len() as u32)?;
-        put_name(task, cx, a[4], a[5], domain)?;
+        put_name(task, cx, a[4], a[5], domain, unicode)?;
         task.put_u32(cx, a[6], kind)?;
         Ok(TRUE)
     })();
@@ -1019,11 +1070,19 @@ pub fn get_acl_information(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply
 /// `ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, revision, &sd, &size)`: a self-relative descriptor,
 /// in `LocalAlloc` memory.
 pub fn convert_string_security_descriptor_to_security_descriptor_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    convert_string_security_descriptor_to_security_descriptor(task, cx, a, true)
+}
+
+pub fn convert_string_security_descriptor_to_security_descriptor_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    convert_string_security_descriptor_to_security_descriptor(task, cx, a, false)
+}
+
+fn convert_string_security_descriptor_to_security_descriptor(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], unicode: bool) -> Reply {
     let r = (|| {
         if a[1] != 1 {
             return Err(task.failed(cx, 1305));
         }
-        let s = task.mem(cx, false, |t| user::read_wstr(&t.space(), a[0], 65536)).map_err(|_| task.failed(cx, 998))?;
+        let s = task.mem(cx, false, |t| read_text(&t.space(), a[0], 65536, unicode)).map_err(|_| task.failed(cx, 998))?;
         let d = match Descriptor::from_sddl(&s) {
             Ok(d) => d,
             Err(e) => return Err(task.failed(cx, e)),
@@ -1040,6 +1099,14 @@ pub fn convert_string_security_descriptor_to_security_descriptor_w(task: &mut Ta
 /// `ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, revision, which, &sddl, &length)`: the parts asked
 /// for, in `LocalAlloc` memory; the length counts the NUL.
 pub fn convert_security_descriptor_to_string_security_descriptor_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    convert_security_descriptor_to_string_security_descriptor(task, cx, a, true)
+}
+
+pub fn convert_security_descriptor_to_string_security_descriptor_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    convert_security_descriptor_to_string_security_descriptor(task, cx, a, false)
+}
+
+fn convert_security_descriptor_to_string_security_descriptor(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], unicode: bool) -> Reply {
     let r = (|| {
         if a[1] != 1 {
             return Err(task.failed(cx, 1305));
@@ -1047,9 +1114,9 @@ pub fn convert_security_descriptor_to_string_security_descriptor_w(task: &mut Ta
         let d = task.read_descriptor(cx, a[0])?;
         let s = d.to_sddl(a[2] as u32);
         if a[4] != 0 {
-            task.put_u32(cx, a[4], s.encode_utf16().count() as u32 + 1)?;
+            task.put_u32(cx, a[4], (text(&s, unicode).len() / if unicode { 2 } else { 1 }) as u32)?;
         }
-        task.put_allocated(cx, a[3], &wide(&s))
+        task.put_allocated(cx, a[3], &text(&s, unicode))
     })();
     reply(r)
 }
@@ -1284,7 +1351,7 @@ impl Task {
         match kind {
             1 => {
                 // FILE_FLAG_BACKUP_SEMANTICS opens folders too.
-                let (file, _) = self.open_file(name, 0, 3, 0x0200_0000)?;
+                let (file, _) = self.open_file(name, 0, crate::files::FILE_SHARE_ALL, 3, 0x0200_0000)?;
                 Ok(Target::File(file.path.to_ascii_lowercase()))
             }
             4 => {
@@ -1313,8 +1380,8 @@ impl Task {
         }
     }
 
-    fn read_name(&mut self, cx: &mut Cx<'_>, at: u64) -> Result<String, u32> {
-        self.mem(cx, false, |t| user::read_wstr(&t.space(), at, 32768)).map_err(|_| 998)
+    fn read_name(&mut self, cx: &mut Cx<'_>, at: u64, unicode: bool) -> Result<String, u32> {
+        self.mem(cx, false, |t| read_text(&t.space(), at, 32768, unicode)).map_err(|_| 998)
     }
 }
 
@@ -1340,8 +1407,16 @@ pub fn set_security_info(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 
 /// `GetNamedSecurityInfoW(name, type, info, &owner, &group, &dacl, &sacl, &sd)`.
 pub fn get_named_security_info_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    get_named_security_info(task, cx, a, true)
+}
+
+pub fn get_named_security_info_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    get_named_security_info(task, cx, a, false)
+}
+
+fn get_named_security_info(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], unicode: bool) -> Reply {
     let code = (|| {
-        let name = task.read_name(cx, a[0])?;
+        let name = task.read_name(cx, a[0], unicode)?;
         let target = task.named_target(cx, &name, a[1] as u32)?;
         match task.give_security(cx, &target, a[2] as u32, [a[3], a[4], a[5], a[6], a[7]]) {
             0 => Ok(()),
@@ -1353,9 +1428,17 @@ pub fn get_named_security_info_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) ->
 
 /// `SetNamedSecurityInfoW(name, type, info, owner, group, dacl, sacl)`.
 pub fn set_named_security_info_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    set_named_security_info(task, cx, a, true)
+}
+
+pub fn set_named_security_info_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    set_named_security_info(task, cx, a, false)
+}
+
+fn set_named_security_info(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], unicode: bool) -> Reply {
     let info = a[2] as u32;
     let code = (|| {
-        let name = task.read_name(cx, a[0])?;
+        let name = task.read_name(cx, a[0], unicode)?;
         let target = task.named_target(cx, &name, a[1] as u32)?;
         let from = task.parts_descriptor(cx, info, [a[3], a[4], a[5], a[6]]).map_err(|_| ERROR_INVALID_PARAMETER)?;
         task.write_security(&target, info, &from)
@@ -1413,13 +1496,29 @@ pub fn set_kernel_object_security(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -
 
 /// `GetFileSecurityW(name, info, sd, length, &needed)` and `SetFileSecurityW(name, info, sd)`.
 pub fn get_file_security_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let target = task.read_name(cx, a[0]).and_then(|n| task.named_target(cx, &n, 1));
+    get_file_security(task, cx, a, true)
+}
+
+pub fn get_file_security_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    get_file_security(task, cx, a, false)
+}
+
+fn get_file_security(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], unicode: bool) -> Reply {
+    let target = task.read_name(cx, a[0], unicode).and_then(|n| task.named_target(cx, &n, 1));
     let r = give_into(task, cx, target, a[1] as u32, a[2], a[3], a[4]);
     finish(task, cx, r, false)
 }
 
 pub fn set_file_security_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let target = task.read_name(cx, a[0]).and_then(|n| task.named_target(cx, &n, 1));
+    set_file_security(task, cx, a, true)
+}
+
+pub fn set_file_security_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    set_file_security(task, cx, a, false)
+}
+
+fn set_file_security(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], unicode: bool) -> Reply {
+    let target = task.read_name(cx, a[0], unicode).and_then(|n| task.named_target(cx, &n, 1));
     let r = take_from(task, cx, target, a[1] as u32, a[2]);
     finish(task, cx, r, false)
 }
@@ -1434,6 +1533,9 @@ pub fn reg_get_key_security(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Repl
 
 pub fn reg_set_key_security(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let target = task.key_of(a[0]).map(Target::Key);
+    if let Ok(Target::Key(id)) = &target {
+        lock(&task.k.registry).changed(*id, crate::registry::CHANGE_SECURITY);
+    }
     let r = take_from(task, cx, target, a[1] as u32, a[2]);
     finish(task, cx, r, true)
 }

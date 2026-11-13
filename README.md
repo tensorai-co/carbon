@@ -229,17 +229,22 @@ another process on Windows hosts; a worker process per machine.
 
 **4. atlas runs real Windows programs and installers** ([atlas](kernels/atlas/README.md#to-do))
 
-1. The loader, complete: the PEB's lists, `DllMain` on detach, `FreeLibrary`, delay loads, API sets, manifests.
-2. C++ exceptions, vectored handlers, stack overflow with a guard page.
-3. The C runtime's hot half in ntdll, and FLS.
-4. Threads: fibers and the thread pool.
-5. Files: sharing modes, links, other drives.
-6. The registry: change notification, the 32-bit view, `RegLoadKey`/`RegSaveKey`.
+1. The loader's last piece: manifests (side-by-side assemblies and activation contexts). The PEB's lists,
+   `FreeLibrary` that unloads, detach, delay loads and API sets are done.
+2. C++ exceptions. (Vectored handlers, guard pages and stack overflow are done.)
+3. The C runtime's rest, as a MinGW C++ program asks (`setjmp`, `_beginthreadex`, low-level I/O, `strftime`, math).
+   (ucrtbase's startup, heap, strings, stdio and printf are done, so MinGW-built C programs run; FLS is done.)
+4. Threads: the thread pool's callback priorities. (Fibers and the thread pool, with its I/O and timer queues, are
+   done.)
+5. Files: other drives. (Sharing modes, hard and symbolic links, and file times that can be set are done.)
+6. The registry: Windows' own hive format, for hives from a real Windows. (Change notification, the 32-bit view, and
+   saving, restoring, loading and unloading hives are done.)
 7. 32-bit x86, which installers are: exec's 32-bit translation, the i686 ntdll, `SysWOW64`.
 8. Winsock over `net` (with `net`'s phase 4). *Done means:* a Windows program downloads over HTTPS.
 9. `msiexec` in host Rust, and `cmd.exe`, `reg.exe`, `regsvr32.exe`, `rundll32.exe`. *Done means:* a real `.msi`
    installs.
-10. ANSI (`*A`) versions; then the long tail of exports, as the `missing` stubs name them.
+10. The long tail of exports, as the `missing` stubs and `carbon atlas imports` name them. (Code pages, the `*A`
+    functions and ANSI windows are done.)
 
 **5. The desktop, and programs with windows** ([display](display/README.md#to-do), [atlas](kernels/atlas/README.md#2-the-window-kernel))
 
@@ -288,7 +293,6 @@ Each blocks the work named; the README linked has the details and a recommendati
 | `get-task-allow` on macOS, or another way to take the stub's task? | the macOS sandbox | [exec](exec/README.md#open-questions) |
 | How the Windows driver is signed (EV certificate, attestation) | shipping winkvm | [exec](exec/README.md#open-questions) |
 | Graphics APIs: host exports, guest code, or a GPU protocol? | graphics | [atlas](kernels/atlas/README.md#open-questions) |
-| How much of the C runtime runs in the program | atlas's C runtime | [atlas](kernels/atlas/README.md#open-questions) |
 | QUIC and TLS for remote: `quinn` and `rustls`, or our own? | remote's first picture | [remote](remote/README.md#open-questions) |
 | One remote port per machine or a host gateway; 4433 or 443 by default | remote | [remote](remote/README.md#open-questions) |
 | TLS for atlas's WinHTTP and Schannel: `rustls` in one crate, or our own? | Winsock's HTTPS | [net](net/README.md#open-questions) |

@@ -91,6 +91,11 @@ impl Task {
         let Ok(raw) = self.mem(cx, false, |t| user::read_vec(&t.space(), name_at, len.min(259) as usize)) else { return status::ACCESS_VIOLATION };
         let raw = String::from_utf8_lossy(&raw).into_owned();
         let name = module_name(&raw);
+        // An API set is its DLL's other name: the loader learns which from the path it's given.
+        let (raw, name) = match crate::imports::api_set(&name) {
+            Some(dll) => (dll.to_string(), dll.to_string()),
+            None => (raw, name),
+        };
         let found = self.find_or_map(cx, &raw, &name);
         let (base, path) = match found {
             Ok(found) => found,
@@ -158,9 +163,34 @@ impl Task {
         Ok((base, windows_path))
     }
 
+    /// `UNMAP_IMAGE`: a DLL the loader has unloaded. Only one it mapped by name, from the disk: atlas's own and
+    /// ntdll stay, as do the program and anything that isn't an image.
+    pub(crate) fn unmap_image(&mut self, cx: &mut Cx<'_>, base: u64, size: u64) -> u32 {
+        if base >= images::SYSTEM_BASE || !base.is_multiple_of(GRANULE) || size == 0 {
+            return status::INVALID_PARAMETER;
+        }
+        let range = base..(base + size).next_multiple_of(GRANULE);
+        {
+            let mut state = lock(&self.process.state);
+            let Some(name) = state.mapped.iter().find(|(_, (b, _))| *b == base).map(|(n, _)| n.clone()) else { return status::INVALID_PARAMETER };
+            let program = module_name(&state.image);
+            if name == "ntdll.dll" || name == program {
+                return status::INVALID_PARAMETER;
+            }
+            if state.regions.iter().any(|(r, a)| r.start < range.end && r.end > range.start && a.kind != AreaKind::Image) {
+                return status::INVALID_PARAMETER;
+            }
+            state.mapped.remove(&name);
+            state.regions.remove(range.clone());
+        }
+        cx.turn(|t| t.space().unmap(range));
+        status::SUCCESS
+    }
+
     /// `VirtualProtect` and `PROTECT`: gives pages a new protection, and writes the old one.
     pub(crate) fn virtual_protect(&mut self, cx: &mut Cx<'_>, addr: u64, size: u64, protect: u32, old_out: u64) -> u32 {
         let Some(prot) = crate::process::prot_from(protect) else { return status::INVALID_PARAMETER };
+        let guard = protect & crate::process::PAGE_GUARD != 0;
         let range = addr & !(PAGE - 1)..(addr + size.max(1)).next_multiple_of(PAGE);
         let old = {
             let mut state = lock(&self.process.state);
@@ -175,14 +205,18 @@ impl Task {
                 if prot.write() && a.view.as_ref().is_some_and(|v| !v.copy && !v.section.writable) {
                     return status::INVALID_PARAMETER;
                 }
-                old.get_or_insert(a.prot);
+                old.get_or_insert((a.prot, a.guard));
                 at = r.end;
             }
-            state.regions.update(range.clone(), |a| a.prot = prot);
-            old.unwrap_or(Prot::NONE)
+            state.regions.update(range.clone(), |a| {
+                a.prot = prot;
+                a.guard = guard;
+            });
+            old.unwrap_or((Prot::NONE, false))
         };
-        cx.turn(|t| t.space().protect(range, prot));
-        if old_out != 0 && self.mem(cx, true, |t| user::write_u32(&mut t.space(), old_out, prot_to_page(old))).is_err() {
+        cx.turn(|t| t.space().protect(range, if guard { Prot::NONE } else { prot }));
+        let old = prot_to_page(old.0) | if old.1 { crate::process::PAGE_GUARD } else { 0 };
+        if old_out != 0 && self.mem(cx, true, |t| user::write_u32(&mut t.space(), old_out, old)).is_err() {
             return status::ACCESS_VIOLATION;
         }
         status::SUCCESS

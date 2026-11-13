@@ -1,9 +1,11 @@
 //! Structured exception handling, as Windows does it on x64 and ARM64: atlas delivers a fault here with its CONTEXT and
 //! EXCEPTION_RECORD; the dispatcher walks up the stack by each function's unwind data, asking each language handler in
 //! turn; a handler that takes it unwinds to its target with `RtlUnwindEx`, running termination handlers on the way.
-//! `RtlRaiseException` does the same for an exception the program raises itself.
+//! `RtlRaiseException` does the same for an exception the program raises itself. Vectored exception handlers are
+//! asked first, before any frame's; vectored continue handlers hear each exception the program carries on from.
 
-use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
 use atlas_abi::{record, status};
 
@@ -53,6 +55,10 @@ pub struct Pointers {
 
 type Handler = extern "system" fn(*mut Record, u64, *mut Context, *mut Dispatcher) -> u32;
 
+/// How many frames a dispatch or an unwind walks at most: each is higher up the stack than the last, so this only
+/// stops a broken one going round in circles.
+const MOST_FRAMES: usize = 1 << 20;
+
 const CONTINUE_EXECUTION: u32 = 0;
 const CONTINUE_SEARCH: u32 = 1;
 const UNWINDING: u32 = 2;
@@ -97,11 +103,135 @@ fn step(c: &mut Context, handler_type: u32, unwound: bool) -> Option<(Unwound, u
     (c.pc != 0 && c.sp() >= sp).then_some(result)
 }
 
-/// Asks each frame's handler about an exception, from where it happened up. True to carry on from `context`.
+/// The two lists of vectored handlers: exception handlers (0) and continue handlers (1).
+const EXCEPTION_HANDLERS: usize = 0;
+const CONTINUE_HANDLERS: usize = 1;
+const MOST_VECTORED: usize = 64;
+
+/// Each list's handlers and where each goes: lower first. A handler added first gets a place below every other's,
+/// one added last a place above.
+struct Lists {
+    slots: [[(u64, i64); MOST_VECTORED]; 2],
+    first: i64,
+    last: i64,
+}
+
+struct Vectored {
+    busy: AtomicBool,
+    lists: UnsafeCell<Lists>,
+}
+
+// SAFETY: `lists` is only touched while `busy` is held.
+unsafe impl Sync for Vectored {}
+
+static VECTORED: Vectored = Vectored { busy: AtomicBool::new(false), lists: UnsafeCell::new(Lists { slots: [[(0, 0); MOST_VECTORED]; 2], first: 0, last: 0 }) };
+
+fn with_vectored<R>(f: impl FnOnce(&mut Lists) -> R) -> R {
+    while VECTORED.busy.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+    // SAFETY: held exclusively, as `busy` says.
+    let result = f(unsafe { &mut *VECTORED.lists.get() });
+    VECTORED.busy.store(false, Ordering::Release);
+    result
+}
+
+/// A handler's handle: its slot's address, which is the same for as long as it's there.
+fn handle_of(list: usize, slot: usize) -> u64 {
+    (&raw const VECTORED.lists) as u64 + ((list * MOST_VECTORED + slot) * 16) as u64
+}
+
+fn add_vectored(list: usize, first: u32, handler: u64) -> u64 {
+    if handler == 0 {
+        return 0;
+    }
+    with_vectored(|l| {
+        let Some(slot) = l.slots[list].iter().position(|s| s.0 == 0) else { return 0 };
+        let place = if first != 0 {
+            l.first -= 1;
+            l.first
+        } else {
+            l.last += 1;
+            l.last
+        };
+        l.slots[list][slot] = (handler, place);
+        handle_of(list, slot)
+    })
+}
+
+fn remove_vectored(list: usize, handle: u64) -> u32 {
+    with_vectored(|l| {
+        let slot = (0..MOST_VECTORED).find(|&i| handle_of(list, i) == handle && l.slots[list][i].0 != 0);
+        match slot {
+            Some(i) => {
+                l.slots[list][i] = (0, 0);
+                1
+            }
+            None => 0,
+        }
+    })
+}
+
+/// Asks a list's handlers in turn, as `EXCEPTION_POINTERS`: true if one says to carry on (only exception handlers
+/// can; every continue handler is told).
+fn call_vectored(list: usize, record: &mut Record, context: &mut Context) -> bool {
+    let mut handlers = [(0u64, 0i64); MOST_VECTORED];
+    let n = with_vectored(|l| {
+        let mut n = 0;
+        for &s in l.slots[list].iter().filter(|s| s.0 != 0) {
+            handlers[n] = s;
+            n += 1;
+        }
+        n
+    });
+    handlers[..n].sort_unstable_by_key(|h| h.1);
+    let mut pointers = Pointers { record, context };
+    for &(handler, _) in &handlers[..n] {
+        // SAFETY: the program's handler, as Windows calls it.
+        let handler: extern "system" fn(*mut Pointers) -> i32 = unsafe { core::mem::transmute(handler) };
+        if handler(&mut pointers) == -1 && list == EXCEPTION_HANDLERS {
+            return true;
+        }
+    }
+    false
+}
+
+/// `AddVectoredExceptionHandler(first, handler)`: a handle, or null.
+#[unsafe(no_mangle)]
+pub extern "system" fn RtlAddVectoredExceptionHandler(first: u32, handler: u64) -> u64 {
+    add_vectored(EXCEPTION_HANDLERS, first, handler)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn RtlRemoveVectoredExceptionHandler(handle: u64) -> u32 {
+    remove_vectored(EXCEPTION_HANDLERS, handle)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn RtlAddVectoredContinueHandler(first: u32, handler: u64) -> u64 {
+    add_vectored(CONTINUE_HANDLERS, first, handler)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn RtlRemoveVectoredContinueHandler(handle: u64) -> u32 {
+    remove_vectored(CONTINUE_HANDLERS, handle)
+}
+
+/// Asks the vectored exception handlers, then each frame's handler, from where it happened up. True to carry on from
+/// `context`, once the vectored continue handlers have heard.
 fn dispatch(record: &mut Record, context: &mut Context) -> bool {
+    let handled = call_vectored(EXCEPTION_HANDLERS, record, context) || dispatch_frames(record, context);
+    if handled {
+        call_vectored(CONTINUE_HANDLERS, record, context);
+    }
+    handled
+}
+
+/// Asks each frame's handler about an exception, from where it happened up. True to carry on from `context`.
+fn dispatch_frames(record: &mut Record, context: &mut Context) -> bool {
     let mut c = *context;
     let mut unwound = false;
-    for _ in 0..1024 {
+    for _ in 0..MOST_FRAMES {
         let pc = c.pc;
         let Some((found, base, entry)) = step(&mut c, EHANDLER, unwound) else { break };
         if found.handler != 0 {
@@ -230,7 +360,7 @@ pub extern "system" fn RtlUnwindEx(target_frame: u64, target_ip: u64, record: *m
         record.flags |= EXIT_UNWIND;
     }
     let mut unwound = false;
-    for _ in 0..1024 {
+    for _ in 0..MOST_FRAMES {
         let mut before = c;
         let Some((found, base, entry)) = step(&mut c, UHANDLER, unwound) else { break };
         if found.establisher == target_frame {

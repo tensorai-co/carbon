@@ -49,7 +49,7 @@ impl Task {
         if wide {
             self.mem(cx, false, |t| user::read_wstr(&t.space(), at, 260)).ok()
         } else {
-            self.mem(cx, false, |t| user::read_cstr(&t.space(), at, 260)).ok().map(|b| String::from_utf8_lossy(&b).into_owned())
+            self.mem(cx, false, |t| user::read_cstr(&t.space(), at, 260)).ok().map(|b| crate::ansi::text(&b))
         }
     }
 

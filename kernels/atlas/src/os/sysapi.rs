@@ -426,7 +426,7 @@ fn computer_name() -> &'static str {
 /// fits, else the size it needs with it, failing with `too_small`.
 fn put_name(task: &mut Task, cx: &mut Cx<'_>, buffer: u64, size: u64, name: &str, ansi: bool, too_small: u32) -> Result<u64, u64> {
     let room = u32_at(&task.get(cx, size, 4)?, 0) as usize;
-    let mut bytes = if ansi { name.as_bytes().to_vec() } else { wide(name) };
+    let mut bytes = if ansi { crate::ansi::bytes(name) } else { wide(name) };
     let len = if ansi { bytes.len() } else { bytes.len() / 2 };
     if room <= len || buffer == 0 {
         task.put(cx, size, &(len as u32 + 1).to_le_bytes())?;

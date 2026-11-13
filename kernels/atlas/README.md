@@ -7,8 +7,15 @@ has to run inside the program, ntdll, is a crate (`guest/`) that cargo builds fo
 **Where it stands.** Programs run on ARM64 natively and x86-64 translated, with the loader and SEH, threads and
 waits, processes, anonymous and named pipes, sections, asynchronous I/O and completion ports, files, the registry,
 security (tokens, descriptors, access checks, impersonation), resources and version information, the system's
-version and information, and windows on the desktop with input. Six DLLs declare 501 exports between them, and ntdll
-has 75.
+version and information, and windows on the desktop with input. The loader is Windows' own in all but manifests: the
+PEB's lists, references counted and DLLs unloaded, detach as threads and the process end, API sets and delay loads.
+Exceptions go to vectored handlers before frames' handlers, and guard pages and stack overflows raise theirs. Fibers
+switch in the program, each with its own stack and FLS, whose callbacks run as fibers, threads and slots end. Files
+are shared as their opens say, with hard and symbolic links and times that can be set. The thread pool runs in the
+program: work, timers and waits, on pools of their own or the process's. The registry tells watchers of changes, has
+WOW64's 32-bit view, and saves, restores, loads and unloads hives. Code pages convert as Windows' do, every `*A`
+function speaks Windows-1252, and ANSI windows get their messages' text in it. ucrtbase.dll is atlas's own C runtime, in the
+program, so MinGW-built C programs run. Seven DLLs declare 857 exports between them, and ntdll has 277.
 
 ## Layout
 
@@ -64,12 +71,19 @@ On this Mac, through hvf, every test program passes. Each one's opening comment 
 | atlas, ARM64 native and x86-64 translated | The basics: the console, the command line, memory, an upcall, a message box, and ntdll's own exports |
 | atlas's `windows.c`, both ISAs | Window classes, creation and its messages, painting and GDI, timers, and messages between threads |
 | atlas's `desktop.c`, both ISAs | Windows on the desktop: activation and focus, coordinates, input through `SendInput`, capture, the clipboard, stacking |
-| atlas's `registry.c`, both ISAs | A fresh machine's hives, keys and every value type, enumeration, deletion, and saving |
+| atlas's `crt.c`, both ISAs, and built by MinGW-w64 (x86-64) | The C runtime: printf's conversions, snprintf, strings, strtol and strtod, qsort, the heap, getenv, the arguments, files in text and binary mode, rand, atexit |
+| atlas's `ansiwin.c`, both ISAs | ANSI windows: a class and window made with the `*A` functions, its `WndProc` given names, text and characters in 1252 however they're sent; a Unicode window driven by the `*A` functions; `GetMessageA` and `DispatchMessageA`; `WndProc`s set by `SetWindowLongPtrA` and `W` |
+| atlas's `ansi.c`, both ISAs | Code pages: `MultiByteToWideChar` and `WideCharToMultiByte` in 1252, 437 and UTF-8; `*A` functions with é in their names, as the `*W` ones see them: files, paths, the registry, the environment, objects, accounts, locales and version information |
+| atlas's `registry.c`, both ISAs | A fresh machine's hives, keys and every value type, enumeration, deletion, and saving; change notification, asynchronous and not; the 32-bit view; hives saved, restored, loaded and unloaded |
 | atlas's `environment.c`, both ISAs | The environment a logon gives, from the registry: read, expanded, set and deleted |
+| atlas's `links.c`, both ISAs | Sharing modes, opens refused and allowed; deleting and moving open files; a deleted file still read where it's open; hard links; symbolic links to files and folders, as attributes, listings and `RemoveDirectory` see them; file times set and read back |
 | atlas's `files.c`, both ISAs | Folders and files: made, opened, read, found, copied, moved and deleted, and System32's DLLs |
 | atlas's `threads.c`, both ISAs | Threads, critical sections and waits, TLS, events, mutexes, semaphores, SRW locks, condition variables and APCs |
-| atlas's `loader.c`, both ISAs | An app's own DLLs, relocated, with `DllMain`, forwarders, `LoadLibrary` and `GetProcAddress`, and SEH |
+| atlas's `loader.c`, both ISAs | An app's own DLLs, relocated, with `DllMain`, forwarders, `LoadLibrary` and `GetProcAddress`; the PEB's lists; `FreeLibrary` unloading, with detach and notifications; thread and process detach; an API set; `Ldr*`; a delay-loaded DLL; and SEH |
 | atlas's `process.c`, both ISAs | Processes and anonymous pipes: `CreateProcess`, redirected output, inherited handles, exit codes |
+| atlas's `pool.c`, both ISAs | The thread pool: work run many at once and waited for, cancelled, on a pool of one thread; simple callbacks and `QueueUserWorkItem`; what a callback does as it returns; timers once and repeating, and stopped; waits signalled and timed out; registered waits; cleanup groups; I/O objects on a file and a pipe, and `BindIoCompletionCallback`; timer queues |
+| atlas's `fibers.c`, both ISAs | Threads made fibers and back; fibers switched between, each with its own stack, data and FLS; exceptions and a stack overflow caught on a fiber; FLS callbacks as a fiber's deleted, a thread ends and a slot's freed; a fiber that returns |
+| atlas's `exceptions.c`, both ISAs | Vectored exception and continue handlers, in order, carrying on and passing; guard pages, as `VirtualQuery` and `VirtualProtect` see them; a stack overflow caught, on two threads |
 | atlas's `sections.c`, both ISAs | Sections and file mappings, `VirtualQuery`, and waitable timers |
 | atlas's `io.c`, both ISAs | Completion ports and overlapped I/O: events, packets, `ReadFileEx` routines |
 | atlas's `pipes.c`, both ISAs | Named pipes, byte and message, pending I/O, and a pipe between two processes |
@@ -103,9 +117,9 @@ program in `guest/`, crossing where Windows crosses:
 | 1. The NT kernel | `ntoskrnl`, 489 calls | host Rust: objects, threads, processes, memory and sections, files, pipes, completion ports, the registry, security, system information, exceptions |
 | 2. The window kernel | `win32k`, 1,485 calls | host Rust: `win32k/`, windows, messages, input and basic GDI, on `display` |
 | 3. The services | csrss, lsass, services, rpcss, winlogon, svchost's | none, but the registry |
-| 4. ntdll | the loader, heap, Rtl, the Nt stubs | `guest/`: loader, heap, sync, exceptions, environment; 75 exports, two of them `Nt*`/`Zw*` |
-| 5. The Win32 core | kernelbase, kernel32, user32, gdi32, advapi32, shell32 | `os/`: six DLLs, 501 exports |
-| 6. The runtimes | C runtime, COM, shell UI, graphics, networking, crypto, media, devices | none |
+| 4. ntdll | the loader, heap, Rtl, the Nt stubs | `guest/`: loader, heap, sync, exceptions, environment, the thread pool; 146 exports, two of them `Nt*`/`Zw*` |
+| 5. The Win32 core | kernelbase, kernel32, user32, gdi32, advapi32, shell32 | `os/`: six DLLs, 663 exports |
+| 6. The runtimes | C runtime, COM, shell UI, graphics, networking, crypto, media, devices | ucrtbase, in the program (`guest/src/crt.rs`, `stdio.rs`) |
 | 7. The programs Windows ships | cmd, reg, regsvr32, rundll32, msiexec, explorer, … | none |
 
 The Win32 core, by atlas's `dll!` declarations (a stub is a `missing` export, declared but ending the process
@@ -113,13 +127,14 @@ naming itself):
 
 | DLL | Windows' exports | atlas: host | in ntdll | stubs | declared |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| kernel32 | 1,561 | 193 | 68 | 1 | 17% |
-| user32 | 992 | 99 | | 5 | 10% |
-| gdi32 | 545 | 18 | | 5 | 4% |
-| advapi32 | 589 | 99 | | 4 | 18% |
-| shell32 | 475 | 4 | | | 1% |
-| version | 16 | 5 | | | 31% |
-| ntdll | 1,544 | | 21 by Windows' names, 54 of atlas's own | | 1% |
+| kernel32 | 1,561 | 235 | 131 | | 23% |
+| user32 | 992 | 125 | | | 13% |
+| gdi32 | 545 | 20 | | 5 | 5% |
+| advapi32 | 589 | 131 | | 1 | 22% |
+| shell32 | 475 | 5 | | | 1% |
+| version | 16 | 10 | | | 63% |
+| ucrtbase | 2,560 | | 194 | | 8% |
+| ntdll | 1,544 | | 35 by Windows' names, 242 of atlas's own | | 2% |
 
 Between ntdll and the host there are 12 calls of atlas's own (`atlas-abi`'s `call`), and every host export traps
 straight to its Rust.
@@ -203,13 +218,36 @@ Windows, it's the loader in the program (`guest/src/loader.rs`):
 
 - It resolves the program's imports, asking atlas to map each DLL by name (`MAP_IMAGE`). atlas's own come from their
   declarations, always; anything else is found as Windows looks, in the program's folder and then System32, and
-  relocated as it's mapped, as NT's kernel does.
+  relocated as it's mapped, as NT's kernel does. An API set (`api-ms-win-*`) is its DLL's other name: atlas maps
+  the DLL (`imports::api_set` has the map), and the loader knows it by the path it's given.
 - Exports by name (binary search) and by ordinal; forwarders (`dll.name`, `dll.#ordinal`) followed to the end; the
   import table opened with `PROTECT` while it's filled in.
 - Static TLS for each module with a TLS directory (its index, and this thread's block from its template), TLS
-  callbacks, then each DLL's `DllMain`, dependencies first, then the program's entry point.
-- `LoadLibraryA/W`, `LoadLibraryExA/W`, `GetProcAddress`, `GetModuleHandleA/W`, `GetModuleFileNameW` and
-  `FreeLibrary` are kernel32 guest exports that forward to it.
+  callbacks, then each DLL's `DllMain`, dependencies first (in the order their imports were resolved), then the
+  program's entry point. A `DllMain` that fails at start ends the process with STATUS_DLL_INIT_FAILED; one that
+  fails in `LoadLibrary` is told DLL_PROCESS_DETACH and unloaded, as on Windows.
+- The PEB's `PEB_LDR_DATA` has an `LDR_DATA_TABLE_ENTRY` for each module on its three lists, as programs walk them:
+  load and memory order (the program, ntdll, kernel32, then the rest as they're loaded) and initialization order
+  (ntdll, then each DLL as its `DllMain` runs), with each entry's base, entry point, size, names, flags, TLS index
+  and counts.
+- **References and unloading.** What the process starts with stays, as do atlas's own DLLs. A DLL loaded at run
+  time counts its references (`LoadLibrary`, `GetModuleHandleEx`, and each module loaded at run time that imports
+  it); `FreeLibrary` that takes the last away tells it DLL_PROCESS_DETACH and unmaps it (`UNMAP_IMAGE`), and lets
+  go of what it imported, which goes too if nothing else holds it. A forwarder's DLL is pinned.
+- **Ending.** A thread that ends tells each DLL DLL_THREAD_DETACH, newest first (unless it asked not to hear about
+  threads with `DisableThreadLibraryCalls`), and lets go of its static TLS. `ExitProcess`, the program's entry point
+  returning, or the last thread ending is ntdll's `RtlExitUserProcess`: the process's other threads end first, then
+  each DLL hears DLL_PROCESS_DETACH, newest first, with a non-null `lpReserved`, and the program's TLS callbacks
+  too. A thread or process ended from outside (`TerminateThread`, `TerminateProcess`) tells no one, as on Windows.
+- **Delay loads**: `ResolveDelayLoadedAPI`, which MSVC's delay-load helper and Windows' own DLLs call, loads the DLL
+  the first time one of its imports is called, keeps its handle where the descriptor says, and writes the export in
+  the thunk; when either fails, it asks the failure hooks, and with nothing from them raises the helper's
+  exception (0xC06D007E for the DLL, 0xC06D007F for the export).
+- `LoadLibraryA/W`, `LoadLibraryExA/W`, `GetProcAddress`, `GetModuleHandleA/W`, `GetModuleHandleExA/W`,
+  `GetModuleFileNameW`, `FreeLibrary`, `FreeLibraryAndExitThread` and `DisableThreadLibraryCalls` are kernel32 guest
+  exports that forward to it. ntdll has Windows' own: `LdrLoadDll`, `LdrUnloadDll`, `LdrGetDllHandle`,
+  `LdrGetProcedureAddress`, `LdrFindEntryForAddress`, `LdrResolveDelayLoadedAPI`, and DLL notifications
+  (`LdrRegisterDllNotification`), which hear each DLL loaded and unloaded.
 
 **Processes** (`os/procapi.rs`, `pipes.rs`). `CreateProcessW`/`A` start a process on a host thread and CPU of its
 own, with a space of its own, while objects and their names stay the machine's, so processes share them as on
@@ -373,8 +411,60 @@ alertable ones run queued APCs (`QueueUserAPC`) as upcalls, returning `WAIT_IO_C
 
 **In the program** (`guest/src/sync.rs`): critical sections, SRW locks, condition variables, `InitOnceExecuteOnce`
 and `WaitOnAddress` never leave the program uncontended; contended, they wait in atlas by address (`WAIT_ADDRESS`,
-`WAKE_ADDRESS`, on `kernels-core`'s futexes). `TlsAlloc` slots are in the TEB, FLS slots in a block it points at,
-and `GetCurrentThreadId` and friends read the TEB. The exception dispatch in progress is per thread, in the TEB.
+`WAKE_ADDRESS`, on `kernels-core`'s futexes). `TlsAlloc` slots are in the TEB, and `GetCurrentThreadId` and friends
+read the TEB. The exception dispatch in progress is per thread, in the TEB.
+
+**FLS** (`guest/src/sync.rs`): each thread's and each fiber's slots are a block the TEB's `FlsData` points at, made
+when first used, and every block is on one list. A slot's callback (`FlsAlloc`'s) has each value that isn't 0 as its
+thread ends (before DLLs hear DLL_THREAD_DETACH, as Windows runs them), as its fiber's deleted, and as the process
+ends, for the thread that ends it; `FlsFree` gives it every thread's and fiber's value, from the list, before the
+slot is free.
+
+**Fibers** (`guest/src/fiber.rs`), all in the program. A fiber is a block with its parameter first (`GetFiberData`
+reads it through the TEB's `FiberData`, as winnt.h does), the TEB's stack fields and FLS block as they were when it
+last ran, and its callee-saved registers (x64's eight and xmm6 to xmm15; ARM64's x19 to x30 and d8 to d15).
+`SwitchToFiber`, in assembly for each ISA, saves the running fiber's, puts the other's in the TEB, and carries on
+where it left off. `CreateFiber(Ex)` gives a fiber a stack of its own, a megabyte or what it asks, with guard pages
+at its bottom, so a stack overflow on a fiber is caught as on a thread; its routine returning ends the thread, with
+0. `ConvertThreadToFiber(Ex)`, `ConvertFiberToThread`, `IsThreadAFiber`, and `DeleteFiber`, which runs the fiber's
+FLS callbacks and frees its stack, or ends the thread if it's the fiber running.
+
+**The thread pool** (`guest/src/pool.rs`), in the program, as Windows' ntdll has it. A pool is a queue of callbacks
+and the threads that run them: a worker takes the next and runs it, and with nothing to do waits on the pool's
+signal (by address, in atlas); after 20 seconds idle it ends, down to the pool's minimum. Submitting wakes an idle
+worker, or starts one if none is and the pool's below its maximum (512 for the process's own). Workers are threads
+like any other, started by atlas (`CREATE_THREAD`) through ntdll's thread start, so DLLs hear of them.
+- **Work:** `CreateThreadpoolWork`, `SubmitThreadpoolWork`, `WaitForThreadpoolWorkCallbacks` (which can cancel what
+  hasn't started) and `CloseThreadpoolWork`, which lets the object go once its callbacks have run;
+  `TrySubmitThreadpoolCallback` and `QueueUserWorkItem`, once each.
+- **Pools:** `CreateThreadpool`, `SetThreadpoolThreadMaximum` and `Minimum` (the minimum started at once), and
+  `CloseThreadpool`; a callback environment's pool and cleanup group, as `TP_CALLBACK_ENVIRON` lays them out.
+- **Timers:** one thread keeps every timer set, sleeping until the next is due by the shared data page's interrupt
+  time, and queues each as it comes due, again every period if it has one. `SetThreadpoolTimer` (relative or
+  absolute, or not set), `IsThreadpoolTimerSet`, waiting for and closing them.
+- **Waits:** each wait has a thread of its own, waiting on its handle and on an event that says the wait's been
+  changed or closed, with kernel32's `WaitForMultipleObjects`; it queues one callback with WAIT_OBJECT_0 or
+  WAIT_TIMEOUT. `RegisterWaitForSingleObject` is the same, every time (or once, WT_EXECUTEONLYONCE), with
+  `UnregisterWait(Ex)`.
+- **As a callback returns:** an event set, a semaphore or mutex released, a critical section left, a DLL freed, as
+  its instance was told; `CallbackMayRunLong` starts another worker if none is idle; and
+  `DisassociateCurrentThreadFromCallback` lets those waiting for the object's callbacks stop waiting for this one.
+- **Cleanup groups:** objects made with one are closed together by `CloseThreadpoolCleanupGroupMembers`, their
+  callbacks run first (or cancelled).
+- **I/O:** the process has one completion port for the pool, made when first wanted, and a thread waiting on it.
+  `CreateThreadpoolIo` associates a handle with it, keyed by the I/O object, and each completion (a file's at once,
+  a pipe's when the other end writes) queues the object's callback with its OVERLAPPED, its error and its bytes.
+  `StartThreadpoolIo` and `CancelThreadpoolIo` count operations as Windows asks; `WaitForThreadpoolIoCallbacks` and
+  `CloseThreadpoolIo` as for work. `BindIoCompletionCallback` is the same with the older callback, on the process's
+  pool. An I/O object is never freed, since a completion may still come for it.
+- **Timer queues:** `CreateTimerQueue` is a group of timers; `CreateTimerQueueTimer` is a pool timer whose callback
+  is `(parameter, TRUE)`, due in milliseconds, then every period (or once, WT_EXECUTEONLYONCE), on the process's
+  pool; `ChangeTimerQueueTimer`, and `DeleteTimerQueueTimer` and `DeleteTimerQueue(Ex)` waiting for callbacks (with
+  INVALID_HANDLE_VALUE) or setting an event once they've run. A null queue is the default one.
+
+ntdll calls kernel32's host exports for events, waits and completion ports by number, as a program's stub does:
+`EXPORT_NUMBER` finds it by name the first time, and `sys::call6` puts a fifth and sixth argument where Windows'
+convention has them (`x4` and `x5`, or the stack past the home space).
 
 **Files** (`files.rs`, `os/fileapi.rs`): Windows paths (`C:\...`, relative to the current directory, root-relative,
 `\\?\`, either slash, `.` and `..`, trailing dots and spaces dropped) onto the machine's disk, which folds case.
@@ -383,6 +473,22 @@ and `GetCurrentThreadId` and friends read the TEB. The exception dispatch in pro
 `SetFilePointer(Ex)`, `GetFileSize(Ex)`, `SetEndOfFile`, `GetFileType`, attributes and `GetFileInformationByHandle`;
 folders, delete, move, copy; `FindFirstFile`/`FindNextFile` with `*` and `?`; the current directory, full and temp
 paths. Errors are Windows' own: ERROR_FILE_NOT_FOUND where the folder's there, ERROR_PATH_NOT_FOUND where it isn't.
+
+- **Sharing.** Every file open on the disk is known by its inode, with what it was opened for (reading or running,
+  writing, deleting) and its `FILE_SHARE_*`. An open for something another doesn't share, or that doesn't share what
+  another is open for, is ERROR_SHARING_VIOLATION; one for attributes only isn't checked, either way. `DeleteFile`,
+  `RemoveDirectory` and `MoveFileEx` (the file moved, and one it replaces) need everything that has it open to share
+  deleting. Deleting is Windows 10's: the name goes at once, and what has the file open keeps reading and writing
+  it until it's closed, since an open file holds its inode on the disk.
+- **Links.** `CreateHardLink` gives a file (not a folder) another name; `GetFileInformationByHandle` counts them and
+  gives both one file number. `CreateSymbolicLink` makes a link to a Windows path, absolute or from the link's own
+  folder, of a file or (SYMBOLIC_LINK_FLAG_DIRECTORY) a folder. Opening through one reaches its target; a link to
+  nothing is there, but opening it is ERROR_FILE_NOT_FOUND. `GetFileAttributes` and `FindFirstFile` see the link
+  itself, a reparse point (with IO_REPARSE_TAG_SYMLINK) and a folder if it's a folder's; `DeleteFile` and
+  `RemoveDirectory` take the link away, and leave what it leads to.
+- **Times.** A file's last write is the disk's own; when it was made and last read are kept beside it (an extended
+  attribute), set as it's made. `SetFileTime` sets any of the three, and `GetFileTime`, `GetFileAttributesEx`,
+  `GetFileInformationByHandle` and `FindFirstFile` give them.
 
 The **system layer** puts `C:\Windows`, `System32`, `SysWOW64` and `Temp` on every disk. `System32` also has atlas's
 DLLs and ntdll, which nothing stores: listing it shows them, and opening one reads the image atlas made in memory for
@@ -397,6 +503,21 @@ when `RegFlushKey` asks and when the machine stops, and loaded from there when i
 `RegCreateKeyEx`, `RegQueryValueEx`, `RegSetValueEx` (W and A), `RegGetValueW` with its type filters and expansion,
 deleting values, keys and trees, enumerating keys and values, `RegQueryInfoKeyW`, `RegFlushKey` and `GetUserNameW`.
 
+- **Change notification.** The registry notes each change as it's made: a key's subkey made or deleted
+  (REG_NOTIFY_CHANGE_NAME), a value set or deleted (LAST_SET), its descriptor (SECURITY); a key deleted is every
+  kind of change to it. After each advapi32 call, the watches those changes match have their events set, once
+  each: `RegNotifyChangeKeyValue` on the key, or (with `bWatchSubtree`) anything under it, by its filter. Not
+  asynchronous, it waits for the change itself.
+- **The 32-bit view.** With KEY_WOW64_32KEY, `RegOpenKeyEx`, `RegCreateKeyEx` and `RegDeleteKeyEx` find the key as
+  WOW64 redirects it: `HKLM\SOFTWARE\X` is `SOFTWARE\WOW6432Node\X`, but for the keys both views share (`Clients`,
+  `Policies`, `Classes` but for `CLSID`, `AppID`, `Interface`, `TypeLib` and the media types, which are
+  `Classes\WOW6432Node`'s, and a few of Microsoft's). A fresh machine's 32-bit view has Windows' version keys, with
+  `C:\Program Files (x86)` as its program files.
+- **Hives.** `RegSaveKey(Ex)` writes a key and what's under it to a new file, in atlas's format, with
+  SeBackupPrivilege enabled. With SeRestorePrivilege, `RegRestoreKey` replaces a key's contents with a file's,
+  `RegLoadKey` makes a file a new key under `HKEY_LOCAL_MACHINE` or `HKEY_USERS` (not saved with the machine's
+  registry, but written back to its file at `RegFlushKey` and as it's unloaded), and `RegUnLoadKey` takes it away.
+
 **The environment** (`environment.rs`, ntdll's `env.rs`): atlas makes a process's first environment as Windows does
 at logon: the system `Environment` key under `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager`, then the
 user's (whose `Path` goes after the system's), expanded; the session's variables (the user's folders and name, the
@@ -406,6 +527,40 @@ the machine was started with (`Options::env`). It goes in the process parameters
 `GetEnvironmentVariable`, `SetEnvironmentVariable` (a NULL value deletes; each change makes a new block on the
 process heap, kept in order), `ExpandEnvironmentStrings` (names it doesn't know stay as they are),
 `GetEnvironmentStrings` and `FreeEnvironmentStrings`, each in W and A. Names fold case.
+
+**Code pages** (`ansi.rs`, `os/nlsapi.rs`). atlas is a US English Windows: its ANSI code page is Windows-1252
+(`GetACP`) and its OEM one 437 (`GetOEMCP`, and the console's until `SetConsoleOutputCP` says otherwise); UTF-8,
+US-ASCII and Latin-1 convert too (`IsValidCodePage`, `GetCPInfo(Ex)`). `MultiByteToWideChar` and
+`WideCharToMultiByte` convert as Windows' do: NUL-terminated or counted, how much room it takes when there's none
+given, ERROR_INSUFFICIENT_BUFFER when there's too little, MB_ERR_INVALID_CHARS and WC_ERR_INVALID_CHARS for UTF-8
+that isn't, and a default character (the program's, or `?`) for what a code page hasn't, saying whether it was used.
+Every `*A` function reads and gives back its strings in 1252, the same conversion ntdll's environment functions use
+(the table is in `atlas-abi`), so a name with é in it is one name to both: files and folders, paths, the module's
+own name, the command line, the registry, objects' names, accounts and SIDs, resources, locales, the clipboard's
+CF_TEXT (and CF_OEMTEXT in 437), and version information, whose `VerQueryValueA` converts a string value into the
+room after the block that `GetFileVersionInfoSizeA` asked for. `WriteConsoleA` shows its bytes in the console's code
+page; `WriteFile` to the console passes them through, so a program that writes UTF-8 is shown as it means.
+
+**The C runtime** (`os/ucrtbase.rs`, `guest/src/crt.rs`, `stdio.rs`). ucrtbase.dll is part of Windows 10, so atlas
+has its own, and every export runs in the program (as ntdll code): programs reach it by name or by its API sets
+(`api-ms-win-crt-*`), as MSVC's `/MD` and MinGW's UCRT programs do. It has the heap (`malloc` and the rest on
+ntdll's), memory and strings narrow and wide, character classes, `strtol`, `strtod` and the rest, `qsort`, `rand`
+(Windows' own sequence), `errno` (in atlas-guest's room in the TEB), and startup and exit: the arguments split as the
+C runtime splits them, the environment, `_initterm`, onexit tables, `atexit`, `exit`, `abort` and `signal`. Its stdio
+has the three standard streams and `fopen`'s, over kernel32's files (called by number), in text mode unless binary;
+writes aren't buffered, reads are. Its `printf` engine, behind `__stdio_common_v*printf`, has every conversion but
+`%a` and `%n`, every flag and size, narrow and wide. A MinGW-built x86-64 C program runs as it is.
+
+**ANSI windows.** Inside win32k every message's text is UTF-16. A class registered with `RegisterClass(Ex)A` is ANSI,
+and so are its windows (`IsWindowUnicode` FALSE), until `SetWindowLongPtrW` gives one a `WndProc` (and
+`SetWindowLongPtrA` makes one ANSI). A message to an ANSI window's `WndProc` is converted on the way in: WM_SETTEXT's
+text, WM_NCCREATE's and WM_CREATE's CREATESTRUCT names, and WM_CHAR's (and the other character messages')
+character; WM_GETTEXT's buffer is the procedure's to fill in ANSI and is converted back into the caller's. The `*A`
+functions convert the other way as a message comes in: `SendMessageA`, `PostMessageA`, `DispatchMessageA`,
+`DefWindowProcA`, `SetWindowTextA` and `GetWindowTextA`; `GetMessageA` and `PeekMessageA` give characters in ANSI;
+`CreateWindowExA` takes its names in ANSI. Converted text goes on the calling thread's stack, below where it trapped,
+with the stack pointer lowered while the message is out (`Task::with_scratch`), so a message sent to another thread
+reads it while the sender waits.
 
 **Windows** (`win32k/`, `os/user32.rs`, `os/gdi32.rs`): window classes and windows, with parents and children,
 text, longs and extra bytes, and places and sizes; each thread's message queue. A window belongs to the thread that
@@ -456,7 +611,18 @@ stack. ntdll does the rest as Windows does (`guest/src/exception.rs`, `unwind.rs
 - `NtContinue` is atlas's `CONTINUE` call. `RtlRaiseException` and kernel32's `RaiseException` raise from the
   program itself, with `RtlCaptureContext` in assembly. `RtlLookupFunctionEntry`, `RtlVirtualUnwind`, `RtlUnwind`,
   `RtlUnwindEx` and `SetUnhandledExceptionFilter` are there for runtimes that use them.
+- **Vectored handlers** (`AddVectoredExceptionHandler`) are asked first, before any frame's, those added `first`
+  before the rest; one that says to carry on (-1) ends the search. Vectored continue handlers
+  (`AddVectoredContinueHandler`) then hear every exception the program carries on from, however it was handled.
 - Unhandled, it says which exception and where, and the process ends with its code.
+
+**Guard pages and the stack.** A page committed or protected with PAGE_GUARD (`VirtualAlloc`, `VirtualProtect`, and
+`VirtualQuery` saying so) is mapped with no access; its first touch takes the guard away from that page and raises
+STATUS_GUARD_PAGE_VIOLATION. Every thread's stack is a megabyte committed as it's touched, whose bottom 16 KiB are
+guard pages (the TEB's `DeallocationStack` says where the stack starts): touching them raises STATUS_STACK_OVERFLOW,
+with the guard taken from all of them, so the handler has the room to run in, and the TEB's `StackLimit` moved down.
+A second overflow has none left, and ends the process, as on Windows. exec's x86-64 translation makes a `push` and a
+`call` store before they move `rsp`, so a fault on the stack is precise and the unwinder sees the frame as it was.
 
 ---
 
@@ -473,17 +639,19 @@ By layer, bottom up. Items are host Rust unless marked **[guest]** (ntdll), or a
   `SetThreadContext`; `DuplicateHandle` of another process's pseudo-handles; `NtQueryInformationProcess` and
   `NtQueryInformationThread`; job objects (kill-on-close, limits, completion messages); `GetStartupInfo` with what
   the parent passed, and `CREATE_NEW_CONSOLE` and the other console flags; `SuspendThread` on a thread blocked in a
-  wait; `DLL_THREAD_DETACH`, `DLL_PROCESS_DETACH` and FLS callbacks as threads and processes end.
+  wait.
 - **Memory and sections:** a `WriteFile` to a mapped file seen by its views (one cache for both); `SEC_RESERVE`;
-  image sections; guard pages and stack growth, with `STATUS_STACK_OVERFLOW`; `VirtualAlloc2`'s placeholders; write
+  image sections; `SetThreadStackGuarantee`, and stack sizes from the PE header; `VirtualAlloc2`'s placeholders; write
   watch; large pages, refused politely; one namespace for sections' and other objects' names.
-- **Files and I/O:** sharing modes; file times that can be set; hard and symbolic links, junctions and reparse
-  points; `ReplaceFile`, and `MoveFileEx` until reboot; change notification (`ReadDirectoryChangesW`); other drive
+- **Files and I/O:** junctions and other reparse points (`FSCTL_GET_REPARSE_POINT` and the rest), opening a link
+  itself (FILE_FLAG_OPEN_REPARSE_POINT), and `GetFinalPathNameByHandle` through a link; `ReplaceFile`, and `MoveFileEx` until reboot; change notification (`ReadDirectoryChangesW`); other drive
   letters, `GetVolumeInformation` and free space; overlapped pipe writes that wait for room,
   `GetNamedPipeHandleState`, `CancelSynchronousIo`; mailslots; `DeviceIoControl` for volumes, the console, and AFD
   for sockets **[net]**.
-- **The registry:** `RegNotifyChangeKeyValue`; the 32-bit view (`WOW6432Node`); `RegLoadKey`, `RegSaveKey` and
-  `RegRestoreKey`; saving more often than at a flush and the machine's end; transactions, refused cleanly.
+- **The registry:** Windows' own hive format (`regf`), so `RegLoadKey` takes a hive from a real Windows (a default
+  user's `NTUSER.DAT`); the 32-bit view of `HKCU\Software\Classes`, and 32-bit programs in it by default; a key's
+  notification ending as its handle's closed; saving more often than at a flush and the machine's end; transactions,
+  refused cleanly.
 - **Security:** `SetEntriesInAcl` and the trustee helpers; inheritance from a folder or parent key; descriptors on
   processes, threads, pipes and keys made with one; descriptors kept on disk, not only while the machine runs;
   restricted tokens, as a browser engine's sandbox needs; `MakeAbsoluteSD` and the `*A` functions.
@@ -527,24 +695,26 @@ BITS, audio **[audio]**, WMI's common classes); and **the event log**.
 - **`Rtl*`, by family:** strings (`UNICODE_STRING`, conversions, comparisons, case); integers and GUIDs; bitmaps; AVL,
   generic and hash tables; time conversions; security descriptor and SID helpers; compression; the heap's other
   entry points; paths (`RtlDosPathNameToNtPathName_U`); activation contexts.
-- **The loader:** `PEB_LDR_DATA`'s three lists, which programs walk themselves; `LdrGetProcedureAddress` and
-  `LdrLoadDll`; DLL load notifications; `DllMain` on detach and thread attach; `FreeLibrary` that unloads; delay
-  loads (`ResolveDelayLoadedAPI`); API sets from a schema in the PEB (`imports::api_set` knows the map); side-by-side
-  manifests.
-- The thread pool (`Tp*`) on completion ports; FLS; vectored exception handlers; C++ exceptions' support
-  (`__CxxFrameHandler3`/`4`, `_CxxThrowException`) where no vcruntime is brought; the C runtime's slice (`mem*`,
-  `str*`, `wcs*`, `sprintf`, `qsort`, `bsearch`); `Etw*` that succeed and do nothing.
+- **The loader:** side-by-side manifests and activation contexts; a loader lock held across `DllMain`, as Windows
+  has, so two threads loading at once wait for each other; dependency cycles between DLLs loaded at run time, which
+  stay loaded; `LoadLibraryEx`'s flags (`LOAD_LIBRARY_AS_DATAFILE`, search paths) and `SetDllDirectory`;
+  `GetModuleHandle` by an API set's name; a schema of API sets in the PEB, for programs that read it themselves.
+- The thread pool's rest: callback priorities, WT_EXECUTEINTIMERTHREAD and the other legacy flags, and the `Tp*`
+  exports by Windows' names; C++ exceptions' support
+  (`__CxxFrameHandler3`/`4`, `_CxxThrowException`) where no vcruntime is brought; `Etw*` that succeed and do nothing.
 
 ### 5. The Win32 core
 
 - **kernel32:** process lists (toolhelp) and `psapi`; the console in full (input records, modes, screen buffers,
   cursor and colours, code pages, `AllocConsole`, virtual terminal sequences); strings and NLS
-  (`MultiByteToWideChar` for every code page programs use, `CompareString`, `LCMapString`, `GetLocaleInfoEx`, number
-  and date formats, `GetACP`); every `*A` function; resources' rest (`UpdateResource`, `LOAD_LIBRARY_AS_DATAFILE`,
-  message tables for `FormatMessage`); fibers; the thread pool's Win32 face; job objects; `SetThreadExecutionState`;
+  (code pages beyond 1252, 437 and UTF-8, the double-byte ones too; `CompareString`, `LCMapString`,
+  `GetLocaleInfoEx`, number and date formats); resources' rest (`UpdateResource`, `LOAD_LIBRARY_AS_DATAFILE`,
+  message tables for `FormatMessage`); job objects; `SetThreadExecutionState`;
   the long tail, as the import scanner and the `missing` stubs say.
 - **advapi32:** services; the event log; CryptoAPI's legacy face over bcrypt; ETW registration that succeeds.
-- **user32 and gdi32:** every `*A` function; dialog, menu, icon, cursor and accelerator resources; `wsprintf`;
+- **user32 and gdi32:** ANSI windows' rest: `GetWindowLongPtrA`'s and `GetClassLongPtrA`'s `WndProc` for a Unicode
+  window (and the W ones' for an ANSI one) as a handle `CallWindowProc` converts through, as Windows gives, and
+  controls' messages with text (`EM_*`, `LB_*`, `CB_*`) once there are controls; dialog, menu, icon, cursor and accelerator resources; `wsprintf`;
   `SystemParametersInfo` and the system colours.
 - **The shell's core** (shell32, shlwapi, shcore): known folders; `ShellExecute(Ex)` by association and `runas`;
   `SHFileOperation` and `IFileOperation`; shell links; `SHBrowseForFolder`; icons and the system image list;
@@ -558,7 +728,7 @@ interface is the to-do, not each export.
 
 | Group | DLLs | To do |
 | --- | --- | --- |
-| C runtime | ucrtbase, msvcrt | **[guest]** mostly in the program, as library code over kernel32 |
+| C runtime | ucrtbase, msvcrt | **[guest]** ucrtbase's rest, as a MinGW C++ program asks: `setjmp`/`longjmp`, `_beginthreadex`, low-level I/O (`_read`, `_write`, `_fstat64`), wide stdio, `strftime`, the multibyte conversions, math; then msvcrt.dll for older MinGW programs |
 | COM and RPC | combase, ole32, oleaut32, rpcrt4, propsys, urlmon | apartments, the class registry, in-process servers, marshalling, `IStream` and compound files (MSI needs them), OLE automation; WinRT refused cleanly |
 | Shell and common UI | comctl32, comdlg32, uxtheme, dwmapi, riched20, imm32, usp10, windowscodecs, gdiplus | comctl32 6's controls and `TaskDialog`, the common dialogs, flat themes, RichEdit, Uniscribe, WIC's decoders, GDI+ |
 | Graphics | dxgi, d3d9/11/12, d2d1, dwrite, opengl32, vulkan-1 | **[gpu]** DXGI and Direct3D 11 first with a software path, then 9 and 12, Direct2D, DirectWrite, WGL, Vulkan |
@@ -578,9 +748,9 @@ First `cmd.exe` (variables, `if`, `for`, `goto`, `call`, pipes, redirection, `.b
 - **32-bit x86 (WoW64)** **[exec]** **[guest]**: most installers are 32-bit. It needs exec's i386 translation, the
   i686 ntdll, 32-bit TEBs and PEBs, `SysWOW64`, the registry's and file system's redirection, and every layer built
   for i686.
-- **ANSI and code pages:** every `*A` function through the same conversions.
+- **ANSI and code pages:** each `*A` function still to come is the `*W` with 1252 strings, as those there are.
 - **Manifests:** side-by-side assemblies and activation contexts decide which comctl32 a program gets.
-- **API sets:** the loader following `api-ms-win-*` and `ext-ms-*` to their DLL, as the scanner already does.
+- **API sets:** `ext-ms-*` sets, and the `api-ms-win-*` the map doesn't know yet, as programs ask.
 
 ### What real programs will ask for next
 
@@ -592,9 +762,8 @@ Installers, winget and large desktop apps go past the layers' first items, in ro
 2. **What ordinary programs use:** menus; real fonts and the rest of GDI, with `DrawTextExW`, `ScrollWindowEx` and
    Uniscribe; real icons and cursors; services; restricted tokens, job objects with limits, and desktops and window
    stations (a browser engine's sandbox); `msi.dll` with compound files written.
-3. **What's faked underneath:** `MsgWaitForMultipleObjects`; change notification; sharing modes; links and
-   junctions; `MoveFileEx` until reboot; transactions; windows across processes and `SetWindowsHookExW`; registry
-   notification, and the environment from the registry so what an installer sets reaches new processes; process
+3. **What's faked underneath:** `MsgWaitForMultipleObjects`; change notification; junctions; `MoveFileEx` until reboot; transactions; windows across processes and `SetWindowsHookExW`;
+   the environment from the registry so what an installer sets reaches new processes; process
    times, `GetProcessMemoryInfo`, and local time zones.
 4. **Packaging:** MSIX, app containers and package identity; WinRT activation.
 5. **Graphics, sound, video and input:** Direct3D (dxgi and d3d11, then d3d12 with DXBC and DXIL, d3d9, dcomp),
@@ -617,8 +786,8 @@ NTLM, and the x87 stack missing from a 32-bit `CONTEXT`.
   engine's sandboxed processes.
 
 The kernel's areas come first and are done. Then, each step ending with its tests passing on both ISAs: ntdll's
-foundation (the `Nt*` exports, `Rtl*`, the loader's lists, unloading and delay loads, API sets, the thread pool,
-FLS); 32-bit, while the layers are thin; the Win32 core's breadth (NLS, the console, every `*A`, advapi32's
+foundation (the `Nt*` exports, `Rtl*`; the loader's lists, unloading, delay loads, API sets, FLS, fibers and the
+thread pool are done); 32-bit, while the layers are thin; the Win32 core's breadth (NLS, the console, advapi32's
 services, the shell's core); the window kernel's breadth (bitmaps, fonts, regions, menus, dialogs, controls, icons,
 `MsgWaitForMultipleObjects`); the services; the runtimes, group by group; and the programs Windows ships.
 
@@ -630,17 +799,16 @@ services, the shell's core); the window kernel's breadth (bitmaps, fonts, region
   Windows does, so each kernel object has one entry point. The `Nt*` exports are needed either way.
 - **RPC between processes:** real ALPC under `rpcrt4`, or a host channel of atlas's own with `rpcrt4` and `combase`
   written to it.
-- **ucrtbase:** atlas's own (an OS DLL since Windows 10), or Microsoft's where a program brings one.
 - **Which Windows atlas is:** it reports Windows 10 22H2 (10.0.19045); Windows 11 would change manifests, API sets and
   what programs check for.
 - **Graphics APIs.** Direct3D, DXGI and OpenGL make thousands of calls a frame, and as `host` exports each would be
   an exit. Real drivers batch calls in the program and submit once a frame. atlas probably needs the same: record
   commands into a buffer in the program, and translate them to Metal or Vulkan host-side at `Present`. That's a
   second, small piece of code in the program. (Host exports, guest code, or a GPU protocol: not decided.)
-- **How much of the C runtime runs in the program.** `printf` and `strtod` are big and called often, while `fopen`
-  should trap. Measuring real programs should draw this line, not a guess made up front.
-
 Settled while building:
+
+- **ucrtbase** is atlas's own, as it's an OS DLL since Windows 10, and atlas's DLLs win; all of it runs in the
+  program, reaching kernel32's host exports by number for files.
 
 - **Where the registry is saved**: one file in the machine's own layer, `C:\Windows\System32\config\REGISTRY`, in
   atlas's own format. It goes with the machine and freezes into an image with it.

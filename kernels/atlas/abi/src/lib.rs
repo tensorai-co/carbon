@@ -15,6 +15,8 @@ pub mod call {
     pub const TRAP_AT: u64 = ATLAS_PAGE + 0x40;
 
     /// Calls `atlas-guest` makes, at the Nt level: one numbering for every ISA.
+    /// Ends the process: `(handle, code)`. With a handle of 0, as `RtlExitUserProcess` does first, it ends every
+    /// other thread instead, and returns once they're gone.
     pub const TERMINATE_PROCESS: u64 = 1;
     /// Maps a DLL, as the loader needs it: `(name, length, base_out, path_out)`. The name is ASCII, a bare file name
     /// or a Windows path. It's atlas's own, made for this ISA, or a file's, found as Windows would. atlas relocates it
@@ -37,6 +39,16 @@ pub mod call {
     pub const THREAD_STARTED: u64 = 11;
     /// `NtQuerySystemInformation(class, buffer, length, return_length)`: an NTSTATUS.
     pub const QUERY_SYSTEM_INFORMATION: u64 = 12;
+    /// Unmaps a DLL the loader has let go of: `(base, size)`. atlas's own DLLs stay.
+    pub const UNMAP_IMAGE: u64 = 13;
+    /// Whether this is the process's only thread: 1 or 0 (`ThreadAmILastThread`).
+    pub const LAST_THREAD: u64 = 14;
+    /// Starts a thread of this process at `start(parameter)`, through ntdll's thread start as `CreateThread`'s do:
+    /// `(start, parameter)`, giving 1, or 0 if it couldn't. The thread pool's workers.
+    pub const CREATE_THREAD: u64 = 15;
+    /// The call number of one of kernel32's host exports, by name: `(name, length)`, giving 0 if there's none. ntdll
+    /// calls it with that number as a program's stub would, with up to four arguments.
+    pub const EXPORT_NUMBER: u64 = 16;
 
     /// An upcall's callback has returned: this is the trap at the return address atlas gave it.
     pub const UPCALL_RETURN: u64 = 0xfff;
@@ -49,6 +61,7 @@ pub mod call {
 /// NTSTATUS values.
 pub mod status {
     pub const SUCCESS: u32 = 0;
+    pub const GUARD_PAGE_VIOLATION: u32 = 0x8000_0001;
     pub const BREAKPOINT: u32 = 0x8000_0003;
     pub const NOT_IMPLEMENTED: u32 = 0xc000_0002;
     pub const ACCESS_VIOLATION: u32 = 0xc000_0005;
@@ -59,6 +72,9 @@ pub mod status {
     pub const DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
     pub const INTEGER_DIVIDE_BY_ZERO: u32 = 0xc000_0094;
     pub const DLL_NOT_FOUND: u32 = 0xc000_0135;
+    pub const DLL_INIT_FAILED: u32 = 0xc000_0142;
+    pub const PROCEDURE_NOT_FOUND: u32 = 0xc000_007a;
+    pub const ORDINAL_NOT_FOUND: u32 = 0xc000_0138;
     pub const ENTRYPOINT_NOT_FOUND: u32 = 0xc000_0139;
     pub const STACK_OVERFLOW: u32 = 0xc000_00fd;
     pub const STACK_BUFFER_OVERRUN: u32 = 0xc000_0409;
@@ -110,6 +126,8 @@ pub mod teb {
     /// NT_TIB: the stack's top and bottom.
     pub const STACK_BASE: u64 = 0x08;
     pub const STACK_LIMIT: u64 = 0x10;
+    /// NT_TIB.FiberData: the fiber running on this thread, if it's been made a fiber.
+    pub const FIBER_DATA: u64 = 0x20;
     /// NT_TIB.Self: the TEB's own address.
     pub const SELF: u64 = 0x30;
     pub const CLIENT_ID: u64 = 0x40;
@@ -117,19 +135,27 @@ pub mod teb {
     pub const LAST_ERROR: u64 = 0x68;
     /// The array of each module's static TLS block.
     pub const THREAD_LOCAL_STORAGE: u64 = 0x58;
+    /// DeallocationStack: the bottom of the stack's reservation, below its guard pages.
+    pub const DEALLOCATION_STACK: u64 = 0x1478;
     /// `TlsAlloc`'s 64 slots.
     pub const TLS_SLOTS: u64 = 0x1480;
     /// FlsData: a block of `FlsAlloc`'s slots, made when first wanted.
     pub const FLS_DATA: u64 = 0x17c8;
+    /// SameTebFlags, a u16; `HasFiberData` (4) says the thread is a fiber.
+    pub const SAME_TEB_FLAGS: u64 = 0x17ee;
     /// atlas-guest's own: the exception dispatch in progress on this thread. Past the TEB's end; atlas gives every TEB
     /// room for it.
     pub const ATLAS_DISPATCH: u64 = 0x1900;
+    /// atlas-guest's own: the C runtime's `errno` for this thread.
+    pub const ATLAS_ERRNO: u64 = 0x1908;
     pub const SIZE: u64 = 0x1838;
 }
 
 /// Where things are in a 64-bit PEB.
 pub mod peb {
     pub const IMAGE_BASE: u64 = 0x10;
+    /// PEB_LDR_DATA: the loader's three lists of modules, which ntdll keeps and programs walk.
+    pub const LDR: u64 = 0x18;
     pub const PROCESS_PARAMETERS: u64 = 0x20;
     pub const PROCESS_HEAP: u64 = 0x30;
     pub const NUMBER_OF_PROCESSORS: u64 = 0xb8;
@@ -145,6 +171,44 @@ pub mod peb {
     pub const SIZE: u64 = 0x7c8;
 }
 
+/// The loader's structures, 64-bit: PEB_LDR_DATA, and an LDR_DATA_TABLE_ENTRY for each module, as Windows 10 has them.
+pub mod ldr {
+    pub const DATA_SIZE: u64 = 0x58;
+    pub const DATA_INITIALIZED: u64 = 0x04;
+    /// Three LIST_ENTRY heads: load order, memory order, initialization order.
+    pub const IN_LOAD_ORDER: u64 = 0x10;
+    pub const IN_MEMORY_ORDER: u64 = 0x20;
+    pub const IN_INITIALIZATION_ORDER: u64 = 0x30;
+    pub const DATA_SHUTDOWN_IN_PROGRESS: u64 = 0x48;
+
+    pub const ENTRY_SIZE: u64 = 0x120;
+    /// An entry's links into each list.
+    pub const LOAD_LINKS: u64 = 0x00;
+    pub const MEMORY_LINKS: u64 = 0x10;
+    pub const INITIALIZATION_LINKS: u64 = 0x20;
+    pub const DLL_BASE: u64 = 0x30;
+    pub const ENTRY_POINT: u64 = 0x38;
+    pub const SIZE_OF_IMAGE: u64 = 0x40;
+    /// UNICODE_STRINGs.
+    pub const FULL_DLL_NAME: u64 = 0x48;
+    pub const BASE_DLL_NAME: u64 = 0x58;
+    pub const FLAGS: u64 = 0x68;
+    pub const OBSOLETE_LOAD_COUNT: u64 = 0x6c;
+    pub const TLS_INDEX: u64 = 0x6e;
+    pub const TIME_DATE_STAMP: u64 = 0x80;
+    pub const ORIGINAL_BASE: u64 = 0xf8;
+    pub const LOAD_REASON: u64 = 0x10c;
+    pub const REFERENCE_COUNT: u64 = 0x114;
+
+    /// Flags: an image that's a DLL; its DllMain ran; its DllMain had DLL_PROCESS_ATTACH.
+    pub const IMAGE_DLL: u32 = 0x4;
+    pub const ENTRY_PROCESSED: u32 = 0x4000;
+    pub const PROCESS_ATTACH_CALLED: u32 = 0x8_0000;
+    /// LDR_DLL_LOAD_REASON: a static import, or `LoadLibrary`.
+    pub const REASON_STATIC: u32 = 0;
+    pub const REASON_DYNAMIC: u32 = 4;
+}
+
 /// Where things are in 64-bit RTL_USER_PROCESS_PARAMETERS. Each is a UNICODE_STRING: lengths, then a pointer.
 pub mod params {
     pub const STANDARD_INPUT: u64 = 0x20;
@@ -158,4 +222,26 @@ pub mod params {
     /// Its size, in bytes.
     pub const ENVIRONMENT_SIZE: u64 = 0x3f0;
     pub const SIZE: u64 = 0x440;
+}
+
+/// Windows-1252, the ANSI code page atlas's `*A` functions speak (`GetACP`), both ways. Its 0x80 to 0x9F aren't
+/// Latin-1's; the bytes Windows leaves unassigned there stand for the C1 controls, as `MultiByteToWideChar` has them.
+pub mod ansi {
+    const HIGH: [u16; 32] = [
+        0x20ac, 0x0081, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021, 0x02c6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008d, 0x017d, 0x008f,
+        0x0090, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014, 0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0x009d, 0x017e, 0x0178,
+    ];
+
+    /// A byte of Windows-1252 as UTF-16.
+    pub fn from_1252(b: u8) -> u16 {
+        if (0x80..0xa0).contains(&b) { HIGH[(b - 0x80) as usize] } else { u16::from(b) }
+    }
+
+    /// A UTF-16 unit as Windows-1252, if it has it.
+    pub fn to_1252(u: u16) -> Option<u8> {
+        match u {
+            0..0x80 | 0xa0..0x100 => Some(u as u8),
+            _ => HIGH.iter().position(|&h| h == u).map(|i| 0x80 + i as u8),
+        }
+    }
 }
