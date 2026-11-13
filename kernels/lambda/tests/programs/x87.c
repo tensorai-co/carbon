@@ -4,7 +4,7 @@
 typedef unsigned char u8;
 typedef long long i64;
 #ifdef __APPLE__
-/* Also an x86-64 macOS program, to check the answers on a real x87 (Rosetta 2's). */
+/* Also an x86-64 macOS program, to check the answers on a real x87 (macOS's own x86-64 translation). */
 #include <stdlib.h>
 #include <unistd.h>
 static void say(const char *s) { int n = 0; while (s[n]) n++; write(1, s, n); }

@@ -107,7 +107,7 @@ cases = []
 
 
 def case(name, inputs, code, want, reference=True):
-    """`reference`: whether Rosetta 2's x87 runs it too (it hasn't the undocumented `ffreep`)."""
+    """`reference`: whether macOS's own x86-64 translation runs it too (it hasn't the undocumented `ffreep`)."""
     cases.append((name, bytes(inputs), code, list(want), reference))
 
 
@@ -275,7 +275,7 @@ case("fcmovu after an unordered fucomi", d(math.nan) + d(5) + d(1),
 
 # The control and status words, and the environment.
 case("fldcw, fnstcw", u16(0xF7F) + u16(0x37F), fldcw(0) + fnstcw(0) + fldcw(2) + fnstcw(2), u16(0xF7F) + u16(0x37F))
-# Intel's manual says fnstenv masks every exception after storing (glibc's feholdexcept counts on it); Rosetta 2's
+# Intel's manual says fnstenv masks every exception after storing (glibc's feholdexcept counts on it); macOS's own translation
 # doesn't, so the control word just after isn't compared. exec's translator masks them.
 case("fnstenv, fldenv", u16(0xE40) + u16(0x37F),
      [0xDB, 0xE2] + fldcw(0) + mem(0xD9, 6, RSI, 0) + fnstcw(28) + mem(0xD9, 4, RSI, 0) + fnstcw(30) + fldcw(2),
@@ -304,7 +304,7 @@ w("")
 w("typedef unsigned char u8;")
 w("typedef long long i64;")
 w("#ifdef __APPLE__")
-w("/* Also an x86-64 macOS program, to check the answers on a real x87 (Rosetta 2's). */")
+w("/* Also an x86-64 macOS program, to check the answers on a real x87 (macOS's own x86-64 translation). */")
 w("#include <stdlib.h>")
 w("#include <unistd.h>")
 w("static void say(const char *s) { int n = 0; while (s[n]) n++; write(1, s, n); }")
