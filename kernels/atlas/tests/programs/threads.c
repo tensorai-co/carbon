@@ -6,6 +6,11 @@
 // condition variable; WaitOnAddress; InitOnceExecuteOnce from four threads; CREATE_SUSPENDED and ResumeThread;
 // QueueUserAPC and an alertable SleepEx; named events; TerminateThread; ExitThread; DuplicateHandle of a pseudo-handle
 
+// x86's thread-local variables are found through fs:[__tls_array], which the C runtime defines as 0x2c, the TEB's
+// ThreadLocalStoragePointer; there's none here.
+#if defined(__i386__)
+__asm__(".globl __tls_array\n.set __tls_array, 0x2c");
+#endif
 typedef __INTPTR_TYPE__ LONG_PTR;
 typedef __UINTPTR_TYPE__ ULONG_PTR;
 typedef __SIZE_TYPE__ SIZE_T;

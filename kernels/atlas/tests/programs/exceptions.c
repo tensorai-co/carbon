@@ -27,9 +27,9 @@ __declspec(dllimport) HANDLE __stdcall CreateThread(void *, SIZE_T, DWORD (__std
 __declspec(dllimport) DWORD __stdcall WaitForSingleObject(HANDLE, DWORD);
 __declspec(dllimport) int __stdcall GetExitCodeThread(HANDLE, DWORD *);
 
-typedef struct { DWORD code, flags; u64 record, address; DWORD count, pad; u64 information[15]; } RECORD;
+typedef struct { DWORD code, flags; ULONG_PTR record, address; DWORD count; ULONG_PTR information[15]; } RECORD;
 typedef struct { RECORD *record; void *context; } POINTERS;
-typedef struct { u64 base, allocation_base; DWORD allocation_protect, pad; u64 size; DWORD state, protect, type, pad2; } MBI;
+typedef struct { ULONG_PTR base, allocation_base; DWORD allocation_protect; SIZE_T size; DWORD state, protect, type; } MBI;
 
 static HANDLE out;
 static int failures;
@@ -64,7 +64,7 @@ static long __stdcall commit(POINTERS *p) {
     char *at = (char *)p->record->information[1];
     if (p->record->code != 0xC0000005 || at < lazy || at >= lazy + 0x10000) return 0;
     committed = committed + 1;
-    VirtualAlloc((void *)((u64)at & ~0xfffull), 0x1000, 0x1000, 4);
+    VirtualAlloc((void *)((ULONG_PTR)at & ~(ULONG_PTR)0xfff), 0x1000, 0x1000, 4);
     return -1;
 }
 

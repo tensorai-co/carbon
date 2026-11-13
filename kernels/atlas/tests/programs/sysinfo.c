@@ -12,6 +12,8 @@
 //   a suspended child, its parent and its threads), both handle lists (an event's handle and its duplicate, the same
 //   object), the kernel's modules, the debugger, and the lengths it wants; and GetSystemTimes.
 
+typedef __UINTPTR_TYPE__ ULONG_PTR;
+typedef __SIZE_TYPE__ SIZE_T;
 typedef void *HANDLE;
 typedef unsigned int DWORD;
 typedef unsigned short WORD;
@@ -38,7 +40,7 @@ typedef struct {
     WORD architecture, reserved;
     DWORD page_size;
     void *minimum, *maximum;
-    u64 active_mask;
+    ULONG_PTR active_mask;
     DWORD processors, processor_type, granularity;
     WORD level, revision;
 } SYSTEM_INFO;

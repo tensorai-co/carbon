@@ -9,6 +9,11 @@
 // too; RaiseException with a filter; __finally during an unwind and on a normal exit; EXCEPTION_CONTINUE_EXECUTION;
 // integer divide by zero (x86-64); and, as it ends, DLL_PROCESS_DETACH
 
+// x86's thread-local variables are found through fs:[__tls_array], which the C runtime defines as 0x2c, the TEB's
+// ThreadLocalStoragePointer; there's none here.
+#if defined(__i386__)
+__asm__(".globl __tls_array\n.set __tls_array, 0x2c");
+#endif
 typedef __INTPTR_TYPE__ LONG_PTR;
 typedef __UINTPTR_TYPE__ ULONG_PTR;
 typedef __SIZE_TYPE__ SIZE_T;
@@ -34,8 +39,9 @@ __declspec(dllimport) DWORD __stdcall WaitForSingleObject(HANDLE, DWORD);
 __declspec(dllimport) int __stdcall CloseHandle(HANDLE);
 __declspec(dllimport) void *__stdcall ResolveDelayLoadedAPI(void *, const void *, void *, void *, void **, DWORD);
 
-typedef struct { unsigned short length, max; unsigned pad; const WCHAR *buffer; } USTR;
-typedef struct { unsigned short length, max; unsigned pad; const char *buffer; } ASTR;
+// UNICODE_STRING and ANSI_STRING: two lengths, then the buffer, aligned to a pointer.
+typedef struct { unsigned short length, max; const WCHAR *buffer; } USTR;
+typedef struct { unsigned short length, max; const char *buffer; } ASTR;
 __declspec(dllimport) int __stdcall LdrGetDllHandle(void *, void *, const USTR *, HANDLE *);
 __declspec(dllimport) int __stdcall LdrGetProcedureAddress(HANDLE, const ASTR *, DWORD, void **);
 __declspec(dllimport) int __stdcall LdrRegisterDllNotification(DWORD, void *, void *, void **);
@@ -50,22 +56,31 @@ __declspec(dllimport) int square(int);
 
 // The delay-load helper MSVC's delayimp.lib has, as Windows' own DLLs have it: everything is ResolveDelayLoadedAPI.
 extern char __ImageBase;
-void *__delayLoadHelper2(const void *descriptor, void **thunk) { return ResolveDelayLoadedAPI(&__ImageBase, descriptor, 0, 0, thunk, 0); }
+void *__stdcall __delayLoadHelper2(const void *descriptor, void **thunk) { return ResolveDelayLoadedAPI(&__ImageBase, descriptor, 0, 0, thunk, 0); }
 
 // The PEB's lists: an LDR_DATA_TABLE_ENTRY's three links, then its base, entry point, size and names.
 typedef struct LIST { struct LIST *next, *prev; } LIST;
-typedef struct { LIST load, memory, init; void *base, *entry; DWORD size, pad; USTR full, name; } ENTRY;
+typedef struct { LIST load, memory, init; void *base, *entry; DWORD size; USTR full, name; } ENTRY;
+// The PEB's lists of modules: the TEB's PEB, its PEB_LDR_DATA, and the three LIST_ENTRY heads in it, each two
+// pointers wide, as an entry's links are.
 static LIST *ldr_list(int which) {
     char *teb;
 #if defined(__aarch64__)
     __asm__ volatile("mov %0, x18" : "=r"(teb));
+    char *peb = *(char **)(teb + 0x60), *ldr = *(char **)(peb + 0x18);
+    char *heads = ldr + 0x10;
+#elif defined(__i386__)
+    __asm__ volatile("mov %%fs:0x18, %0" : "=r"(teb));
+    char *peb = *(char **)(teb + 0x30), *ldr = *(char **)(peb + 0x0c);
+    char *heads = ldr + 0x0c;
 #else
     __asm__ volatile("mov %%gs:0x30, %0" : "=r"(teb));
-#endif
     char *peb = *(char **)(teb + 0x60), *ldr = *(char **)(peb + 0x18);
-    return (LIST *)(ldr + 0x10 + which * 0x10);
+    char *heads = ldr + 0x10;
+#endif
+    return (LIST *)heads + which;
 }
-static ENTRY *entry_of(LIST *links, int which) { return (ENTRY *)((char *)links - which * 0x10); }
+static ENTRY *entry_of(LIST *links, int which) { return (ENTRY *)(links - which); }
 static int named(const USTR *s, const char *want) {
     unsigned n = s->length / 2, i = 0;
     for (; i < n && want[i]; i++) {
@@ -201,8 +216,8 @@ void mainCRTStartup(void) {
     check(set && set == GetModuleHandleA("kernel32.dll") && GetProcAddress(set, "Sleep"), "an API set is its DLL");
 
     static const WCHAR wide[] = {'M', 'y', 'L', 'i', 'b', '.', 'd', 'l', 'l'};
-    USTR lib_name = {sizeof wide, sizeof wide, 0, wide};
-    ASTR add_name = {3, 3, 0, "addXX"};
+    USTR lib_name = {sizeof wide, sizeof wide, wide};
+    ASTR add_name = {3, 3, "addXX"};
     HANDLE by_ldr = 0;
     void *add_at = 0;
     check(LdrGetDllHandle(0, 0, &lib_name, &by_ldr) == 0 && by_ldr == lib, "LdrGetDllHandle");

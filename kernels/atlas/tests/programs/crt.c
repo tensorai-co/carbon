@@ -72,7 +72,7 @@ I char ***__p___argv(void);
 #define ERANGE 34
 #define EOF (-1)
 #define stdout __acrt_iob_func(1)
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(__i386__)
 // MSVC's linker wants it wherever floating point is used; a program's C runtime would define it.
 int _fltused = 0;
 #endif
@@ -142,7 +142,9 @@ int run(int argc, char **argv) {
     check(fmt_is("3.142     2.50 2.50    | 1.234568e+04 1.230000E-04", "%.3f %8.2f %-8.2f| %e %E", 3.14159, 2.5, 2.5, 12345.678, 0.000123), "  %f and %e");
     check(fmt_is("100000 1e+06 1e-05 0.0001 0.5 2.50000", "%g %g %g %g %g %#g", 100000.0, 1000000.0, 0.00001, 0.0001, 0.5, 2.5), "  %g");
     check(fmt_is("hello|hel|     hello|hello     |", "%s|%.3s|%10s|%-10s|", "hello", "hello", "hello", "hello"), "  strings, cut and padded");
-    check(fmt_is("ab% 0000000000001234 wide (null)", "%c%c%% %p %ls %s", 'a', 'b', (void *)0x1234, L"wide", (char *)0), "  %c, %%, %p, a wide string and a null one");
+    // %p is a pointer's width in hex digits: 16, or 8 in a 32-bit program.
+    check(fmt_is(sizeof(void *) == 8 ? "ab% 0000000000001234 wide (null)" : "ab% 00001234 wide (null)", "%c%c%% %p %ls %s", 'a', 'b', (void *)0x1234, L"wide", (char *)0),
+          "  %c, %%, %p, a wide string and a null one");
     check(fmt_is("     7|1.00|-0003", "%*d|%.*f|%05d", 6, 7, 2, 1.0, -3), "  * for width and precision; zeros after the sign");
     check(fmt_is("inf -inf nan", "%f %f %f", 1.0 / 0.0, -1.0 / 0.0, 0.0 / 0.0), "  inf and nan");
     check(FMT(b, 5, "%s", "abcdefgh") == 8 && strcmp(b, "abcd") == 0, "snprintf: cut to fit, terminated, the whole length given");

@@ -203,3 +203,136 @@ core::arch::global_asm!(
     "call \"_AtlasUnwindFrom@20\"",
     "ud2",
 );
+
+// ---- `_except_handler3`: the handler MSVC's and clang's `__try` register on x86 ----
+
+/// The registration `__try` makes: the chain's link and handler, then its scope table and the try level it's in.
+/// Below it, the function keeps its stack pointer (at -8) and, while a filter runs, the EXCEPTION_POINTERS (at -4).
+#[repr(C)]
+struct Eh3Registration {
+    next: *mut Registration,
+    handler: usize,
+    scope_table: *const ScopeEntry,
+    try_level: i32,
+}
+
+/// One `__try`'s entry: the level it's nested in, its filter (null for a `__finally`), and its handler (the
+/// `__except` block, or the `__finally` funclet).
+#[repr(C)]
+struct ScopeEntry {
+    previous: i32,
+    filter: usize,
+    handler: usize,
+}
+
+/// The frame pointer filters, handlers and `__finally` funclets expect: the registration's address and 16, as
+/// MSVC's frame has its own ebp just above the registration.
+fn frame_ebp(frame: *mut Eh3Registration) -> usize {
+    frame as usize + 0x10
+}
+
+unsafe extern "C" {
+    /// Calls `f` with ebp set to `ebp`, giving its result.
+    fn atlas_call_with_ebp(f: usize, ebp: usize) -> u32;
+    /// Jumps to `target` with ebp set to `ebp`: an `__except` block, which sets its own stack.
+    fn atlas_jump_with_ebp(target: usize, ebp: usize) -> !;
+}
+
+core::arch::global_asm!(
+    ".globl _atlas_call_with_ebp",
+    "_atlas_call_with_ebp:",
+    "push ebp",
+    "push ebx",
+    "push esi",
+    "push edi",
+    "mov eax, [esp + 20]",
+    "mov ebp, [esp + 24]",
+    "call eax",
+    "pop edi",
+    "pop esi",
+    "pop ebx",
+    "pop ebp",
+    "ret",
+    "",
+    ".globl _atlas_jump_with_ebp",
+    "_atlas_jump_with_ebp:",
+    "mov eax, [esp + 4]",
+    "mov ebp, [esp + 8]",
+    "jmp eax",
+);
+
+/// Runs the `__finally` blocks of a frame from its current try level out to `stop`, each level taken off first, so a
+/// block that raises isn't run again.
+unsafe fn local_unwind(frame: *mut Eh3Registration, stop: i32) {
+    // SAFETY: the registration and its scope table, as the caller says.
+    unsafe {
+        for _ in 0..MOST_FRAMES {
+            let level = (*frame).try_level;
+            if level == -1 || level == stop {
+                break;
+            }
+            let entry = &*(*frame).scope_table.add(level as usize);
+            (*frame).try_level = entry.previous;
+            if entry.filter == 0 {
+                atlas_call_with_ebp(entry.handler, frame_ebp(frame));
+            }
+        }
+    }
+}
+
+/// `_local_unwind2(frame, stop)`, as MSVC's runtime exports it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _local_unwind2(frame: *mut Registration, stop: i32) {
+    // SAFETY: a `__try` frame of the caller's.
+    unsafe { local_unwind(frame.cast(), stop) }
+}
+
+/// `_except_handler3(record, frame, context, dispatcher)`: asked about an exception, it tries each `__try` around where
+/// it happened, innermost first: a filter that says to carry on, carries on; one that takes it has every frame
+/// above unwound (`RtlUnwind`), then the `__finally` blocks inside its own, then its `__except` block runs. Asked
+/// while unwinding, it runs the frame's `__finally` blocks.
+///
+/// # Safety
+///
+/// Called by the dispatcher with a registration `__try` made.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _except_handler3(record: *mut Record, frame: *mut Registration, context: *mut Context, _dispatcher: *mut c_void) -> u32 {
+    const EXECUTE_HANDLER: u32 = 1;
+    const CONTINUE_EXECUTION_FILTER: u32 = u32::MAX;
+    let frame: *mut Eh3Registration = frame.cast();
+    // SAFETY: the dispatcher's record and context, and the frame's registration and scope table.
+    unsafe {
+        if (*record).flags & (UNWINDING | EXIT_UNWIND) != 0 {
+            local_unwind(frame, -1);
+            return CONTINUE_SEARCH;
+        }
+        // EXCEPTION_POINTERS, where the filter's `GetExceptionInformation()` finds them.
+        let mut pointers = [record as usize, context as usize];
+        (frame as *mut usize).sub(1).write(pointers.as_mut_ptr() as usize);
+        let mut level = (*frame).try_level;
+        for _ in 0..MOST_FRAMES {
+            if level == -1 {
+                break;
+            }
+            let entry = &*(*frame).scope_table.add(level as usize);
+            if entry.filter != 0 {
+                match atlas_call_with_ebp(entry.filter, frame_ebp(frame)) {
+                    CONTINUE_EXECUTION_FILTER => return CONTINUE_EXECUTION,
+                    EXECUTE_HANDLER => {
+                        RtlUnwind(frame.cast(), core::ptr::null_mut(), record, core::ptr::null_mut());
+                        local_unwind(frame, level);
+                        (*frame).try_level = entry.previous;
+                        atlas_jump_with_ebp(entry.handler, frame_ebp(frame));
+                    }
+                    _ => {}
+                }
+            }
+            level = entry.previous;
+        }
+        CONTINUE_SEARCH
+    }
+}
+
+unsafe extern "system" {
+    fn RtlUnwind(target_frame: *mut Registration, target_ip: *mut c_void, record: *mut Record, return_value: *mut c_void);
+}

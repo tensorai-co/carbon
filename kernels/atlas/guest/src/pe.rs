@@ -3,6 +3,8 @@
 
 /// The size of a pointer, a handle or a SIZE_T in this ISA, in bytes.
 pub const PTR: u64 = size_of::<usize>() as u64;
+/// INVALID_HANDLE_VALUE (-1), as a handle the program or atlas gives here reads: pointer-sized, so 0xffffffff on x86.
+pub const INVALID_HANDLE: u64 = usize::MAX as u64;
 /// An import thunk's bit that says it's by ordinal: the top one.
 pub const ORDINAL: u64 = 1 << (PTR * 8 - 1);
 

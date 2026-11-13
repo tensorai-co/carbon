@@ -5,7 +5,7 @@ declaration made into a PE in memory, so a machine has no Windows files to insta
 has to run inside the program, ntdll, is a crate (`guest/`) that cargo builds for each ISA and embeds.
 
 **Where it stands.** Programs run on ARM64 natively and x86-64 translated, and 32-bit x86 programs run too (WoW64,
-translated on Apple silicon; phases 1 to 5 of its six, below, are done): 15 of the test programs pass every check as
+translated on Apple silicon; phases 1 to 5 of its six, below, are done): 22 of the test programs pass every check as
 32-bit programs, with x86's own SEH, PE32 images and 32-bit layouts throughout. They have the loader and SEH, threads and
 waits, processes, anonymous and named pipes, sections, asynchronous I/O and completion ports, files, the registry,
 security (tokens, descriptors, access checks, impersonation), resources and version information, the system's
@@ -807,12 +807,11 @@ First `cmd.exe` (variables, `if`, `for`, `goto`, `call`, pipes, redirection, `.b
      whatever its parent's said: PROCESSOR_ARCHITECTURE (x86, with PROCESSOR_ARCHITEW6432 AMD64), ProgramFiles and
      CommonProgramFiles (the (x86) folders for a 32-bit program). 32-bit and 64-bit programs start each other.
      `carbon run` knows a 32-bit `.exe` (platform `windows/386`), and gives it x86's memory ordering.
-  6. [ ] **Every test program for i686**, passing; then an NSIS installer built from source, then Steam's. `build.sh`
-     builds i686 programs with import libraries made from what each object imports (x86's `_Name@N` names). 15 run
-     and pass every check (538): `wow64.c`, files, io, pipes, process, sections, registry, links, environment,
-     security, pool, windows, desktop, ansiwin and resources, their pointer-sized types declared as such. Still to
-     come: threads and loader (`__tls_array` and their own DLLs for i686), fibers and exceptions (`__try` needs
-     `_except_handler3`, the C runtime's), crt, ansi, sysinfo and hello.
+  6. [ ] **Every test program for i686**, passing; then real installers, Steam's first. Every test program but
+     `sysinfo.c` (whose checks are 64-bit offsets; `wow64.c` checks the same calls at 32 bits) builds for i686 and
+     passes every check: 22 programs, 725 checks, with the loader's own DLLs, thread-local variables
+     (`__tls_array`), `__try` through `_except_handler3` (now in the i686 ntdll, with `_local_unwind2`), and the C
+     runtime. `build.sh` makes each program's import libraries from what its object imports, `__imp_` or not.
 - **ANSI and code pages:** each `*A` function still to come is the `*W` with 1252 strings, as those there are.
 - **Manifests:** side-by-side assemblies and activation contexts decide which comctl32 a program gets.
 - **API sets:** `ext-ms-*` sets, and the `api-ms-win-*` the map doesn't know yet, as programs ask.

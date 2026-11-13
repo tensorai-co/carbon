@@ -48,10 +48,14 @@ static void *current_fiber(void) {
     char *teb;
 #if defined(__aarch64__)
     __asm__ volatile("mov %0, x18" : "=r"(teb));
+    return *(void **)(teb + 0x20);
+#elif defined(__i386__)
+    __asm__ volatile("mov %%fs:0x18, %0" : "=r"(teb));
+    return *(void **)(teb + 0x10);
 #else
     __asm__ volatile("mov %%gs:0x30, %0" : "=r"(teb));
-#endif
     return *(void **)(teb + 0x20);
+#endif
 }
 static void *fiber_data(void) { return *(void **)current_fiber(); }
 

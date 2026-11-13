@@ -1027,7 +1027,7 @@ pub extern "system" fn AtlasUnregisterWaitEx(wait: usize, event: usize) -> i32 {
         wait_callbacks(object, true);
     }
     close(object);
-    if event != 0 && event != u64::MAX {
+    if event != 0 && event != crate::pe::INVALID_HANDLE {
         set_event(event);
     }
     1
@@ -1048,7 +1048,7 @@ fn io_port() -> u64 {
     if port != 0 {
         return port;
     }
-    let made = create_io_completion_port(u64::MAX, 0, 0, 0);
+    let made = create_io_completion_port(crate::pe::INVALID_HANDLE, 0, 0, 0);
     if made == 0 {
         return 0;
     }
@@ -1225,7 +1225,7 @@ fn delete_queue_timer(timer: *mut Object, event: u64) {
         wait_callbacks(timer, true);
     }
     close(timer);
-    if event != 0 && event != u64::MAX {
+    if event != 0 && event != crate::pe::INVALID_HANDLE {
         set_event(event);
     }
 }
@@ -1257,10 +1257,10 @@ pub extern "system" fn AtlasDeleteTimerQueueEx(queue: usize, event: usize) -> i3
         if next.is_null() {
             break;
         }
-        delete_queue_timer(next, if event == 0 { 0 } else { u64::MAX });
+        delete_queue_timer(next, if event == 0 { 0 } else { crate::pe::INVALID_HANDLE });
     }
     free(queue);
-    if event != 0 && event != u64::MAX {
+    if event != 0 && event != crate::pe::INVALID_HANDLE {
         set_event(event);
     }
     1

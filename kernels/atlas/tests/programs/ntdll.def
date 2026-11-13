@@ -8,3 +8,5 @@ LdrGetDllHandle
 LdrGetProcedureAddress
 LdrRegisterDllNotification
 LdrUnregisterDllNotification
+_except_handler3
+_local_unwind2

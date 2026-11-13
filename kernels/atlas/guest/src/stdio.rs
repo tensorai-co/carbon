@@ -203,7 +203,7 @@ pub unsafe extern "C" fn AtlasCrtFopen(name: *const u8, mode: *const u8) -> *mut
     };
     let access = if read { GENERIC_READ } else { 0 } | if write { GENERIC_WRITE } else { 0 };
     let handle = create_file_a(name as u64, access, 3, 0, disposition, 0x80, 0);
-    if handle == u64::MAX || handle == 0 {
+    if handle == crate::pe::INVALID_HANDLE || handle == 0 {
         // ENOENT, EEXIST, EACCES, as the error was.
         crate::crt::set_errno(match crate::RtlGetLastWin32Error() {
             2 | 3 => 2,

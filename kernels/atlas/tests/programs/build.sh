@@ -59,38 +59,69 @@ if command -v x86_64-w64-mingw32-gcc >/dev/null; then
 fi
 
 # 32-bit x86 (WoW64). x86's imports are stdcall names, `_Name@N`, whose N (the bytes of arguments) the .def files
-# don't say: each program's object says which it imports, and each goes in an import library for the DLL whose .def
-# has it, decorated, with `-k` so the DLL's own name is the plain one, as on Windows.
+# don't say: each program's object says which it imports (through `__imp_`, or directly, as `__try`'s
+# `_except_handler3`), and each goes in an import library for the system DLL whose .def has it, decorated, with `-k`
+# so the DLL's own name is the plain one, as on Windows. The test DLLs' own import libraries come from linking them.
+cc32="$llvm/clang --target=i686-pc-windows-msvc -nostdlib -ffreestanding -fno-builtin -fno-stack-protector -O2 -fuse-ld=lld"
+system_dlls="kernel32 user32 ntdll advapi32 gdi32 shell32 version ucrtbase"
+# The system import libraries an object needs: i686_imports object folder, printing the libraries.
+i686_imports() {
+    obj=$1
+    tmp=$2
+    for sym in $("$llvm/llvm-nm" -u "$obj" | awk '{print $2}'); do
+        imp=${sym#__imp_}
+        imp=${imp#_}
+        for dll in $system_dlls; do
+            line=$(grep -E "^${imp%@*}( DATA)?\$" "$dll.def" | head -1)
+            if [ -n "$line" ]; then
+                [ -f "$tmp/$dll.def" ] || head -2 "$dll.def" > "$tmp/$dll.def"
+                grep -qx "$imp${line#${imp%@*}}" "$tmp/$dll.def" || echo "$imp${line#${imp%@*}}" >> "$tmp/$dll.def"
+                break
+            fi
+        done
+    done
+    for def in "$tmp"/*.def; do
+        [ -e "$def" ] || continue
+        "$llvm/llvm-dlltool" -m i386 -k -d "$def" -l "${def%.def}.lib"
+        echo "${def%.def}.lib"
+    done
+}
+# A program: i686 source.c out.exe [more to link].
 i686() {
     src=$1
     exe=$2
     shift 2
     tmp=$(mktemp -d)
-    cc32="$llvm/clang --target=i686-pc-windows-msvc -nostdlib -ffreestanding -fno-builtin -fno-stack-protector -O2 -fuse-ld=lld"
     $cc32 -c "$src" -o "$tmp/prog.o"
-    for imp in $("$llvm/llvm-nm" -u "$tmp/prog.o" | awk '{print $2}' | sed -n 's/^__imp__//p'); do
-        for def in *.def; do
-            if grep -qx "${imp%@*}" "$def"; then
-                [ -f "$tmp/$def" ] || head -2 "$def" > "$tmp/$def"
-                echo "$imp" >> "$tmp/$def"
-                break
-            fi
-        done
-    done
-    libs=""
-    for def in "$tmp"/*.def; do
-        [ -e "$def" ] || continue
-        "$llvm/llvm-dlltool" -m i386 -k -d "$def" -l "${def%.def}.lib"
-        libs="$libs ${def%.def}.lib"
-    done
+    libs=$(i686_imports "$tmp/prog.o" "$tmp")
     # shellcheck disable=SC2086
     $cc32 "$tmp/prog.o" $libs -Wl,/entry:mainCRTStartup -Wl,/subsystem:console "$@" -o "$exe"
     rm -rf "$tmp"
 }
+# A DLL, with its .def and its import library beside it: i686dll source.c out.dll [more to link].
+i686dll() {
+    src=$1
+    dll=$2
+    shift 2
+    tmp=$(mktemp -d)
+    $cc32 -c "$src" -o "$tmp/dll.o"
+    libs=$(i686_imports "$tmp/dll.o" "$tmp")
+    # shellcheck disable=SC2086
+    $cc32 -shared "$tmp/dll.o" $libs -Wl,/entry:DllMain -Wl,/def:"${src%.c}.def" "$@" -o "$dll"
+    rm -rf "$tmp"
+}
 mkdir -p "$out/loader-i686"
-for prog in wow64 files io pipes process sections registry links environment security pool windows desktop ansiwin; do
+for prog in wow64 files io pipes process sections registry links environment security pool windows desktop ansiwin exceptions fibers crt ansi hello; do
     i686 $prog.c "$out/loader-i686/$prog.exe" || echo "i686: $prog.c doesn't build"
 done
+# The loader's DLLs, as the 64-bit ones are made.
+o="$out/loader-i686"
+i686dll mylib.c "$o/mylib.dll" -Wl,/base:0x400000 || echo "i686: mylib.c doesn't build"
+i686dll mylib2.c "$o/mylib2.dll" || echo "i686: mylib2.c doesn't build"
+i686dll mylib3.c "$o/mylib3.dll" "$o/mylib2.lib" || echo "i686: mylib3.c doesn't build"
+i686dll mylib4.c "$o/mylib4.dll" || echo "i686: mylib4.c doesn't build"
+i686 loader.c "$o/loader.exe" -Wl,/delayload:mylib4.dll "$o/mylib.lib" "$o/mylib4.lib" || echo "i686: loader.c doesn't build"
+i686 threads.c "$o/threads.exe" "$o/mylib.lib" || echo "i686: threads.c doesn't build"
 # wow64.exe's 64-bit partner, beside it: a 32-bit program starting a 64-bit one, which starts a 32-bit one.
 "$llvm/clang" --target=x86_64-pc-windows-msvc -nostdlib -ffreestanding -fno-builtin -fno-stack-protector -O2 -fuse-ld=lld \
     -Wl,/entry:mainCRTStartup -Wl,/subsystem:console wowchild.c "$out/kernel32-x86_64.lib" -o "$out/loader-i686/wowchild.exe"
