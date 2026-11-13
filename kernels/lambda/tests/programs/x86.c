@@ -1,5 +1,5 @@
 // General-purpose x86-64 instructions the translator learned from real programs: 8- and 16-bit rotates, multiplies
-// and divides, locked bit tests and bit tests on memory, and fxsave/fxrstor. Each runs in inline assembly on values
+// and divides, locked bit tests and bit tests on memory, fxsave/fxrstor, and the string instructions. Each runs in inline assembly on values
 // the compiler can't see, and is checked against what the compiler works out from the same constants, so it passes
 // on real x86 hardware too. x86-64 only. Built like hello.c.
 
@@ -173,6 +173,66 @@ void cmain(i64 *sp) {
         check(*(u64 *)(image + 32) == 0x8000000000000000ul && *(u16 *)(image + 40) == 0x3ffe, "fxsave: ST(0) as an 80-bit number");
         check(got[0] == in(3) && (u16)(got[1] >> 48) == (u16)in(3) && x == 0.5 && st == 0, "fxrstor: xmm7 and the x87 stack back");
         (void)st;
+    }
+
+    // The string instructions: scas, cmps and lods, once and repeated, up and down; rcx and the pointers after, and the
+    // flags of the last compare.
+    {
+        static char text[] = "carbon\0tail";
+        u64 rcx = (u64)-1, at = (u64)text;
+        u8 zf;
+        __asm__ volatile("repne scasb\n setz %2" : "+c"(rcx), "+D"(at), "=r"(zf) : "a"(in(7) - 3) : "cc", "memory");
+        check(~rcx - 1 == 6 && at == (u64)text + 7 && zf == 1, "repne scasb: strlen, stopping past the NUL");
+    }
+    {
+        static char text[] = "carbon";
+        u64 rcx = 3, at = (u64)text;
+        u8 zf;
+        __asm__ volatile("repne scasb\n setz %2" : "+c"(rcx), "+D"(at), "=r"(zf) : "a"((u64)'z') : "cc", "memory");
+        check(rcx == 0 && at == (u64)text + 3 && zf == 0, "repne scasb: rcx running out first, ZF clear");
+    }
+    {
+        static char a[] = "abcdefgh", b[] = "abcdXfgh";
+        u64 rcx = 8, si = (u64)a, di = (u64)b;
+        u8 zf, cf;
+        __asm__ volatile("repe cmpsb\n setz %3\n setc %4" : "+c"(rcx), "+S"(si), "+D"(di), "=r"(zf), "=r"(cf) : : "cc", "memory");
+        // 'e' - 'X' is positive: no borrow.
+        check(rcx == 3 && si == (u64)a + 5 && di == (u64)b + 5 && zf == 0 && cf == 0, "repe cmpsb: the first difference, and its flags");
+        rcx = 8, si = (u64)a, di = (u64)a;
+        __asm__ volatile("repe cmpsb\n setz %3" : "+c"(rcx), "+S"(si), "+D"(di), "=r"(zf) : : "cc", "memory");
+        check(rcx == 0 && si == (u64)a + 8 && zf == 1, "repe cmpsb: all equal");
+    }
+    {
+        static u16 a[] = {1, 2, 3, 4}, b[] = {1, 2, 7, 4};
+        u64 rcx = 4, si = (u64)&a[3], di = (u64)&b[3];
+        u8 zf, cf;
+        __asm__ volatile("std\n repe cmpsw\n cld\n setz %3\n setc %4" : "+c"(rcx), "+S"(si), "+D"(di), "=r"(zf), "=r"(cf) : : "cc", "memory");
+        // Down: 4 = 4, then 3 < 7 borrows.
+        check(rcx == 2 && si == (u64)&a[1] && di == (u64)&b[1] && zf == 0 && cf == 1, "std; repe cmpsw: stepping down, CF from a borrow");
+    }
+    {
+        static u64 words[] = {5, 6, 0x123456789abcdefull, 8};
+        u64 rcx = 4, at = (u64)words, rax = 0x123456789abcdefull;
+        u8 zf;
+        __asm__ volatile("repne scasq\n setz %2" : "+c"(rcx), "+D"(at), "=r"(zf) : "a"(rax) : "cc", "memory");
+        check(rcx == 1 && at == (u64)&words[3] && zf == 1, "repne scasq: a quadword found");
+    }
+    {
+        static u8 bytes[] = {0x11, 0x22, 0x33};
+        u64 before = in(3) | 0xffffffffffff0000ull, rax = before, si = (u64)bytes;
+        __asm__ volatile("lodsb\n lodsb" : "+a"(rax), "+S"(si) : : "memory");
+        check(rax == ((before & ~0xffull) | 0x22) && si == (u64)bytes + 2, "lodsb: al only, rsi stepping");
+        static u64 q[] = {0x1122334455667788ull};
+        si = (u64)q;
+        __asm__ volatile("lodsq" : "+a"(rax), "+S"(si) : : "memory");
+        check(rax == q[0] && si == (u64)q + 8, "lodsq");
+    }
+    {
+        // A repeated compare with rcx 0 reads nothing and leaves the flags: ZF set by the cmp before stays.
+        u64 rcx = 0, at = 0;
+        u8 zf;
+        __asm__ volatile("cmp %%rcx, %%rcx\n repne scasb\n setz %2" : "+c"(rcx), "+D"(at), "=r"(zf) : "a"(in(7)) : "cc", "memory");
+        check(rcx == 0 && at == 0 && zf == 1, "repne scasb with rcx 0: nothing read, the flags as they were");
     }
 
     say(failures ? "some checks failed\n" : "all passed\n");

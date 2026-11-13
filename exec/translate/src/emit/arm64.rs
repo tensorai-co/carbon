@@ -881,7 +881,7 @@ impl Emitter {
                 self.store(Op::Reg(RDX, false), v, S0)?;
                 Ok(Next::Continue)
             }
-            0xA4 | 0xA5 | 0xAA | 0xAB => self.string(inst, op),
+            0xA4..=0xA7 | 0xAA..=0xAF => self.string(inst, op),
             // fwait: no x87 exception is ever pending.
             0x9B => Ok(Next::Continue),
             0x9E => {
@@ -1038,44 +1038,69 @@ impl Emitter {
         Ok(Next::End)
     }
 
-    /// `movs` and `stos`, once or with `rep`: up, or down with DF set.
+    /// The string instructions, once or repeated: `movs`, `cmps`, `stos`, `lods` and `scas`, stepping up, or down with
+    /// DF set. Repeated, each goes while `rcx` isn't 0, counting it down; `cmps` and `scas` also stop when the compare
+    /// comes out unequal (`repe`) or equal (`repne`), with the flags of that last compare. With `rcx` 0 nothing is read
+    /// and the flags stay as they were.
     fn string(&mut self, inst: &Inst, op: u8) -> Lowered {
         let size = if op & 1 == 0 { 8 } else { inst.size_v() };
         let step = u16::from(size / 8);
-        let moving = op < 0xA8;
+        // Which of rsi and rdi it steps: every one but stos reads at rsi, every one but lods at rdi.
+        let (uses_si, uses_di) = (!matches!(op & !1, 0xAA | 0xAE), op & !1 != 0xAC);
+        let compares = matches!(op & !1, 0xA6 | 0xAE);
+        let repeated = inst.rep || inst.repne;
         let down = self.df;
         let wide = self.wide();
-        let a = &mut self.asm;
-        let top = a.len();
-        let done = if inst.rep {
-            a.cbz(wide, RCX, 0);
-            Some(top)
-        } else {
-            None
-        };
-        if moving {
-            a.ldr(size, S0, RSI);
-            a.str(size, S0, RDI);
-            if down {
-                a.sub_imm(wide, RSI, RSI, step);
-            } else {
-                a.add_imm(wide, RSI, RSI, step);
+        let top = self.asm.len();
+        let mut exits = Vec::new();
+        if repeated {
+            exits.push(self.asm.len());
+            self.asm.cbz(wide, RCX, 0);
+        }
+        match op & !1 {
+            0xA4 => {
+                self.asm.ldr(size, S0, RSI);
+                self.asm.str(size, S0, RDI);
             }
-        } else {
-            a.str(size, RAX, RDI);
+            0xA6 => {
+                self.asm.ldr(size, S0, RSI);
+                self.asm.ldr(size, S1, RDI);
+                self.alu(Alu::Cmp, size, S0, S1);
+            }
+            0xAA => self.asm.str(size, RAX, RDI),
+            0xAC => {
+                self.asm.ldr(size, S0, RSI);
+                self.store(Op::Reg(RAX, false), size, S0)?;
+            }
+            0xAE => {
+                self.asm.ldr(size, S1, RDI);
+                self.alu(Alu::Cmp, size, RAX, S1);
+            }
+            _ => return Err(Unsupported),
         }
-        if down {
-            a.sub_imm(wide, RDI, RDI, step);
-        } else {
-            a.add_imm(wide, RDI, RDI, step);
+        // Stepping and counting are `add` and `sub`, which leave the compare's flags.
+        let a = &mut self.asm;
+        for reg in [(uses_si, RSI), (uses_di, RDI)].into_iter().filter(|u| u.0).map(|u| u.1) {
+            if down {
+                a.sub_imm(wide, reg, reg, step);
+            } else {
+                a.add_imm(wide, reg, reg, step);
+            }
         }
-        if let Some(done) = done {
+        if repeated {
             a.sub_imm(wide, RCX, RCX, 1);
+            if compares {
+                exits.push(a.len());
+                // repe (F3) goes on while equal; repne (F2) while not.
+                a.b_cond(if inst.repne { Cond::Eq } else { Cond::Ne }, 0);
+            }
             let back = a.len();
             a.b(0);
             a.patch(back, top);
             let here = a.len();
-            a.patch(done, here);
+            for exit in exits {
+                a.patch(exit, here);
+            }
         }
         Ok(Next::Continue)
     }
@@ -1390,7 +1415,7 @@ impl Emitter {
                 self.exit(exit::UNSUPPORTED, inst.at);
                 Ok(Next::End)
             }
-            0x18..=0x1F => Ok(Next::Continue), // prefetches, hints, endbr64, nop r/m
+            0x0D | 0x18..=0x1F => Ok(Next::Continue), // prefetches (prefetchw's too), hints, endbr64, nop r/m
             0x10..=0x17 | 0x28..=0x2F | 0x50..=0x7F | 0xC2 | 0xC4..=0xC6 | 0xD0..=0xFF => self.sse(inst),
             0xAE if matches!(inst.rm, Some(Rm::Mem(_))) && matches!(inst.ext, 2 | 3) => self.mxcsr(inst),
             0xAE if matches!(inst.rm, Some(Rm::Mem(_))) && matches!(inst.ext, 0 | 1) => self.fxsave(inst, inst.ext == 1),

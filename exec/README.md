@@ -395,9 +395,10 @@ it, in more detail. When an item is done it's ticked here, with what it took.
       that sets it leaves as UNSUPPORTED), `mov` to and from `moffs`, and `ret imm16` past 4 KiB. Eight conformance
       cases check it: calls and stdcall's `ret 8`, the ID bit, `cmpxchg8b`, fs, `int 0x2e`'s arguments, a fault's pc.
       Not yet: 16-bit addressing (`67`), segment registers as operands, far calls, BCD, `bound`, `enter`, `loop`.
+- [x] Every string instruction: `movs`, `stos`, `lods`, `cmps` and `scas`, once or repeated (`rep`, `repe`, `repne`),
+      stepping down with DF set, as `std` and `cld` leave it within a block. lambda's `x86.c` checks them.
 - [ ] SSE3's `addsub`, SSSE3 and later, and AVX.
-- [ ] The parity flag beyond `ucomis*` and `fcomi`; string instructions beyond `movs` and `stos` (which step down
-      with DF set, as `std` and `cld` leave it within a block); exact flags after `mul` and `imul` (CF and OF are; SF, ZF and PF aren't); `rcl`, `rcr`; signed
+- [ ] The parity flag beyond `ucomis*` and `fcomi`; exact flags after `mul` and `imul` (CF and OF are; SF, ZF and PF aren't); `rcl`, `rcr`; signed
       128-bit divides (unsigned ones are done); `cmpxchg16b`; `lock adc`/`sbb`; `syscall`'s `r11`.
 
 ### 3. Speed

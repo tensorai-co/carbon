@@ -205,7 +205,7 @@ blocks real work, it moves up. Each item's detail is in the README it links to.
    kernels' programs on the macOS sandbox; whole runs of pages per `ptrace` call on Linux. *Done means:* both kernels'
    test programs pass on every sandbox.
 2. x86-64 programs as they're built: the x87 transcendentals, `pushf`/`popf`, signed 128-bit divides, the remaining
-   flags and string instructions, `cmpxchg16b`; SSE3 and later, then AVX, as programs ask.
+   flags, `cmpxchg16b`; SSE3 and later, then AVX, as programs ask. (Every string instruction is done.)
 3. The translator's speed and safety: code written through a second mapping (JITs like .NET's). *Done means:* a real
    JIT (a JavaScript engine, or LuaJIT) runs in an x86-64 image.
 4. exec's core faster and safer: ASIDs and VPIDs, hvf moving only the registers used, one translation runtime in
