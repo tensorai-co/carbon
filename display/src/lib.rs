@@ -114,6 +114,10 @@ impl Surface {
 
     pub fn fill(&mut self, rect: &Rect, color: Rgb, clip: &Rect) {
         let r = rect.intersect(clip).intersect(&self.bounds());
+        // Rectangles that don't overlap intersect in one with no width (or height), which may be inside out.
+        if r.left >= r.right {
+            return;
+        }
         for y in r.top..r.bottom {
             let row = (y * self.width) as usize;
             self.pixels[row + r.left as usize..row + r.right as usize].fill(color);
@@ -263,6 +267,15 @@ mod tests {
         assert_eq!(s.get(2, font::ASCENT - 7), Some(0x00ff00));
         s.resize(30, 10, 0x123456);
         assert_eq!((s.get(4, 3), s.get(25, 5)), (Some(0xff0000), Some(0x123456)));
+    }
+
+    #[test]
+    fn filling_outside_the_clip_draws_nothing() {
+        let mut s = Surface::new(20, 20, 0xffffff);
+        // Overlapping down but not across: their intersection is inside out.
+        s.fill(&Rect::new(12, 0, 18, 10), 0xff0000, &Rect::new(0, 0, 5, 20));
+        s.fill(&Rect::new(8, 2, 4, 6), 0xff0000, &s.bounds());
+        assert!((0..20).all(|x| (0..20).all(|y| s.get(x, y) == Some(0xffffff))));
     }
 
     #[test]
