@@ -373,6 +373,8 @@ it, in more detail. When an item is done it's ticked here, with what it took.
 - [x] **SSE and SSE2** in the translator (`emit/sse.rs`): moves, shuffles, packs, integer and float arithmetic,
       conversions with x86's integer-indefinite answers, compares, `ucomis*` flags, `movmsk*`, and MXCSR on FPCR. The
       test programs are built as they come; Debian 13's x86-64 bash runs, with `ls`, `cat`, `sort`, `grep`, `wc`.
+      MMX too, the same integer operations on `mm0`–`mm7`, which are x87's `d16`–`d23` as on an x87, for the 32-bit
+      crypto code that uses them.
 - [x] **x87** (`emit/x87.rs`), at double precision: ST(0)–ST(7) in `d16`–`d23`, moved on a push or pop so TOP stays
       0; loads and stores of every format, exact 80-bit conversions, the arithmetic, compares into C0–C3 and into
       flags, `fcmov`, `fist` with the control word's rounding, `fprem` in exact parts, `fscale`, `fxam`, the control

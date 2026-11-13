@@ -216,6 +216,49 @@ case('stmxcsr', 'stmxcsr (%0)\\n andl $-64, (%0)\\n movd (%0), %%xmm1', A, A, pa
 case('ldmxcsr: round toward zero', 'movl $0x7f80, (%0)\\n ldmxcsr (%0)\\n cvtsd2si %%xmm1, %%rax\\n movl $0x1f80, (%0)\\n'
      ' ldmxcsr (%0)\\n movq %%rax, %%xmm1', pack('d', [2.7, 0]), A, r64(2))
 
+# MMX: the same integer operations on 64-bit registers, as 32-bit cryptographic code uses them. Each loads mm1 and
+# mm2 from the inputs' low 8 bytes, stores mm1's result, and leaves x87's state with emms; the high 8 bytes are 0.
+def mmx(name, op, a, b, want8, pre=''):
+    asm = (f'movq (%1), %%mm1\\n movq (%2), %%mm2\\n {pre}{op}\\n movq %%mm1, (%0)\\n emms\\n movdqu (%0), %%xmm1')
+    case('mmx ' + name, asm, a, b, want8 + bytes(8))
+
+def lanes8(fmt, a, b, f): return lanes(fmt, a[:8], b[:8], f)
+M1 = pack('Q', [0xffffffff_fffffff0, 0])
+M2 = pack('Q', [0x00000001_fffffffe, 0])
+mmx('paddq', 'paddq %%mm2, %%mm1', M1, M2, pack('Q', [(0xffffffff_fffffff0 + 0x00000001_fffffffe) % 2**64]))
+mmx('psubq', 'psubq %%mm2, %%mm1', M1, M2, pack('Q', [(0xffffffff_fffffff0 - 0x00000001_fffffffe) % 2**64]))
+mmx('pmuludq', 'pmuludq %%mm2, %%mm1', M1, M2, pack('Q', [0xfffffff0 * 0xfffffffe]))
+mmx('pxor', 'pxor %%mm2, %%mm1', A, B, bytes(x ^ y for x, y in zip(A[:8], B[:8])))
+mmx('pand', 'pand %%mm2, %%mm1', A, B, bytes(x & y for x, y in zip(A[:8], B[:8])))
+mmx('por', 'por %%mm2, %%mm1', A, B, bytes(x | y for x, y in zip(A[:8], B[:8])))
+mmx('pandn', 'pandn %%mm2, %%mm1', A, B, bytes(~x & y & 0xff for x, y in zip(A[:8], B[:8])))
+q = 0x8123456789abcdef
+mmx('psrlq by 13', 'psrlq $13, %%mm1', pack('Q', [q, 0]), A, pack('Q', [q >> 13]))
+mmx('psllq by 29', 'psllq $29, %%mm1', pack('Q', [q, 0]), A, pack('Q', [(q << 29) % 2**64]))
+mmx('psrlq by mm2', 'psrlq %%mm2, %%mm1', pack('Q', [q, 0]), pack('Q', [7, 0]), pack('Q', [q >> 7]))
+mmx('psraw by 3', 'psraw $3, %%mm1', W1, A, pack('h', [v >> 3 for v in unpack('h', W1[:8])]))
+mmx('paddd', 'paddd %%mm2, %%mm1', D1, D2, lanes8('i', D1, D2, lambda x, y: wrap(32, True)(x + y)))
+mmx('paddw', 'paddw %%mm2, %%mm1', W1, W2, lanes8('h', W1, W2, lambda x, y: wrap(16, True)(x + y)))
+mmx('pcmpeqd', 'pcmpeqd %%mm2, %%mm1', D1, D2, lanes8('i', D1, D2, lambda x, y: -1 if x == y else 0))
+mmx('pcmpgtd', 'pcmpgtd %%mm2, %%mm1', D1, D2, lanes8('i', D1, D2, lambda x, y: -1 if x > y else 0))
+mmx('pmullw', 'pmullw %%mm2, %%mm1', W1, W2, lanes8('h', W1, W2, lambda x, y: wrap(16, True)(x * y)))
+mmx('pmulhuw', 'pmulhuw %%mm2, %%mm1', W1, W2, lanes8('H', W1, W2, lambda x, y: (x * y) >> 16))
+mmx('pmaddwd', 'pmaddwd %%mm2, %%mm1', W1, W2, pack('i', [wrap(32, True)(sum(x * y for x, y in zip(unpack('h', W1[i:i + 4]), unpack('h', W2[i:i + 4])))) for i in (0, 4)]))
+mmx('psadbw', 'psadbw %%mm2, %%mm1', A, B, pack('Q', [sum(abs(x - y) for x, y in zip(A[:8], B[:8]))]))
+mmx('pavgb', 'pavgb %%mm2, %%mm1', A, B, bytes((x + y + 1) >> 1 for x, y in zip(A[:8], B[:8])))
+mmx('pminub', 'pminub %%mm2, %%mm1', A, B, bytes(min(x, y) for x, y in zip(A[:8], B[:8])))
+mmx('punpckldq', 'punpckldq %%mm2, %%mm1', A, B, A[0:4] + B[0:4])
+mmx('punpckhdq', 'punpckhdq %%mm2, %%mm1', A, B, A[4:8] + B[4:8])
+mmx('punpcklbw', 'punpcklbw %%mm2, %%mm1', A, B, bytes(v for i in range(4) for v in (A[i], B[i])))
+mmx('punpckhbw', 'punpckhbw %%mm2, %%mm1', A, B, bytes(v for i in range(4, 8) for v in (A[i], B[i])))
+mmx('punpckhwd', 'punpckhwd %%mm2, %%mm1', A, B, A[4:6] + B[4:6] + A[6:8] + B[6:8])
+mmx('packsswb', 'packsswb %%mm2, %%mm1', W1, W2, pack('b', [sat(-128, 127)(v) for v in unpack('h', W1[:8]) + unpack('h', W2[:8])]))
+mmx('packuswb', 'packuswb %%mm2, %%mm1', W1, W2, pack('B', [sat(0, 255)(v) for v in unpack('h', W1[:8]) + unpack('h', W2[:8])]))
+mmx('pshufw', 'pshufw $0x1b, %%mm2, %%mm1', A, W2, pack('h', list(reversed(unpack('h', W2[:8])))))
+mmx('pinsrw and pextrw', 'pextrw $3, %%mm2, %%eax\\n pinsrw $1, %%eax, %%mm1', A, W2, A[0:2] + W2[6:8] + A[4:8])
+mmx('movd in and out', 'movd %%mm2, %%eax\\n addl $1, %%eax\\n movd %%eax, %%mm1', A, D2, pack('i', [8, 0]))
+mmx('movq from memory', 'movq 8(%2), %%mm1', A, B, B[8:16])
+
 def c_bytes(b): return '{' + ', '.join(f'0x{x:02x}' for x in b) + '}'
 
 print('''// SSE and SSE2, each instruction run on known inputs and checked byte for byte, on lambda for x86-64. Written by

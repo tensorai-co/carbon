@@ -4,9 +4,13 @@
 //! logic, packed integer arithmetic and compares, shifts by an immediate, unpacks, packs and shuffles, the
 //! `movmsk`s, scalar and packed floating point with x86's own `min`/`max` and conversion results, compares into masks
 //! and into flags, and MXCSR's rounding and flush-to-zero (as FPCR's). Of SSE3, which every Windows 10 x86-64 CPU has
-//! and Windows' compilers use: the horizontal adds and subtracts, `movddup`, `movsldup`, `movshdup` and `lddqu`. MMX
-//! (the same opcodes without `66`), SSE3's `addsub`, SSSE3 and later, and shifts by a register count are still
-//! unsupported stops.
+//! and Windows' compilers use: the horizontal adds and subtracts, `movddup`, `movsldup`, `movshdup` and `lddqu`.
+//! MMX, the same integer opcodes without `66` on 64-bit registers, as cryptographic libraries' 32-bit code uses them
+//! (`Emitter::mmx`). SSE3's `addsub`, SSSE3 and later are still unsupported stops.
+//!
+//! MMX's `mm0`–`mm7` are x87's registers on an x87, so here they're `d16`–`d23`, x87's (whose TOP is always 0, so
+//! `mmN` is ST(N), as it is on an x87 whose TOP is 0, which is where MMX code finds it). A value MMX leaves there isn't
+//! a double, so a context saved in the middle of MMX code (an exception's) doesn't keep it exactly.
 //!
 //! x86's scalar operations keep the rest of the destination register; ARM's zero it. So a scalar result is made in a
 //! scratch register and put into lane 0.
@@ -77,10 +81,110 @@ fn integer(op: u8) -> Option<(u32, u8)> {
     })
 }
 
+/// `mm0`: `d16`, x87's ST(0).
+const MM0: u8 = 16;
+
+/// The opcodes that are MMX's without a prefix.
+fn is_mmx(op: u8) -> bool {
+    matches!(op, 0x60..=0x6B | 0x6E..=0x77 | 0x7E | 0x7F | 0xC4 | 0xC5 | 0xD1..=0xD5 | 0xD8..=0xEF | 0xF1..=0xF6 | 0xF8..=0xFE)
+}
+
 impl Emitter {
+    /// An MMX instruction. Most are their SSE2 (`66`) form on `d16`–`d23`, a memory operand loaded as its 64 bits:
+    /// each works lane by lane, so the low 64 bits are MMX's answer, whatever's above them. What works across lanes
+    /// is here: the moves, the high unpacks, the packs, `pshufw` (`pshuflw`'s low half), `pinsrw` and `pextrw` (four
+    /// words), and `emms`, which has nothing to do (x87's tags aren't kept).
+    fn mmx(&mut self, inst: &Inst) -> Lowered {
+        let mm = |n: u8| MM0 + (n & 7);
+        let op = inst.op;
+        let d = mm(inst.reg);
+        // A source that's an mm register or 64 bits of memory.
+        let source = |e: &mut Emitter| -> Result<u8, Unsupported> {
+            match inst.rm {
+                Some(Rm::Reg(n)) => Ok(mm(n)),
+                Some(Rm::Mem(mem)) => {
+                    e.address(&mem, inst.next(), true);
+                    e.asm.ldr_d(V_TMP, A);
+                    Ok(V_TMP)
+                }
+                None => Err(Unsupported),
+            }
+        };
+        match op {
+            0x77 => return Ok(Next::Continue),
+            // movq mm, mm/m64
+            0x6F => {
+                let s = source(self)?;
+                self.asm.fmov_d_d(d, s);
+                return Ok(Next::Continue);
+            }
+            // movq mm/m64, mm; movntq m64, mm
+            0x7F | 0xE7 => {
+                match inst.rm {
+                    Some(Rm::Reg(n)) if op == 0x7F => self.asm.fmov_d_d(mm(n), d),
+                    Some(Rm::Mem(mem)) => {
+                        self.address(&mem, inst.next(), true);
+                        self.asm.str_d(d, A);
+                    }
+                    _ => return Err(Unsupported),
+                }
+                return Ok(Next::Continue);
+            }
+            // punpckhbw, punpckhwd, punpckhdq: the low unpack of all 16 bytes, whose high half is the high unpack of
+            // the low halves.
+            0x68..=0x6A => {
+                let s = source(self)?;
+                self.asm.v3(vec::ZIP1, op - 0x68, V0, d, s);
+                self.asm.ext_16b(d, V0, V0, 8);
+                return Ok(Next::Continue);
+            }
+            // packsswb, packuswb, packssdw: both operands' elements, together in one register, narrowed.
+            0x63 | 0x67 | 0x6B => {
+                let s = source(self)?;
+                let (size, unsigned) = match op {
+                    0x63 => (0, false),
+                    0x67 => (0, true),
+                    _ => (1, false),
+                };
+                self.asm.v3(vec::ZIP1, 3, V1, d, s);
+                self.asm.narrow(size, unsigned, false, d, V1);
+                return Ok(Next::Continue);
+            }
+            _ => {}
+        }
+        let mut x = *inst;
+        x.opsize16 = true;
+        match op {
+            // movd: a general register or memory one side, so only the mm register is mapped.
+            0x6E | 0x7E | 0xC4 => x.reg = d,
+            // pextrw r32, mm, imm: the mm register is the source.
+            0xC5 => {
+                let Some(Rm::Reg(n)) = inst.rm else { return Err(Unsupported) };
+                x.rm = Some(Rm::Reg(mm(n)));
+            }
+            _ => {
+                x.reg = d;
+                let s = source(self)?;
+                x.rm = Some(Rm::Reg(s));
+            }
+        }
+        match op {
+            0x70 => {
+                x.opsize16 = false;
+                x.repne = true;
+            }
+            0xC4 | 0xC5 => x.imm &= 3,
+            _ => {}
+        }
+        self.sse(&x)
+    }
+
     /// An SSE or SSE2 instruction: a `0F` opcode in 10–17, 28–2F, 50–7F, C2, C4–C6 or D0–FF.
     pub(super) fn sse(&mut self, inst: &Inst) -> Lowered {
         let (op, p) = (inst.op, prefix(inst));
+        if p == P::None && is_mmx(op) {
+            return self.mmx(inst);
+        }
         let d = inst.reg;
         match (op, p) {
             (0x10 | 0x11 | 0x28 | 0x29, _) | (0x6F | 0x7F, P::P66 | P::F3) => {
