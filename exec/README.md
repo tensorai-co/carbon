@@ -32,7 +32,7 @@ where a backend says it can't run them yet:
 
 | Backend | Conformance | lambda (Linux programs) | atlas (Windows programs) |
 | --- | --- | --- | --- |
-| `vm/hvf` | 38 of 38 (ARM64, x86-64) | all, both ISAs | all, both ISAs |
+| `vm/hvf` | 48 of 48 (ARM64, x86-64, 32-bit x86) | all, both ISAs | all, both ISAs |
 | `sandbox/macos` | 12 of 12 (ARM64) | not run there yet | not run there yet |
 | `vm/kvm` | 25 of 25 (x86-64) | all | all |
 | `sandbox/linux` | 24 of 24 | all but fork and threads (one CPU) | all but threads (one CPU) |
@@ -46,7 +46,7 @@ Which programs each backend runs:
 
 | Backend | ARM64 programs | x86-64 programs | 32-bit x86 programs |
 | --- | --- | --- | --- |
-| `vm/hvf` | **native** | **translated** | translated: not started |
+| `vm/hvf` | **native** | **translated** | **translated** (exec's own cases; atlas's WoW64 to come) |
 | `sandbox/macos` | **rewritten** (one CPU) | translated: not started | not started |
 | `vm/kvm` | translated: not started | **native** | native: needs a 32-bit code segment in the shim |
 | `sandbox/linux` | translated: not started | **native** (one CPU) | not started |
@@ -385,8 +385,16 @@ it, in more detail. When an item is done it's ticked here, with what it took.
       `pmuludq`, `pmulhw`, `pmulhuw`, `pmaddwd`, `psadbw`, and shifts by a register's count. `sse.c` and lambda's
       `x86.c` check them.
 - [x] SSE3's horizontal adds and subtracts, `movddup`, `movsldup`, `movshdup`, `lddqu` (Windows' compilers use them).
+- [x] **32-bit x86** in the translator, for atlas's WoW64: the decoder's 32-bit mode (no REX, so `40`–`4F` are
+      `inc` and `dec`; 32-bit addresses; `[disp32]` absolute; 4-byte `moffs`), and the emitter's (a 32-bit stack for
+      `push`, `pop`, `call`, `ret` and indirect branches; string instructions stepping in 32 bits; `pusha`, `popa`;
+      `cmpxchg8b` as one `casal`). An `Isa::X86_32` space on hvf is translated, with its eight registers' top halves
+      kept clear and ID and AC kept in `x8`. `pushf` and `popf` in both modes (DF only as a block knows it: a `popf`
+      that sets it leaves as UNSUPPORTED), `mov` to and from `moffs`, and `ret imm16` past 4 KiB. Eight conformance
+      cases check it: calls and stdcall's `ret 8`, the ID bit, `cmpxchg8b`, fs, `int 0x2e`'s arguments, a fault's pc.
+      Not yet: 16-bit addressing (`67`), segment registers as operands, far calls, BCD, `bound`, `enter`, `loop`.
 - [ ] SSE3's `addsub`, SSSE3 and later, and AVX.
-- [ ] `pushf`, `popf`; the parity flag beyond `ucomis*` and `fcomi`; string instructions beyond `movs` and `stos` (which step down
+- [ ] The parity flag beyond `ucomis*` and `fcomi`; string instructions beyond `movs` and `stos` (which step down
       with DF set, as `std` and `cld` leave it within a block); exact flags after `mul` and `imul` (CF and OF are; SF, ZF and PF aren't); `rcl`, `rcr`; signed
       128-bit divides (unsigned ones are done); `cmpxchg16b`; `lock adc`/`sbb`; `syscall`'s `r11`.
 

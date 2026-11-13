@@ -1,4 +1,7 @@
-//! x86-64 programs on an ARM64 vm backend, through `exec-translate`.
+//! x86-64 and 32-bit x86 programs on an ARM64 vm backend, through `exec-translate`.
+//!
+//! A 32-bit x86 space is translated the same way, with the translator in its 32-bit mode: its program lives below
+//! 4 GiB, and the code cache and lookup table stay where they are, above anything its addresses can reach.
 //!
 //! A translated space keeps its translations in a code cache at the top of its own address space, mapped for EL0 to
 //! run and nothing else. A CPU runs a block until it leaves by `brk`, with the next x86 address in `x16`; core takes
@@ -33,7 +36,7 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 
 use exec_mmu::{Format, Frame, Native, OutOfMemory, PAGE, Prot};
-use exec_translate::emit::arm64::{self, CACHE_BASE, CACHE_SIZE, CHAIN_EXIT, LOOKUP_BASE, LOOKUP_BYTES, REGION_END, exit};
+use exec_translate::emit::arm64::{self, CACHE_BASE, CACHE_SIZE, CHAIN_EXIT, LOOKUP_BASE, LOOKUP_BYTES, REGION_END, X32_EFLAGS, X32_EFLAGS_KEPT, exit};
 use exec_translate::runtime::{Block, Cache};
 
 use crate::contract::{Sandbox, Vm};
@@ -54,8 +57,8 @@ const FETCH_BYTES: u64 = 15 * BLOCK_INSTRUCTIONS as u64 + 16;
 /// ARM's carry, which is x86's CF inverted while a translation runs.
 const C: u64 = 1 << 29;
 
-/// The instruction sets an ARM64 vm backend takes, translating x86-64.
-pub(crate) const TRANSLATING: &[Isa] = &[Isa::Arm64, Isa::X86_64];
+/// The instruction sets an ARM64 vm backend takes, translating x86-64 and 32-bit x86.
+pub(crate) const TRANSLATING: &[Isa] = &[Isa::Arm64, Isa::X86_64, Isa::X86_32];
 
 /// Half the code cache: one is written to at a time.
 const HALF: u64 = CACHE_SIZE / 2;
@@ -70,6 +73,8 @@ fn half_range(half: u64) -> Range<u64> {
 
 #[derive(Default)]
 pub(crate) struct Translated {
+    /// A 32-bit x86 space: translated in the translator's 32-bit mode.
+    x32: bool,
     /// The books for the half of the code cache being written to.
     cache: Cache,
     /// The other half's, from before it filled: CPUs may still be finishing blocks there.
@@ -89,6 +94,13 @@ pub(crate) struct Translated {
     /// Pages the program may write that live blocks came from, with the access the kernel gave them. Core took write
     /// away so the program's first write comes here, and gives it back when it forgets those blocks.
     guarded: BTreeMap<u64, Prot>,
+}
+
+impl Translated {
+    /// The books for a new space of this instruction set.
+    pub(crate) fn new(isa: Isa) -> Translated {
+        Translated { x32: isa == Isa::X86_32, ..Translated::default() }
+    }
 }
 
 /// Where a CPU was left in a code cache at the end of its last turn: enough to move it off that code later, if the
@@ -139,16 +151,34 @@ fn literal(words: [u8; 12]) -> u64 {
     u64::from_le_bytes(words[4..12].try_into().unwrap_or_default())
 }
 
-/// The program's registers, from a stopped vCPU's: rax–r15 are x0–x15, fs and gs bases x28 and x27.
-pub(crate) fn x86_regs(r: &Arm64VcpuRegs, rip: u64) -> Regs {
+/// The program's registers, from a stopped vCPU's: rax–r15 are x0–x15, fs and gs bases x28 and x27. A 32-bit
+/// program (`x32`) has eight, and the EFLAGS bits the translator keeps in `x8` (ID and AC) go into its flags.
+pub(crate) fn x86_regs(r: &Arm64VcpuRegs, rip: u64, x32: bool) -> Regs {
     let mut gpr = [0; 16];
-    gpr.copy_from_slice(&r.x[..16]);
     let nzcv = (r.spsr & NZCV) ^ C;
-    Regs::X86(X86Regs { gpr, rip, rflags: merge_nzcv(0x202, nzcv), fs_base: r.x[28], gs_base: r.x[27] })
+    let mut rflags = merge_nzcv(0x202, nzcv);
+    if x32 {
+        for (g, x) in gpr.iter_mut().zip(&r.x[..8]) {
+            *g = x & 0xffff_ffff;
+        }
+        rflags |= r.x[usize::from(X32_EFLAGS)] & X32_EFLAGS_KEPT;
+    } else {
+        gpr.copy_from_slice(&r.x[..16]);
+    }
+    Regs::X86(X86Regs { gpr, rip, rflags, fs_base: r.x[28], gs_base: r.x[27] })
 }
 
-pub(crate) fn set_x86_regs(r: &mut Arm64VcpuRegs, x: &X86Regs) {
-    r.x[..16].copy_from_slice(&x.gpr);
+/// The other way. A 32-bit program's registers keep their top halves clear, as its translation relies on.
+pub(crate) fn set_x86_regs(r: &mut Arm64VcpuRegs, x: &X86Regs, x32: bool) {
+    if x32 {
+        for (reg, g) in r.x[..16].iter_mut().zip(&x.gpr) {
+            *reg = g & 0xffff_ffff;
+        }
+        r.x[8..16].fill(0);
+        r.x[usize::from(X32_EFLAGS)] = x.rflags & X32_EFLAGS_KEPT;
+    } else {
+        r.x[..16].copy_from_slice(&x.gpr);
+    }
     r.x[28] = x.fs_base;
     r.x[27] = x.gs_base;
     r.spsr = (r.spsr & !NZCV) | (eflags_to_nzcv(x.rflags) ^ C);
@@ -257,6 +287,11 @@ fn cpuid(r: &mut Arm64VcpuRegs) {
 impl<V: Vm, S: Sandbox> Core<V, S> {
     pub(crate) fn translating(&self, root: u64) -> bool {
         self.translated.contains_key(&root)
+    }
+
+    /// Whether a translated space is 32-bit x86.
+    pub(crate) fn translating_x32(&self, root: u64) -> bool {
+        self.translated.get(&root).is_some_and(|t| t.x32)
     }
 
     /// Where a stopped thread is in its program: where it goes next, or where it stopped in a translation.
@@ -423,7 +458,7 @@ impl<V: Vm, S: Sandbox> Core<V, S> {
                 }
                 let target = r.x[16];
                 self.entries[index] = Some(target);
-                let Regs::X86(x) = x86_regs(r, target) else { return None };
+                let Regs::X86(x) = x86_regs(r, target, self.translating_x32(root)) else { return None };
                 match kind {
                     Ok(exit::JUMP) => None,
                     Ok(exit::SYSCALL) => Some(x86::syscall(Trap::Syscall, &x)),
@@ -533,7 +568,7 @@ impl<V: Vm, S: Sandbox> Core<V, S> {
             return Ok(Some(block.at));
         }
         let bytes = self.fetch(root, pc);
-        let translation = arm64::translate(pc, &bytes, BLOCK_INSTRUCTIONS);
+        let translation = arm64::translate(pc, &bytes, BLOCK_INSTRUCTIONS, self.translating_x32(root));
         let stuck = !translation.cacheable && translation.map.len() <= 1;
         if stuck && self.fetch_reported[index] == Some(pc) {
             return Ok(None);

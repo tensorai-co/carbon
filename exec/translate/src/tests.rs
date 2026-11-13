@@ -238,7 +238,7 @@ fn lengths_match_llvm() {
 fn a_block_ends_at_its_branch() {
     // add rax, rbx; cmp byte ptr [rax + 8], 0; je +1; nop; nop
     let bytes = [0x48, 0x01, 0xd8, 0x80, 0x78, 0x08, 0x00, 0x74, 0x01, 0x90, 0x90];
-    let t = translate(0x40_0000, &bytes, 64);
+    let t = translate(0x40_0000, &bytes, 64, false);
     let pcs: Vec<u64> = t.map.iter().map(|(_, pc)| *pc).collect();
     assert_eq!(pcs, [0x40_0000, 0x40_0003, 0x40_0007]);
     assert!(t.cacheable);
@@ -252,7 +252,7 @@ fn a_block_ends_at_its_branch() {
 #[test]
 fn a_return_looks_itself_up() {
     // ret: the lookup table's probe, then an exit with the address in x16 if it misses.
-    let t = translate(0x40_0000, &[0xc3], 64);
+    let t = translate(0x40_0000, &[0xc3], 64, false);
     let last = u32::from_le_bytes(t.code[t.code.len() - 4..].try_into().unwrap());
     assert_eq!(last, 0xD420_0000 | u32::from(exit::JUMP) << 5);
     let words: Vec<u32> = t.code.chunks(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect();
@@ -273,7 +273,7 @@ fn lookup_entries_and_chain_branches() {
 #[test]
 fn code_that_runs_out_is_a_fetch_exit() {
     // mov rax, imm64, cut short
-    let t = translate(0x1000, &[0x48, 0xb8, 1, 2, 3], 64);
+    let t = translate(0x1000, &[0x48, 0xb8, 1, 2, 3], 64, false);
     assert!(!t.cacheable);
     let last = u32::from_le_bytes(t.code[t.code.len() - 4..].try_into().unwrap());
     assert_eq!(last, 0xD420_0000 | u32::from(exit::FETCH) << 5);
@@ -284,12 +284,95 @@ fn the_direction_flag_lasts_its_block() {
     let words = |t: &crate::emit::arm64::Translation| -> Vec<u32> { t.code.chunks(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect() };
     let unsupported = 0xD420_0000 | u32::from(exit::UNSUPPORTED) << 5;
     // std; rep movsb; cld; ret: down, then up again before the block ends.
-    let t = translate(0x40_0000, &[0xfd, 0xf3, 0xa4, 0xfc, 0xc3], 64);
+    let t = translate(0x40_0000, &[0xfd, 0xf3, 0xa4, 0xfc, 0xc3], 64, false);
     let w = words(&t);
     assert!(!w.contains(&unsupported));
     // rsi and rdi step down: sub x6, x6, #1 and sub x7, x7, #1.
     assert!(w.contains(&0xD100_04C6) && w.contains(&0xD100_04E7));
     // std; ret: a block can't end with DF set, so it stops at the ret.
-    let t = translate(0x40_0000, &[0xfd, 0xc3], 64);
+    let t = translate(0x40_0000, &[0xfd, 0xc3], 64, false);
     assert_eq!(*words(&t).last().unwrap(), unsupported);
+}
+
+/// 32-bit x86's encodings, as LLVM's assembler makes them (`clang --target=i386-linux-gnu`, then `llvm-objdump`).
+const X32_CASES: &[(&str, &[u8])] = &[
+    ("inc eax", &[0x40]),
+    ("dec edi", &[0x4f]),
+    ("push ebp", &[0x55]),
+    ("mov ebp, esp", &[0x89, 0xe5]),
+    ("pushal", &[0x60]),
+    ("popal", &[0x61]),
+    ("pushfd", &[0x9c]),
+    ("popfd", &[0x9d]),
+    ("mov eax, dword ptr [0x12345678]", &[0xa1, 0x78, 0x56, 0x34, 0x12]),
+    ("mov dword ptr ds:[0x12345678], eax", &[0x3e, 0xa3, 0x78, 0x56, 0x34, 0x12]),
+    ("mov al, byte ptr ds:[0x10]", &[0x3e, 0xa0, 0x10, 0, 0, 0]),
+    ("mov ecx, dword ptr [ebp + 0x8]", &[0x8b, 0x4d, 0x08]),
+    ("mov eax, dword ptr fs:[0x18]", &[0x64, 0xa1, 0x18, 0, 0, 0]),
+    ("lea esi, [eax + 4*ecx + 0x100]", &[0x8d, 0xb4, 0x88, 0x00, 0x01, 0x00, 0x00]),
+    ("mov eax, 0x11223344", &[0xb8, 0x44, 0x33, 0x22, 0x11]),
+    ("call dword ptr [eax + 0x4]", &[0xff, 0x50, 0x04]),
+    ("call dword ptr ds:[0x401000]", &[0x3e, 0xff, 0x15, 0x00, 0x10, 0x40, 0x00]),
+    ("push dword ptr [ebx]", &[0xff, 0x33]),
+    ("pop dword ptr [ebx]", &[0x8f, 0x03]),
+    ("ret 0x8", &[0xc2, 0x08, 0x00]),
+    ("lock cmpxchg8b qword ptr [esi]", &[0xf0, 0x0f, 0xc7, 0x0e]),
+    ("add byte ptr [eax], 0x1", &[0x80, 0x00, 0x01]),
+    ("leave", &[0xc9]),
+    ("movzx eax, word ptr [esi + 0x2]", &[0x0f, 0xb7, 0x46, 0x02]),
+    ("rep movsd", &[0xf3, 0xa5]),
+];
+
+#[test]
+fn x32_lengths_match_llvm() {
+    use crate::decode::x86::decode_in;
+    for (text, bytes) in X32_CASES {
+        let inst = decode_in(0x1000, bytes, true).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+        assert_eq!(usize::from(inst.len), bytes.len(), "{text}");
+    }
+    // `jmp dword ptr [4*eax + 0x402000]`, and an int 0x2e.
+    assert_eq!(decode_in(0, &[0xff, 0x24, 0x85, 0x00, 0x20, 0x40, 0x00], true).unwrap().len, 7);
+    assert_eq!(decode_in(0, &[0xcd, 0x2e], true).unwrap().len, 2);
+}
+
+#[test]
+fn x32_operands() {
+    use crate::decode::x86::{Base, Mem, Rm, Seg, decode_in};
+    // 40 is inc eax, not a REX prefix.
+    let inc = decode_in(0, &[0x40], true).unwrap();
+    assert_eq!((inc.op, inc.rex, inc.reg), (0x40, 0, 0));
+    // [disp32] is absolute, not RIP-relative.
+    let call = decode_in(0, &[0xff, 0x15, 0x00, 0x10, 0x40, 0x00], true).unwrap();
+    assert_eq!(call.rm, Some(Rm::Mem(Mem { base: None, index: None, disp: 0x40_1000, seg: None, addr32: true })));
+    // moffs is a memory operand, with its segment.
+    let teb = decode_in(0, &[0x64, 0xa1, 0x18, 0, 0, 0], true).unwrap();
+    assert_eq!(teb.rm, Some(Rm::Mem(Mem { base: None, index: None, disp: 0x18, seg: Some(Seg::Fs), addr32: true })));
+    // Every address is 32 bits.
+    let load = decode_in(0, &[0x8b, 0x4d, 0x08], true).unwrap();
+    assert_eq!(load.rm, Some(Rm::Mem(Mem { base: Some(Base::Reg(5)), index: None, disp: 8, seg: None, addr32: true })));
+    // A branch's target wraps at 4 GiB.
+    let back = decode_in(0x10, &[0xe9, 0x00, 0x00, 0x00, 0x80], true).unwrap();
+    assert_eq!(back.target(), 0x8000_0015);
+    let wrap = decode_in(0x10, &[0xeb, 0xe0], true).unwrap();
+    assert_eq!(wrap.target(), 0xffff_fff2);
+    // 16-bit addressing isn't decoded.
+    assert!(decode_in(0, &[0x67, 0x8b, 0x07], true).is_err());
+}
+
+#[test]
+fn x32_translates_without_leaving() {
+    let words = |t: &crate::emit::arm64::Translation| -> Vec<u32> { t.code.chunks(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect() };
+    let unsupported = 0xD420_0000 | u32::from(exit::UNSUPPORTED) << 5;
+    for (text, bytes) in X32_CASES {
+        let t = translate(0x40_0000, bytes, 1, true);
+        let w = words(&t);
+        // pushfd and popfd's own exit is for a DF they can't know while translating; anything else is a miss.
+        let leaves = w.iter().filter(|&&w| w == unsupported).count();
+        let allowed = usize::from(*text == "popfd");
+        assert!(leaves <= allowed, "{text} isn't translated");
+    }
+    // push ebp: a 32-bit store below esp, then esp down by 4 in 32 bits (mov x19, x5; stur w19, [x4, #-4];
+    // sub w4, w4, #4).
+    let w = words(&translate(0x40_0000, &[0x55], 1, true));
+    assert_eq!(&w[..3], &[0xAA05_03F3, 0xB81F_C093, 0x5100_1084]);
 }

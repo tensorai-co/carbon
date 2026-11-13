@@ -745,9 +745,28 @@ First `cmd.exe` (variables, `if`, `for`, `goto`, `call`, pipes, redirection, `.b
 
 ### Across every layer
 
-- **32-bit x86 (WoW64)** **[exec]** **[guest]**: most installers are 32-bit. It needs exec's i386 translation, the
-  i686 ntdll, 32-bit TEBs and PEBs, `SysWOW64`, the registry's and file system's redirection, and every layer built
-  for i686.
+- **32-bit x86 (WoW64)** **[exec]** **[guest]**: most installers are 32-bit (Steam's, NSIS's, Inno Setup's). In
+  order, each phase ending with its tests passing:
+  1. [x] **exec runs 32-bit x86** on hvf: the translator's 32-bit mode, checked by exec's conformance suite. kvm
+     and winkvm have a 32-bit code segment in the shim already; their conformance cases still need running there.
+  2. [ ] **The i686 ntdll**: `build.rs` builds `atlas-guest` for `i686-pc-windows-msvc` too; `arch.rs`, `sys.rs`
+     and `fiber.rs` in i686 assembly (atlas's calls by `int 0x2e`, number in eax, arguments as exec's `Trap::Int2e`
+     reads them); x86's `CONTEXT` (0x2cc bytes, with the x87 save area); and SEH as x86 has it: a chain of frames
+     from `fs:[0]`, walked by `RtlDispatchException` and unwound by `RtlUnwind`, not unwind tables.
+  3. [ ] **32-bit processes**: PE32 images parsed, mapped and relocated (`IMAGE_REL_BASED_HIGHLOW`); a 32-bit
+     layout below 2 GiB (or 4 GiB for a large-address-aware program), with atlas's page, ntdll and the system DLLs
+     in it; the TEB32, PEB32, `RTL_USER_PROCESS_PARAMETERS32` and loader entries with 32-bit pointers, `fs` at the
+     TEB; atlas's address constants per ISA.
+  4. [ ] **System DLLs for i686**: `images/make.rs` makes PE32 images whose host stubs are
+     `mov eax, nr; int 0x2e; ret 4*n`, popping the arguments stdcall's way (the `(n)` in each `host` declaration), and
+     `ret` alone for the cdecl ones (`wsprintfA`, ucrtbase's); host exports read their arguments with
+     `Convention::Stdcall`; upcalls push theirs.
+  5. [ ] **WoW64 as programs see it**: `SysWOW64` for 32-bit processes, with `System32` redirected to it
+     (`Wow64DisableWow64FsRedirection` and `Sysnative`); the registry's 32-bit view by default; `IsWow64Process(2)`,
+     `GetNativeSystemInfo`, `PROCESSOR_ARCHITECTURE` and `PROCESSOR_ARCHITEW6432`; 32-bit and 64-bit processes
+     starting each other.
+  6. [ ] **Every test program for i686** (`build.sh`'s third arch), passing; then an NSIS installer built from source,
+     then Steam's.
 - **ANSI and code pages:** each `*A` function still to come is the `*W` with 1252 strings, as those there are.
 - **Manifests:** side-by-side assemblies and activation contexts decide which comctl32 a program gets.
 - **API sets:** `ext-ms-*` sets, and the `api-ms-win-*` the map doesn't know yet, as programs ask.

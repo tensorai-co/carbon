@@ -1,4 +1,8 @@
-//! x86-64: prefixes, REX, the one- and two-byte opcode maps, ModRM, SIB, displacements and immediates.
+//! x86-64 and 32-bit x86: prefixes, REX, the one- and two-byte opcode maps, ModRM, SIB, displacements and immediates.
+//!
+//! In 32-bit mode (`decode_in` with `x32`) there's no REX (`40`–`4F` are `inc` and `dec`), every address is 32 bits,
+//! ModRM's `[disp32]` is absolute rather than RIP-relative, and `moffs` is 4 bytes. `67`'s 16-bit addressing isn't
+//! decoded: compilers don't make it.
 //!
 //! It decodes every instruction's length and operands, whether or not the emitter can lower it, so a block always
 //! ends at a real instruction boundary. Opcodes it doesn't know at all are `Error::Undecodable`.
@@ -57,6 +61,8 @@ pub struct Inst {
     pub ext: u8,
     pub rm: Option<Rm>,
     pub imm: i64,
+    /// Decoded in 32-bit mode: addresses, the stack and branch targets are 32 bits.
+    pub x32: bool,
 }
 
 impl Inst {
@@ -81,7 +87,13 @@ impl Inst {
 
     /// Where a relative branch goes.
     pub fn target(&self) -> u64 {
-        self.next().wrapping_add(self.imm as u64)
+        let target = self.next().wrapping_add(self.imm as u64);
+        if self.x32 { target & 0xffff_ffff } else { target }
+    }
+
+    /// The size of what the stack holds, and of an indirect branch's target: 32 or 64.
+    pub fn word(&self) -> u8 {
+        if self.x32 { 32 } else { 64 }
     }
 }
 
@@ -112,7 +124,15 @@ fn imm_len(inst: &Inst) -> Option<u8> {
                 z
             }
         }
-        (0, 0xA0..=0xA3) => 8,
+        (0, 0xA0..=0xA3) => {
+            if inst.x32 {
+                4
+            } else {
+                8
+            }
+        }
+        // pusha, popa, into, salc: 32-bit only, decoded so a block ends at them.
+        (0, 0x60 | 0x61 | 0xCE | 0xD6) if inst.x32 => 0,
         (0, 0xC2 | 0xCA) => 2,
         (0, 0xC8) => 3,
         (0, 0xE8 | 0xE9) => 4,
@@ -140,19 +160,26 @@ fn imm_len(inst: &Inst) -> Option<u8> {
     })
 }
 
-/// Decodes the instruction at the start of `bytes`, which is at `at`.
+/// Decodes the x86-64 instruction at the start of `bytes`, which is at `at`.
 pub fn decode(at: u64, bytes: &[u8]) -> Result<Inst, Error> {
+    decode_in(at, bytes, false)
+}
+
+/// Decodes the instruction at the start of `bytes`, which is at `at`, in 32-bit mode with `x32`.
+pub fn decode_in(at: u64, bytes: &[u8], x32: bool) -> Result<Inst, Error> {
     let mut i = 0usize;
     let get = |i: usize| bytes.get(i).copied().ok_or(Error::Truncated(at + i as u64));
-    let mut inst = Inst { at, len: 0, map: 0, op: 0, opsize16: false, rep: false, repne: false, lock: false, rex: 0, reg: 0, ext: 0, rm: None, imm: 0 };
+    let mut inst = Inst { at, len: 0, map: 0, op: 0, opsize16: false, rep: false, repne: false, lock: false, rex: 0, reg: 0, ext: 0, rm: None, imm: 0, x32 };
     let mut seg = None;
-    let mut addr32 = false;
+    let mut addr32 = x32;
     loop {
         match get(i)? {
             0xF0 => inst.lock = true,
             0xF2 => inst.repne = true,
             0xF3 => inst.rep = true,
             0x66 => inst.opsize16 = true,
+            // 16-bit addressing, in 32-bit mode.
+            0x67 if x32 => return Err(Error::Undecodable(at)),
             0x67 => addr32 = true,
             0x64 => seg = Some(Seg::Fs),
             0x65 => seg = Some(Seg::Gs),
@@ -164,7 +191,9 @@ pub fn decode(at: u64, bytes: &[u8]) -> Result<Inst, Error> {
             return Err(Error::Undecodable(at));
         }
     }
-    if let b @ 0x40..=0x4F = get(i)? {
+    if let b @ 0x40..=0x4F = get(i)?
+        && !x32
+    {
         inst.rex = b;
         i += 1;
     }
@@ -213,7 +242,8 @@ pub fn decode(at: u64, bytes: &[u8]) -> Result<Inst, Error> {
                     mem.base = Some(Base::Reg(base | rex_b));
                 }
             } else if rm == 5 && md == 0 {
-                mem.base = Some(Base::Rip);
+                // RIP-relative in 64-bit mode; an absolute address in 32-bit mode.
+                mem.base = if x32 { None } else { Some(Base::Rip) };
                 disp_len = 4;
             } else {
                 mem.base = Some(Base::Reg(rm | rex_b));
@@ -223,10 +253,18 @@ pub fn decode(at: u64, bytes: &[u8]) -> Result<Inst, Error> {
         }
     } else if inst.map == 0 && matches!(op, 0x50..=0x5F | 0x90..=0x97 | 0xB0..=0xBF) || inst.map == 1 && matches!(op, 0xC8..=0xCF) {
         inst.reg = (op & 7) | rex_b;
+    } else if x32 && inst.map == 0 && matches!(op, 0x40..=0x4F) {
+        // inc and dec, by the register in the opcode.
+        inst.reg = op & 7;
     }
 
     let imm_bytes = imm_len(&inst).ok_or(Error::Undecodable(at))?;
     inst.imm = read_signed(bytes, &mut i, imm_bytes, at)?;
+    // moffs: an absolute address, given as a memory operand so it's addressed like any other (and in 32-bit mode
+    // truncated to 32 bits as every address is).
+    if inst.map == 0 && matches!(op, 0xA0..=0xA3) {
+        inst.rm = Some(Rm::Mem(Mem { base: None, index: None, disp: inst.imm, seg, addr32 }));
+    }
     if i > 15 {
         return Err(Error::Undecodable(at));
     }
@@ -269,10 +307,12 @@ pub struct X86 {
 
 impl Decoder for X86 {
     fn decode(&self, at: u64, bytes: &[u8]) -> Result<Insn, Error> {
-        if self.mode != Isa::X86_64 {
-            return Err(Error::Undecodable(at));
-        }
-        let inst = decode(at, bytes)?;
+        let x32 = match self.mode {
+            Isa::X86_64 => false,
+            Isa::X86_32 => true,
+            Isa::Arm64 => return Err(Error::Undecodable(at)),
+        };
+        let inst = decode_in(at, bytes, x32)?;
         Ok(Insn { at, len: inst.len, flow: flow(&inst) })
     }
 }

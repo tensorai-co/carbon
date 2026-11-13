@@ -95,7 +95,11 @@ fn exits(stop: &Stop, nr: u64, code: u64) -> Result<(), String> {
 
 /// The system call that ends the program, in each ISA's Linux numbering.
 fn exit_nr(isa: Isa) -> u64 {
-    if isa == Isa::Arm64 { 93 } else { 60 }
+    match isa {
+        Isa::Arm64 => 93,
+        Isa::X86_64 => 60,
+        Isa::X86_32 => 1,
+    }
 }
 
 fn hex(s: &str) -> Vec<u8> {
@@ -595,6 +599,119 @@ const CASES: &[Case] = &[
     },
 ];
 
+/// A 32-bit x86 case: its name, its code, and how it's checked. They reach their kernel by `int 0x80` (32-bit
+/// Linux's exit is 1, with its code in ebx) or `int 0x2e`, and find the data page and the hole from their own
+/// address (`call 1f; 1: pop`), as 32-bit x86 has no RIP-relative addressing.
+struct X32Case {
+    name: &'static str,
+    x86_32: &'static str,
+    check: fn(Isolation, &[u8]) -> Result<(), String>,
+}
+
+const X32_CASES: &[X32Case] = &[
+    // mov ebx, 42; mov eax, 1; int 0x80
+    X32Case { name: "exit(42) by int 0x80", x86_32: "bb2a000000b801000000cd80", check: |iso, code| {
+        let (_, stop) = first_stop(Isa::X86_32, iso, code)?;
+        exits(&stop, 1, 42)
+    } },
+    // The stack: a loop calling a function with an argument on it, ten times (55); pusha and popa around
+    // `xor esi, esi`; a stdcall function of two arguments that pops them with `ret 8` (16). exit(71), with esp back
+    // where it started.
+    X32Case {
+        name: "calls, pusha and popa, and ret 8, then exit(71)",
+        x86_32: "31f6b90a00000051e81c000000594975f66031f6616a076a09e81000000089f301c3b801000000cd8003742404c38b44240403442408c20800",
+        check: |iso, code| {
+            let (mut p, stop) = first_stop(Isa::X86_32, iso, code)?;
+            exits(&stop, 1, 71)?;
+            let top = p.base + SIZE;
+            match p.exec.enter(&mut p.cpu).thread().regs() {
+                Regs::X86(r) if r.gpr[4] == top => Ok(()),
+                other => Err(format!("esp isn't back at {top:#x}: {other:x?}")),
+            }
+        },
+    },
+    // pushfd and popfd: the ID bit toggles (1), stc shows as CF (2), and popfd of 0xc1 sets CF (4). exit(7).
+    X32Case {
+        name: "pushfd and popfd: ID toggles, CF both ways, exit(7)",
+        x86_32: "9c5889c13500002000509d9c5831c8c1e81583e00189c3f99c5a83e201d1e209d331c068c10000009d0f92c0c1e00209c3b801000000cd80",
+        check: |iso, code| {
+            let (_, stop) = first_stop(Isa::X86_32, iso, code)?;
+            exits(&stop, 1, 7)
+        },
+    },
+    // The data page holds the qword 1 and then the dword 10. lock cmpxchg8b swaps 0:1 for 0x66:0x55 (ZF set, so bl
+    // is 1), inc makes the dword 11, and ebx = 1 + 2 * 0x55 + 0x66 + 11. exit(284), and the page as it says.
+    X32Case {
+        name: "cmpxchg8b and inc on memory, exit(284)",
+        x86_32: "e8000000005f81c7fbff0000b80100000031d2bb55000000b966000000f00fc70f0f94c38b078b5704ff47088b4f088d1c4301d301cbb801000000cd80",
+        check: |iso, code| {
+            let mut data = [0u8; 12];
+            data[0] = 1;
+            data[8] = 10;
+            let mut p = Program::load(iso, Isa::X86_32, code, &data)?;
+            let stop = p.run(false);
+            exits(&stop, 1, 284)?;
+            let after = p.data(12);
+            if after[..12] != [0x55, 0, 0, 0, 0x66, 0, 0, 0, 11, 0, 0, 0] {
+                return Err(format!("the data page is {:x?}", &after[..12]));
+            }
+            Ok(())
+        },
+    },
+    // fs: the kernel points fs's base at the data page, which has 5 at 4 and 7 at 8. mov eax, fs:[4] (moffs);
+    // mov ebx, fs:[8] (ModRM); exit(12).
+    X32Case { name: "fs-relative loads, exit(12)", x86_32: "64a104000000648b1d0800000001c3b801000000cd80", check: |iso, code| {
+        let mut data = [0u8; 12];
+        data[4] = 5;
+        data[8] = 7;
+        let mut p = Program::load(iso, Isa::X86_32, code, &data)?;
+        {
+            let fs = p.base + DATA;
+            let mut turn = p.exec.enter(&mut p.cpu);
+            let mut regs = turn.thread().regs();
+            if let Regs::X86(r) = &mut regs {
+                r.fs_base = fs;
+            }
+            turn.thread().set_regs(&regs);
+        }
+        let stop = p.run(false);
+        exits(&stop, 1, 12)
+    } },
+    // int 0x2e, Windows' old way in: the number in eax and six arguments in ebx, ecx, edx, esi, edi, ebp. The
+    // kernel answers 100, which the program exits with.
+    X32Case {
+        name: "int 0x2e's number and six arguments, and its answer",
+        x86_32: "b834120000bb01000000b902000000ba03000000be04000000bf05000000bd06000000cd2e89c3b801000000cd80",
+        check: |iso, code| {
+            let (mut p, stop) = first_stop(Isa::X86_32, iso, code)?;
+            match stop {
+                Stop::Syscall { nr: 0x1234, args: [1, 2, 3, 4, 5, 6] } => {}
+                other => return Err(format!("wanted int 0x2e 0x1234 (1..6), got {other:x?}")),
+            }
+            p.exec.enter(&mut p.cpu).thread().set_return(100);
+            exits(&p.run(false), 1, 100)
+        },
+    },
+    // Reading the hole: a fault at its address, at the load's own pc.
+    X32Case { name: "reading an unmapped page faults at its own pc", x86_32: "e8000000005805fbff07008b00", check: |iso, code| {
+        let (p, stop) = first_stop(Isa::X86_32, iso, code)?;
+        match stop {
+            Stop::Fault { addr, access, pc } if addr == p.base + HOLE && access == Prot::R && pc == p.base + 11 => Ok(()),
+            other => Err(format!("wanted a read fault at {:#x} from {:#x}, got {other:x?}", p.base + HOLE, p.base + 11)),
+        }
+    } },
+    // Carries and the byte registers: 0xffffffff + 1 carries into adc (1); cl, then ch, then inc cl to zero (ZF, and
+    // ecx 0x100); exit(1 + 1 + 0x100).
+    X32Case {
+        name: "carries and byte registers, exit(258)",
+        x86_32: "b8ffffffff83c00183d000b980000000b1ffb501fec10f94c20fb6d201d001c889c3b801000000cd80",
+        check: |iso, code| {
+            let (_, stop) = first_stop(Isa::X86_32, iso, code)?;
+            exits(&stop, 1, 258)
+        },
+    },
+];
+
 fn main() {
     // On macOS the sandbox's stub is this binary again.
     run_if_stub();
@@ -661,6 +778,33 @@ fn main() {
                         println!("FAILED  {label}: {why}");
                         failed += 1;
                     }
+                }
+            }
+        }
+        for case in X32_CASES {
+            let label = format!("{:<7} {}", "x86-32", case.name);
+            if !isas.contains(&Isa::X86_32) {
+                println!("skip    {label}: {backend} doesn't run it");
+                skipped += 1;
+                continue;
+            }
+            if gate_of(isolation, Isa::X86_32).is_some() {
+                println!("skip    {label}: {backend}'s programs reach their kernel through its gate");
+                skipped += 1;
+                continue;
+            }
+            match (case.check)(isolation, &hex(case.x86_32)) {
+                Ok(()) => {
+                    println!("ok      {label}");
+                    passed += 1;
+                }
+                Err(why) if why.starts_with("skip: ") => {
+                    println!("skip    {label}: {}", &why[6..]);
+                    skipped += 1;
+                }
+                Err(why) => {
+                    println!("FAILED  {label}: {why}");
+                    failed += 1;
                 }
             }
         }

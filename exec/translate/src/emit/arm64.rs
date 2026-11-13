@@ -1,9 +1,12 @@
-//! x86-64 → ARM64, a block at a time.
+//! x86-64 and 32-bit x86 → ARM64, a block at a time.
 //!
 //! # Where x86 lives
 //!
 //! The 16 general registers are `x0`–`x15` in encoding order (`rax` is `x0`, `rsp` is `x4`). The fs and gs bases are
-//! `x28` and `x27`. `xmm0`–`xmm15` are `v0`–`v15`. `x16` carries a block exit's target and `x17` a memory operand's
+//! `x28` and `x27`. A 32-bit program has eight, `x0`–`x7`, whose top halves are always zero: everything that writes
+//! one writes 32 bits or fewer, and the stack and string instructions step its pointers in 32 bits. `x8`, which it
+//! has no `r8` for, keeps the EFLAGS bits that aren't flags ARM has, ID (21) and AC (18), so `pushfd` and `popfd`
+//! see the ID bit change, as a program checking for `cpuid` does. `xmm0`–`xmm15` are `v0`–`v15`. `x16` carries a block exit's target and `x17` a memory operand's
 //! address; `x19`–`x26` and `v28`–`v31` are scratch. x87's stack is `v16`–`v23` and its control and status words
 //! `v24` (`x87.rs`). Nothing else is touched.
 //!
@@ -130,9 +133,14 @@ pub struct Translation {
     pub end: u64,
 }
 
-/// Translates the block at `start`, whose bytes as far as they can be read are `bytes`, up to `most` instructions.
-pub fn translate(start: u64, bytes: &[u8], most: usize) -> Translation {
-    let mut e = Emitter { asm: Asm::new(), df: false };
+/// Where a 32-bit program's EFLAGS bits beyond ARM's flags live (see above), and which they are.
+pub const X32_EFLAGS: u8 = 8;
+pub const X32_EFLAGS_KEPT: u64 = 1 << 21 | 1 << 18;
+
+/// Translates the block at `start`, whose bytes as far as they can be read are `bytes`, up to `most` instructions:
+/// 32-bit x86 with `x32`, else x86-64.
+pub fn translate(start: u64, bytes: &[u8], most: usize, x32: bool) -> Translation {
+    let mut e = Emitter { asm: Asm::new(), df: false, x32 };
     let mut map = Vec::new();
     let mut pc = start;
     let mut cacheable = true;
@@ -148,7 +156,7 @@ pub fn translate(start: u64, bytes: &[u8], most: usize) -> Translation {
             break;
         }
         map.push((offset, pc));
-        let inst = match x86::decode(pc, &bytes[(pc - start) as usize..]) {
+        let inst = match x86::decode_in(pc, &bytes[(pc - start) as usize..], x32) {
             Ok(inst) => inst,
             Err(Error::Truncated(missing)) => {
                 e.asm.mov_imm(A, pc);
@@ -247,9 +255,21 @@ struct Emitter {
     asm: Asm,
     /// DF, as `std` and `cld` have left it in this block.
     df: bool,
+    /// 32-bit x86: the stack and pointers are 32 bits.
+    x32: bool,
 }
 
 impl Emitter {
+    /// Whether arithmetic on a pointer (the stack, a string instruction's) is 64-bit: in 32-bit x86 it wraps at 32.
+    fn wide(&self) -> bool {
+        !self.x32
+    }
+
+    /// The size of what the stack holds.
+    fn word(&self) -> u8 {
+        if self.x32 { 32 } else { 64 }
+    }
+
     fn exit(&mut self, kind: u16, target: u64) {
         self.asm.mov_imm(T, target);
         self.asm.brk(kind);
@@ -313,15 +333,18 @@ impl Emitter {
     /// A memory operand's address, into `x17`. `lea` leaves the segment out.
     fn address(&mut self, mem: &Mem, next: u64, segment: bool) {
         let a = &mut self.asm;
+        // An absolute address (32-bit x86's `[disp32]`, `moffs`) is just its displacement.
+        let absolute = mem.base.is_none() && mem.index.is_none();
         match mem.base {
             Some(Base::Rip) => a.mov_imm(A, next.wrapping_add(mem.disp as u64)),
             Some(Base::Reg(base)) => a.mov(true, A, base),
+            None if absolute => a.mov_imm(A, if mem.addr32 { mem.disp as u64 & 0xffff_ffff } else { mem.disp as u64 }),
             None => a.mov_imm(A, 0),
         }
         if let Some((index, scale)) = mem.index {
             a.add_shift(true, A, A, index, Shift::Lsl, scale);
         }
-        if mem.base != Some(Base::Rip) && mem.disp != 0 {
+        if mem.base != Some(Base::Rip) && !absolute && mem.disp != 0 {
             if (1..4096).contains(&mem.disp) {
                 a.add_imm(true, A, A, mem.disp as u16);
             } else if (-4095..0).contains(&mem.disp) {
@@ -497,13 +520,144 @@ impl Emitter {
     /// as they were before the instruction, as x86's are, and the exception is precise. (`push rsp` pushes rsp's old
     /// value, too, as x86 does.)
     fn push(&mut self, value: u8) {
-        self.asm.stur(64, value, RSP, -8);
-        self.asm.sub_imm(true, RSP, RSP, 8);
+        let (word, wide) = (self.word(), self.wide());
+        let bytes = i16::from(word / 8);
+        self.asm.stur(word, value, RSP, -bytes);
+        self.asm.sub_imm(wide, RSP, RSP, bytes as u16);
     }
 
     fn pop(&mut self, into: u8) {
-        self.asm.ldr(64, into, RSP);
-        self.asm.add_imm(true, RSP, RSP, 8);
+        let (word, wide) = (self.word(), self.wide());
+        self.asm.ldr(word, into, RSP);
+        self.asm.add_imm(wide, RSP, RSP, u16::from(word / 8));
+    }
+
+    /// `pushf`: EFLAGS from ARM's flags (CF inverted), DF as this block knows it, IF and bit 1, and in 32-bit x86
+    /// the ID and AC bits `x8` keeps. PF and AF aren't kept, and read as clear.
+    fn pushf(&mut self) {
+        let a = &mut self.asm;
+        a.mrs_nzcv(S0);
+        a.mov_imm(S1, 0x202 | if self.df { 0x400 } else { 0 });
+        a.orn(false, S2, ZR, S0);
+        a.lsr_imm(false, S2, S2, 29);
+        a.bfi(true, S1, S2, 0, 1);
+        a.lsr_imm(false, S2, S0, 30);
+        a.bfi(true, S1, S2, 6, 1);
+        a.lsr_imm(false, S2, S0, 31);
+        a.bfi(true, S1, S2, 7, 1);
+        a.lsr_imm(false, S2, S0, 28);
+        a.bfi(true, S1, S2, 11, 1);
+        if self.x32 {
+            a.orr(true, S1, S1, X32_EFLAGS);
+        }
+        self.push(S1);
+    }
+
+    /// `popf`: ARM's flags from EFLAGS' CF, ZF, SF and OF, and in 32-bit x86 the ID and AC bits into `x8`. A value
+    /// with DF set leaves the block as UNSUPPORTED before anything changes, since DF is only known while translating;
+    /// one without it clears DF for the rest of the block.
+    fn popf(&mut self, inst: &Inst) {
+        let word = self.word();
+        let a = &mut self.asm;
+        a.ldr(word, S0, RSP);
+        a.ubfx(true, S1, S0, 10, 1);
+        let at = a.len();
+        a.cbz(true, S1, 0);
+        self.exit(exit::UNSUPPORTED, inst.at);
+        let here = self.asm.len();
+        self.asm.patch(at, here);
+        self.df = false;
+        let wide = self.wide();
+        let a = &mut self.asm;
+        a.add_imm(wide, RSP, RSP, u16::from(word / 8));
+        a.mov_imm(S1, 0);
+        a.lsr_imm(false, S2, S0, 7);
+        a.bfi(true, S1, S2, 31, 1);
+        a.lsr_imm(false, S2, S0, 6);
+        a.bfi(true, S1, S2, 30, 1);
+        a.orn(false, S2, ZR, S0);
+        a.bfi(true, S1, S2, 29, 1);
+        a.lsr_imm(false, S2, S0, 11);
+        a.bfi(true, S1, S2, 28, 1);
+        a.msr_nzcv(S1);
+        if self.x32 {
+            a.mov_imm(S2, X32_EFLAGS_KEPT);
+            a.and(true, X32_EFLAGS, S0, S2);
+        }
+    }
+
+    /// `pusha`: eax, ecx, edx, ebx, esp as it was, ebp, esi, edi. The stores first, so a fault leaves esp as it was.
+    fn pusha(&mut self) {
+        let a = &mut self.asm;
+        a.mov(true, S0, RSP);
+        for (i, reg) in [RAX, RCX, RDX, 3, S0, RBP, RSI, RDI].into_iter().enumerate() {
+            a.stur(32, reg, RSP, -4 * (i as i16 + 1));
+        }
+        a.sub_imm(false, RSP, RSP, 32);
+    }
+
+    /// `popa`: the same back, but esp, which ends 32 bytes up. Loaded into scratch first, so a fault changes nothing.
+    fn popa(&mut self) {
+        let a = &mut self.asm;
+        let scratch = [S0, S1, S2, S3, F0, F1, F2];
+        // edi, esi, ebp, (esp), ebx, edx, ecx, eax, from the top of the stack up.
+        let regs = [RDI, RSI, RBP, 3, RDX, RCX, RAX];
+        let offsets = [0u16, 4, 8, 16, 20, 24, 28];
+        for (s, off) in scratch.iter().zip(offsets) {
+            a.add_imm(false, A, RSP, off);
+            a.ldr(32, *s, A);
+        }
+        for (reg, s) in regs.iter().zip(scratch) {
+            a.mov(false, *reg, s);
+        }
+        a.add_imm(false, RSP, RSP, 32);
+    }
+
+    /// `inc` and `dec`, which leave CF as it was.
+    fn inc_dec(&mut self, inst: &Inst, dst: Op, size: u8, dec: bool) -> Lowered {
+        self.asm.mrs_nzcv(F0);
+        let kind = if dec { Alu::Sub } else { Alu::Add };
+        self.asm.mov_imm(S1, 1);
+        if inst.lock {
+            if !matches!(dst, Op::Mem) {
+                return Err(Unsupported);
+            }
+            if dec {
+                self.asm.sub(true, S2, ZR, S1);
+                self.asm.ldaddal(size, S2, S0, A);
+            } else {
+                self.asm.ldaddal(size, S1, S0, A);
+            }
+            self.alu(kind, size, S0, S1);
+        } else {
+            self.load(dst, size, S0);
+            self.alu(kind, size, S0, S1);
+            self.store(dst, size, R)?;
+        }
+        self.keep_carry(F0);
+        Ok(Next::Continue)
+    }
+
+    /// `cmpxchg8b`: edx:eax against the 8 bytes there, atomically, ecx:ebx stored if they match. ZF says whether they
+    /// did, and the other flags stay; edx:eax ends with what was there either way (when they matched, it's the same).
+    fn cmpxchg8b(&mut self, inst: &Inst) -> Lowered {
+        let Op::Mem = self.rm(inst, 64)? else { return Err(Unsupported) };
+        let a = &mut self.asm;
+        a.mov(false, S0, RAX);
+        a.bfi(true, S0, RDX, 32, 32);
+        a.mov(false, S1, 3);
+        a.bfi(true, S1, RCX, 32, 32);
+        a.mov(true, S2, S0);
+        a.casal(64, S2, S1, A);
+        a.mrs_nzcv(F0);
+        a.subs(true, ZR, S2, S0);
+        a.mrs_nzcv(F1);
+        a.lsr_imm(true, F1, F1, 30);
+        a.bfi(true, F0, F1, 30, 1);
+        a.msr_nzcv(F0);
+        a.mov(false, RAX, S2);
+        a.lsr_imm(true, RDX, S2, 32);
+        Ok(Next::Continue)
     }
 
     // ---- Instructions ----
@@ -605,7 +759,33 @@ impl Emitter {
                 self.pop(RBP);
                 Ok(Next::Continue)
             }
-            0x63 => {
+            0x40..=0x4F if self.x32 => self.inc_dec(inst, Op::Reg(inst.reg, false), v, op >= 0x48),
+            0x60 if self.x32 && !inst.opsize16 => {
+                self.pusha();
+                Ok(Next::Continue)
+            }
+            0x61 if self.x32 && !inst.opsize16 => {
+                self.popa();
+                Ok(Next::Continue)
+            }
+            0x9C if !inst.opsize16 => {
+                self.pushf();
+                Ok(Next::Continue)
+            }
+            0x9D if !inst.opsize16 => {
+                self.popf(inst);
+                Ok(Next::Continue)
+            }
+            // mov to and from moffs, which the decoder gives as a memory operand.
+            0xA0..=0xA3 => {
+                let size = if op & 1 == 0 { 8 } else { v };
+                let mem = self.rm(inst, size)?;
+                let (dst, src) = if op < 0xA2 { (Op::Reg(RAX, false), mem) } else { (mem, Op::Reg(RAX, false)) };
+                self.load(src, size, S0);
+                self.store(dst, size, S0)?;
+                Ok(Next::Continue)
+            }
+            0x63 if !self.x32 => {
                 let src = self.rm(inst, 32)?;
                 self.load(src, 32, S0);
                 if inst.w() {
@@ -626,7 +806,7 @@ impl Emitter {
                 self.imul(inst.reg, v)
             }
             0x70..=0x7F => self.jcc(inst, op & 15),
-            0x80..=0x83 if op != 0x82 => {
+            0x80..=0x83 if op != 0x82 || self.x32 => {
                 let kind = Self::alu_kind(inst.ext).ok_or(Unsupported)?;
                 let size = if op == 0x80 { 8 } else { v };
                 let dst = self.rm(inst, size)?;
@@ -669,9 +849,10 @@ impl Emitter {
                 Ok(Next::Continue)
             }
             0x8F if inst.ext == 0 => {
+                let word = self.word();
                 self.pop(S0);
-                let dst = self.rm(inst, 64)?;
-                self.store(dst, 64, S0)?;
+                let dst = self.rm(inst, word)?;
+                self.store(dst, word, S0)?;
                 Ok(Next::Continue)
             }
             0x90 if inst.rep => {
@@ -738,8 +919,15 @@ impl Emitter {
             }
             0xC2 | 0xC3 => {
                 self.pop(T);
-                if op == 0xC2 && inst.imm != 0 {
-                    self.asm.add_imm(true, RSP, RSP, (inst.imm as u16) & 0xFFF);
+                let bytes = inst.imm as u16;
+                if op == 0xC2 && bytes != 0 {
+                    let wide = self.wide();
+                    if bytes < 4096 {
+                        self.asm.add_imm(wide, RSP, RSP, bytes);
+                    } else {
+                        self.asm.mov_imm(S0, u64::from(bytes));
+                        self.asm.add(wide, RSP, RSP, S0);
+                    }
                 }
                 self.jump_indirect();
                 Ok(Next::End)
@@ -812,32 +1000,13 @@ impl Emitter {
             0xFE | 0xFF if inst.ext < 2 => {
                 let size = if op == 0xFE { 8 } else { v };
                 let dst = self.rm(inst, size)?;
-                self.asm.mrs_nzcv(F0);
-                let kind = if inst.ext == 0 { Alu::Add } else { Alu::Sub };
-                self.asm.mov_imm(S1, 1);
-                if inst.lock {
-                    if !matches!(dst, Op::Mem) {
-                        return Err(Unsupported);
-                    }
-                    if kind == Alu::Sub {
-                        self.asm.sub(true, S2, ZR, S1);
-                        self.asm.ldaddal(size, S2, S0, A);
-                    } else {
-                        self.asm.ldaddal(size, S1, S0, A);
-                    }
-                    self.alu(kind, size, S0, S1);
-                } else {
-                    self.load(dst, size, S0);
-                    self.alu(kind, size, S0, S1);
-                    self.store(dst, size, R)?;
-                }
-                self.keep_carry(F0);
-                Ok(Next::Continue)
+                self.inc_dec(inst, dst, size, inst.ext == 1)
             }
             0xFF => match inst.ext {
                 2 | 4 => {
-                    let target = self.rm(inst, 64)?;
-                    self.load(target, 64, T);
+                    let word = self.word();
+                    let target = self.rm(inst, word)?;
+                    self.load(target, word, T);
                     if inst.ext == 2 {
                         self.asm.mov_imm(S0, inst.next());
                         self.push(S0);
@@ -846,8 +1015,9 @@ impl Emitter {
                     Ok(Next::End)
                 }
                 6 => {
-                    let src = self.rm(inst, 64)?;
-                    self.load(src, 64, S0);
+                    let word = self.word();
+                    let src = self.rm(inst, word)?;
+                    self.load(src, word, S0);
                     self.push(S0);
                     Ok(Next::Continue)
                 }
@@ -874,10 +1044,11 @@ impl Emitter {
         let step = u16::from(size / 8);
         let moving = op < 0xA8;
         let down = self.df;
+        let wide = self.wide();
         let a = &mut self.asm;
         let top = a.len();
         let done = if inst.rep {
-            a.cbz(true, RCX, 0);
+            a.cbz(wide, RCX, 0);
             Some(top)
         } else {
             None
@@ -886,20 +1057,20 @@ impl Emitter {
             a.ldr(size, S0, RSI);
             a.str(size, S0, RDI);
             if down {
-                a.sub_imm(true, RSI, RSI, step);
+                a.sub_imm(wide, RSI, RSI, step);
             } else {
-                a.add_imm(true, RSI, RSI, step);
+                a.add_imm(wide, RSI, RSI, step);
             }
         } else {
             a.str(size, RAX, RDI);
         }
         if down {
-            a.sub_imm(true, RDI, RDI, step);
+            a.sub_imm(wide, RDI, RDI, step);
         } else {
-            a.add_imm(true, RDI, RDI, step);
+            a.add_imm(wide, RDI, RDI, step);
         }
         if let Some(done) = done {
-            a.sub_imm(true, RCX, RCX, 1);
+            a.sub_imm(wide, RCX, RCX, 1);
             let back = a.len();
             a.b(0);
             a.patch(back, top);
@@ -1261,6 +1432,8 @@ impl Emitter {
                 self.imul(inst.reg, v)
             }
             0xB0 | 0xB1 => self.cmpxchg(inst, if op == 0xB0 { 8 } else { v }),
+            // cmpxchg8b; cmpxchg16b (REX.W) isn't covered.
+            0xC7 if inst.ext == 1 && !inst.w() => self.cmpxchg8b(inst),
             // bt, bts, btr, btc, by a register.
             0xA3 | 0xAB | 0xB3 | 0xBB => self.bit_test(inst, v, (op >> 3) & 3, None),
             0xA4 | 0xA5 | 0xAC | 0xAD => self.double_shift(inst, v),

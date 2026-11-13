@@ -6,7 +6,8 @@
 //! a translated address back to the program's.
 //!
 //! Built so far: x86-64 → ARM64 (`emit::arm64`): x86-64's integer instructions, SSE2, and x87 at double precision,
-//! as Debian's own programs use them (`apt`, `dpkg`, Python, git). What it doesn't cover becomes an undefined-instruction
+//! as Debian's own programs use them (`apt`, `dpkg`, Python, git); and 32-bit x86 → ARM64, the same emitter in its
+//! 32-bit mode, for atlas's WoW64. What it doesn't cover becomes an undefined-instruction
 //! stop at that address, which lambda reports with the instruction's bytes.
 //! ARM64 → x86-64 and same-ISA rewriting are still to come.
 #![cfg_attr(not(test), no_std)]

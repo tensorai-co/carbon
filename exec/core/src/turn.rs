@@ -108,7 +108,7 @@ impl<'e, V: Vm, S: Sandbox> Turn<'e, V, S> {
         let root = self.core.mmu.new_root()?;
         self.core.spaces.insert(root, isa);
         if isa.is_x86() && Isa::host() == Isa::Arm64 && matches!(self.core.mode, Mode::Vm { .. }) {
-            self.core.translated.insert(root, Translated::default());
+            self.core.translated.insert(root, Translated::new(isa));
         }
         Ok(SpaceId(root))
     }
@@ -124,7 +124,7 @@ impl<'e, V: Vm, S: Sandbox> Turn<'e, V, S> {
             // with the access the kernel gave them.
             self.core.mmu.unmap(copy, REGION);
             self.core.unguard_copy(root, copy);
-            self.core.translated.insert(copy, Translated::default());
+            self.core.translated.insert(copy, Translated::new(isa));
         }
         // The source's pages went read-only.
         self.core.changed(root, 0..u64::MAX);
@@ -473,7 +473,7 @@ impl<V: Vm, S: Sandbox> Thread<'_, V, S> {
             CpuInner::Vm { cpu, shim, data } => {
                 if translating && let Some(r) = V::Shim::arm64(cpu.regs()) {
                     let rip = self.core.x86_pc(index, root, r.elr);
-                    return translated::x86_regs(r, rip);
+                    return translated::x86_regs(r, rip, self.core.translating_x32(root));
                 }
                 shim.program(&self.core.mmu, data, cpu.regs())
             }
@@ -492,7 +492,7 @@ impl<V: Vm, S: Sandbox> Thread<'_, V, S> {
                     if x.rip != self.core.x86_pc(index, root, r.elr) {
                         self.core.entries[index] = Some(x.rip);
                     }
-                    translated::set_x86_regs(r, x);
+                    translated::set_x86_regs(r, x, self.core.translating_x32(root));
                     return;
                 }
                 shim.set_program(&self.core.mmu, data, cpu.regs(), regs)
