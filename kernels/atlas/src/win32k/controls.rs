@@ -79,17 +79,17 @@ const EN_MAXTEXT: u64 = 0x501;
 /// An edit's text, unless `EM_LIMITTEXT` says otherwise.
 const EDIT_LIMIT: usize = 30000;
 
-const WS_BORDER: u32 = 0x0080_0000;
-const WS_EX_CLIENTEDGE: u32 = 0x200;
+pub(super) const WS_BORDER: u32 = 0x0080_0000;
+pub(super) const WS_EX_CLIENTEDGE: u32 = 0x200;
 const WS_EX_STATICEDGE: u32 = 0x2_0000;
 
 const FACE: Rgb = 0xe1e1e1;
 const FACE_PRESSED: Rgb = 0xcce4f7;
 const EDGE: Rgb = 0xadadad;
-const ACCENT: Rgb = 0x0078d7;
+pub(super) const ACCENT: Rgb = 0x0078d7;
 const MARK: Rgb = 0x333333;
-const BORDER: Rgb = 0x7a7a7a;
-const GRAY: Rgb = 0x6d6d6d;
+pub(super) const BORDER: Rgb = 0x7a7a7a;
+pub(super) const GRAY: Rgb = 0x6d6d6d;
 
 /// A control's own state.
 #[derive(Debug, Clone, Default)]
@@ -111,6 +111,10 @@ pub struct Control {
     /// `EM_SETPASSWORDCHAR`'s, or `ES_PASSWORD`'s asterisk.
     pub password: Option<u16>,
     pub modified: bool,
+    /// A progress bar's range, position and colours.
+    pub progress: super::comctl::Progress,
+    /// A list view's columns and items.
+    pub list: super::comctl::ListView,
 }
 
 /// A label's text without its `&` mnemonics (`&&` is an `&`), and the place of the character it marks.
@@ -169,7 +173,7 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
 }
 
 /// Draws a rectangle of dots, as a focused control's outline is.
-fn dotted(s: &mut Surface, r: &Rect, color: Rgb, clip: &Rect) {
+pub(super) fn dotted(s: &mut Surface, r: &Rect, color: Rgb, clip: &Rect) {
     for x in (r.left..r.right).step_by(2) {
         s.set(x, r.top, color, clip);
         s.set(x, r.bottom - 1, color, clip);
@@ -182,15 +186,15 @@ fn dotted(s: &mut Surface, r: &Rect, color: Rgb, clip: &Rect) {
 
 /// The colours a control is drawn in, as its parent gave them: the background (None to leave what's under it), the
 /// text's, and the text's background (None for TRANSPARENT).
-struct Colors {
-    background: Option<Rgb>,
-    text: Rgb,
-    text_background: Option<Rgb>,
+pub(super) struct Colors {
+    pub background: Option<Rgb>,
+    pub text: Rgb,
+    pub text_background: Option<Rgb>,
 }
 
 impl Task {
     /// Works on a control's state, made the first time it's asked for.
-    fn control<R>(&self, hwnd: u64, f: impl FnOnce(&mut super::Window, &mut Control) -> R) -> Option<R> {
+    pub(super) fn control<R>(&self, hwnd: u64, f: impl FnOnce(&mut super::Window, &mut Control) -> R) -> Option<R> {
         let mut w = self.win32k();
         let w = &mut *w;
         let win = w.windows.get_mut(&hwnd)?;
@@ -199,7 +203,7 @@ impl Task {
     }
 
     /// Tells a control's parent something happened: `WM_COMMAND` with its ID and `code`.
-    fn notify(&mut self, cx: &mut Cx<'_>, hwnd: u64, code: u64) -> Result<(), Reply> {
+    pub(super) fn notify(&mut self, cx: &mut Cx<'_>, hwnd: u64, code: u64) -> Result<(), Reply> {
         let Some((parent, id)) = self.win32k().windows.get(&hwnd).map(|w| (w.parent, w.id)) else { return Ok(()) };
         if parent != super::DESKTOP {
             self.send_message(cx, parent, WM_COMMAND, code << 16 | (id & 0xffff), hwnd)?;
@@ -209,7 +213,7 @@ impl Task {
 
     /// Asks a control's parent for its colours (`message` is the `WM_CTLCOLOR*` for it), with a DC for it: the brush it
     /// gives fills the control, and the DC's text colour, background and mode as it left them draw its text.
-    fn colors(&mut self, cx: &mut Cx<'_>, hwnd: u64, hdc: u64, message: u32, default: Rgb) -> Result<Colors, Reply> {
+    pub(super) fn colors(&mut self, cx: &mut Cx<'_>, hwnd: u64, hdc: u64, message: u32, default: Rgb) -> Result<Colors, Reply> {
         let parent = self.win32k().windows.get(&hwnd).map_or(0, |w| w.parent);
         let brush = if parent != super::DESKTOP && parent != 0 {
             self.send_message(cx, parent, message, hdc, hwnd)?
@@ -231,7 +235,7 @@ impl Task {
 
     /// Paints a control: validated, its parent asked for its colours, then `draw` with its pixels, where its client
     /// area is in them, the clip, and what it's to show.
-    fn paint_control(&mut self, cx: &mut Cx<'_>, hwnd: u64, message: u32, default: Rgb, draw: impl FnOnce(&mut Surface, (i32, i32), &Rect, &Colors, &PaintInfo)) -> Result<u64, Reply> {
+    pub(super) fn paint_control(&mut self, cx: &mut Cx<'_>, hwnd: u64, message: u32, default: Rgb, draw: impl FnOnce(&mut Surface, (i32, i32), &Rect, &Colors, &PaintInfo)) -> Result<u64, Reply> {
         let info = {
             let mut w = self.win32k();
             let focus = w.focus;
@@ -244,13 +248,14 @@ impl Task {
             PaintInfo { client, text, style, ex_style, focused: focus == hwnd, enabled, control: c }
         };
         let hdc = self.get_dc(hwnd);
-        let colors = self.colors(cx, hwnd, hdc, message, default)?;
+        // 0: a control that keeps its colours itself, as comctl32's do.
+        let colors = if message == 0 { Colors { background: Some(default), text: 0, text_background: None } } else { self.colors(cx, hwnd, hdc, message, default)? };
         self.win32k().draw(hdc, |s, origin, clip, _| draw(s, origin, clip, &colors, &info));
         self.release_dc(hdc);
         Ok(0)
     }
 
-    fn capture(&mut self, hwnd: u64, on: bool) {
+    pub(super) fn capture(&mut self, hwnd: u64, on: bool) {
         let shown = {
             let mut w = self.win32k();
             let shown = w.top_level_of(hwnd).and_then(|t| w.windows.get(&t)).map_or(0, |t| t.shown);
@@ -262,7 +267,7 @@ impl Task {
 
     /// What's common to the controls: their font, and what a disabled one or one losing the focus needs (painting
     /// again).
-    fn control_common(&mut self, cx: &mut Cx<'_>, hwnd: u64, message: u32, wparam: u64, lparam: u64) -> Result<Option<u64>, Reply> {
+    pub(super) fn control_common(&mut self, cx: &mut Cx<'_>, hwnd: u64, message: u32, wparam: u64, lparam: u64) -> Result<Option<u64>, Reply> {
         Ok(Some(match message {
             WM_SETFONT => {
                 self.control(hwnd, |_, c| c.font = wparam);
@@ -710,14 +715,14 @@ impl Task {
 }
 
 /// What a control's painting needs to know of it.
-struct PaintInfo {
-    client: Rect,
-    text: String,
-    style: u32,
-    ex_style: u32,
-    focused: bool,
-    enabled: bool,
-    control: Control,
+pub(super) struct PaintInfo {
+    pub client: Rect,
+    pub text: String,
+    pub style: u32,
+    pub ex_style: u32,
+    pub focused: bool,
+    pub enabled: bool,
+    pub control: Control,
 }
 
 impl PaintInfo {

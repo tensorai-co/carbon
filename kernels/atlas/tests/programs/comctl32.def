@@ -1,0 +1,14 @@
+LIBRARY COMCTL32.dll
+EXPORTS
+InitCommonControls
+InitCommonControlsEx
+ImageList_Create
+ImageList_Destroy
+ImageList_Add
+ImageList_AddMasked
+ImageList_ReplaceIcon
+ImageList_Draw
+ImageList_GetImageCount
+ImageList_GetIconSize
+ImageList_Remove
+ImageList_SetBkColor

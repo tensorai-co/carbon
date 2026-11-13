@@ -5,9 +5,10 @@ declaration made into a PE in memory, so a machine has no Windows files to insta
 has to run inside the program, ntdll, is a crate (`guest/`) that cargo builds for each ISA and embeds.
 
 **Where it stands.** Programs run on ARM64 natively and x86-64 translated, and 32-bit x86 programs run too (WoW64,
-translated on Apple silicon; phases 1 to 5 of its six, below, are done): 24 of the test programs pass every check as
+translated on Apple silicon; phases 1 to 5 of its six, below, are done): 25 of the test programs pass every check as
 32-bit programs, with x86's own SEH, PE32 images and 32-bit layouts throughout, and a real 32-bit installer starts,
-unpacks its data, runs its start-up script and shows its dialogs, as far as the page that needs comctl32's controls. They have the loader and SEH, threads and
+unpacks its data, runs its start-up script, shows its dialogs and installs its files with its progress shown, as far as
+making its shortcuts. They have the loader and SEH, threads and
 waits, processes, anonymous and named pipes, sections, asynchronous I/O and completion ports, files, the registry,
 security (tokens, descriptors, access checks, impersonation), resources and version information, the system's
 version and information, and windows on the desktop with input. The loader is Windows' own in all but manifests: the
@@ -18,7 +19,7 @@ are shared as their opens say, with hard and symbolic links and times that can b
 program: work, timers and waits, on pools of their own or the process's. The registry tells watchers of changes, has
 WOW64's 32-bit view, and saves, restores, loads and unloads hives. Code pages convert as Windows' do, every `*A`
 function speaks Windows-1252, and ANSI windows get their messages' text in it. ucrtbase.dll is atlas's own C runtime, in the
-program, so MinGW-built C programs run. Nine DLLs declare 983 exports between them, 955 written and 28 stubs that say so, and ntdll has 300.
+program, so MinGW-built C programs run. Nine DLLs declare 989 exports between them, 967 written and 22 stubs that say so, and ntdll has 300.
 
 ## Layout
 
@@ -73,12 +74,13 @@ for all three Windows targets: with rustup, that needs `rustup component add rus
 prints every host export with its result, and each thread that gives its CPU up, waits for one, or takes one again.
 `cargo test -p atlas` runs the unit tests.
 
-On this Mac, through hvf, every test program passes, on ARM64 and x86-64, and the 24 built for i686 too. Each one's
+On this Mac, through hvf, every test program passes, on ARM64 and x86-64, and the 25 built for i686 too. Each one's
 opening comment says what it checks. `crt.exe` (and `crt-mingw.exe`) want the arguments `one "two words"`.
 
 | Program | What it covers |
 | --- | --- |
 | atlas, ARM64 native and x86-64 translated | The basics: the console, the command line, memory, an upcall, a message box, and ntdll's own exports |
+| atlas's `comctl.c`, both ISAs and i686 | comctl32's controls in a dialog: a progress bar's range, position, delta, step, clamping and bar colour, and what it paints; a report list view's columns, items inserted where asked, their text in each column and their `lParam`, `LVM_GETITEM`, selection and the `LVN_ITEMCHANGED` its parent hears, single selection, the down arrow, a column sized to its text, `LVM_ENSUREVISIBLE`, deleting, its image lists and its procedure through `CallWindowProc`; image lists made, added to, counted, sized, removed from and destroyed |
 | atlas's `dialog.c`, both ISAs and i686, with `dialog.rc` | Dialogs: the dialog class as `GetClassInfoEx` gives it and a class of the program's own from it; templates in memory and a `DIALOGEX` resource, their controls, IDs and text; `WM_INITDIALOG` and the focus; `DWLP_DLGPROC`; `Get`/`SetDlgItemText` and `Int`; check boxes and an automatic radio group; `WM_COMMAND` and `EN_CHANGE`; `DM_GETDEFID`; Tab, Enter, Escape and typing through `IsDialogMessage`; `EnableWindow`; a control's procedure through `CallWindowProc`; what the controls paint, read with `GetPixel`, in a `WM_CTLCOLORSTATIC` brush; modal dialogs, their owner disabled, ended by Enter and by `WM_CLOSE` |
 | atlas's `windows.c`, both ISAs | Window classes, creation and its messages, painting and GDI, timers, and messages between threads |
 | atlas's `desktop.c`, both ISAs | Windows on the desktop: activation and focus, coordinates, input through `SendInput`, capture, the clipboard, stacking |
@@ -640,6 +642,20 @@ lower-case edits, a limit, and the `EM_*` messages programs use most. Their pare
 `EN_CHANGE`, `EN_UPDATE`, `EN_SETFOCUS`, `EN_KILLFOCUS` and `EN_MAXTEXT`. Images (a static's icon or bitmap, a
 button's) are kept and not drawn yet, and an owner-drawn button is only its face.
 
+comctl32's progress bar and list view are win32k's too (`win32k/comctl.rs`), their classes there from the start as if
+comctl32 had registered them as it loaded, and their procedures exported from comctl32 (`AtlasProgressWndProc`,
+`AtlasListViewWndProc`). A progress bar has its range (16- and 32-bit), position, delta, step (wrapping past the top
+as comctl32's does), bar and background colours, and error and paused states, drawn smooth, across or up; a marquee
+is a block moved along by each `PBM_SETMARQUEE` and step. A list view keeps its columns (with their width, text and
+alignment; `LVSCW_AUTOSIZE` and `AUTOSIZE_USEHEADER`) and its items (their text in each column, state, image and
+`lParam`), in the W and A forms of the `LVM_*` messages programs use most: inserting, setting and getting items and
+their text, deleting, `LVM_SETITEMSTATE` and `LVM_GETNEXTITEM`, single selection, scrolling (`LVM_ENSUREVISIBLE`,
+`LVM_SCROLL`, the wheel), the arrows and Home, End, Page Up and Down, colours, extended styles and image lists. It's
+drawn as a report, with a header unless `LVS_NOCOLUMNHEADER`; its icon, small icon and list views are drawn as one
+column of the same rows for now. Its parent hears `NM_CLICK`, `NM_DBLCLK`, `NM_RCLICK` and `LVN_ITEMCHANGED`
+through `WM_NOTIFY`. Image lists keep their images' size and count; bitmaps aren't drawn yet, so neither are their
+images, nor a list view's.
+
 GDI draws host-side, into each top-level window's pixels on the desktop: DCs from `GetDC` and `BeginPaint`, clipped
 to the client area or what needs painting; stock and made brushes and pens; `FillRect`, `FrameRect`, `Rectangle`,
 `MoveToEx`/`LineTo`, `SetPixel`/`GetPixel`, `TextOutW` and `DrawTextW` in the one font (5 by 7 in a 6 by 13
@@ -718,7 +734,9 @@ By layer, bottom up. Items are host Rust unless marked **[guest]** (ntdll), or a
   besides US; menus (`CreateMenu`, `SetMenu`, `TrackPopupMenu`, menu bars, accelerators, and the system menu shown);
   dialogs' rest (menus in templates, `DS_SETFOREGROUND` and the other `DS_*` styles, owner-drawn buttons' WM_DRAWITEM,
   icons and bitmaps in statics and buttons, keyboard mnemonics); the standard controls still to come (LISTBOX,
-  COMBOBOX, SCROLLBAR, and an edit's scrolling, clipboard and undo);
+  COMBOBOX, SCROLLBAR, and an edit's scrolling, clipboard and undo); comctl32's others (tree view, tabs, trackbar,
+  up-down, status bar, toolbar, tooltips, the header as a control of its own) and the list view's rest (its icon
+  views, editing labels, sorting, `LVN_GETDISPINFO`'s callback items, owner data);
   scroll bars and carets; icons and cursors as objects (`LoadImage`, `DrawIconEx`, `GetIconInfo`); hooks
   (`SetWindowsHookEx`); window stations and desktops as objects; `MsgWaitForMultipleObjects`, one wait for messages
   and objects, so no GUI program polls; windows across processes (`SendMessage`, `EnumWindows`, `WindowFromPoint`);
@@ -851,7 +869,7 @@ First `cmd.exe` (variables, `if`, `for`, `goto`, `call`, pipes, redirection, `.b
      `carbon run` knows a 32-bit `.exe` (platform `windows/386`), and gives it x86's memory ordering.
   6. [ ] **Every test program for i686**, passing; then real installers. Every test program but `sysinfo.c` (whose
      checks are 64-bit offsets; `wow64.c` checks the same calls at 32 bits) builds for i686 and passes every check:
-     23 programs, 771 checks, with the loader's own DLLs, thread-local variables (`__tls_array`), `__try` through
+     25 programs, 841 checks, with the loader's own DLLs, thread-local variables (`__tls_array`), `__try` through
      `_except_handler3` (now in the i686 ntdll, with `_local_unwind2`), and the C runtime. `build.sh` makes each
      program's import libraries from what its object imports, `__imp_` or not. `installer.c` checks what installers
      call first, on all three ISAs: `wsprintf` is C-variadic, so each ISA's is a few lines of the guest's assembly
@@ -859,15 +877,16 @@ First `cmd.exe` (variables, `if`, `for`, `goto`, `call`, pipes, redirection, `.b
      A real 32-bit installer now starts, unpacks its compressed data, runs its start-up script (the registry, files,
      `.onInit`'s checks), and shows its main dialog with its first page (a child dialog of its own class, made from
      what `GetClassInfo` gave for `#32770`): text, a group box, an edit with the install folder, the disk space, and
-     its buttons, which work. Its Install button takes it to its progress page, which it can't make yet: that
-     template's controls are comctl32's. Still to do there, in order:
-     - **comctl32's controls:** the progress bar (`msctls_progress32`), list view (`SysListView32`) and tree view, and
-       image lists (`ImageList_Create`, `AddMasked`, `Destroy`).
+     its buttons, which work. Its Install button takes it to its progress page (a progress bar and a details list,
+     comctl32's), where it extracts its files with each one shown, the bar filling as it goes; then it stops at
+     `SHGetSpecialFolderLocation`, as it makes its shortcuts. Still to do there, in order:
+     - **The shell:** `SHGetSpecialFolderLocation` and `SHGetPathFromIDList` (the shortcuts' folders),
+       `SHBrowseForFolder` (the Browse button), `SHFileOperation`, `ShellExecute` (running what it installed), and
+       `SHGetFileInfo`'s flags (it's only right with none).
      - **Icons and bitmaps from resources:** `LoadImage` and `LoadBitmap` give a placeholder handle so far, so the
        header's picture is blank.
-     - **Menus:** `CreatePopupMenu`, `AppendMenu`, `TrackPopupMenu` (a list's context menu).
-     - **The shell:** `SHGetSpecialFolderLocation` and `SHGetPathFromIDList`, `SHBrowseForFolder` (the Browse
-       button), `SHFileOperation`, `ShellExecute`, and `SHGetFileInfo`'s flags (it's only right with none).
+     - **Menus:** `CreatePopupMenu`, `AppendMenu`, `TrackPopupMenu` (the details list's context menu).
+     - **Image lists drawn**, with the bitmaps they're made from.
      - **The rest:** `MessageBoxIndirect`, `SendMessageTimeout`, `SystemParametersInfo`, `GetMessagePos`,
        `ExitWindowsEx`. COM has no classes yet, so a shortcut an installer makes is skipped, as it is on Windows when
        the class isn't there.
@@ -901,7 +920,7 @@ NTLM, and the x87 stack missing from a 32-bit `CONTEXT`.
 
 - **Per DLL:** declared, host, in ntdll and stubs, against Windows' exports, counted from the `dll!` declarations.
 - **Per area:** a freestanding test program in `tests/programs` on both ISAs (and i686 once it runs). Still to write:
-  `gdi.c`, `controls.c` (comctl32's), `com.c`, `winsock.c`, `crypto.c`.
+  `gdi.c`, `com.c`, `winsock.c`, `crypto.c`.
 - **The long tail:** `carbon atlas imports` ranks what folders of real programs lack; next is counting the `missing`
   stubs and `GetProcAddress` names programs reach as they run.
 - **Checkpoints**, each run headless and screenshotted: a console tool, a plain Win32 program, a dialog program with

@@ -7,6 +7,7 @@
 //! win32k keeps what Windows says about them (window and client rectangles, child windows, focus) and turns the
 //! desktop's events into messages (`pump`).
 
+pub mod comctl;
 pub mod controls;
 pub mod dialog;
 pub mod gdi;
@@ -118,12 +119,14 @@ pub enum SysProc {
     Button,
     Static,
     Edit,
+    Progress,
+    ListView,
 }
 
 const SYS_PROCS: u64 = 0xffff_ffff_fff0_0000;
 
 impl SysProc {
-    pub const ALL: [SysProc; 4] = [SysProc::Dialog, SysProc::Button, SysProc::Static, SysProc::Edit];
+    pub const ALL: [SysProc; 6] = [SysProc::Dialog, SysProc::Button, SysProc::Static, SysProc::Edit, SysProc::Progress, SysProc::ListView];
 
     /// The value a window or class holds for it.
     pub fn handle(self) -> u64 {
@@ -134,13 +137,15 @@ impl SysProc {
         value.checked_sub(SYS_PROCS).and_then(|i| SysProc::ALL.get(i as usize).copied())
     }
 
-    /// The user32 export a program calls it through.
-    pub fn export(self) -> &'static str {
+    /// The DLL and export a program calls it through: user32's, or comctl32's for its controls.
+    pub fn export(self) -> (&'static str, &'static str) {
         match self {
-            SysProc::Dialog => "DefDlgProcW",
-            SysProc::Button => "AtlasButtonWndProc",
-            SysProc::Static => "AtlasStaticWndProc",
-            SysProc::Edit => "AtlasEditWndProc",
+            SysProc::Dialog => ("USER32.dll", "DefDlgProcW"),
+            SysProc::Button => ("USER32.dll", "AtlasButtonWndProc"),
+            SysProc::Static => ("USER32.dll", "AtlasStaticWndProc"),
+            SysProc::Edit => ("USER32.dll", "AtlasEditWndProc"),
+            SysProc::Progress => ("COMCTL32.dll", "AtlasProgressWndProc"),
+            SysProc::ListView => ("COMCTL32.dll", "AtlasListViewWndProc"),
         }
     }
 }
@@ -446,6 +451,8 @@ pub struct Win32k {
     /// Each window's system menu, as `GetSystemMenu` gives it: its commands' states (`MF_GRAYED`, `MF_DISABLED`),
     /// by command. A command greyed there is one `DefWindowProc` won't carry out.
     pub system_menus: BTreeMap<u64, BTreeMap<u64, u32>>,
+    /// comctl32's image lists, by handle.
+    pub image_lists: BTreeMap<u64, comctl::ImageList>,
 }
 
 /// A window's system menu's handle is this plus the window's.
@@ -546,6 +553,7 @@ impl Win32k {
             dialogs: BTreeMap::new(),
             controls: BTreeMap::new(),
             system_menus: BTreeMap::new(),
+            image_lists: BTreeMap::new(),
         };
         w.register_system_classes();
         w
@@ -557,11 +565,14 @@ impl Win32k {
         // COLOR_BTNFACE + 1, a dialog's face; IDC_ARROW, and IDC_IBEAM over an edit.
         // Name, atom (or one of its own), procedure, extra bytes, background, cursor.
         type System = (&'static str, Option<u16>, SysProc, usize, u64, u64);
-        let classes: [System; 4] = [
+        let classes: [System; 6] = [
             ("#32770", Some(0x8002), SysProc::Dialog, DLGWINDOWEXTRA, 16, 32512),
             ("Button", None, SysProc::Button, 0, 0, 32512),
             ("Static", None, SysProc::Static, 0, 0, 32512),
             ("Edit", None, SysProc::Edit, 0, 0, 32513),
+            // comctl32's, which every program has here as if it had loaded comctl32.
+            ("msctls_progress32", None, SysProc::Progress, 0, 0, 32512),
+            ("SysListView32", None, SysProc::ListView, 0, 0, 32512),
         ];
         for (name, atom, proc, extra, background, cursor) in classes {
             let atom = atom.unwrap_or_else(|| {
@@ -1481,6 +1492,8 @@ impl Task {
             SysProc::Button => self.button_proc(cx, hwnd, message, wparam, lparam),
             SysProc::Static => self.static_proc(cx, hwnd, message, wparam, lparam),
             SysProc::Edit => self.edit_proc(cx, hwnd, message, wparam, lparam),
+            SysProc::Progress => self.progress_proc(cx, hwnd, message, wparam, lparam),
+            SysProc::ListView => self.list_view_proc(cx, hwnd, message, wparam, lparam),
         }
     }
 
@@ -1488,7 +1501,10 @@ impl Task {
     /// it, in this process.
     pub fn wndproc_address(&self, value: u64) -> u64 {
         match SysProc::of(value) {
-            Some(proc) => self.system_export("USER32.dll", proc.export()).unwrap_or(0),
+            Some(proc) => {
+                let (dll, name) = proc.export();
+                self.system_export(dll, name).unwrap_or(0)
+            }
             None => value,
         }
     }

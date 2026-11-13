@@ -183,7 +183,7 @@ programs and how to build them are in [lambda's](kernels/lambda/README.md#runnin
   ptys, signals, threads, `epoll` and friends, sockets, and `apt-get install` of curl, Python and git, which then
   work over HTTPS. **atlas** runs Windows programs with its loader and SEH, threads, processes and objects, pipes,
   sections, asynchronous I/O, files, the registry, security, resources and system information, and windows on the
-  desktop with input, dialogs and the basic controls, on ARM64, x86-64 and 32-bit x86.
+  desktop with input, dialogs and the basic controls, a progress bar and list view, on ARM64, x86-64 and 32-bit x86.
 - **`carbon run debian:13 -- bash`** works on all three hosts, from an image pulled over HTTPS (trusting what the host
   trusts), with machines kept by name, stopped, frozen and started again.
 - **net** gives each machine its own network out through the host's sockets: `apt-get update` and `curl https://`
@@ -250,8 +250,9 @@ another process on Windows hosts; a worker process per machine.
 
 1. The desktop on Linux and Windows hosts' screens, as it is on the Mac's.
 2. The desktop's rest: WM_NCHITTEST and frames a program draws itself, keyboard layouts besides US.
-3. atlas's user interface: menus, comctl32's controls, the list box and combo box, `MsgWaitForMultipleObjects`.
-   (Dialogs, with buttons, statics and edits, are done.)
+3. atlas's user interface: menus, the list box and combo box, comctl32's other controls (the tree view, tabs),
+   `MsgWaitForMultipleObjects`. (Dialogs, with buttons, statics and edits, and comctl32's progress bar and list view
+   are done.)
 4. GDI: bitmaps and memory DCs, DIB sections with shared pages, regions and shapes, real fonts.
 5. lambda's Wayland and X11 servers, so GTK, Qt and Firefox run.
 6. Graphics APIs: OpenGL, Direct3D and DXGI, and how they reach the host's GPU.
