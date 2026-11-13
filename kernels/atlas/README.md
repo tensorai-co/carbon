@@ -4,7 +4,9 @@ atlas runs Windows programs. It is all of Windows that programs reach, as one Ru
 declaration made into a PE in memory, so a machine has no Windows files to install, and the one part of Windows that
 has to run inside the program, ntdll, is a crate (`guest/`) that cargo builds for each ISA and embeds.
 
-**Where it stands.** Programs run on ARM64 natively and x86-64 translated, with the loader and SEH, threads and
+**Where it stands.** Programs run on ARM64 natively and x86-64 translated, and 32-bit x86 programs run too (WoW64,
+translated on Apple silicon; phases 1 to 4 of its six, below, are done): 15 of the test programs pass every check as
+32-bit programs, with x86's own SEH, PE32 images and 32-bit layouts throughout. They have the loader and SEH, threads and
 waits, processes, anonymous and named pipes, sections, asynchronous I/O and completion ports, files, the registry,
 security (tokens, descriptors, access checks, impersonation), resources and version information, the system's
 version and information, and windows on the desktop with input. The loader is Windows' own in all but manifests: the
@@ -21,11 +23,14 @@ program, so MinGW-built C programs run. Seven DLLs declare 857 exports between t
 
 ```
 kernels/atlas/
-  build.rs        builds guest/ for each ISA and embeds it
-  abi/            atlas-abi: what guest/ and atlas share (call numbers, TEB/PEB/CONTEXT layouts, status codes)
-  guest/          atlas-guest: ntdll, the in-process part (loader, heap, sync, exceptions and unwinding, environment)
+  build.rs        builds guest/ for each ISA (ARM64, x86-64 and i686) and embeds it
+  abi/            atlas-abi: what guest/ and atlas share (call numbers, TEB/PEB/CONTEXT layouts at 64 and 32 bits,
+                  status codes)
+  guest/          atlas-guest: ntdll, the in-process part (loader, heap, sync, exceptions and unwinding, environment);
+                  seh32.rs is x86's SEH, msvc32.rs its 64-bit division helpers
   src/
     lib.rs        boot, the dispatcher
+    abi.rs        a process's structures by its ISA: TEB, PEB, parameters, records, OVERLAPPED, pointer width
     process.rs threads.rs     processes, threads, the PEB and TEB
     mapping.rs    VirtualAlloc and friends, at 64 KiB granularity
     sections.rs   sections and file mappings
@@ -39,7 +44,8 @@ kernels/atlas/
     imports.rs    what a PE imports, against what atlas declares (`carbon atlas imports`)
     exceptions.rs upcall.rs   delivering exceptions; running the program's callbacks from host code
     win32k/       windows and messages over display's desktop, input, GDI
-    images/       PE parsing, mapping images, and making the system DLLs from os/'s declarations
+    images/       PE parsing, mapping images, making the system DLLs from os/'s declarations (PE32+, or PE32 with
+                  stdcall stubs), and where things go in each ISA's space (`layout`)
     os/           each system DLL as a submodule: kernel32, user32, gdi32, advapi32, …
 ```
 
@@ -53,18 +59,21 @@ and `os/dsound`, and the system layer's fonts.
 cargo build --example run-windows
 codesign --force --sign - --entitlements carbon.entitlements target/debug/examples/run-windows   # macOS
 target/debug/examples/run-windows path/to/program.exe args...
-kernels/atlas/tests/programs/build.sh out/      # the test programs, for both ISAs, with LLVM's clang and lld-link
+kernels/atlas/tests/programs/build.sh out/      # the test programs, for each ISA, with LLVM's clang and lld-link
 target/debug/examples/run-windows out/loader-aarch64/loader.exe   # DLLs beside it go on the disk too
+target/debug/examples/run-windows out/loader-i686/wow64.exe       # a 32-bit program
 carbon atlas imports setup.exe                  # what a program imports that atlas lacks (a folder: ranked)
 ```
 
-The runner uses the host's `vm` backend; `CARBON_ISOLATION=sandbox` (or `auto`) picks the sandbox. ntdll is built
-from source for both Windows targets: with rustup, that needs `rustup component add rust-src` and LLVM's `lld-link`
+The runner uses the host's `vm` backend; `CARBON_ISOLATION=sandbox` (or `auto`) picks the sandbox. 32-bit programs
+run on hvf so far (kvm and winkvm haven't run them yet; the sandboxes don't run them). ntdll is built from source
+for all three Windows targets: with rustup, that needs `rustup component add rust-src` and LLVM's `lld-link`
 (Debian's `lld` package has it); on Windows, MSVC (Visual Studio Build Tools) and `lld-link.exe`. `CARBON_TRACE=1`
 prints every host export with its result, and each thread that gives its CPU up, waits for one, or takes one again.
 `cargo test -p atlas` runs the unit tests.
 
-On this Mac, through hvf, every test program passes. Each one's opening comment says what it checks.
+On this Mac, through hvf, every test program passes, on ARM64 and x86-64, and the 15 built for i686 too. Each one's
+opening comment says what it checks. `crt.exe` (and `crt-mingw.exe`) want the arguments `one "two words"`.
 
 | Program | What it covers |
 | --- | --- |

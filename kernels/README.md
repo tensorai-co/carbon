@@ -107,7 +107,7 @@ wait or an upcall.
 | --- | --- | --- |
 | ARM64 | native | needs ARM64 → x86-64 translation (not started) |
 | x86-64 | translated by exec | native |
-| i686 (32-bit x86) | translated by exec (32-bit decoding not started) | native (the shims need a 32-bit code segment) |
+| i686 (32-bit x86) | translated by exec: atlas's WoW64 runs on it | native (the shims have a 32-bit code segment; not run yet) |
 | ARM32 | not supported: Apple silicon can't run it, and few programs need it | not supported |
 
 exec handles all translation, so **a kernel only ever sees the program's own ISA**, and `kernels-core::call` is the one
