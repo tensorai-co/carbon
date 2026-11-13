@@ -325,6 +325,24 @@ impl Machines {
         self.images.save(image, &index, &record.platform, &record.config, &format!("frozen from machine {name}"))
     }
 
+    /// Copies a stopped machine's file, or folder and all in it, at `path` (as the machine names it: `/etc/hosts`, or
+    /// `C:\\Program Files\\App` on Windows) into the host's folder `to`, under its own name. How many files it copied.
+    /// Symbolic links are left out.
+    pub fn copy_out(&self, name: &str, path: &str, to: &Path) -> Result<usize, String> {
+        let record = self.record(name).ok_or_else(|| format!("there's no machine called {name}"))?;
+        if record.running() {
+            return Err(format!("{name} is running: stop it first"));
+        }
+        match record.kernel {
+            Kernel::Lambda => copy_tree(&self.disk::<lambda::Meta>(&record, lambda::Meta::dir(0o755), false)?, path, to),
+            Kernel::Atlas => {
+                // A Windows path, on the machine's one drive.
+                let path = path.strip_prefix("C:").or_else(|| path.strip_prefix("c:")).unwrap_or(path).replace('\\', "/");
+                copy_tree(&self.disk::<atlas::Meta>(&record, atlas::Meta { attributes: 0x10 }, true)?, &path, to)
+            }
+        }
+    }
+
     /// A machine's disk: its image's index, if it has one, under its own log.
     fn disk<M: Persist>(&self, record: &Record, root: M, fold: bool) -> Result<Fs<M>, String> {
         let index = match &record.index {
@@ -609,6 +627,33 @@ fn find_program(disk: &lambda::Disk, program: &str, env: &[String]) -> Option<St
     path.split(':').map(|dir| format!("{}/{program}", dir.trim_end_matches('/'))).find(|candidate| {
         disk.resolve(ROOT, candidate, true).and_then(|ino| disk.stat(ino)).is_ok_and(|stat| stat.kind == layers::Kind::File)
     })
+}
+
+/// `path` on `disk`, and all in it, copied into the host's folder `to`. How many files.
+fn copy_tree<M: Persist>(disk: &Fs<M>, path: &str, to: &Path) -> Result<usize, String> {
+    let ino = disk.resolve(ROOT, path, false).map_err(|e| format!("{path}: {e:?}"))?;
+    let name = path.trim_end_matches('/').rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or("root");
+    fn walk<M: Persist>(disk: &Fs<M>, ino: layers::Ino, at: &Path) -> Result<usize, String> {
+        match disk.entries(ino) {
+            Ok(entries) => {
+                fs::create_dir_all(at).map_err(|e| format!("{}: {e}", at.display()))?;
+                let mut n = 0;
+                for (name, child, kind) in entries {
+                    match kind {
+                        layers::Kind::Symlink => {}
+                        _ => n += walk(disk, child, &at.join(&name))?,
+                    }
+                }
+                Ok(n)
+            }
+            Err(_) => {
+                let bytes = disk.contents(ino).map_err(|e| format!("{}: {e:?}", at.display()))?;
+                fs::write(at, bytes).map_err(|e| format!("{}: {e}", at.display()))?;
+                Ok(1)
+            }
+        }
+    }
+    walk(disk, ino, &to.join(name))
 }
 
 #[cfg(test)]

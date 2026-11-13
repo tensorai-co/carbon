@@ -43,6 +43,7 @@ usage: carbon <command> ...
   stop NAME                                  stop a running machine (SIGTERM, then everything after 10s)
   rm NAME                                    remove a stopped machine and its files
   freeze NAME IMAGE                          make an image of a stopped machine's disk
+  cp NAME:PATH DIR                           copy a stopped machine's file or folder into DIR on this host
   display screenshot NAME [-o FILE]          a running machine's screen, as a PNG (screen.png by default)
   display windows NAME                       a running machine's windows, top first: ID, place, size, state, title
   display move NAME X Y                      moves its pointer
@@ -209,6 +210,12 @@ fn main() {
         "ls" | "ps" => ls(&machines),
         "stop" => machines.stop(&one("a machine's name")).unwrap_or_else(|e| fail(e)),
         "rm" => machines.remove(&one("a machine's name")).unwrap_or_else(|e| fail(e)),
+        "cp" => {
+            let (from, to) = (one("NAME:PATH"), one("a folder on this host"));
+            let (name, path) = from.split_once(':').unwrap_or_else(|| fail("cp copies from NAME:PATH, as web:/etc/hosts".to_string()));
+            let n = machines.copy_out(name, path, std::path::Path::new(&to)).unwrap_or_else(|e| fail(e));
+            println!("{n} files");
+        }
         "freeze" => {
             let (name, image) = (one("a machine's name"), one("a name for the image"));
             let image = machines.freeze(&name, &image).unwrap_or_else(|e| fail(e));

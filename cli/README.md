@@ -22,6 +22,7 @@ carbon ls                                   # NAME  FROM  ISOLATION  STATUS
 carbon stop dev                             # SIGTERM to its first process; everything ends 10 s later
 carbon rm dev                               # a stopped machine and its files
 carbon freeze dev mine:1                    # an image of a stopped machine's disk
+carbon cp app:'C:\logs' out/               # a stopped machine's file or folder, copied out to the host
 carbon display screenshot app -o screen.png # a running machine's screen
 carbon display windows app                  # its windows, top first: ID, place, size, state, title
 carbon display click app 640 400            # input, as a user's: move, click, drag, scroll, type, key
