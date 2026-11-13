@@ -647,79 +647,79 @@ static void case156(u8 *out, const u8 *a, const u8 *b) {
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
 static void case157(u8 *out, const u8 *a, const u8 *b) {
-    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n movl $-7, %%eax\n cvtsi2sd %%eax, %%xmm1\n movdqu %%xmm1, (%0)"
+    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cvtdq2pd %%xmm2, %%xmm1\n movdqu %%xmm1, (%0)"
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
 static void case158(u8 *out, const u8 *a, const u8 *b) {
-    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n movq $-7, %%rax\n cvtsi2sdq %%rax, %%xmm1\n movdqu %%xmm1, (%0)"
+    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cvttpd2dq %%xmm2, %%xmm1\n movdqu %%xmm1, (%0)"
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
 static void case159(u8 *out, const u8 *a, const u8 *b) {
-    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n movl $9, %%eax\n cvtsi2ss %%eax, %%xmm1\n movdqu %%xmm1, (%0)"
+    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cvtpd2dq %%xmm2, %%xmm1\n movdqu %%xmm1, (%0)"
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
 static void case160(u8 *out, const u8 *a, const u8 *b) {
-    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cmpps $0, %%xmm2, %%xmm1\n movdqu %%xmm1, (%0)"
+    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n movl $-7, %%eax\n cvtsi2sd %%eax, %%xmm1\n movdqu %%xmm1, (%0)"
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
 static void case161(u8 *out, const u8 *a, const u8 *b) {
-    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cmpps $1, %%xmm2, %%xmm1\n movdqu %%xmm1, (%0)"
+    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n movq $-7, %%rax\n cvtsi2sdq %%rax, %%xmm1\n movdqu %%xmm1, (%0)"
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
 static void case162(u8 *out, const u8 *a, const u8 *b) {
-    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cmpps $2, %%xmm2, %%xmm1\n movdqu %%xmm1, (%0)"
+    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n movl $9, %%eax\n cvtsi2ss %%eax, %%xmm1\n movdqu %%xmm1, (%0)"
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
 static void case163(u8 *out, const u8 *a, const u8 *b) {
-    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cmpps $3, %%xmm2, %%xmm1\n movdqu %%xmm1, (%0)"
+    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cmpps $0, %%xmm2, %%xmm1\n movdqu %%xmm1, (%0)"
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
 static void case164(u8 *out, const u8 *a, const u8 *b) {
-    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cmpps $4, %%xmm2, %%xmm1\n movdqu %%xmm1, (%0)"
+    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cmpps $1, %%xmm2, %%xmm1\n movdqu %%xmm1, (%0)"
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
 static void case165(u8 *out, const u8 *a, const u8 *b) {
-    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cmpps $5, %%xmm2, %%xmm1\n movdqu %%xmm1, (%0)"
+    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cmpps $2, %%xmm2, %%xmm1\n movdqu %%xmm1, (%0)"
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
 static void case166(u8 *out, const u8 *a, const u8 *b) {
-    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cmpps $6, %%xmm2, %%xmm1\n movdqu %%xmm1, (%0)"
+    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cmpps $3, %%xmm2, %%xmm1\n movdqu %%xmm1, (%0)"
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
 static void case167(u8 *out, const u8 *a, const u8 *b) {
-    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cmpps $7, %%xmm2, %%xmm1\n movdqu %%xmm1, (%0)"
+    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cmpps $4, %%xmm2, %%xmm1\n movdqu %%xmm1, (%0)"
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
 static void case168(u8 *out, const u8 *a, const u8 *b) {
-    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cmpsd $1, %%xmm2, %%xmm1\n movdqu %%xmm1, (%0)"
+    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cmpps $5, %%xmm2, %%xmm1\n movdqu %%xmm1, (%0)"
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
 static void case169(u8 *out, const u8 *a, const u8 *b) {
-    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n pmovmskb %%xmm1, %%eax\n movq %%rax, %%xmm1\n movdqu %%xmm1, (%0)"
+    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cmpps $6, %%xmm2, %%xmm1\n movdqu %%xmm1, (%0)"
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
 static void case170(u8 *out, const u8 *a, const u8 *b) {
-    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n movmskps %%xmm1, %%eax\n movq %%rax, %%xmm1\n movdqu %%xmm1, (%0)"
+    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cmpps $7, %%xmm2, %%xmm1\n movdqu %%xmm1, (%0)"
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
 static void case171(u8 *out, const u8 *a, const u8 *b) {
-    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n movmskpd %%xmm1, %%eax\n movq %%rax, %%xmm1\n movdqu %%xmm1, (%0)"
+    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cmpsd $1, %%xmm2, %%xmm1\n movdqu %%xmm1, (%0)"
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
 static void case172(u8 *out, const u8 *a, const u8 *b) {
-    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n pextrw $5, %%xmm1, %%eax\n movq %%rax, %%xmm1\n movdqu %%xmm1, (%0)"
+    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n pmovmskb %%xmm1, %%eax\n movq %%rax, %%xmm1\n movdqu %%xmm1, (%0)"
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
 static void case173(u8 *out, const u8 *a, const u8 *b) {
-    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cvttsd2si %%xmm1, %%rax\n movq %%rax, %%xmm1\n movdqu %%xmm1, (%0)"
+    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n movmskps %%xmm1, %%eax\n movq %%rax, %%xmm1\n movdqu %%xmm1, (%0)"
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
 static void case174(u8 *out, const u8 *a, const u8 *b) {
-    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cvtsd2si %%xmm1, %%rax\n movq %%rax, %%xmm1\n movdqu %%xmm1, (%0)"
+    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n movmskpd %%xmm1, %%eax\n movq %%rax, %%xmm1\n movdqu %%xmm1, (%0)"
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
 static void case175(u8 *out, const u8 *a, const u8 *b) {
-    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cvttsd2si %%xmm1, %%rax\n movq %%rax, %%xmm1\n movdqu %%xmm1, (%0)"
+    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n pextrw $5, %%xmm1, %%eax\n movq %%rax, %%xmm1\n movdqu %%xmm1, (%0)"
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
 static void case176(u8 *out, const u8 *a, const u8 *b) {
@@ -727,27 +727,27 @@ static void case176(u8 *out, const u8 *a, const u8 *b) {
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
 static void case177(u8 *out, const u8 *a, const u8 *b) {
-    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cvttsd2si %%xmm1, %%eax\n movq %%rax, %%xmm1\n movdqu %%xmm1, (%0)"
+    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cvtsd2si %%xmm1, %%rax\n movq %%rax, %%xmm1\n movdqu %%xmm1, (%0)"
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
 static void case178(u8 *out, const u8 *a, const u8 *b) {
-    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cvttsd2si %%xmm1, %%eax\n movq %%rax, %%xmm1\n movdqu %%xmm1, (%0)"
+    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cvttsd2si %%xmm1, %%rax\n movq %%rax, %%xmm1\n movdqu %%xmm1, (%0)"
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
 static void case179(u8 *out, const u8 *a, const u8 *b) {
-    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cvttss2si %%xmm1, %%eax\n movq %%rax, %%xmm1\n movdqu %%xmm1, (%0)"
+    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cvttsd2si %%xmm1, %%rax\n movq %%rax, %%xmm1\n movdqu %%xmm1, (%0)"
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
 static void case180(u8 *out, const u8 *a, const u8 *b) {
-    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n xorl %%eax, %%eax\n xorl %%ebx, %%ebx\n ucomisd %%xmm2, %%xmm1\n setz %%al\n setp %%ah\n setc %%bl\n shll $16, %%ebx\n orl %%ebx, %%eax\n movq %%rax, %%xmm1\n movdqu %%xmm1, (%0)"
+    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cvttsd2si %%xmm1, %%eax\n movq %%rax, %%xmm1\n movdqu %%xmm1, (%0)"
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
 static void case181(u8 *out, const u8 *a, const u8 *b) {
-    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n xorl %%eax, %%eax\n xorl %%ebx, %%ebx\n ucomisd %%xmm2, %%xmm1\n setz %%al\n setp %%ah\n setc %%bl\n shll $16, %%ebx\n orl %%ebx, %%eax\n movq %%rax, %%xmm1\n movdqu %%xmm1, (%0)"
+    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cvttsd2si %%xmm1, %%eax\n movq %%rax, %%xmm1\n movdqu %%xmm1, (%0)"
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
 static void case182(u8 *out, const u8 *a, const u8 *b) {
-    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n xorl %%eax, %%eax\n xorl %%ebx, %%ebx\n ucomisd %%xmm2, %%xmm1\n setz %%al\n setp %%ah\n setc %%bl\n shll $16, %%ebx\n orl %%ebx, %%eax\n movq %%rax, %%xmm1\n movdqu %%xmm1, (%0)"
+    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n cvttss2si %%xmm1, %%eax\n movq %%rax, %%xmm1\n movdqu %%xmm1, (%0)"
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
 static void case183(u8 *out, const u8 *a, const u8 *b) {
@@ -755,10 +755,22 @@ static void case183(u8 *out, const u8 *a, const u8 *b) {
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
 static void case184(u8 *out, const u8 *a, const u8 *b) {
-    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n stmxcsr (%0)\n andl $-64, (%0)\n movd (%0), %%xmm1\n movdqu %%xmm1, (%0)"
+    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n xorl %%eax, %%eax\n xorl %%ebx, %%ebx\n ucomisd %%xmm2, %%xmm1\n setz %%al\n setp %%ah\n setc %%bl\n shll $16, %%ebx\n orl %%ebx, %%eax\n movq %%rax, %%xmm1\n movdqu %%xmm1, (%0)"
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
 static void case185(u8 *out, const u8 *a, const u8 *b) {
+    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n xorl %%eax, %%eax\n xorl %%ebx, %%ebx\n ucomisd %%xmm2, %%xmm1\n setz %%al\n setp %%ah\n setc %%bl\n shll $16, %%ebx\n orl %%ebx, %%eax\n movq %%rax, %%xmm1\n movdqu %%xmm1, (%0)"
+                     :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
+}
+static void case186(u8 *out, const u8 *a, const u8 *b) {
+    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n xorl %%eax, %%eax\n xorl %%ebx, %%ebx\n ucomisd %%xmm2, %%xmm1\n setz %%al\n setp %%ah\n setc %%bl\n shll $16, %%ebx\n orl %%ebx, %%eax\n movq %%rax, %%xmm1\n movdqu %%xmm1, (%0)"
+                     :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
+}
+static void case187(u8 *out, const u8 *a, const u8 *b) {
+    __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n stmxcsr (%0)\n andl $-64, (%0)\n movd (%0), %%xmm1\n movdqu %%xmm1, (%0)"
+                     :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
+}
+static void case188(u8 *out, const u8 *a, const u8 *b) {
     __asm__ volatile("movdqu (%1), %%xmm1\n movdqu (%2), %%xmm2\n movl $0x7f80, (%0)\n ldmxcsr (%0)\n cvtsd2si %%xmm1, %%rax\n movl $0x1f80, (%0)\n ldmxcsr (%0)\n movq %%rax, %%xmm1\n movdqu %%xmm1, (%0)"
                      :: "r"(out), "r"(a), "r"(b) : "rax", "rbx", "xmm1", "xmm2", "memory", "cc");
 }
@@ -1238,92 +1250,101 @@ void cmain(void) {
     { static const u8 x[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f}, y[16] = {0x00, 0x00, 0xc0, 0x3f, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0xc8, 0x42, 0x00, 0x00, 0x80, 0x3e}, want[16] = {0x01, 0x00, 0x00, 0x00, 0xfe, 0xff, 0xff, 0xff, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
       case156(out, a, b); check(same(out, want), "cvttps2dq"); }
+    { static const u8 x[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f}, y[16] = {0xf9, 0xff, 0xff, 0xff, 0xa0, 0x86, 0x01, 0x00, 0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00}, want[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1c, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6a, 0xf8, 0x40};
+      for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
+      case157(out, a, b); check(same(out, want), "cvtdq2pd"); }
+    { static const u8 x[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f}, y[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1a, 0x40}, want[16] = {0xfe, 0xff, 0xff, 0xff, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+      for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
+      case158(out, a, b); check(same(out, want), "cvttpd2dq"); }
+    { static const u8 x[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f}, y[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1a, 0x40}, want[16] = {0xfd, 0xff, 0xff, 0xff, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+      for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
+      case159(out, a, b); check(same(out, want), "cvtpd2dq"); }
     { static const u8 x[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0xbf}, y[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe0, 0x3f}, want[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1c, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0xbf};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
-      case157(out, a, b); check(same(out, want), "cvtsi2sd, 32-bit"); }
+      case160(out, a, b); check(same(out, want), "cvtsi2sd, 32-bit"); }
     { static const u8 x[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0xbf}, y[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe0, 0x3f}, want[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1c, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0xbf};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
-      case158(out, a, b); check(same(out, want), "cvtsi2sd, 64-bit"); }
+      case161(out, a, b); check(same(out, want), "cvtsi2sd, 64-bit"); }
     { static const u8 x[16] = {0x00, 0x00, 0xc0, 0x3f, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0xc8, 0x42, 0x00, 0x00, 0x80, 0x3e}, y[16] = {0x00, 0x00, 0x00, 0x3f, 0x00, 0x00, 0x80, 0x40, 0x00, 0x00, 0x40, 0xc0, 0x00, 0x00, 0x80, 0x3e}, want[16] = {0x00, 0x00, 0x10, 0x41, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0xc8, 0x42, 0x00, 0x00, 0x80, 0x3e};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
-      case159(out, a, b); check(same(out, want), "cvtsi2ss"); }
+      case162(out, a, b); check(same(out, want), "cvtsi2ss"); }
     { static const u8 x[16] = {0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0xc0, 0x7f, 0x00, 0x00, 0x40, 0x40, 0x00, 0x00, 0x80, 0x40}, y[16] = {0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0xa0, 0x40}, want[16] = {0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
-      case160(out, a, b); check(same(out, want), "cmpps $0"); }
+      case163(out, a, b); check(same(out, want), "cmpps $0"); }
     { static const u8 x[16] = {0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0xc0, 0x7f, 0x00, 0x00, 0x40, 0x40, 0x00, 0x00, 0x80, 0x40}, y[16] = {0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0xa0, 0x40}, want[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
-      case161(out, a, b); check(same(out, want), "cmpps $1"); }
+      case164(out, a, b); check(same(out, want), "cmpps $1"); }
     { static const u8 x[16] = {0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0xc0, 0x7f, 0x00, 0x00, 0x40, 0x40, 0x00, 0x00, 0x80, 0x40}, y[16] = {0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0xa0, 0x40}, want[16] = {0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
-      case162(out, a, b); check(same(out, want), "cmpps $2"); }
+      case165(out, a, b); check(same(out, want), "cmpps $2"); }
     { static const u8 x[16] = {0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0xc0, 0x7f, 0x00, 0x00, 0x40, 0x40, 0x00, 0x00, 0x80, 0x40}, y[16] = {0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0xa0, 0x40}, want[16] = {0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
-      case163(out, a, b); check(same(out, want), "cmpps $3"); }
+      case166(out, a, b); check(same(out, want), "cmpps $3"); }
     { static const u8 x[16] = {0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0xc0, 0x7f, 0x00, 0x00, 0x40, 0x40, 0x00, 0x00, 0x80, 0x40}, y[16] = {0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0xa0, 0x40}, want[16] = {0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
-      case164(out, a, b); check(same(out, want), "cmpps $4"); }
+      case167(out, a, b); check(same(out, want), "cmpps $4"); }
     { static const u8 x[16] = {0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0xc0, 0x7f, 0x00, 0x00, 0x40, 0x40, 0x00, 0x00, 0x80, 0x40}, y[16] = {0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0xa0, 0x40}, want[16] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
-      case165(out, a, b); check(same(out, want), "cmpps $5"); }
+      case168(out, a, b); check(same(out, want), "cmpps $5"); }
     { static const u8 x[16] = {0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0xc0, 0x7f, 0x00, 0x00, 0x40, 0x40, 0x00, 0x00, 0x80, 0x40}, y[16] = {0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0xa0, 0x40}, want[16] = {0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
-      case166(out, a, b); check(same(out, want), "cmpps $6"); }
+      case169(out, a, b); check(same(out, want), "cmpps $6"); }
     { static const u8 x[16] = {0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0xc0, 0x7f, 0x00, 0x00, 0x40, 0x40, 0x00, 0x00, 0x80, 0x40}, y[16] = {0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0xa0, 0x40}, want[16] = {0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
-      case167(out, a, b); check(same(out, want), "cmpps $7"); }
+      case170(out, a, b); check(same(out, want), "cmpps $7"); }
     { static const u8 x[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe0, 0x3f}, y[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0xbf}, want[16] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe0, 0x3f};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
-      case168(out, a, b); check(same(out, want), "cmpsd $1"); }
+      case171(out, a, b); check(same(out, want), "cmpsd $1"); }
     { static const u8 x[16] = {0x80, 0x7f, 0xff, 0x01, 0x40, 0xc0, 0x00, 0xfe, 0x33, 0xcc, 0x7f, 0x80, 0x01, 0x02, 0x03, 0x04}, y[16] = {0x80, 0x7f, 0xff, 0x01, 0x40, 0xc0, 0x00, 0xfe, 0x33, 0xcc, 0x7f, 0x80, 0x01, 0x02, 0x03, 0x04}, want[16] = {0xa5, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
-      case169(out, a, b); check(same(out, want), "pmovmskb"); }
+      case172(out, a, b); check(same(out, want), "pmovmskb"); }
     { static const u8 x[16] = {0x00, 0x00, 0xc0, 0x3f, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0xc8, 0x42, 0x00, 0x00, 0x80, 0x3e}, y[16] = {0x00, 0x00, 0xc0, 0x3f, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0xc8, 0x42, 0x00, 0x00, 0x80, 0x3e}, want[16] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
-      case170(out, a, b); check(same(out, want), "movmskps"); }
+      case173(out, a, b); check(same(out, want), "movmskps"); }
     { static const u8 x[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0xbf}, y[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0xbf}, want[16] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
-      case171(out, a, b); check(same(out, want), "movmskpd"); }
+      case174(out, a, b); check(same(out, want), "movmskpd"); }
     { static const u8 x[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f}, y[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f}, want[16] = {0x1a, 0x1b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
-      case172(out, a, b); check(same(out, want), "pextrw $5"); }
+      case175(out, a, b); check(same(out, want), "pextrw $5"); }
     { static const u8 x[16] = {0x9a, 0x99, 0x99, 0x99, 0x99, 0x99, 0x05, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, y[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f}, want[16] = {0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
-      case173(out, a, b); check(same(out, want), "cvttsd2si, 64-bit"); }
+      case176(out, a, b); check(same(out, want), "cvttsd2si, 64-bit"); }
     { static const u8 x[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, y[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f}, want[16] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
-      case174(out, a, b); check(same(out, want), "cvtsd2si, nearest-even"); }
+      case177(out, a, b); check(same(out, want), "cvtsd2si, nearest-even"); }
     { static const u8 x[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, y[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f}, want[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
-      case175(out, a, b); check(same(out, want), "cvttsd2si, a NaN: indefinite"); }
+      case178(out, a, b); check(same(out, want), "cvttsd2si, a NaN: indefinite"); }
     { static const u8 x[16] = {0xea, 0x8c, 0xa0, 0x39, 0x59, 0x3e, 0x29, 0x46, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, y[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f}, want[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
-      case176(out, a, b); check(same(out, want), "cvttsd2si, too big: indefinite"); }
+      case179(out, a, b); check(same(out, want), "cvttsd2si, too big: indefinite"); }
     { static const u8 x[16] = {0x00, 0x00, 0x00, 0xc0, 0x0b, 0x5a, 0xe6, 0x41, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, y[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f}, want[16] = {0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
-      case177(out, a, b); check(same(out, want), "cvttsd2si, 32-bit too big: indefinite"); }
+      case180(out, a, b); check(same(out, want), "cvttsd2si, 32-bit too big: indefinite"); }
     { static const u8 x[16] = {0x00, 0x00, 0xc0, 0xff, 0xff, 0xff, 0xdf, 0x41, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, y[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f}, want[16] = {0xff, 0xff, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
-      case178(out, a, b); check(same(out, want), "cvttsd2si, 32-bit 2^31 - 1"); }
+      case181(out, a, b); check(same(out, want), "cvttsd2si, 32-bit 2^31 - 1"); }
     { static const u8 x[16] = {0x00, 0x00, 0x00, 0x3f, 0x00, 0x00, 0x80, 0x40, 0x00, 0x00, 0x40, 0xc0, 0x00, 0x00, 0x80, 0x3e}, y[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f}, want[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
-      case179(out, a, b); check(same(out, want), "cvttss2si, 32-bit"); }
+      case182(out, a, b); check(same(out, want), "cvttss2si, 32-bit"); }
     { static const u8 x[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, y[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, want[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
-      case180(out, a, b); check(same(out, want), "ucomisd, greater"); }
+      case183(out, a, b); check(same(out, want), "ucomisd, greater"); }
     { static const u8 x[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, y[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, want[16] = {0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
-      case181(out, a, b); check(same(out, want), "ucomisd, less"); }
+      case184(out, a, b); check(same(out, want), "ucomisd, less"); }
     { static const u8 x[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, y[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, want[16] = {0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
-      case182(out, a, b); check(same(out, want), "ucomisd, equal"); }
+      case185(out, a, b); check(same(out, want), "ucomisd, equal"); }
     { static const u8 x[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, y[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, want[16] = {0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
-      case183(out, a, b); check(same(out, want), "ucomisd, unordered"); }
+      case186(out, a, b); check(same(out, want), "ucomisd, unordered"); }
     { static const u8 x[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f}, y[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f}, want[16] = {0x80, 0x1f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
-      case184(out, a, b); check(same(out, want), "stmxcsr"); }
+      case187(out, a, b); check(same(out, want), "stmxcsr"); }
     { static const u8 x[16] = {0x9a, 0x99, 0x99, 0x99, 0x99, 0x99, 0x05, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, y[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f}, want[16] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
       for (int i = 0; i < 16; i++) { a[i] = x[i]; b[i] = y[i]; out[i] = 0; }
-      case185(out, a, b); check(same(out, want), "ldmxcsr: round toward zero"); }
+      case188(out, a, b); check(same(out, want), "ldmxcsr: round toward zero"); }
     sys(231, failures, 0, 0);
 }

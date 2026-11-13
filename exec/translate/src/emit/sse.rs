@@ -186,6 +186,26 @@ impl Emitter {
                     P::F2 => return Err(Unsupported),
                 }
             }
+            (0xE6, P::F3 | P::F2 | P::P66) => match p {
+                // cvtdq2pd: the low two 32-bit integers widened (sshll v.2d, v.2s, #0), then converted (scvtf v.2d).
+                P::F3 => {
+                    let s = self.src_scalar(inst, true)?;
+                    self.asm.put(0x0F20_A400 | u32::from(s) << 5 | u32::from(V0));
+                    self.asm.put(0x4E61_D800 | u32::from(V0) << 5 | u32::from(d));
+                }
+                // cvtpd2dq (rounded as MXCSR says: frinti v.2d first) and cvttpd2dq (truncated): fcvtzs v.2d, then
+                // narrowed with saturation into the low half (sqxtn v.2s), the high half zeroed.
+                _ => {
+                    let s = self.src128(inst)?;
+                    let mut from = s;
+                    if p == P::F2 {
+                        self.asm.put(0x6EE1_9800 | u32::from(s) << 5 | u32::from(V0));
+                        from = V0;
+                    }
+                    self.asm.put(0x4EE1_B800 | u32::from(from) << 5 | u32::from(V0));
+                    self.asm.put(0x0EA1_4800 | u32::from(V0) << 5 | u32::from(d));
+                }
+            },
             (0x60..=0x62 | 0x68..=0x6A | 0x6C | 0x6D, P::P66) => {
                 let s = self.src128(inst)?;
                 let size = match op & 0xF {
