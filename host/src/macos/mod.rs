@@ -1,8 +1,11 @@
-//! macOS: memory from the Mach VM statistics, and certificates by the system's own trust settings.
+//! macOS: memory from the Mach VM statistics, certificates by the system's own trust settings, and fonts from Core
+//! Text.
 
+mod fonts;
 mod trust;
 
 pub use crate::unix::{random, set_raw, terminal_size, thread_cpu};
+pub use fonts::{fonts, open_font};
 pub use trust::check as check_certificates;
 
 unsafe extern "C" {

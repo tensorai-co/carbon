@@ -13,7 +13,9 @@ pub mod keymap;
 pub mod observe;
 pub mod output;
 pub mod positioner;
+pub mod raster;
 pub mod selection;
+pub mod sfnt;
 
 pub use buffer::{Buffer, Canvas, Format, Pixels};
 pub use desktop::Desktop;

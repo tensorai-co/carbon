@@ -17,3 +17,12 @@ fn meminfo(key: &str) -> Option<u64> {
     let kib: u64 = line[key.len()..].trim().trim_end_matches("kB").trim().parse().ok()?;
     Some(kib * 1024)
 }
+
+/// The host's fonts: not listed here yet, so programs get none (the to-do list's fonts on Linux and Windows hosts).
+pub fn fonts() -> Vec<crate::FontFace> {
+    Vec::new()
+}
+
+pub fn open_font(_id: &str) -> Option<std::sync::Arc<dyn crate::HostFont>> {
+    None
+}

@@ -68,3 +68,12 @@ pub fn set_raw(_raw: bool) {}
 pub fn terminal_size() -> Option<(u16, u16)> {
     None
 }
+
+/// The host's fonts: not listed here yet, so programs get none (the to-do list's fonts on Linux and Windows hosts).
+pub fn fonts() -> Vec<crate::FontFace> {
+    Vec::new()
+}
+
+pub fn open_font(_id: &str) -> Option<std::sync::Arc<dyn crate::HostFont>> {
+    None
+}

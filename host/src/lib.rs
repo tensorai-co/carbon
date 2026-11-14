@@ -13,6 +13,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 mod unix;
+pub mod fonts;
+
+pub use fonts::{FontFace, HostFont, PathOp};
 
 #[cfg(target_os = "macos")]
 #[path = "macos/mod.rs"]
@@ -165,6 +168,15 @@ pub trait Host: Send + Sync + 'static {
     fn check_certificates(&self, chain: &[&[u8]], usage: CertificateUsage, name: Option<&str>, at: Option<i64>) -> CertificateTrust {
         let _ = (chain, usage, name, at);
         CertificateTrust::CANT_CHECK
+    }
+    /// The faces of the fonts installed on the host (none on a host that can't list them yet).
+    fn fonts(&self) -> Vec<FontFace> {
+        Vec::new()
+    }
+    /// One of `fonts`' faces, open, by its `id`.
+    fn open_font(&self, id: &str) -> Option<Arc<dyn HostFont>> {
+        let _ = id;
+        None
     }
 }
 
@@ -347,6 +359,14 @@ impl Host for Std {
             return CertificateTrust::MALFORMED;
         }
         sys::check_certificates(chain, usage, name, at)
+    }
+
+    fn fonts(&self) -> Vec<FontFace> {
+        sys::fonts()
+    }
+
+    fn open_font(&self, id: &str) -> Option<Arc<dyn HostFont>> {
+        sys::open_font(id)
     }
 }
 
