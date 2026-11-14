@@ -172,8 +172,19 @@ pub fn decode_in(at: u64, bytes: &[u8], x32: bool) -> Result<Inst, Error> {
     let mut inst = Inst { at, len: 0, map: 0, op: 0, opsize16: false, rep: false, repne: false, lock: false, rex: 0, reg: 0, ext: 0, rm: None, imm: 0, x32 };
     let mut seg = None;
     let mut addr32 = x32;
+    // Prefixes, REX among them in 64-bit mode: a REX counts only right before the opcode, as the CPU has it, so a
+    // later REX replaces an earlier one (`48 41 ff e2` is `jmp r10`), and a legacy prefix after one cancels it.
     loop {
-        match get(i)? {
+        let b = get(i)?;
+        match b {
+            0x40..=0x4F if !x32 => {
+                inst.rex = b;
+                i += 1;
+                if i >= 15 {
+                    return Err(Error::Undecodable(at));
+                }
+                continue;
+            }
             0xF0 => inst.lock = true,
             0xF2 => inst.repne = true,
             0xF3 => inst.rep = true,
@@ -186,16 +197,11 @@ pub fn decode_in(at: u64, bytes: &[u8], x32: bool) -> Result<Inst, Error> {
             0x26 | 0x2E | 0x36 | 0x3E => {}
             _ => break,
         }
+        inst.rex = 0;
         i += 1;
         if i >= 14 {
             return Err(Error::Undecodable(at));
         }
-    }
-    if let b @ 0x40..=0x4F = get(i)?
-        && !x32
-    {
-        inst.rex = b;
-        i += 1;
     }
     let mut op = get(i)?;
     i += 1;

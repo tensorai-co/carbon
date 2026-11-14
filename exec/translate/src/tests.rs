@@ -336,6 +336,17 @@ fn x32_lengths_match_llvm() {
 }
 
 #[test]
+fn rex_counts_only_before_the_opcode() {
+    use crate::decode::x86::decode;
+    // Two REX prefixes: the last one is the instruction's (jmp r10, not rax), the first ignored.
+    let jmp = decode(0, &[0x48, 0x41, 0xff, 0xe2]).unwrap();
+    assert_eq!((jmp.op, jmp.rex, jmp.reg, jmp.len), (0xff, 0x41, 4, 4));
+    // A legacy prefix after a REX cancels it: 48 66 89 c8 is mov ax, cx, with no REX.W.
+    let mov = decode(0, &[0x48, 0x66, 0x89, 0xc8]).unwrap();
+    assert_eq!((mov.op, mov.rex, mov.opsize16, mov.len), (0x89, 0, true, 4));
+}
+
+#[test]
 fn x32_operands() {
     use crate::decode::x86::{Base, Mem, Rm, Seg, decode_in};
     // 40 is inc eax, not a REX prefix.
