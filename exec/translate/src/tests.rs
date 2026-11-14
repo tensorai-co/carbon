@@ -387,3 +387,31 @@ fn x32_translates_without_leaving() {
     let w = words(&translate(0x40_0000, &[0x55], 1, true));
     assert_eq!(&w[..3], &[0xAA05_03F3, 0xB81F_C093, 0x5100_1084]);
 }
+
+#[test]
+fn lse_atomics_round_trip() {
+    use crate::emit::asm::{Atomic, AtomicOp, decode_atomic};
+    for (size, bits) in [(0, 8), (1, 16), (2, 32), (3, 64)] {
+        let mut a = Asm::new();
+        a.swpal(bits, 19, 20, 17);
+        a.casal(bits, 20, 21, 17);
+        a.ldaddal(bits, 22, 19, 17);
+        a.ldclral(bits, 21, 19, 17);
+        a.ldeoral(bits, 20, 19, 17);
+        a.ldsetal(bits, 26, 19, 17);
+        a.ldr(bits, 19, 17);
+        let expected = [
+            Some(Atomic { op: AtomicOp::Swp, size, rs: 19, rt: 20, rn: 17 }),
+            Some(Atomic { op: AtomicOp::Cas, size, rs: 20, rt: 21, rn: 17 }),
+            Some(Atomic { op: AtomicOp::Add, size, rs: 22, rt: 19, rn: 17 }),
+            Some(Atomic { op: AtomicOp::Clr, size, rs: 21, rt: 19, rn: 17 }),
+            Some(Atomic { op: AtomicOp::Eor, size, rs: 20, rt: 19, rn: 17 }),
+            Some(Atomic { op: AtomicOp::Set, size, rs: 26, rt: 19, rn: 17 }),
+            None,
+        ];
+        assert_eq!(a.code.len(), expected.len());
+        for (word, want) in a.code.into_iter().zip(expected) {
+            assert_eq!(decode_atomic(word), want);
+        }
+    }
+}

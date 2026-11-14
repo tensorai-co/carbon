@@ -37,6 +37,7 @@ use std::ops::Range;
 
 use exec_mmu::{Format, Frame, Native, OutOfMemory, PAGE, Prot};
 use exec_translate::emit::arm64::{self, CACHE_BASE, CACHE_SIZE, CHAIN_EXIT, LOOKUP_BASE, LOOKUP_BYTES, REGION_END, X32_EFLAGS, X32_EFLAGS_KEPT, exit};
+use exec_translate::emit::asm::{AtomicOp, decode_atomic};
 use exec_translate::runtime::{Block, Cache};
 
 use crate::contract::{Sandbox, Vm};
@@ -491,11 +492,106 @@ impl<V: Vm, S: Sandbox> Core<V, S> {
                 Some(Stop::Fault { addr, access, pc: program(self, pc) })
             }
             Stop::Undefined { pc } => Some(Stop::Undefined { pc: program(self, pc) }),
+            Stop::Alignment { pc } if in_cache(pc) => self.emulate_atomic(index, root, r, pc),
             Stop::Alignment { pc } => Some(Stop::Alignment { pc: program(self, pc) }),
             Stop::Breakpoint { pc } => Some(Stop::Breakpoint { pc: program(self, pc) }),
             Stop::Syscall { .. } => Some(Stop::Internal { pc: r.elr, detail: 0x7001 }),
             other => Some(other),
         }
+    }
+
+    /// Emulates an LSE atomic instruction in the code cache that faulted on alignment (such as crossing a 16-byte
+    /// boundary), after verifying page permissions and stopping other CPUs so the read-modify-write stays atomic.
+    fn emulate_atomic(&mut self, index: usize, root: u64, r: &mut Arm64VcpuRegs, pc: u64) -> Option<Stop> {
+        let mut insn = [0u8; 4];
+        if self
+            .mmu
+            .copy(root, pc, 4, false, &mut |host, len, done| {
+                // SAFETY: `len` bytes of a code cache page, into a 4-byte buffer.
+                unsafe { std::ptr::copy_nonoverlapping(host, insn.as_mut_ptr().add(done), len) };
+            })
+            .is_err()
+        {
+            return Some(Stop::Alignment { pc: self.program_pc(root, pc) });
+        }
+        let Some(atomic) = decode_atomic(u32::from_le_bytes(insn)) else {
+            return Some(Stop::Alignment { pc: self.program_pc(root, pc) });
+        };
+        let bytes = 1usize << atomic.size;
+        let addr = if atomic.rn < 31 { r.x[atomic.rn as usize] } else { r.sp_el0 };
+        let Some(last) = addr.checked_add(bytes as u64 - 1) else {
+            return Some(Stop::Fault { addr, access: Prot::W, pc: self.program_pc(root, pc) });
+        };
+        let first = addr & !(PAGE - 1);
+        let second = last & !(PAGE - 1);
+        for page in [Some(first), (second != first).then_some(second)].into_iter().flatten() {
+            let mut entry = self.mmu.descriptor(root, page);
+            if Native::is_valid(entry)
+                && !Native::prot(entry).write()
+                && self.translated.get(&root).is_some_and(|t| t.guarded.contains_key(&page))
+            {
+                self.forget_code(root, page..page + PAGE);
+                entry = self.mmu.descriptor(root, page);
+            }
+            if !Native::is_valid(entry) || !Native::prot(entry).write() || entry & Native::SHARED != 0 {
+                let fault_addr = if page == first { addr } else { page };
+                return Some(Stop::Fault { addr: fault_addr, access: Prot::W, pc: self.program_pc(root, pc) });
+            }
+        }
+        let _pause = self.pause_others(index);
+        let mut buf = [0u8; 8];
+        if self
+            .mmu
+            .copy(root, addr, bytes, false, &mut |host, len, done| {
+                // SAFETY: `len` bytes of verified mapped guest memory, into `buf`.
+                unsafe { std::ptr::copy_nonoverlapping(host, buf.as_mut_ptr().add(done), len) };
+            })
+            .is_err()
+        {
+            return Some(Stop::Fault { addr, access: Prot::W, pc: self.program_pc(root, pc) });
+        }
+        let mask = if bytes == 8 { u64::MAX } else { (1u64 << (bytes * 8)) - 1 };
+        let old = u64::from_le_bytes(buf) & mask;
+        let reg = |idx: u8| if idx < 31 { r.x[idx as usize] } else { 0 };
+        let rs = reg(atomic.rs) & mask;
+        let rt = reg(atomic.rt) & mask;
+        let (new, out_reg, write_mem) = match atomic.op {
+            AtomicOp::Swp => (rs, atomic.rt, true),
+            AtomicOp::Cas => (rt, atomic.rs, old == rs),
+            AtomicOp::Add => (old.wrapping_add(rs) & mask, atomic.rt, true),
+            AtomicOp::Clr => (old & !rs & mask, atomic.rt, true),
+            AtomicOp::Eor => ((old ^ rs) & mask, atomic.rt, true),
+            AtomicOp::Set => ((old | rs) & mask, atomic.rt, true),
+        };
+        if write_mem {
+            let new_bytes = new.to_le_bytes();
+            let _ = self.mmu.copy(root, addr, bytes, true, &mut |host, len, done| {
+                // SAFETY: `len` bytes from `new_bytes` into verified writable unshared guest memory.
+                unsafe { std::ptr::copy_nonoverlapping(new_bytes.as_ptr().add(done), host, len) };
+            });
+        }
+        if out_reg < 31 {
+            r.x[out_reg as usize] = old;
+        }
+        if std::env::var_os("CARBON_ATOMIC_TRACE").is_some() {
+            eprintln!(
+                "exec: atomic {:?}/{} pc={:#x} addr={:#x} old={:#x} new={:#x} write={} rs(x{})={:#x} rt(x{})={:#x} rbx={:#x}",
+                atomic.op,
+                bytes,
+                self.program_pc(root, pc),
+                addr,
+                old,
+                new,
+                write_mem,
+                atomic.rs,
+                rs,
+                atomic.rt,
+                rt,
+                r.x[3]
+            );
+        }
+        r.elr += 4;
+        None
     }
 
     /// Points the CPU at the translation of where it goes next, if that's changed.

@@ -43,6 +43,7 @@ pub struct Cpu<V: Vm, S: Sandbox> {
     pub(crate) index: usize,
     pub(crate) inner: CpuInner<V, S>,
     pub(crate) shared: Arc<CpuShared>,
+    pub(crate) paused: Arc<AtomicBool>,
     pub(crate) generation: Arc<AtomicU64>,
     /// `!Send` and `!Sync`: hvf's vCPUs, for one, only work on their own thread.
     pub(crate) _thread: PhantomData<*const ()>,
@@ -79,13 +80,13 @@ impl<V: Vm, S: Sandbox> Cpu<V, S> {
 
     /// Runs the program until it needs its kernel. The one call made without the kernel's lock.
     pub fn run(&mut self) -> Exit {
-        if self.shared.pending.swap(false, Ordering::SeqCst) {
+        if self.shared.pending.swap(false, Ordering::SeqCst) || self.paused.load(Ordering::SeqCst) {
             return Exit(RawExit::Preempted);
         }
         self.shared.ran.store(true, Ordering::SeqCst);
         self.shared.running.store(true, Ordering::SeqCst);
-        // Running first, then the checks: a preempt or a flush that comes after this sees it running and stops it.
-        if self.shared.pending.swap(false, Ordering::SeqCst) {
+        // Running first, then the checks: a preempt, pause or flush that comes after this sees it running and stops it.
+        if self.shared.pending.swap(false, Ordering::SeqCst) || self.paused.load(Ordering::SeqCst) {
             // It didn't go in after all: its registers are still as its last turn left them.
             self.shared.running.store(false, Ordering::SeqCst);
             self.shared.ran.store(false, Ordering::SeqCst);

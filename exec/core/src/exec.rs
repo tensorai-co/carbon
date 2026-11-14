@@ -19,6 +19,15 @@ use crate::{Backend, Caps, Error, Isa, Isolation, OpenError, Options, Pressure, 
 /// Where a sandbox's guest RAM starts, as frames name it. Nothing walks its tables but core, so any base would do.
 const SANDBOX_BASE: u64 = 0x1_0000_0000;
 
+pub(crate) struct PauseGuard<'a>(&'a AtomicBool);
+
+impl Drop for PauseGuard<'_> {
+    fn drop(&mut self) {
+        std::sync::atomic::fence(Ordering::SeqCst);
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// An opened machine and its first CPU.
 pub type Opened<V, S> = (Core<V, S>, Cpu<V, S>);
 
@@ -51,6 +60,8 @@ pub struct Core<V: Vm, S: Sandbox> {
     pub(crate) cpus: Arc<Mutex<Vec<Arc<CpuShared>>>>,
     /// TLB flushes so far: a CPU that's behind flushes before it next runs.
     pub(crate) generation: Arc<AtomicU64>,
+    /// Set while a turn emulates an unaligned atomic across all CPUs so no other CPU accesses memory concurrently.
+    pub(crate) paused: Arc<AtomicBool>,
     pub(crate) tuning: Tuning,
     pub(crate) keep_free: u64,
     pub(crate) give_back_min: u64,
@@ -123,6 +134,7 @@ impl<V: Vm, S: Sandbox> Core<V, S> {
             ticker: Ticker::start(cpus.clone(), options.tuning.time_slice),
             cpus,
             generation: Arc::new(AtomicU64::new(0)),
+            paused: Arc::new(AtomicBool::new(false)),
             keep_free: options.tuning.keep_free,
             give_back_min: options.tuning.give_back_min,
             tuning: options.tuning.clone(),
@@ -206,7 +218,15 @@ impl<V: Vm, S: Sandbox> Core<V, S> {
             self.resume.push(None);
         }
         let retire = Retire(shared.clone());
-        Ok(Cpu { index, inner, shared, generation: self.generation.clone(), _thread: PhantomData, _retire: retire })
+        Ok(Cpu {
+            index,
+            inner,
+            shared,
+            paused: self.paused.clone(),
+            generation: self.generation.clone(),
+            _thread: PhantomData,
+            _retire: retire,
+        })
     }
 
     /// A CPU's turn in the kernel, on its own thread. Ending it settles: TLBs synced, the sandbox's stub brought up to
@@ -244,14 +264,34 @@ impl<V: Vm, S: Sandbox> Core<V, S> {
     /// for, so nothing can use a page that's gone once this returns.
     fn flush_others(&mut self, me: usize) {
         self.generation.fetch_add(1, Ordering::SeqCst);
+        self.stop_running_others(me, false);
+    }
+
+    /// Stops every other CPU from running in its program until the returned guard drops, so an emulated atomic can
+    /// read and write memory across a 16-byte boundary or page boundary atomically with respect to other CPUs.
+    pub(crate) fn pause_others(&self, me: usize) -> PauseGuard<'_> {
+        self.paused.store(true, Ordering::SeqCst);
+        self.stop_running_others(me, true);
+        std::sync::atomic::fence(Ordering::SeqCst);
+        PauseGuard(&self.paused)
+    }
+
+    fn stop_running_others(&self, me: usize, renotify: bool) {
         let cpus = self.cpus.lock().unwrap_or_else(PoisonError::into_inner).clone();
         for (index, cpu) in cpus.iter().enumerate() {
             if index == me || cpu.gone.load(Ordering::Acquire) || !cpu.running.load(Ordering::SeqCst) {
                 continue;
             }
             (cpu.preempt)();
+            let mut spins = 0u32;
             while cpu.running.load(Ordering::SeqCst) && !cpu.gone.load(Ordering::Acquire) {
-                std::hint::spin_loop();
+                spins = spins.wrapping_add(1);
+                if renotify && (spins & 1023) == 0 {
+                    (cpu.preempt)();
+                    std::thread::yield_now();
+                } else {
+                    std::hint::spin_loop();
+                }
             }
         }
     }

@@ -5,6 +5,56 @@ use alloc::vec::Vec;
 
 pub const ZR: u8 = 31;
 
+const SWPAL: u32 = 0x38E0_8000;
+const CASAL: u32 = 0x08E0_FC00;
+const LDADDAL: u32 = 0x38E0_0000;
+const LDCLRAL: u32 = 0x38E0_1000;
+const LDEORAL: u32 = 0x38E0_2000;
+const LDSETAL: u32 = 0x38E0_3000;
+const ATOMIC_MASK: u32 = 0x3FE0_FC00;
+
+/// An LSE atomic instruction emitted by [`Asm`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtomicOp {
+    Swp,
+    Cas,
+    Add,
+    Clr,
+    Eor,
+    Set,
+}
+
+/// Decoded fields of an LSE atomic instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Atomic {
+    pub op: AtomicOp,
+    /// Log2 of operand size in bytes (`0..=3` for 1, 2, 4 or 8 bytes).
+    pub size: u8,
+    pub rs: u8,
+    pub rt: u8,
+    pub rn: u8,
+}
+
+/// Decodes an LSE atomic instruction emitted by [`Asm`], if `word` is one.
+pub fn decode_atomic(word: u32) -> Option<Atomic> {
+    let op = match word & ATOMIC_MASK {
+        SWPAL => AtomicOp::Swp,
+        CASAL => AtomicOp::Cas,
+        LDADDAL => AtomicOp::Add,
+        LDCLRAL => AtomicOp::Clr,
+        LDEORAL => AtomicOp::Eor,
+        LDSETAL => AtomicOp::Set,
+        _ => return None,
+    };
+    Some(Atomic {
+        op,
+        size: (word >> 30) as u8,
+        rs: ((word >> 16) & 31) as u8,
+        rt: (word & 31) as u8,
+        rn: ((word >> 5) & 31) as u8,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cond {
     Eq = 0,
@@ -366,25 +416,25 @@ impl Asm {
     }
     /// `rt = [rn]; [rn] = rs`.
     pub fn swpal(&mut self, bits: u8, rs: u8, rt: u8, rn: u8) {
-        self.atomic(0x38E0_8000, bits, rs, rt, rn);
+        self.atomic(SWPAL, bits, rs, rt, rn);
     }
     /// `if [rn] == rs { [rn] = rt }; rs = old [rn]`.
     pub fn casal(&mut self, bits: u8, rs: u8, rt: u8, rn: u8) {
-        self.atomic(0x08E0_FC00, bits, rs, rt, rn);
+        self.atomic(CASAL, bits, rs, rt, rn);
     }
     /// `rt = [rn]; [rn] += rs`.
     pub fn ldaddal(&mut self, bits: u8, rs: u8, rt: u8, rn: u8) {
-        self.atomic(0x38E0_0000, bits, rs, rt, rn);
+        self.atomic(LDADDAL, bits, rs, rt, rn);
     }
     /// `rt = [rn]; [rn] &= !rs`.
     pub fn ldclral(&mut self, bits: u8, rs: u8, rt: u8, rn: u8) {
-        self.atomic(0x38E0_1000, bits, rs, rt, rn);
+        self.atomic(LDCLRAL, bits, rs, rt, rn);
     }
     pub fn ldeoral(&mut self, bits: u8, rs: u8, rt: u8, rn: u8) {
-        self.atomic(0x38E0_2000, bits, rs, rt, rn);
+        self.atomic(LDEORAL, bits, rs, rt, rn);
     }
     pub fn ldsetal(&mut self, bits: u8, rs: u8, rt: u8, rn: u8) {
-        self.atomic(0x38E0_3000, bits, rs, rt, rn);
+        self.atomic(LDSETAL, bits, rs, rt, rn);
     }
 
     // ---- Branches: offsets in instructions ----
