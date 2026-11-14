@@ -25,6 +25,7 @@ const ERROR_MAPPED_ALIGNMENT: u32 = 1132;
 
 const SEC_IMAGE: u32 = 0x0100_0000;
 const FILE_MAP_COPY: u32 = 0x1;
+const FILE_MAP_READ: u32 = 0x4;
 const FILE_MAP_WRITE: u32 = 0x2;
 const FILE_MAP_EXECUTE: u32 = 0x20;
 
@@ -33,12 +34,22 @@ const MEM_RESERVE: u32 = 0x2000;
 const MEM_FREE: u32 = 0x1_0000;
 const MEM_PRIVATE: u32 = 0x2_0000;
 const MEM_MAPPED: u32 = 0x4_0000;
+/// SECTION_* rights: a handle's, and what a view needs of it.
+const SECTION_MAP_WRITE: u32 = 0x2;
+const SECTION_MAP_READ: u32 = 0x4;
+const SECTION_MAP_EXECUTE: u32 = 0x8;
+pub(crate) const SECTION_ALL_ACCESS: u32 = 0xf_001f;
 const MEM_IMAGE: u32 = 0x100_0000;
 
 impl Task {
     fn section_handle(&self, handle: u64) -> Option<Arc<Section>> {
+        self.section_with_access(handle).map(|(section, _)| section)
+    }
+
+    /// A section handle's section, and the rights it was granted.
+    fn section_with_access(&self, handle: u64) -> Option<(Arc<Section>, u32)> {
         match lock(&self.process.state).handles.get(handle)? {
-            Handle::Section(section) => Some(section),
+            Handle::Section(section, access) => Some((section, access)),
             _ => None,
         }
     }
@@ -83,7 +94,7 @@ fn create_file_mapping(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) 
     let existing = name.as_ref().and_then(|name| lock(&task.k.sections).get(name).and_then(Weak::upgrade));
     if let Some(existing) = existing {
         task.set_last_error(cx, ERROR_ALREADY_EXISTS);
-        return Reply::Value(lock(&task.process.state).handles.add_with(Handle::Section(existing), inheritable));
+        return Reply::Value(lock(&task.process.state).handles.add_with(Handle::Section(existing, SECTION_ALL_ACCESS), inheritable));
     }
     let section = if file == u64::MAX {
         if size == 0 {
@@ -127,7 +138,7 @@ fn create_file_mapping(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) 
         names.insert(name, Arc::downgrade(&section));
     }
     task.set_last_error(cx, 0);
-    Reply::Value(lock(&task.process.state).handles.add_with(Handle::Section(section), inheritable))
+    Reply::Value(lock(&task.process.state).handles.add_with(Handle::Section(section, SECTION_ALL_ACCESS), inheritable))
 }
 
 pub fn create_file_mapping_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
@@ -143,7 +154,10 @@ fn open_file_mapping(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) ->
     let found = task.section_name(cx, a[2], wide).and_then(|name| lock(&task.k.sections).get(&name).and_then(Weak::upgrade));
     match found {
         Some(section) if !task.allows(&section.security, a[0] as u32, &crate::security::SECTION) => task.null(cx, ERROR_ACCESS_DENIED),
-        Some(section) => Reply::Value(lock(&task.process.state).handles.add_with(Handle::Section(section), a[1] as u32 != 0)),
+        Some(section) => {
+            let access = crate::security::map_generic(a[0] as u32, &crate::security::SECTION);
+            Reply::Value(lock(&task.process.state).handles.add_with(Handle::Section(section, access), a[1] as u32 != 0))
+        }
         None => task.null(cx, ERROR_FILE_NOT_FOUND),
     }
 }
@@ -159,8 +173,16 @@ pub fn open_file_mapping_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply
 /// `MapViewOfFileEx(section, access, offset high, offset low, bytes, base)`: a view at `base`, or wherever there's
 /// room. Its pages come in as they're touched.
 pub fn map_view_of_file_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(section) = task.section_handle(a[0]) else { return task.null(cx, ERROR_INVALID_HANDLE) };
+    let Some((section, granted)) = task.section_with_access(a[0]) else { return task.null(cx, ERROR_INVALID_HANDLE) };
     let access = a[1] as u32;
+    // The view may be only what the handle was granted: writing needs SECTION_MAP_WRITE, executing
+    // SECTION_MAP_EXECUTE, and reading (a copy-on-write view too) SECTION_MAP_READ.
+    let needs = if access & FILE_MAP_WRITE != 0 { SECTION_MAP_WRITE } else { 0 }
+        | if access & FILE_MAP_EXECUTE != 0 { SECTION_MAP_EXECUTE } else { 0 }
+        | if access & (FILE_MAP_READ | FILE_MAP_COPY) != 0 { SECTION_MAP_READ } else { 0 };
+    if needs & !granted != 0 {
+        return task.null(cx, ERROR_ACCESS_DENIED);
+    }
     let offset = (a[2] << 32) | (a[3] & 0xffff_ffff);
     if !offset.is_multiple_of(GRANULE) {
         return task.null(cx, ERROR_MAPPED_ALIGNMENT);
@@ -236,6 +258,13 @@ pub fn flush_view_of_file(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply 
 
 /// `VirtualQuery(address, &info, size)`: MEMORY_BASIC_INFORMATION for the run of pages from there that are alike.
 pub fn virtual_query(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let process = task.process.clone();
+    virtual_query_of(task, cx, &process, a)
+}
+
+/// `VirtualQuery(address, &info, length)` of `process`'s memory, this one's or another's, laid out as this process's
+/// ISA lays MEMORY_BASIC_INFORMATION out.
+fn virtual_query_of(task: &mut Task, cx: &mut Cx<'_>, process: &crate::process::Process, a: &[u64]) -> Reply {
     // MEMORY_BASIC_INFORMATION: 48 bytes, or 28 for a 32-bit program.
     let abi = task.abi();
     let size_of = if abi.width == 8 { 48 } else { 28 };
@@ -245,11 +274,11 @@ pub fn virtual_query(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     }
     let page = a[0] & !(PAGE - 1);
     let info = {
-        let state = lock(&task.process.state);
+        let state = lock(&process.state);
         match state.regions.find(page) {
             None => {
                 // Free up to whatever comes next.
-                let next = state.regions.iter().map(|(r, _)| r.start).filter(|&s| s > page).min().unwrap_or(task.layout().system_base);
+                let next = state.regions.iter().map(|(r, _)| r.start).filter(|&s| s > page).min().unwrap_or(crate::images::layout(process.isa).system_base);
                 (page, 0, 0, next.saturating_sub(page), MEM_FREE, 0, 0)
             }
             Some((range, area)) => {
@@ -337,43 +366,75 @@ pub fn is_bad_read_ptr(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
     Reply::Value(u64::from(!accessible(task, a[0], a[1], false)))
 }
 
-/// The `...Ex` memory calls take a process first: this one's go as the plain call does; another's can't be reached
-/// from here yet (ERROR_ACCESS_DENIED).
-fn own(task: &mut Task, cx: &mut Cx<'_>, process: u64) -> Result<(), Reply> {
-    match task.process_of(process) {
-        Some(p) if Arc::ptr_eq(&p, &task.process) => Ok(()),
-        Some(_) => Err(task.fail(cx, 5)),
-        None => Err(task.fail(cx, ERROR_INVALID_HANDLE)),
+/// The `...Ex` memory calls take a process first: this one, or another (whose space is changed from here, as a
+/// debugger or a sandbox's broker changes its child's).
+fn target(task: &mut Task, cx: &mut Cx<'_>, process: u64) -> Result<Arc<crate::process::Process>, Reply> {
+    task.process_of(process).ok_or_else(|| task.fail(cx, ERROR_INVALID_HANDLE))
+}
+
+/// `VirtualAllocEx(process, address, size, kind, protect)`.
+pub fn virtual_alloc_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let process = match target(task, cx, a[0]) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    match task.virtual_alloc_in(cx, &process, a[1], a[2], a[3] as u32, a[4] as u32) {
+        Some(base) => Reply::Value(base),
+        None => task.fail(cx, ERROR_INVALID_PARAMETER),
     }
 }
 
-pub fn virtual_alloc_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    own(task, cx, a[0]).map_or_else(|r| r, |()| super::kernel32::virtual_alloc_from(task, cx, &a[1..]))
-}
-
+/// `VirtualFreeEx(process, address, size, kind)`.
 pub fn virtual_free_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    own(task, cx, a[0]).map_or_else(|r| r, |()| super::kernel32::virtual_free_from(task, cx, &a[1..]))
+    let process = match target(task, cx, a[0]) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    if task.virtual_free_in(cx, &process, a[1], a[2], a[3] as u32) { Reply::Value(1) } else { task.fail(cx, ERROR_INVALID_PARAMETER) }
 }
 
+/// `VirtualProtectEx(process, address, size, protect, &old)`.
 pub fn virtual_protect_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    own(task, cx, a[0]).map_or_else(|r| r, |()| super::kernel32::virtual_protect_from(task, cx, &a[1..]))
+    let process = match target(task, cx, a[0]) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    if task.virtual_protect_in(cx, &process, a[1], a[2], a[3] as u32, a[4]) == 0 { Reply::Value(1) } else { task.fail(cx, ERROR_INVALID_PARAMETER) }
 }
 
+/// `VirtualQueryEx(process, address, &info, length)`.
 pub fn virtual_query_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    own(task, cx, a[0]).map_or_else(|r| r, |()| virtual_query(task, cx, &a[1..]))
+    let process = match target(task, cx, a[0]) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    virtual_query_of(task, cx, &process, &a[1..])
 }
 
 /// `ReadProcessMemory(process, from, buffer, size, &read)` and `WriteProcessMemory(process, to, buffer, size,
-/// &written)`, in this process.
+/// &written)`, in this process or another (ERROR_PARTIAL_COPY if any of it can't be read or written).
 fn process_memory(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], write: bool) -> Reply {
-    if let Err(r) = own(task, cx, a[0]) {
-        return r;
-    }
+    const ERROR_PARTIAL_COPY: u32 = 299;
+    let Some(process) = task.process_of(a[0]) else { return task.fail(cx, ERROR_INVALID_HANDLE) };
     let size = (a[3] as usize).min(1 << 30);
     let (from, to) = if write { (a[2], a[1]) } else { (a[1], a[2]) };
-    let Ok(data) = task.mem(cx, false, |t| user::read_vec(&t.space(), from, size)) else { return task.fail(cx, 299) };
-    if task.mem(cx, true, |t| user::write(&mut t.space(), to, &data)).is_err() {
-        return task.fail(cx, 299);
+    if Arc::ptr_eq(&process, &task.process) {
+        let Ok(data) = task.mem(cx, false, |t| user::read_vec(&t.space(), from, size)) else { return task.fail(cx, ERROR_PARTIAL_COPY) };
+        if task.mem(cx, true, |t| user::write(&mut t.space(), to, &data)).is_err() {
+            return task.fail(cx, ERROR_PARTIAL_COPY);
+        }
+    } else if write {
+        let Ok(data) = task.mem(cx, false, |t| user::read_vec(&t.space(), from, size)) else { return task.fail(cx, ERROR_PARTIAL_COPY) };
+        let k = task.k.clone();
+        if !crate::process::write_remote(&k, cx, &process, &[(to, &data)]) {
+            return task.fail(cx, ERROR_PARTIAL_COPY);
+        }
+    } else {
+        let k = task.k.clone();
+        let Some(data) = crate::process::read_remote(&k, cx, &process, from, size) else { return task.fail(cx, ERROR_PARTIAL_COPY) };
+        if task.mem(cx, true, |t| user::write(&mut t.space(), to, &data)).is_err() {
+            return task.fail(cx, ERROR_PARTIAL_COPY);
+        }
     }
     if a[4] != 0 {
         let _ = task.write_ptr(cx, a[4], size as u64);
@@ -387,4 +448,47 @@ pub fn read_process_memory(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply
 
 pub fn write_process_memory(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     process_memory(task, cx, a, true)
+}
+
+/// `AtlasQueryProcess(handle, &out)`, for ntdll's `NtQueryInformationProcess` on another process: its exit status
+/// (STILL_ACTIVE while it runs), its PEB, its ID and its parent's, as four 64-bit words. An NTSTATUS.
+pub fn atlas_query_process(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(process) = task.process_of(a[0]) else { return Reply::Value(0xc000_0008) }; // STATUS_INVALID_HANDLE
+    let exit = lock(&process.object.state).exit.unwrap_or(0x103);
+    let (peb, parent) = {
+        let state = lock(&process.state);
+        (state.peb, state.parent)
+    };
+    let out: Vec<u8> = [u64::from(exit), peb, process.pid, parent].iter().flat_map(|v| v.to_le_bytes()).collect();
+    match task.mem(cx, true, |t| user::write(&mut t.space(), a[1], &out)) {
+        Ok(()) => Reply::Value(0),
+        Err(_) => Reply::Value(0xc000_0005), // STATUS_ACCESS_VIOLATION
+    }
+}
+
+/// `AtlasQuerySection(handle, &out)`, for ntdll's `NtQuerySection`: the section's size and its allocation attributes
+/// (SEC_FILE for a file's, SEC_COMMIT for the page file's; atlas makes no image sections), as two 64-bit words. An
+/// NTSTATUS.
+pub fn atlas_query_section(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    const SEC_FILE: u64 = 0x80_0000;
+    const SEC_COMMIT: u64 = 0x800_0000;
+    let Some(section) = task.section_handle(a[0]) else { return Reply::Value(0xc000_0008) }; // STATUS_INVALID_HANDLE
+    let attributes = if section.file.is_some() { SEC_FILE } else { SEC_COMMIT };
+    let mut out = section.size.to_le_bytes().to_vec();
+    out.extend(attributes.to_le_bytes());
+    match task.mem(cx, true, |t| user::write(&mut t.space(), a[1], &out)) {
+        Ok(()) => Reply::Value(0),
+        Err(_) => Reply::Value(0xc000_0005), // STATUS_ACCESS_VIOLATION
+    }
+}
+
+/// `AtlasQueryObject(handle, class, &out, length, &returned)`, for ntdll's `NtQueryObject`. An NTSTATUS.
+pub fn atlas_query_object(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(u64::from(task.query_object(cx, a[0], a[1] as u32, a[2], a[3] as u32 as u64, a[4])))
+}
+
+/// `AtlasProcessHandles(class, &out, length, &returned)`, for ntdll's `NtQueryInformationProcess` of this process's
+/// handles: ProcessHandleInformation (51) or ProcessHandleTable (58). An NTSTATUS.
+pub fn atlas_process_handles(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(u64::from(task.process_handles(cx, a[0] as u32, a[1], a[2] as u32 as u64, a[3])))
 }

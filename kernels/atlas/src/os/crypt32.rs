@@ -44,9 +44,9 @@ dll! {
     missing CryptQueryObject;
     missing CryptStringToBinaryA;
     missing PFXImportCertStore;
-    missing CertAddStoreToCollection;
+    host CertAddStoreToCollection(4) => cert_add_store_to_collection;
     missing CertCompareCertificateName;
-    missing CertControlStore;
+    host CertControlStore(4) => cert_control_store;
     missing CertFindChainInStore;
     missing CertGetCertificateContextProperty;
     missing CertGetEnhancedKeyUsage;
@@ -57,10 +57,10 @@ dll! {
     missing CryptAcquireCertificatePrivateKey;
     missing CryptMsgClose;
     missing CryptMsgGetParam;
-    missing CryptProtectData;
-    missing CryptProtectMemory;
-    missing CryptUnprotectData;
-    missing CryptUnprotectMemory;
+    host CryptProtectData(7) => crypt_protect_data;
+    host CryptProtectMemory(3) => crypt_protect_memory;
+    host CryptUnprotectData(7) => crypt_unprotect_data;
+    host CryptUnprotectMemory(3) => crypt_protect_memory;
     missing CryptVerifyCertificateSignatureEx;
 }
 
@@ -263,6 +263,41 @@ struct State {
     contexts: HashMap<(u64, u64), Context>,
     /// Chain contexts, by address: the certificate contexts in them.
     chains: HashMap<(u64, u64), Vec<u64>>,
+    /// Collection stores' members, by the collection's handle: what it holds besides its own.
+    members: HashMap<(u64, u64), Vec<u64>>,
+    /// Stores the program closed that a collection still holds: they go when nothing does.
+    closed: std::collections::HashSet<(u64, u64)>,
+}
+
+impl State {
+    /// Every certificate a store holds: its own, then its members' (a collection's), each store once.
+    fn certificates(&self, pid: u64, store: u64) -> Vec<Vec<u8>> {
+        let (mut out, mut seen, mut queue) = (Vec::new(), std::collections::HashSet::new(), vec![store]);
+        while let Some(h) = queue.pop() {
+            if !seen.insert(h) {
+                continue;
+            }
+            out.extend(self.stores.get(&(pid, h)).cloned().unwrap_or_default());
+            queue.extend(self.members.get(&(pid, h)).into_iter().flatten().rev());
+        }
+        out
+    }
+
+    /// Whether any collection still holds `store`.
+    fn held(&self, pid: u64, store: u64) -> bool {
+        self.members.iter().any(|((p, _), m)| *p == pid && m.contains(&store))
+    }
+
+    /// Lets go of a closed store, and of members only it held.
+    fn forget(&mut self, pid: u64, store: u64) {
+        self.stores.remove(&(pid, store));
+        self.closed.remove(&(pid, store));
+        for member in self.members.remove(&(pid, store)).unwrap_or_default() {
+            if self.closed.contains(&(pid, member)) && !self.held(pid, member) {
+                self.forget(pid, member);
+            }
+        }
+    }
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -396,9 +431,50 @@ fn cert_open_store(task: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
     Reply::Value(handle)
 }
 
+/// `CertCloseStore(store, flags)`: a store a collection holds stays, for the collection, until it lets go.
 fn cert_close_store(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
     let pid = task.process.pid;
-    with(|s| s.stores.remove(&(pid, a[0])));
+    with(|s| {
+        if s.held(pid, a[0]) {
+            s.closed.insert((pid, a[0]));
+        } else {
+            s.forget(pid, a[0]);
+        }
+    });
+    Reply::Value(1)
+}
+
+/// `CertControlStore(store, flags, control, &parameter)`: atlas's stores change only as the program changes them, so
+/// there's nothing to resync (1) or commit (3), auto-resync (4) costs nothing, and a change notification's event (2)
+/// is never set (5 cancels it).
+fn cert_control_store(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let pid = task.process.pid;
+    if !with(|s| s.stores.contains_key(&(pid, a[0]))) {
+        return task.fail(cx, 6); // ERROR_INVALID_HANDLE
+    }
+    match a[2] as u32 {
+        1..=5 => Reply::Value(1),
+        _ => task.fail(cx, 120), // ERROR_CALL_NOT_IMPLEMENTED
+    }
+}
+
+/// `CertAddStoreToCollection(collection, sibling, flags, priority)`: the collection holds what the sibling does, now
+/// and as it changes (a collection is any store opened with CERT_STORE_PROV_COLLECTION, which opens empty).
+fn cert_add_store_to_collection(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let pid = task.process.pid;
+    let added = with(|s| {
+        if !s.stores.contains_key(&(pid, a[0])) || !s.stores.contains_key(&(pid, a[1])) {
+            return false;
+        }
+        let members = s.members.entry((pid, a[0])).or_default();
+        if !members.contains(&a[1]) {
+            members.push(a[1]);
+        }
+        true
+    });
+    if !added {
+        return task.fail(cx, 6); // ERROR_INVALID_HANDLE
+    }
     Reply::Value(1)
 }
 
@@ -552,7 +628,7 @@ fn cert_get_certificate_chain(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Re
         let w = task.abi().width;
         // CERT_CONTEXT's hCertStore, its last field.
         let own_store = task.mem(cx, false, |t| user::read_ptr(&t.space(), a[1] + if w == 8 { 32 } else { 16 }, w)).unwrap_or(0);
-        let pool: Vec<Vec<u8>> = with(|s| [a[3], own_store].iter().flat_map(|h| s.stores.get(&(pid, *h)).cloned().unwrap_or_default()).collect());
+        let pool: Vec<Vec<u8>> = with(|s| [a[3], own_store].iter().flat_map(|h| s.certificates(pid, *h)).collect());
         let at = if a[2] != 0 {
             let ft = task.mem(cx, false, |t| user::read_vec(&t.space(), a[2], 8)).map_err(|_| E_INVALIDARG)?;
             let ft = u64::from_le_bytes(ft.try_into().unwrap_or_default());
@@ -653,6 +729,27 @@ fn cert_free_certificate_chain(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> R
 }
 
 #[cfg(test)]
+mod collection_tests {
+    use super::State;
+
+    #[test]
+    fn collections_hold_their_members() {
+        let mut s = State::default();
+        for h in [1, 2, 3] {
+            s.stores.insert((9, h), vec![vec![h as u8]]);
+        }
+        s.members.insert((9, 1), vec![2, 3]);
+        s.members.insert((9, 3), vec![1]);
+        assert_eq!(s.certificates(9, 1), vec![vec![1], vec![2], vec![3]]);
+        // A member closed stays while the collection holds it, and goes with it.
+        assert!(s.held(9, 2));
+        s.closed.insert((9, 2));
+        s.forget(9, 1);
+        assert!(!s.stores.contains_key(&(9, 2)) && s.stores.contains_key(&(9, 3)));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -665,4 +762,157 @@ mod tests {
         assert_eq!((t.tag, t.body.len(), rest.len()), (0x30, 256, 0));
         assert!(tlv(&[0x30, 0x05, 1]).is_none());
     }
+}
+
+// ---- Data protection (DPAPI) ----
+//
+// A blob is "ATL1", a random nonce, the description's length and the description (UTF-16), then the data sealed
+// with ChaCha20-Poly1305 under the machine's key, over the description and the caller's entropy. The key is made once
+// for each machine, at random, and kept in its registry where only the machine reads it, so a blob opens on the
+// machine that made it and nowhere else, and one that's changed doesn't open at all.
+
+const ERROR_INVALID_PARAMETER: u32 = 87;
+/// ERROR_INVALID_DATA: a blob this machine didn't make, or one that's been changed.
+const ERROR_INVALID_DATA: u32 = 13;
+const MAGIC: &[u8; 4] = b"ATL1";
+const KEY_PATH: &str = "SECURITY\\Policy\\Secrets\\DataProtection";
+
+impl Task {
+    /// The machine's data protection key, made the first time.
+    fn protection_key(&mut self) -> [u8; 32] {
+        let now = self.k.host.wall();
+        let mut registry = lock(&self.k.registry);
+        let machine = registry.root(crate::registry::Root::LocalMachine);
+        if let Ok(key) = registry.open(machine, KEY_PATH)
+            && let Ok(v) = registry.value(key, "Key")
+            && let Ok(k) = <[u8; 32]>::try_from(v.data.as_slice())
+        {
+            return k;
+        }
+        let mut k = [0u8; 32];
+        self.k.host.random(&mut k);
+        if let Ok((key, _)) = registry.create(machine, KEY_PATH, false, now) {
+            let _ = registry.set_value(key, "Key", crate::registry::REG_BINARY, k.to_vec(), now);
+        }
+        k
+    }
+
+    /// A DATA_BLOB's bytes ({ size, pointer }); None for a null blob.
+    fn read_blob(&mut self, cx: &mut Cx<'_>, at: u64) -> Option<Vec<u8>> {
+        if at == 0 {
+            return None;
+        }
+        let w = self.abi().width;
+        let size = self.mem(cx, false, |t| user::read_u32(&t.space(), at)).ok()?;
+        let ptr = self.mem(cx, false, |t| user::read_ptr(&t.space(), at + w, w)).ok()?;
+        if size == 0 {
+            return Some(Vec::new());
+        }
+        self.mem(cx, false, |t| user::read_vec(&t.space(), ptr, (size as usize).min(1 << 28))).ok()
+    }
+
+    /// Fills a DATA_BLOB with bytes from `LocalAlloc`.
+    fn give_blob(&mut self, cx: &mut Cx<'_>, at: u64, data: &[u8]) -> bool {
+        let block = super::kernel32::global_new(self, cx, data);
+        if block == 0 {
+            return false;
+        }
+        let w = self.abi().width;
+        let ptr = self.abi().ptr(block);
+        self.mem(cx, true, |t| {
+            user::write_u32(&mut t.space(), at, data.len() as u32)?;
+            user::write(&mut t.space(), at + w, &ptr)
+        })
+        .is_ok()
+    }
+}
+
+/// What a blob's tag covers besides its data: its description, then the entropy.
+fn extra(description: &[u8], entropy: &[u8]) -> Vec<u8> {
+    let mut e = (description.len() as u32).to_le_bytes().to_vec();
+    e.extend(description);
+    e.extend(entropy);
+    e
+}
+
+/// `CryptProtectData(&in, description, &entropy, reserved, &prompt, flags, &out)`.
+fn crypt_protect_data(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (Some(data), true) = (task.read_blob(cx, a[0]), a[6] != 0) else {
+        task.set_last_error(cx, ERROR_INVALID_PARAMETER);
+        return Reply::Value(0);
+    };
+    let description: Vec<u8> = if a[1] == 0 { Vec::new() } else { task.text_arg(cx, a[1], true).encode_utf16().flat_map(u16::to_le_bytes).collect() };
+    let entropy = task.read_blob(cx, a[2]).unwrap_or_default();
+    let key = task.protection_key();
+    let mut nonce = [0u8; 12];
+    task.k.host.random(&mut nonce);
+    let mut blob = MAGIC.to_vec();
+    blob.extend(nonce);
+    blob.extend((description.len() as u32).to_le_bytes());
+    blob.extend(&description);
+    blob.extend(crate::crypto::seal(&key, &nonce, &extra(&description, &entropy), &data));
+    if !task.give_blob(cx, a[6], &blob) {
+        task.set_last_error(cx, 8);
+        return Reply::Value(0);
+    }
+    Reply::Value(1)
+}
+
+/// `CryptUnprotectData(&in, &description, &entropy, reserved, &prompt, flags, &out)`.
+fn crypt_unprotect_data(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (Some(blob), true) = (task.read_blob(cx, a[0]), a[6] != 0) else {
+        task.set_last_error(cx, ERROR_INVALID_PARAMETER);
+        return Reply::Value(0);
+    };
+    let entropy = task.read_blob(cx, a[2]).unwrap_or_default();
+    let key = task.protection_key();
+    let opened = (|| {
+        if blob.get(..4)? != MAGIC {
+            return None;
+        }
+        let nonce: [u8; 12] = blob.get(4..16)?.try_into().ok()?;
+        let n = u32::from_le_bytes(blob.get(16..20)?.try_into().ok()?) as usize;
+        let description = blob.get(20..20 + n)?;
+        let data = crate::crypto::open(&key, &nonce, &extra(description, &entropy), blob.get(20 + n..)?)?;
+        Some((description.to_vec(), data))
+    })();
+    let Some((description, data)) = opened else {
+        task.set_last_error(cx, ERROR_INVALID_DATA);
+        return Reply::Value(0);
+    };
+    if a[1] != 0 {
+        let mut text = description;
+        text.extend([0, 0]);
+        let block = super::kernel32::global_new(task, cx, &text);
+        let _ = task.write_ptr(cx, a[1], block);
+    }
+    if !task.give_blob(cx, a[6], &data) {
+        task.set_last_error(cx, 8);
+        return Reply::Value(0);
+    }
+    Reply::Value(1)
+}
+
+/// `CryptProtectMemory(data, size, flags)` and `CryptUnprotectMemory`: in place, by ChaCha20 under the machine's key
+/// and the scope asked (CRYPTPROTECTMEMORY_SAME_PROCESS 0, CROSS_PROCESS 1, SAME_LOGON 2): the same process's number
+/// in the nonce for the first, so another process can't undo it. The size is a multiple of 16, as Windows wants.
+fn crypt_protect_memory(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let size = a[1] as u32 as usize;
+    if !size.is_multiple_of(16) || a[2] > 2 {
+        task.set_last_error(cx, ERROR_INVALID_PARAMETER);
+        return Reply::Value(0);
+    }
+    let key = task.protection_key();
+    let mut nonce = [0u8; 12];
+    nonce[0] = 0x4d;
+    nonce[1] = a[2] as u8;
+    if a[2] == 0 {
+        nonce[4..12].copy_from_slice(&task.process.pid.to_le_bytes());
+    }
+    let Ok(mut data) = task.mem(cx, false, |t| user::read_vec(&t.space(), a[0], size)) else {
+        task.set_last_error(cx, 998);
+        return Reply::Value(0);
+    };
+    crate::crypto::chacha20(&key, 0, &nonce, &mut data);
+    Reply::Value(u64::from(task.mem(cx, true, |t| user::write(&mut t.space(), a[0], &data)).is_ok()))
 }

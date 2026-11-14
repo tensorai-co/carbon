@@ -6,6 +6,7 @@ use kernels_core::lock;
 use kernels_core::thread::Cx;
 use kernels_core::user;
 
+use super::shell32::command_line_to_argv_w;
 use super::advapi32::{reg_close_key, reg_create_key_ex_w, reg_delete_key_ex_w, reg_delete_value_w, reg_open_key_ex_a, reg_open_key_ex_w, reg_query_value_ex_a, reg_query_value_ex_w, reg_set_value_ex_w};
 use super::fileapi::*;
 use super::localeapi::*;
@@ -268,6 +269,10 @@ dll! {
     host MapViewOfFileEx(6) => map_view_of_file_ex;
     host UnmapViewOfFile(1) => unmap_view_of_file;
     host FlushViewOfFile(2) => flush_view_of_file;
+    host AtlasQuerySection(2) => atlas_query_section;
+    host AtlasQueryProcess(2) => atlas_query_process;
+    host AtlasQueryObject(5) => atlas_query_object;
+    host AtlasProcessHandles(4) => atlas_process_handles;
     host GetSystemTimeAsFileTime(1) => get_system_time_as_file_time;
     host GetSystemTimePreciseAsFileTime(1) => get_system_time_as_file_time;
     host GetVersion(0) => get_version;
@@ -499,7 +504,7 @@ dll! {
     // Not written yet: what larger programs import.
     host AllocConsole(0) => accept;
     host AssignProcessToJobObject(2) => accept;
-    missing AttachConsole;
+    host AttachConsole(1) => attach_console;
     host CreateEventExW(4) => create_event_ex_w;
     host CreateJobObjectA(2) => create_job_object;
     host CreateSemaphoreExW(6) => create_semaphore_ex_w;
@@ -513,7 +518,7 @@ dll! {
     host FormatMessageW(7) => format_message_w;
     missing GenerateConsoleCtrlEvent;
     missing GetBinaryTypeW;
-    missing GetConsoleScreenBufferInfo;
+    host GetConsoleScreenBufferInfo(2) => get_console_screen_buffer_info;
     host GetCurrentProcessorNumber(0) => zero;
     missing GetFileInformationByHandleEx;
     host GetLocaleInfoA(4) => get_locale_info_a;
@@ -551,11 +556,11 @@ dll! {
     host Process32First(2) => process32_first;
     host Process32Next(2) => process32_next;
     host QueryUnbiasedInterruptTime(1) => query_unbiased_interrupt_time;
-    missing ReadDirectoryChangesW;
+    host ReadDirectoryChangesW(8) => read_directory_changes_w;
     host ReadProcessMemory(5) => read_process_memory;
     host SetConsoleTextAttribute(2) => accept;
-    host SetDllDirectoryA(1) => succeed;
-    host SetDllDirectoryW(1) => succeed;
+    host SetDllDirectoryA(1) => set_dll_directory_a;
+    host SetDllDirectoryW(1) => set_dll_directory_w;
     missing SetFileInformationByHandle;
     host SetHandleCount(1) => handle_count;
     host SetInformationJobObject(4) => accept;
@@ -590,7 +595,8 @@ dll! {
     host CreateJobObjectW(2) => create_job_object;
     missing CreateMemoryResourceNotification;
     host DeleteProcThreadAttributeList(1) => accept;
-    missing DiscardVirtualMemory;
+    // Pages whose contents may go: kept as they are, which Windows allows.
+    host DiscardVirtualMemory(2) => zero;
     missing EnumSystemLocalesEx;
     missing EscapeCommFunction;
     missing FindFirstVolumeW;
@@ -602,7 +608,7 @@ dll! {
     missing GetConsoleDisplayMode;
     missing GetCurrencyFormatEx;
     host GetFirmwareType(1) => get_firmware_type;
-    missing GetGeoInfoW;
+    host GetGeoInfoW(5) => get_geo_info_w;
     missing GetNumberFormatEx;
     host GetPriorityClass(1) => get_priority_class;
     host GetProcessHandleCount(2) => get_process_handle_count;
@@ -625,7 +631,7 @@ dll! {
     host PowerClearRequest(2) => accept;
     host PowerCreateRequest(1) => power_create_request;
     host PowerSetRequest(2) => accept;
-    missing PrefetchVirtualMemory;
+    host PrefetchVirtualMemory(4) => prefetch_virtual_memory;
     missing PurgeComm;
     host QueryDosDeviceW(3) => query_dos_device_w;
     host QueryFullProcessImageNameA(4) => query_full_process_image_name_a;
@@ -638,7 +644,7 @@ dll! {
     host RtlDeleteFunctionTable(1) => accept;
     missing SetCommState;
     missing SetCommTimeouts;
-    host SetDefaultDllDirectories(1) => accept;
+    host SetDefaultDllDirectories(1) => set_default_dll_directories;
     host SetProcessInformation(4) => accept;
     host SetProcessMitigationPolicy(3) => accept;
     host SetThreadInformation(4) => accept;
@@ -651,7 +657,9 @@ dll! {
     missing Wow64GetThreadContext;
     missing terminate;
     missing CompareObjectHandles;
-    missing QueryUnbiasedInterruptTimePrecise;
+    host QueryUnbiasedInterruptTimePrecise(1) => query_unbiased_interrupt_time;
+    // KernelBase's since Windows 8, which programs look for here when there's no KernelBase to find it in.
+    host CommandLineToArgvW(2) => command_line_to_argv_w;
     host RegCloseKey(1) => reg_close_key;
     host RegOpenKeyExA(5) => reg_open_key_ex_a;
     host RegOpenKeyExW(5) => reg_open_key_ex_w;
@@ -662,6 +670,8 @@ dll! {
     host RegSetValueExW(6) => reg_set_value_ex_w;
     host RegDeleteKeyExW(4) => reg_delete_key_ex_w;
     host RegDeleteValueW(2) => reg_delete_value_w;
+    host ReclaimVirtualMemory(2) => zero;
+    host OfferVirtualMemory(3) => zero;
 }
 
 const TRUE: u64 = 1;
@@ -956,4 +966,39 @@ fn output_debug_string_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 
 fn output_debug_string_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     output_debug_string(task, cx, a, true)
+}
+
+/// `PrefetchVirtualMemory(process, count, &ranges, flags)`: a hint that pages will be wanted soon. They come in as
+/// they're touched here, so there's nothing to do ahead.
+fn prefetch_virtual_memory(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(TRUE)
+}
+
+/// `AttachConsole(process)`: every process here shares the machine's one console (as `AllocConsole` and `FreeConsole`
+/// take it), so attaching to the parent's (ATTACH_PARENT_PROCESS) or any process's succeeds; a process that isn't
+/// there has no console to attach to.
+fn attach_console(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let pid = a[0] as u32;
+    if pid != u32::MAX && task.k.process(u64::from(pid)).is_none() {
+        return task.fail(cx, 87); // ERROR_INVALID_PARAMETER
+    }
+    Reply::Value(TRUE)
+}
+
+/// `GetConsoleScreenBufferInfo(output, &info)`: the console's buffer as the host's terminal is, its columns by its rows
+/// (80 by 25 when there's no terminal to ask), its window the whole of it, the cursor at its top left (where it is in
+/// the host's terminal isn't known), grey on black. An output handle that isn't the console's is ERROR_INVALID_HANDLE.
+fn get_console_screen_buffer_info(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if is_console(task, a[0]) != Some(false) {
+        return task.fail(cx, 6);
+    }
+    let (rows, columns) = task.k.host.terminal_size().unwrap_or((25, 80));
+    let (w, h) = (columns.clamp(1, 0x7fff) as i16, rows.clamp(1, 0x7fff) as i16);
+    // dwSize, dwCursorPosition, wAttributes, srWindow (left, top, right, bottom), dwMaximumWindowSize.
+    let fields: [i16; 11] = [w, h, 0, 0, 0x07, 0, 0, w - 1, h - 1, w, h];
+    let bytes: Vec<u8> = fields.iter().flat_map(|v| v.to_le_bytes()).collect();
+    if task.mem(cx, true, |t| user::write(&mut t.space(), a[1], &bytes)).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(TRUE)
 }

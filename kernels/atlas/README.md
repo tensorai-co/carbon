@@ -168,7 +168,11 @@ naming itself):
 | ntdll | 1,544 | | 35 by Windows' names, 242 of atlas's own | | 2% |
 
 Between ntdll and the host there are 12 calls of atlas's own (`atlas-abi`'s `call`), and every host export traps
-straight to its Rust.
+straight to its Rust. On x86-64, ntdll's `Nt` system services are stubs shaped exactly as Windows 10's (`mov r10,
+rcx; mov eax, n; test byte ptr [0x7ffe0308], 1; jne; syscall; ret; int 2e; ret`, 32 bytes apart), since sandboxes
+read, copy and patch them; their `syscall` carries `call::NT_SERVICES` plus the service's number, and atlas carries on
+into the service's body in ntdll (`AtlasImpl` and its name). A service atlas hasn't written ends the process naming
+itself, as a missing host export does (`guest/src/services.rs`).
 
 ## How it works
 
@@ -876,7 +880,9 @@ By layer, bottom up. Items are host Rust unless marked **[guest]** (ntdll), or a
   `AlphaBlend`, `TransparentBlt`, monochrome bitmaps' colours); regions; ellipses, polygons and paths; mapping modes; real fonts with metrics and the
   registry's substitutes; palettes; printing, refused cleanly.
 - **The graphics driver and composition** **[gpu]** **[display]**: behind Direct3D, DXGI and flip-model swap chains;
-  `dwmapi`'s queries answered from the desktop.
+  `dwmapi`'s queries answered from the desktop. In `gpu`'s order of work: step 0 first (a program's own software
+  renderer, such as ANGLE on SwiftShader, runs on `--gpu none`), then step 5 (DXGI, Direct3D 11 through `dxbc`,
+  `vulkan-1`), then step 7 (Direct3D 12, Direct3D 9, `nvcuda`, WGL).
 - **The rest** (input injection, pointer and touch, power), as programs reach it.
 
 ### 3. The services
@@ -937,7 +943,7 @@ interface is the to-do, not each export.
 | C runtime | ucrtbase, msvcrt | **[guest]** ucrtbase's rest, as a MinGW C++ program asks: `setjmp`/`longjmp`, `_beginthreadex`, low-level I/O (`_read`, `_write`, `_fstat64`), wide stdio, `strftime`, the multibyte conversions, math; then msvcrt.dll for older MinGW programs |
 | COM and RPC | combase, ole32, oleaut32, rpcrt4, propsys, urlmon | apartments, the class registry, in-process servers, marshalling, `IStream` and compound files (MSI needs them), OLE automation; WinRT refused cleanly |
 | Shell and common UI | comctl32, comdlg32, uxtheme, dwmapi, riched20, imm32, usp10, windowscodecs, gdiplus | comctl32 6's controls and `TaskDialog`, the common dialogs, flat themes, RichEdit, Uniscribe, WIC's decoders, GDI+ |
-| Graphics | dxgi, d3d9/11/12, d2d1, dwrite, opengl32, vulkan-1 | **[gpu]** DXGI and Direct3D 11 first with a software path, then 9 and 12, Direct2D, DirectWrite, WGL, Vulkan |
+| Graphics | dxgi, d3d9/11/12, d2d1, dwrite, opengl32, vulkan-1, nvcuda | **[gpu]** DXGI and Direct3D 11 first with a software path, then 9 and 12, Direct2D, DirectWrite, WGL, Vulkan; `nvcuda` for CUDA programs |
 | Networking | ws2_32, mswsock, iphlpapi, dnsapi, winhttp, wininet, netapi32 | **[net]** Winsock with overlapped I/O, `AcceptEx` and `ConnectEx`; addresses; DNS; WinHTTP and WinINet with TLS checked against `host`'s certificates; `URLDownloadToFile` |
 | Security and crypto | bcrypt, ncrypt, crypt32, wintrust, secur32 | bcrypt's algorithms first, certificate stores from the host's roots, `WinVerifyTrust`, schannel, DPAPI |
 | Media | winmm, dsound, mmdevapi, xaudio2, mf | **[audio]** `waveOut`, `PlaySound` and winmm's timers, WASAPI, DirectSound and XAudio2 over it, later Media Foundation |
@@ -1071,11 +1077,13 @@ services, the shell's core); the window kernel's breadth (bitmaps, fonts, region
   written to it.
 - **Which Windows atlas is:** it reports Windows 10 22H2 (10.0.19045); Windows 11 would change manifests, API sets and
   what programs check for.
-- **Graphics APIs.** Direct3D, DXGI and OpenGL make thousands of calls a frame, and as `host` exports each would be
-  an exit. Real drivers batch calls in the program and submit once a frame. atlas probably needs the same: record
-  commands into a buffer in the program, and translate them to Metal or Vulkan host-side at `Present`. That's a
-  second, small piece of code in the program. (Host exports, guest code, or a GPU protocol: not decided.)
 Settled while building:
+
+- **Graphics APIs: a GPU protocol.** Direct3D, DXGI and OpenGL make thousands of calls a frame, and as `host` exports
+  each would be an exit. So atlas's `dxgi`, `d3d11`, `d3d12`, `vulkan-1` and `nvcuda` will be thin guest drivers
+  that encode each call onto `gpu`'s ring, with a doorbell exit only on submit, fence wait and present; the state and
+  hazard tracking and every shader compile happen host-side, in `gpu`
+  ([thin drivers, lowered on the host](../../gpu/README.md#guest-drivers-lowered-on-the-host-to-come)).
 
 - **ucrtbase** is atlas's own, as it's an OS DLL since Windows 10, and atlas's DLLs win; all of it runs in the
   program, reaching kernel32's host exports by number for files.

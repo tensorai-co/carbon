@@ -431,7 +431,9 @@ fn is_descendant(windows: &BTreeMap<u64, Window>, mut hwnd: u64, ancestor: u64) 
 /// Windows and messages, for the whole machine.
 pub struct Win32k {
     pub windows: BTreeMap<u64, Window>,
-    classes: HashMap<String, Class>,
+    /// Window classes by the process that registered them (0 for win32k's own, which every process has) and their
+    /// name in lower case: each process's are its own, as on Windows.
+    classes: HashMap<(u64, String), Class>,
     next_hwnd: u64,
     next_atom: u16,
     queues: HashMap<u64, Queue>,
@@ -618,13 +620,31 @@ impl Win32k {
             });
             // 8: CS_DBLCLKS. A dialog's class is CS_SAVEBITS too, which means nothing here.
             let class = Class { name: name.to_string(), atom, wndproc: proc.handle(), style: 8, extra, background, instance: 0, cursor: 0x0001_0000 | cursor, ansi: false };
-            self.classes.insert(name.to_lowercase(), class);
+            self.classes.insert((0, name.to_lowercase()), class);
         }
     }
 
-    /// A class to change (`SetClassLongPtr`).
-    pub fn class_mut(&mut self, name: &str) -> Option<&mut Class> {
-        self.classes.get_mut(&name.to_lowercase())
+    /// Where process `pid`'s class `name` is: one of its own, else win32k's.
+    fn class_key(&self, pid: u64, name: &str) -> Option<(u64, String)> {
+        let name = name.to_lowercase();
+        [pid, 0].into_iter().map(|p| (p, name.clone())).find(|k| self.classes.contains_key(k))
+    }
+
+    /// A class to change (`SetClassLongPtr`), as process `pid` names it.
+    pub fn class_mut(&mut self, pid: u64, name: &str) -> Option<&mut Class> {
+        let key = self.class_key(pid, name)?;
+        self.classes.get_mut(&key)
+    }
+
+    /// A window's class.
+    pub fn window_class(&self, hwnd: u64) -> Option<&Class> {
+        let w = self.windows.get(&hwnd)?;
+        self.class_by_name(w.pid, &w.class)
+    }
+
+    /// Process `pid`'s classes go, as it ends.
+    pub fn forget_classes(&mut self, pid: u64) {
+        self.classes.retain(|(p, _), _| *p != pid);
     }
 
     /// Whether a window takes input: neither it nor any window it's in is disabled.
@@ -867,7 +887,7 @@ impl Win32k {
                         };
                         // As DefWindowProc's WM_SETCURSOR does: over a client area, its class's cursor, if it has one.
                         if matches!(what, Pointer::Enter | Pointer::Move) && self.capture == 0 {
-                            let class = self.windows.get(&target).and_then(|w| self.class_by_name(&w.class)).map_or(0, |c| c.cursor);
+                            let class = self.window_class(target).map_or(0, |c| c.cursor);
                             if class != 0 {
                                 self.cursor = class;
                                 let cursor = cursor_of(class, &self.gdi.icons);
@@ -1030,13 +1050,14 @@ impl Win32k {
         }
     }
 
-    /// A class's name, as win32k keys it, by its atom.
-    pub fn class_by_atom(&self, atom: u16) -> Option<String> {
-        self.classes.iter().find(|(_, c)| c.atom == atom).map(|(k, _)| k.clone())
+    /// A class's name, as win32k keys it, by its atom: one of process `pid`'s, or win32k's.
+    pub fn class_by_atom(&self, pid: u64, atom: u16) -> Option<String> {
+        self.classes.iter().find(|((p, _), c)| (*p == pid || *p == 0) && c.atom == atom).map(|((_, k), _)| k.clone())
     }
 
-    pub fn class_by_name(&self, name: &str) -> Option<&Class> {
-        self.classes.get(&name.to_lowercase())
+    /// Process `pid`'s class `name`: one of its own, else win32k's.
+    pub fn class_by_name(&self, pid: u64, name: &str) -> Option<&Class> {
+        self.classes.get(&self.class_key(pid, name)?)
     }
 
     /// Every window that's `hwnd` or under it, or that it owns, children before their parents.
@@ -1165,8 +1186,9 @@ impl Task {
     // ---- Classes ----
 
     pub fn register_class(&mut self, mut class: Class) -> Result<u16, u32> {
+        let pid = self.process.pid;
         let mut w = self.win32k();
-        let key = class.name.to_lowercase();
+        let key = (pid, class.name.to_lowercase());
         if w.classes.contains_key(&key) {
             return Err(ERROR_CLASS_ALREADY_EXISTS);
         }
@@ -1178,9 +1200,10 @@ impl Task {
     }
 
     pub fn unregister_class(&mut self, name: &str) -> bool {
+        let pid = self.process.pid;
         let mut w = self.win32k();
-        let key = name.to_lowercase();
-        let used = w.windows.values().any(|win| win.class == key);
+        let key = (pid, name.to_lowercase());
+        let used = w.windows.values().any(|win| win.pid == pid && win.class == key.1);
         !used && w.classes.remove(&key).is_some()
     }
 
@@ -1192,8 +1215,8 @@ impl Task {
     /// A class by its atom, or its name as UTF-16 or ANSI.
     pub fn class_named_as(&mut self, cx: &mut Cx<'_>, at: u64, wide: bool) -> Option<String> {
         if at < 0x1_0000 {
-            let w = self.win32k();
-            return w.classes.values().find(|c| u64::from(c.atom) == at).map(|c| c.name.to_lowercase());
+            let pid = self.process.pid;
+            return self.win32k().class_by_atom(pid, at as u16);
         }
         Some(self.text_arg(cx, at, wide).to_lowercase())
     }
@@ -1231,7 +1254,7 @@ impl Task {
         };
         let hwnd = {
             let mut w = self.win32k();
-            let Some(class) = w.class_by_name(&class_name).cloned() else {
+            let Some(class) = w.class_by_name(self.process.pid, &class_name).cloned() else {
                 drop(w);
                 self.set_last_error(cx, ERROR_CANNOT_FIND_WND_CLASS);
                 return Ok(0);

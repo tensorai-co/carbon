@@ -21,8 +21,9 @@ pub enum Handle {
     Find(Arc<Find>),
     /// A registry key, by its ID.
     Key(u64),
-    /// A section: `CreateFileMapping`'s.
-    Section(Arc<crate::sections::Section>),
+    /// A section: `CreateFileMapping`'s, and the SECTION_* rights this handle was granted (all of them for its
+    /// maker's; what `OpenFileMapping` or `DuplicateHandle` asked for otherwise), which its views may not exceed.
+    Section(Arc<crate::sections::Section>, u32),
     /// An I/O completion port.
     Port(Arc<crate::ports::Port>),
     /// An access token: a process's own (`OpenProcessToken`), or a copy (`DuplicateTokenEx`).

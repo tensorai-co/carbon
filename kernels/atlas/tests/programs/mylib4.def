@@ -1,3 +1,5 @@
 LIBRARY mylib4.dll
 EXPORTS
 square
+bump
+tls_detached

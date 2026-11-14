@@ -5,6 +5,7 @@ use kernels_core::lock;
 use kernels_core::thread::Cx;
 use kernels_core::user;
 
+use super::procapi::create_process_as_user_w;
 use super::secapi::*;
 use super::etw::{event_register, get_trace_logger_handle, register_trace_guids};
 use super::{Reply, dll};
@@ -157,7 +158,7 @@ dll! {
     missing CloseEventLog;
     host CloseServiceHandle(1) => close_service_handle;
     missing ControlService;
-    missing CreateProcessAsUserW;
+    host CreateProcessAsUserW(11) => create_process_as_user_w;
     missing CryptAcquireContextA;
     missing CryptCreateHash;
     missing CryptDestroyHash;
@@ -185,7 +186,7 @@ dll! {
     host BuildTrusteeWithSidW(2) => build_trustee_with_sid;
     missing CloseTrace;
     missing ControlTraceW;
-    missing CreateRestrictedToken;
+    host CreateRestrictedToken(9) => create_restricted_token;
     missing CryptGetProvParam;
     missing CryptSetHashParam;
     missing CryptSignHashW;
@@ -198,7 +199,7 @@ dll! {
     missing LsaNtStatusToWinError;
     missing OpenTraceW;
     missing ProcessTrace;
-    missing RegDisablePredefinedCache;
+    host RegDisablePredefinedCache(0) => reg_disable_predefined_cache;
     host RegisterTraceGuidsW(8) => register_trace_guids;
     host SetEntriesInAclW(4) => set_entries_in_acl_w;
     missing StartTraceW;
@@ -919,5 +920,11 @@ fn close_service_handle(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 
 /// What's written to a trace nobody runs, and what's asked of one: done, nothing.
 fn etw_zero(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(0)
+}
+
+/// `RegDisablePredefinedCache()`: HKEY_CURRENT_USER isn't cached for a process here (each call finds it afresh), so
+/// there's nothing to stop: ERROR_SUCCESS.
+fn reg_disable_predefined_cache(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
     Reply::Value(0)
 }

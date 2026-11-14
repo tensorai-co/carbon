@@ -5,9 +5,10 @@
 // ordinal; ERROR_MOD_NOT_FOUND and ERROR_PROC_NOT_FOUND; GetModuleFileNameW; static TLS and a TLS callback;
 // the PEB's three module lists; GetModuleHandleExA; FreeLibrary counting references and unloading, with DllMain
 // told and a DLL notification, and what only it held unloaded too; DLL_THREAD_DETACH; an API set; LdrGetDllHandle
-// and LdrGetProcedureAddress; a delay-loaded DLL; __try/__except catching an access violation, from three calls down
+// and LdrGetProcedureAddress; a delay-loaded DLL, and its static TLS on a thread already running; __try/__except catching an access violation, from three calls down
 // too; RaiseException with a filter; __finally during an unwind and on a normal exit; EXCEPTION_CONTINUE_EXECUTION;
-// integer divide by zero (x86-64); and, as it ends, DLL_PROCESS_DETACH
+// integer divide by zero (x86-64); DLLs found as Windows searches: the current directory, not once SetDllDirectory
+// leaves it out, and SetDllDirectory's folder; and, as it ends, DLL_PROCESS_DETACH
 
 // x86's thread-local variables are found through fs:[__tls_array], which the C runtime defines as 0x2c, the TEB's
 // ThreadLocalStoragePointer; there's none here.
@@ -33,6 +34,12 @@ __declspec(dllimport) DWORD __stdcall GetLastError(void);
 __declspec(dllimport) void __stdcall RaiseException(DWORD, DWORD, DWORD, const ULONG_PTR *);
 __declspec(dllimport) HANDLE __stdcall GetProcessHeap(void);
 __declspec(dllimport) int __stdcall FreeLibrary(HANDLE);
+__declspec(dllimport) HANDLE __stdcall LoadLibraryW(const WCHAR *);
+__declspec(dllimport) int __stdcall CreateDirectoryW(const WCHAR *, void *);
+__declspec(dllimport) int __stdcall CopyFileW(const WCHAR *, const WCHAR *, int);
+__declspec(dllimport) DWORD __stdcall GetCurrentDirectoryW(DWORD, WCHAR *);
+__declspec(dllimport) int __stdcall SetCurrentDirectoryW(const WCHAR *);
+__declspec(dllimport) int __stdcall SetDllDirectoryW(const WCHAR *);
 __declspec(dllimport) int __stdcall GetModuleHandleExA(DWORD, const char *, HANDLE *);
 __declspec(dllimport) HANDLE __stdcall CreateThread(void *, SIZE_T, DWORD (__stdcall *)(void *), void *, DWORD, DWORD *);
 __declspec(dllimport) DWORD __stdcall WaitForSingleObject(HANDLE, DWORD);
@@ -53,6 +60,19 @@ __declspec(dllimport) int attached;
 __declspec(dllimport) void *heap_alloc(HANDLE, DWORD, SIZE_T);
 __declspec(dllimport) int thread_attached, thread_detached, say_at_exit;
 __declspec(dllimport) int square(int);
+__declspec(dllimport) int bump(void);
+__declspec(dllimport) int tls_detached(void);
+__declspec(dllimport) void __stdcall Sleep(DWORD);
+
+// A thread that starts before mylib4 is loaded, and uses its thread-local counter after.
+static volatile int early_started, early_go, early_bumped;
+static DWORD __stdcall bump_later(void *unused) {
+    (void)unused;
+    early_started = 1;
+    while (!early_go) Sleep(1);
+    early_bumped = bump();
+    return 0;
+}
 
 // The delay-load helper MSVC's delayimp.lib has, as Windows' own DLLs have it: everything is ResolveDelayLoadedAPI.
 extern char __ImageBase;
@@ -225,7 +245,14 @@ void mainCRTStartup(void) {
     check(LdrGetProcedureAddress(two, 0, 5, &add_at) == 0 && add_at == (void *)mul, "and by ordinal");
 
     check(GetModuleHandleA("mylib4.dll") == 0, "a delay-loaded DLL isn't loaded at first");
+    HANDLE early = CreateThread(0, 0, bump_later, 0, 0, 0);
+    while (!early_started) Sleep(1);
     check(square(9) == 81 && GetModuleHandleA("mylib4.dll") != 0 && square(4) == 16, "and is the first time it's called");
+    early_go = 1;
+    WaitForSingleObject(early, 10000);
+    CloseHandle(early);
+    check(early_bumped == 41 && bump() == 41 && bump() == 42, "its static TLS: a copy for a thread that was running before it loaded, and one for this");
+    check(tls_detached() == 41, "and its TLS callback read that thread's copy as it ended");
 
     check(callback_ran && tls_counter == 41, "static TLS: its template, and its callback ran first");
     tls_counter = tls_counter + 1;
@@ -262,6 +289,37 @@ void mainCRTStartup(void) {
     __try { divide(1, 0); } __except (1) { code = GetExceptionCode(); }
     check(code == 0xC0000094, "integer divide by zero");
 #endif
+
+    // ---- Where a DLL is looked for ----
+    static WCHAR here[260], sub[280];
+    DWORD here_len = GetCurrentDirectoryW(260, here);
+    for (DWORD i = 0; i < here_len; i++) sub[i] = here[i];
+    const WCHAR *tail = L"\\searchdir";
+    for (DWORD i = 0; tail[i]; i++) sub[here_len + i] = tail[i];
+    CreateDirectoryW(L"searchdir", 0);
+    check(CopyFileW(L"mylib2.dll", L"searchdir\\searched.dll", 0), "a DLL copied into a folder of its own");
+    check(LoadLibraryW(L"searched.dll") == 0, "not found from here");
+    SetCurrentDirectoryW(L"searchdir");
+    HANDLE searched = LoadLibraryW(L"searched.dll");
+    check(searched != 0, "found in the current directory");
+    FreeLibrary(searched);
+    SetDllDirectoryW(L"");
+    check(LoadLibraryW(L"searched.dll") == 0, "not once SetDllDirectory(\"\") leaves the current directory out");
+    SetCurrentDirectoryW(here);
+    SetDllDirectoryW(sub);
+    searched = LoadLibraryW(L"searched.dll");
+    check(searched != 0, "found in SetDllDirectory's folder");
+    FreeLibrary(searched);
+    SetDllDirectoryW(0);
+    static WCHAR long_path[320];
+    const WCHAR *prefix = L"\\\\?\\", *file = L"\\searched.dll";
+    DWORD at = 0;
+    for (DWORD i = 0; prefix[i]; i++) long_path[at++] = prefix[i];
+    for (DWORD i = 0; sub[i]; i++) long_path[at++] = sub[i];
+    for (DWORD i = 0; file[i]; i++) long_path[at++] = file[i];
+    searched = LoadLibraryW(long_path);
+    check(searched != 0, "and by its \\\\?\\ long path");
+    FreeLibrary(searched);
 
     say_at_exit = 1;
     ExitProcess(failures);

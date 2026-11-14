@@ -835,31 +835,16 @@ pub fn access_check(d: &Descriptor, t: &TokenState, desired: u32, m: &Mapping) -
     } else {
         0
     };
-    // The DACL.
-    let (mut allowed, mut denied) = (0u32, 0u32);
-    match (&d.dacl, d.control & SE_DACL_PRESENT != 0) {
-        (None, true) => allowed = everything,
-        (dacl, _) => {
-            let aces: &[Ace] = dacl.as_ref().map_or(&[], |a| a.aces.as_slice());
-            let owner_rights = Sid::new(3, &[4]);
-            let is_owner = d.owner.as_ref().is_some_and(|o| t.has(o));
-            if is_owner && !aces.iter().any(|a| a.sid == owner_rights && a.flags & 0x8 == 0) {
-                allowed |= READ_CONTROL | WRITE_DAC;
-            }
-            for ace in aces.iter().filter(|a| a.flags & 0x8 == 0 && a.raw.is_none()) {
-                let mask = map_generic(ace.mask, m);
-                let applies = |deny: bool| {
-                    t.has(&ace.sid)
-                        || (ace.sid == owner_rights && is_owner)
-                        || (deny && t.groups.iter().any(|(s, at)| *s == ace.sid && at & SE_GROUP_USE_FOR_DENY_ONLY != 0))
-                };
-                match ace.kind {
-                    ACCESS_ALLOWED if applies(false) => allowed |= mask & !denied,
-                    ACCESS_DENIED if applies(true) => denied |= mask & !allowed,
-                    _ => {}
-                }
-            }
-        }
+    // The DACL: for the token's user and groups, and for a restricted token, again for its restricting SIDs alone
+    // (only for writing, if it's write-restricted), each having to allow a right.
+    let is_owner = d.owner.as_ref().is_some_and(|o| t.has(o));
+    let mut allowed = dacl_allows(d, m, everything, is_owner, &|sid, deny| t.has(sid) || (deny && t.deny_only(sid)));
+    if !t.restricted.is_empty() {
+        let restricting = |sid: &Sid| t.restricted.iter().any(|(s, _)| s == sid);
+        let owner = d.owner.as_ref().is_some_and(restricting);
+        let second = dacl_allows(d, m, everything, owner, &|sid, _| restricting(sid));
+        let checked = if t.write_restricted { (m.write & !(READ_CONTROL | 0x10_0000)) | WRITE_DAC | WRITE_OWNER | 0x1_0000 } else { u32::MAX };
+        allowed &= second | !checked;
     }
     let granted = (allowed | privileged) & !refused;
     if wanted & !granted != 0 {
@@ -870,6 +855,32 @@ pub fn access_check(d: &Descriptor, t: &TokenState, desired: u32, m: &Mapping) -
         return if all == 0 && wanted == 0 { Err(()) } else { Ok(all | wanted) };
     }
     Ok(wanted)
+}
+
+/// What a DACL allows a token whose SIDs `applies` says it has (for an allowed ACE, or with `true`, a denied one),
+/// and whether it's the owner: each right decided by the first ACE that names it.
+fn dacl_allows(d: &Descriptor, m: &Mapping, everything: u32, is_owner: bool, applies: &dyn Fn(&Sid, bool) -> bool) -> u32 {
+    let (mut allowed, mut denied) = (0u32, 0u32);
+    match (&d.dacl, d.control & SE_DACL_PRESENT != 0) {
+        (None, true) => allowed = everything,
+        (dacl, _) => {
+            let aces: &[Ace] = dacl.as_ref().map_or(&[], |a| a.aces.as_slice());
+            let owner_rights = Sid::new(3, &[4]);
+            if is_owner && !aces.iter().any(|a| a.sid == owner_rights && a.flags & 0x8 == 0) {
+                allowed |= READ_CONTROL | WRITE_DAC;
+            }
+            for ace in aces.iter().filter(|a| a.flags & 0x8 == 0 && a.raw.is_none()) {
+                let mask = map_generic(ace.mask, m);
+                let hits = |deny: bool| applies(&ace.sid, deny) || (ace.sid == owner_rights && is_owner);
+                match ace.kind {
+                    ACCESS_ALLOWED if hits(false) => allowed |= mask & !denied,
+                    ACCESS_DENIED if hits(true) => denied |= mask & !allowed,
+                    _ => {}
+                }
+            }
+        }
+    }
+    allowed
 }
 
 // --- Privileges ---
@@ -944,6 +955,8 @@ pub fn new_luid() -> u64 {
 #[derive(Debug, Clone)]
 pub struct TokenState {
     pub user: Sid,
+    /// The user made deny-only by `CreateRestrictedToken`: it only matches denied ACEs.
+    pub user_deny_only: bool,
     /// Groups and their `SE_GROUP_*` attributes; the integrity level is the one with `SE_GROUP_INTEGRITY`.
     pub groups: Vec<(Sid, u32)>,
     /// Privileges by LUID, and their `SE_PRIVILEGE_*` attributes.
@@ -957,6 +970,10 @@ pub struct TokenState {
     pub session: u32,
     /// Changed each time the token is.
     pub modified: u64,
+    /// A restricted token's restricting SIDs and their attributes: an access needs them to allow it too.
+    pub restricted: Vec<(Sid, u32)>,
+    /// `WRITE_RESTRICTED`: the restricting SIDs are checked only for writing.
+    pub write_restricted: bool,
 }
 
 pub struct Token {
@@ -992,6 +1009,7 @@ impl Token {
         let dacl = Acl::new(vec![Ace::new(ACCESS_ALLOWED, 0, 0x1000_0000, Sid::new(5, &[32, 544])), Ace::new(ACCESS_ALLOWED, 0, 0x1000_0000, Sid::new(5, &[18]))]);
         Token::with(TokenState {
             user: user(),
+            user_deny_only: false,
             groups,
             privileges,
             owner: Sid::new(5, &[32, 544]),
@@ -1001,6 +1019,8 @@ impl Token {
             level: 0,
             session: 1,
             modified: new_luid(),
+            restricted: Vec::new(),
+            write_restricted: false,
         })
     }
 
@@ -1026,7 +1046,12 @@ impl TokenState {
 
     /// Whether `sid` is the user or an enabled group (not deny-only).
     pub fn has(&self, sid: &Sid) -> bool {
-        *sid == self.user || self.groups.iter().any(|(s, a)| s == sid && a & 0x4 != 0 && a & SE_GROUP_USE_FOR_DENY_ONLY == 0 && a & SE_GROUP_INTEGRITY == 0)
+        (*sid == self.user && !self.user_deny_only) || self.groups.iter().any(|(s, a)| s == sid && a & 0x4 != 0 && a & SE_GROUP_USE_FOR_DENY_ONLY == 0 && a & SE_GROUP_INTEGRITY == 0)
+    }
+
+    /// Whether `sid` is the user or a group that's deny-only.
+    pub fn deny_only(&self, sid: &Sid) -> bool {
+        (*sid == self.user && self.user_deny_only) || self.groups.iter().any(|(s, a)| s == sid && a & SE_GROUP_USE_FOR_DENY_ONLY != 0)
     }
 }
 
@@ -1095,6 +1120,30 @@ mod tests {
         assert!(access_check(&d("O:SYD:(A;;GA;;;WD)"), &t, EVENT.write, &EVENT).is_err());
         assert_eq!(access_check(&d("O:SYD:(A;;GA;;;WD)"), &t, EVENT.read, &EVENT), Ok(EVENT.read));
         assert_eq!(access_check(&d("O:SYD:(A;;GA;;;WD)S:(ML;;NW;;;LW)"), &t, EVENT.write, &EVENT), Ok(EVENT.write));
+    }
+
+    #[test]
+    fn restricted_tokens_need_both_passes() {
+        let token = Token::administrator();
+        let mut t = kernels_core::lock(&token.state).clone();
+        let d = |sddl: &str| Descriptor::from_sddl(sddl).unwrap();
+        // Administrators deny-only: an allowed ACE for it no longer counts, a denied one still does.
+        t.groups.iter_mut().find(|g| g.0 == Sid::new(5, &[32, 544])).unwrap().1 = SE_GROUP_USE_FOR_DENY_ONLY;
+        assert!(access_check(&d("O:SYD:(A;;GA;;;BA)"), &t, 1, &EVENT).is_err());
+        assert!(access_check(&d("O:SYD:(D;;0x1;;;BA)(A;;GA;;;WD)"), &t, 1, &EVENT).is_err());
+        // Restricted to RESTRICTED (S-1-5-12): what Everyone is allowed needs RESTRICTED allowed it too.
+        t.restricted = vec![(Sid::new(5, &[12]), GROUP_DEFAULT)];
+        assert!(access_check(&d("O:SYD:(A;;GA;;;WD)"), &t, 1, &EVENT).is_err());
+        assert_eq!(access_check(&d("O:SYD:(A;;GA;;;WD)(A;;0x1;;;RC)"), &t, MAXIMUM_ALLOWED, &EVENT), Ok(1));
+        // Write-restricted: reading needs only the first pass.
+        t.write_restricted = true;
+        assert_eq!(access_check(&d("O:SYD:(A;;GA;;;WD)"), &t, EVENT.read, &EVENT), Ok(EVENT.read));
+        assert!(access_check(&d("O:SYD:(A;;GA;;;WD)"), &t, 2, &EVENT).is_err());
+        // The user deny-only.
+        t.restricted.clear();
+        t.user_deny_only = true;
+        let me = format!("O:SYD:(A;;GA;;;{})", t.user);
+        assert!(access_check(&d(&me), &t, 1, &EVENT).is_err());
     }
 
     #[test]

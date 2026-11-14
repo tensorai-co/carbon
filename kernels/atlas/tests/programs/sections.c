@@ -3,7 +3,8 @@
 // Sections:
 // - one the page file backs, seen by two views at once, and by a copy-on-write view that keeps its writes;
 // - VirtualQuery of a view, private memory, the program's image and free space;
-// - access refused, alignment refused;
+// - access refused, alignment refused; a read-only handle duplicated from a writable one, which maps only for
+//   reading and can't be duplicated back to writing;
 // - a file mapping read from its file, written back by FlushViewOfFile and by UnmapViewOfFile, growing its file,
 //   and refused for an empty file;
 // - a named section, and an inherited one, shared with another process.
@@ -82,6 +83,8 @@ K HANDLE __stdcall CreateWaitableTimerExW(SECURITY_ATTRIBUTES *, const WCHAR *, 
 K HANDLE __stdcall OpenWaitableTimerW(DWORD, int, const WCHAR *);
 K int __stdcall SetWaitableTimer(HANDLE, const i64 *, long, void (*)(void *, DWORD, DWORD), void *, int);
 K int __stdcall CancelWaitableTimer(HANDLE);
+K int __stdcall DuplicateHandle(HANDLE, HANDLE, HANDLE, HANDLE *, DWORD, int, DWORD);
+K HANDLE __stdcall GetCurrentProcess(void);
 K void __stdcall GetSystemTimeAsFileTime(u64 *);
 K u64 __stdcall GetTickCount64(void);
 K DWORD __stdcall SleepEx(DWORD, int);
@@ -311,6 +314,29 @@ void mainCRTStartup(void) {
 
     DeleteFileW(path);
     DeleteFileW(W(2, "C:\\Windows\\Temp\\atlas-empty.bin"));
+    // ---- A read-only handle, as a browser engine makes one for shared memory ----
+    HANDLE writable = CreateFileMappingW((HANDLE)-1, 0, 0x04, 0, 0x10000, 0); // PAGE_READWRITE
+    HANDLE ro_dup = 0, ro_again = 0, ro_same = 0;
+    check(writable && DuplicateHandle(GetCurrentProcess(), writable, GetCurrentProcess(), &ro_dup, 0x4, 0, 0), "a FILE_MAP_READ duplicate");
+    SetLastError(0);
+    check(MapViewOfFile(ro_dup, 0x2, 0, 0, 0) == 0 && GetLastError() == 5, "it can't map a view for writing: ERROR_ACCESS_DENIED");
+    void *seen = MapViewOfFile(ro_dup, 0x4, 0, 0, 0);
+    check(seen != 0, "it maps one for reading");
+    SetLastError(0);
+    check(!DuplicateHandle(GetCurrentProcess(), ro_dup, GetCurrentProcess(), &ro_again, 0x2, 0, 0) && GetLastError() == 5,
+          "nor can it be duplicated with FILE_MAP_WRITE");
+    check(DuplicateHandle(GetCurrentProcess(), ro_dup, GetCurrentProcess(), &ro_same, 0, 0, 2) && MapViewOfFile(ro_same, 0x2, 0, 0, 0) == 0,
+          "DUPLICATE_SAME_ACCESS keeps it read-only");
+    void *written = MapViewOfFile(writable, 0x2, 0, 0, 0);
+    check(written != 0, "the writable handle still maps for writing");
+    if (written && seen) {
+        *(volatile DWORD *)written = 0x5eed;
+        check(*(volatile DWORD *)seen == 0x5eed, "and the read-only view sees what it writes");
+    }
+    CloseHandle(ro_same);
+    CloseHandle(ro_dup);
+    CloseHandle(writable);
+
     say(failures ? "some checks failed\n" : "all passed\n");
     ExitProcess(failures);
 }

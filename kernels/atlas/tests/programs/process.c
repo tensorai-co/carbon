@@ -5,7 +5,8 @@
 // - anonymous pipes in one process: reads, peeks, a broken pipe and one with no reader;
 // - CreateProcessW finding the program (by path, and by name with `.exe` added), with ERROR_FILE_NOT_FOUND where
 //   there's none;
-// - exit codes and waiting on a process;
+// - exit codes and waiting on a process; a child's parent ID, as NtQueryInformationProcess gives it; an ended
+//   process's times, by a handle to it;
 // - a child's standard output redirected into a pipe, with an environment and a current directory of its own;
 // - inherited handles at the same values, and a handle that isn't inheritable left behind;
 // - a named event shared between processes;
@@ -53,10 +54,13 @@ K int __stdcall CreateProcessW(const WCHAR *, WCHAR *, SECURITY_ATTRIBUTES *, SE
                                const WCHAR *, STARTUPINFOW *, PROCESS_INFORMATION *);
 K DWORD __stdcall WaitForSingleObject(HANDLE, DWORD);
 K int __stdcall GetExitCodeProcess(HANDLE, DWORD *);
+K int __stdcall GetProcessTimes(HANDLE, unsigned long long *, unsigned long long *, unsigned long long *, unsigned long long *);
 K int __stdcall TerminateProcess(HANDLE, unsigned);
 K HANDLE __stdcall OpenProcess(DWORD, int, DWORD);
 K DWORD __stdcall GetProcessId(HANDLE);
 K DWORD __stdcall GetCurrentProcessId(void);
+K void *__stdcall GetModuleHandleA(const char *);
+K void *__stdcall GetProcAddress(void *, const char *);
 K DWORD __stdcall ResumeThread(HANDLE);
 K HANDLE __stdcall CreateEventW(SECURITY_ATTRIBUTES *, int, int, const WCHAR *);
 K HANDLE __stdcall OpenEventW(DWORD, int, const WCHAR *);
@@ -108,6 +112,15 @@ static const char *argument(int which) {
 /// What a child does, by its first argument.
 static void child(const char *what) {
     if (starts(what, "exit ")) ExitProcess((unsigned)parse(what + 5));
+    if (starts(what, "parent")) {
+        // PROCESS_BASIC_INFORMATION's last field: the parent's ID, as the exit code.
+        typedef long(__stdcall * QUERY)(void *, int, void *, unsigned, unsigned *);
+        QUERY query = (QUERY)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationProcess");
+        __UINTPTR_TYPE__ info[6] = {0};
+        unsigned got = 0;
+        long status = query ? query((void *)-1, 0, info, sizeof info, &got) : -1;
+        ExitProcess(status == 0 && got == sizeof info ? (unsigned)info[5] : 0);
+    }
     if (starts(what, "echo")) {
         // Its first argument, its ATLAS_TEST variable, and its current directory, to its standard output.
         char line[512], *at = line;
@@ -238,6 +251,15 @@ void mainCRTStartup(void) {
     // Exit codes; the program found by its path, and by its name.
     check(start(line_for("exit 42"), 0, 0, 0, 0, 0) && pi.pid != GetCurrentProcessId() && GetProcessId(pi.process) == pi.pid, "CreateProcessW: a new process, its own ID");
     check(finish() == 42, "its exit code, once it's over");
+    check(start(line_for("parent"), 0, 0, 0, 0, 0) && finish() == GetCurrentProcessId(), "its parent's ID is this process's");
+    {
+        unsigned long long created = 0, exited = 0, kernel = 0, user = 0;
+        int started = start(line_for("exit 7"), 0, 0, 0, 0, 0);
+        WaitForSingleObject(pi.process, 10000);
+        int got = started && GetProcessTimes(pi.process, &created, &exited, &kernel, &user);
+        check(got && created != 0 && exited >= created, "an ended process's times, by its handle: when it started and ended");
+        finish();
+    }
     WCHAR by_name[] = {'p', 'r', 'o', 'c', 'e', 's', 's', ' ', 'e', 'x', 'i', 't', ' ', '3', 0};
     check(start(by_name, 0, 0, 0, 0, 0) && finish() == 3, "found by name, .exe added, in the program's folder");
     WCHAR none[] = {'n', 'o', 's', 'u', 'c', 'h', '.', 'e', 'x', 'e', 0};

@@ -77,7 +77,7 @@ dll! {
     missing CoGetApartmentType;
     missing CoGetContextToken;
     missing CoGetInterfaceAndReleaseStream;
-    missing CoGetMalloc;
+    guest CoGetMalloc => AtlasCoGetMalloc;
     missing CoGetObjectContext;
     missing CoMarshalInterThreadInterfaceInStream;
     missing CoRegisterInitializeSpy;
@@ -118,7 +118,24 @@ fn co_create_instance(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     }
     match task.create_com_object(cx, a[0], a[3], a[4]) {
         Ok(Some(hr)) => Reply::Value(hr),
-        Ok(None) => Reply::Value(CLASS_NOT_REGISTERED),
+        Ok(None) => {
+            // Traced, the class there isn't, by its GUID.
+            if task.k.options.trace
+                && let Some(g) = task.read_guid(cx, a[0])
+            {
+                let text = format!(
+                    "{{{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{}}}",
+                    u32::from_le_bytes([g[0], g[1], g[2], g[3]]),
+                    u16::from_le_bytes([g[4], g[5]]),
+                    u16::from_le_bytes([g[6], g[7]]),
+                    g[8],
+                    g[9],
+                    g[10..].iter().map(|b| format!("{b:02x}")).collect::<String>()
+                );
+                task.k.host.write(host::Stream::Err, format!("[{}] no COM class {text}\n", task.tid).as_bytes());
+            }
+            Reply::Value(CLASS_NOT_REGISTERED)
+        }
         Err(reply) => reply,
     }
 }

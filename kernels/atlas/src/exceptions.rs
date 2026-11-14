@@ -45,6 +45,11 @@ impl Task {
     /// Hands an exception to the program's dispatcher, or ends the process if it can't take one.
     pub fn raise(&mut self, cx: &mut Cx<'_>, raised: Raised, what: &str) -> Flow {
         let dispatcher = lock(&self.process.state).dispatcher;
+        // Traced, every exception atlas raises (a fault, an illegal instruction, a breakpoint), handled or not.
+        if self.k.options.trace {
+            let pc = raised.address;
+            self.k.host.write(host::Stream::Err, format!("[{}] raises {:#x}: {what} ({})\n", self.tid, raised.code, self.where_is(pc)).as_bytes());
+        }
         self.nested += 1;
         if dispatcher == 0 || self.nested > MOST_NESTED {
             return self.die(raised.code, what);

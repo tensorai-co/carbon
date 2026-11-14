@@ -192,19 +192,25 @@ impl Kernel {
     }
 
     /// Finishes an I/O where there's no CPU to write with (a handle dropped as its process ends): told now, its
-    /// OVERLAPPED written by the next thread that calls into atlas. Only for one that read nothing.
+    /// OVERLAPPED (and what it read, into its buffer) written by the next thread that calls into atlas.
     pub(crate) fn complete_later(&self, c: Completion) {
         self.notify(&c);
         lock(&self.deferred).push(c);
     }
 
-    /// Writes what `complete_later` left.
+    /// Writes what `complete_later` left: what it read into its buffer, then its OVERLAPPED. The thread it's for
+    /// calls in (it's woken by its event, port or routine) and drains it before it goes back to the program.
     pub(crate) fn drain(&self, cx: &mut kernels_core::thread::Cx<'_>) {
         let list = std::mem::take(&mut *lock(&self.deferred));
         for c in list {
             if let Some(process) = c.op.process.upgrade() {
-                let fields = crate::abi::Abi::of(process.isa).overlapped_result(status(c.error), 0);
-                write_remote(self, cx, &process, &[(c.op.overlapped, &fields)]);
+                let fields = crate::abi::Abi::of(process.isa).overlapped_result(status(c.error), c.data.len() as u64);
+                let mut writes: Vec<(u64, &[u8])> = Vec::new();
+                if !c.data.is_empty() && c.op.buffer != 0 {
+                    writes.push((c.op.buffer, &c.data));
+                }
+                writes.push((c.op.overlapped, &fields));
+                write_remote(self, cx, &process, &writes);
             }
         }
     }

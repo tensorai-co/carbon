@@ -101,15 +101,16 @@ pub extern "system" fn RtlAcquirePrivilege(_privileges: *const u32, _count: u32,
 #[unsafe(no_mangle)]
 pub extern "system" fn RtlReleasePrivilege(_state: *mut c_void) {}
 
+service! {
 /// `NtClose(handle)`.
-#[unsafe(no_mangle)]
 pub extern "system" fn NtClose(handle: usize) -> u32 {
     if close_handle(handle as u64) != 0 { STATUS_SUCCESS } else { STATUS_INVALID_HANDLE }
 }
+}
 
+service! {
 /// `NtWriteFile(handle, event, apc, its context, &status, buffer, length, &offset, key)`: written as `WriteFile`
 /// writes, where the handle is, its IO_STATUS_BLOCK the status and the count.
-#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn NtWriteFile(handle: usize, _event: usize, _apc: usize, _context: usize, status: *mut usize, buffer: *const u8, length: u32, _offset: *const i64, _key: *const u32) -> u32 {
     let mut written = 0u32;
@@ -124,10 +125,11 @@ pub extern "system" fn NtWriteFile(handle: usize, _event: usize, _apc: usize, _c
     }
     code
 }
+}
 
+service! {
 /// `NtQueryVirtualMemory(process, address, class, &info, length, &returned)`: MemoryBasicInformation (0) of this
 /// process, as `VirtualQuery` gives it.
-#[unsafe(no_mangle)]
 pub extern "system" fn NtQueryVirtualMemory(process: usize, address: usize, class: u32, info: *mut c_void, length: usize, returned: *mut usize) -> u32 {
     if process != usize::MAX || class != 0 {
         return STATUS_NOT_IMPLEMENTED;
@@ -142,23 +144,74 @@ pub extern "system" fn NtQueryVirtualMemory(process: usize, address: usize, clas
     }
     STATUS_SUCCESS
 }
+}
 
-/// An ntdll export not written yet: it says so, and the process ends, as a host export's stub does.
-fn unwritten(name: &[u8]) -> ! {
+/// An ntdll export not written yet: it says so, and the process ends, as a host export's stub does. (On x86-64 these
+/// are services, reached through their stubs: `services`.)
+pub(crate) fn unwritten(name: &[u8]) -> ! {
     Message::new().text(b"atlas-guest: ntdll.dll!").text(name).text(b" isn't written yet\n").print();
     crate::sys::terminate(STATUS_NOT_IMPLEMENTED)
 }
 
 macro_rules! unwritten {
     ($($name:ident),*) => {$(
-        #[unsafe(no_mangle)]
+        #[cfg_attr(target_arch = "x86_64", unsafe(export_name = concat!("AtlasImpl", stringify!($name))))]
+        #[cfg_attr(not(target_arch = "x86_64"), unsafe(no_mangle))]
         pub extern "system" fn $name() -> u32 {
             unwritten(stringify!($name).as_bytes())
         }
     )*};
 }
 
-unwritten!(NtCreateFile, NtDeviceIoControlFile, NtQueryObject, NtGetNextThread);
+unwritten!(NtCreateFile, NtDeviceIoControlFile, NtGetNextThread);
+
+host!(query_object, b"AtlasQueryObject", (h, class, out, length, returned));
+
+service! {
+/// `NtQueryObject(handle, class, out, length, &returned)`: basic information (0), the object's name (1) and its type
+/// (2), as the host knows them.
+pub extern "system" fn NtQueryObject(handle: usize, class: u32, out: *mut c_void, length: u32, returned: *mut u32) -> u32 {
+    query_object(handle as u64, u64::from(class), out as usize as u64, u64::from(length), returned as usize as u64) as u32
+}
+}
+
+host!(query_section, b"AtlasQuerySection", (h, out));
+
+service! {
+/// `NtQuerySection(section, class, out, length, &returned)`: SectionBasicInformation (0): no base address, the
+/// allocation attributes and the size. SectionImageInformation (1) is for image sections, which atlas doesn't make.
+pub extern "system" fn NtQuerySection(section: usize, class: u32, out: *mut u8, length: u32, returned: *mut u32) -> u32 {
+    const STATUS_INVALID_INFO_CLASS: u32 = 0xc000_0003;
+    const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xc000_0004;
+    const STATUS_SECTION_NOT_IMAGE: u32 = 0xc000_0049;
+    let w = core::mem::size_of::<usize>();
+    // BaseAddress, then AllocationAttributes, then MaximumSize on eight bytes.
+    let size = w + 4 + if w == 8 { 4 } else { 0 } + 8;
+    match class {
+        0 => {}
+        1 => return STATUS_SECTION_NOT_IMAGE,
+        _ => return STATUS_INVALID_INFO_CLASS,
+    }
+    if (length as usize) < size {
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+    let mut info = [0u64; 2];
+    let status = query_section(section as u64, info.as_mut_ptr() as u64) as u32;
+    if status != STATUS_SUCCESS {
+        return status;
+    }
+    let mut bytes = [0u8; 24];
+    bytes[w..w + 4].copy_from_slice(&(info[1] as u32).to_le_bytes());
+    bytes[size - 8..size].copy_from_slice(&info[0].to_le_bytes());
+    // SAFETY: the program's buffer, at least `size` long.
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), out, size) };
+    if !returned.is_null() {
+        // SAFETY: the program's ULONG.
+        unsafe { returned.write_unaligned(size as u32) };
+    }
+    STATUS_SUCCESS
+}
+}
 
 // ---- The registry by NT path ----
 
@@ -251,14 +304,15 @@ fn key_path(attributes: *const ObjectAttributes) -> Result<(u64, *mut u16), u32>
     terminated(rest).map(|path| (base, path)).ok_or(STATUS_NO_MEMORY)
 }
 
+service! {
 /// `NtOpenKey(&key, access, &attributes)`.
-#[unsafe(no_mangle)]
 pub extern "system" fn NtOpenKey(key: *mut usize, access: u32, attributes: *const ObjectAttributes) -> u32 {
     NtOpenKeyEx(key, access, attributes, 0)
 }
+}
 
+service! {
 /// `NtOpenKeyEx(&key, access, &attributes, options)`: `RegOpenKeyExW`.
-#[unsafe(no_mangle)]
 pub extern "system" fn NtOpenKeyEx(key: *mut usize, access: u32, attributes: *const ObjectAttributes, _options: u32) -> u32 {
     let (base, path) = match key_path(attributes) {
         Ok(found) => found,
@@ -273,9 +327,10 @@ pub extern "system" fn NtOpenKeyEx(key: *mut usize, access: u32, attributes: *co
     }
     status_of(error)
 }
+}
 
+service! {
 /// `NtCreateKey(&key, access, &attributes, title index, class, options, &disposition)`: `RegCreateKeyExW`.
-#[unsafe(no_mangle)]
 pub extern "system" fn NtCreateKey(key: *mut usize, access: u32, attributes: *const ObjectAttributes, _index: u32, class: *const UnicodeString, options: u32, disposition: *mut u32) -> u32 {
     let (base, path) = match key_path(attributes) {
         Ok(found) => found,
@@ -301,26 +356,29 @@ pub extern "system" fn NtCreateKey(key: *mut usize, access: u32, attributes: *co
     }
     status_of(error)
 }
+}
 
+service! {
 /// `NtDeleteKey(key)`: the key itself, `RegDeleteKeyExW` with no subkey.
-#[unsafe(no_mangle)]
 pub extern "system" fn NtDeleteKey(key: usize) -> u32 {
     let empty = 0u16;
     status_of(reg_delete_key_ex_w(key as u64, &raw const empty as u64, 0, 0))
 }
+}
 
+service! {
 /// `NtSetValueKey(key, &name, title index, type, data, size)`: `RegSetValueExW`.
-#[unsafe(no_mangle)]
 pub extern "system" fn NtSetValueKey(key: usize, name: *const UnicodeString, _index: u32, kind: u32, data: *const u8, size: u32) -> u32 {
     let Some(name) = terminated(chars(name)) else { return STATUS_NO_MEMORY };
     let error = reg_set_value_ex_w(key as u64, name as u64, 0, u64::from(kind), data as u64, u64::from(size));
     crate::heap::free(name.cast());
     status_of(error)
 }
+}
 
+service! {
 /// `NtQueryValueKey(key, &name, class, info, length, &needed)`: a value's KEY_VALUE_BASIC_INFORMATION (0),
 /// KEY_VALUE_FULL_INFORMATION (1) or KEY_VALUE_PARTIAL_INFORMATION (2), or the last two's Align64 forms (3, 4).
-#[unsafe(no_mangle)]
 pub extern "system" fn NtQueryValueKey(key: usize, name: *const UnicodeString, class: u32, info: *mut u8, length: u32, needed: *mut u32) -> u32 {
     let text = chars(name);
     let Some(name_z) = terminated(text) else { return STATUS_NO_MEMORY };
@@ -389,4 +447,5 @@ pub extern "system" fn NtQueryValueKey(key: usize, name: *const UnicodeString, c
     };
     crate::heap::free(data);
     status
+}
 }

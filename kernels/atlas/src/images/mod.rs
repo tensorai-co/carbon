@@ -71,6 +71,40 @@ pub fn guest(isa: Isa) -> Option<&'static [u8]> {
     (!image.is_empty()).then_some(image)
 }
 
+/// The stub every x86-64 ntdll service starts with, up to its number: `mov r10, rcx; mov eax, ...`.
+const SERVICE_STUB: [u8; 4] = [0x4c, 0x8b, 0xd1, 0xb8];
+
+/// x86-64 ntdll's services, by number (less `call::NT_SERVICES`): each body's RVA and its export's name. Found from
+/// the guest's exports: each `AtlasImpl` export is a body, and its stub (the export without the prefix) says its
+/// number. Empty where the guest isn't built.
+pub fn nt_services() -> &'static [Option<(u32, String)>] {
+    static TABLE: std::sync::OnceLock<Vec<Option<(u32, String)>>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = Vec::new();
+        let Some(bytes) = guest(Isa::X86_64) else { return table };
+        let Ok(pe) = pe::Pe::parse(bytes) else { return table };
+        let Ok(image) = pe.layout() else { return table };
+        let rva = |name: &str| match pe.export(&image, &pe::Wanted::Name(name.to_string())) {
+            Ok(Some(pe::Found::Rva(rva))) => Some(rva),
+            _ => None,
+        };
+        for name in pe.export_names(&image).unwrap_or_default() {
+            let Some(service) = name.strip_prefix("AtlasImpl") else { continue };
+            let (Some(body), Some(stub)) = (rva(&name), rva(service)) else { continue };
+            let stub = stub as usize;
+            let Some(code) = image.get(stub..stub + 8).filter(|c| c[..4] == SERVICE_STUB) else { continue };
+            let number = u64::from(u32::from_le_bytes([code[4], code[5], code[6], code[7]]));
+            let Some(n) = number.checked_sub(atlas_abi::call::NT_SERVICES).filter(|&n| n < atlas_abi::call::NT_SERVICES_ROOM) else { continue };
+            let n = n as usize;
+            if table.len() <= n {
+                table.resize(n + 1, None);
+            }
+            table[n] = Some((body, service.to_string()));
+        }
+        table
+    })
+}
+
 /// Images made so far, by ISA and DLL.
 type Made = HashMap<(Isa, usize, bool), Arc<Vec<u8>>>;
 
@@ -142,6 +176,8 @@ pub fn x86_wide(name: &str) -> Option<(usize, Join)> {
         "EventUnregister" | "UnregisterTraceGuids" | "GetTraceEnableFlags" | "GetTraceEnableLevel" => (2, |s| vec![s[0] & LOW | (s[1] & LOW) << 32]),
         "TraceEvent" => (3, |s| vec![s[0] & LOW | (s[1] & LOW) << 32, s[2]]),
         "EventWrite" | "EventSetInformation" => (5, |s| vec![s[0] & LOW | (s[1] & LOW) << 32, s[2], s[3], s[4]]),
+        // IDWriteFontFileStream::ReadFileFragment(this, &start, UINT64 offset, UINT64 size, &context).
+        "AtlasDwStreamReadFileFragment" => (7, |s| vec![s[0], s[1], s[2] & LOW | (s[3] & LOW) << 32, s[4] & LOW | (s[5] & LOW) << 32, s[6]]),
         "EventWriteTransfer" => (7, |s| vec![s[0] & LOW | (s[1] & LOW) << 32, s[2], s[3], s[4], s[5], s[6]]),
         _ => return None,
     };

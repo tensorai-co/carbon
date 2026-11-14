@@ -65,6 +65,10 @@ pub(crate) struct ProcState {
     pub mapped: std::collections::BTreeMap<String, (u64, String)>,
     /// The program's folder on the disk, where DLLs are looked for first.
     pub exe_dir: String,
+    /// `SetDllDirectory`'s folder (a full Windows path; empty to leave the current directory out of the search), and
+    /// `SetDefaultDllDirectories`' LOAD_LIBRARY_SEARCH_* flags (0 for the standard search).
+    pub dll_directory: Option<String>,
+    pub dll_search: u32,
     /// The current directory, as a full Windows path.
     pub cwd: String,
     pub regions: Regions<Area>,
@@ -193,6 +197,26 @@ impl Task {
         }
     }
 
+    /// Traced: a breakpoint's place, and the words on the stack that point into modules (return addresses, and some
+    /// that only look like them), nearest first: a backtrace by scanning, for programs without symbols.
+    fn trace_stack(&mut self, cx: &mut Cx<'_>, pc: u64) {
+        let sp = cx.turn(|t| t.thread().regs().sp());
+        let width = self.abi().width as usize;
+        let words = self.mem(cx, false, |t| user::read_vec(&t.space(), sp, 512 * width)).unwrap_or_default();
+        let lowest = lock(&self.process.state).mapped.values().map(|m| m.0).min().unwrap_or(u64::MAX);
+        let mut shown = vec![format!("{pc:#x} ({})", self.where_is(pc))];
+        for w in words.chunks(width) {
+            let v = if width == 8 { u64::from_le_bytes(w.try_into().unwrap_or_default()) } else { u64::from(u32::from_le_bytes(w.try_into().unwrap_or_default())) };
+            if v >= lowest && v < lowest + (1 << 40) {
+                let place = self.where_is(v);
+                if !place.starts_with("no module") && shown.len() < 24 {
+                    shown.push(format!("{v:#x} ({place})"));
+                }
+            }
+        }
+        self.k.host.write(host::Stream::Err, format!("[{}] breakpoint; on the stack: {}\n", self.tid, shown.join(", ")).as_bytes());
+    }
+
     /// Which module `addr` is in, and how far in: the mapped image with the nearest base below it.
     pub fn where_is(&self, addr: u64) -> String {
         let state = lock(&self.process.state);
@@ -225,11 +249,23 @@ impl Task {
                 if self.fault(cx, addr, access) {
                     Flow::Run
                 } else {
+                    // Traced, a jump into the first page (a call through a null pointer), or a touch of the first 64 KiB
+                    // (a null pointer's field), or of the kernel's half (a pointer gone wrong), gets the stack's backtrace.
+                    if self.k.options.trace && (pc < 0x1000 || addr < 0x1_0000 || addr >= 0xffff_8000_0000_0000) {
+                        let what = if pc < 0x1000 { format!("a jump to {pc:#x}") } else { format!("a touch of {addr:#x} at {pc:#x} ({})", self.where_is(pc)) };
+                        self.k.host.write(host::Stream::Err, format!("[{}] {what}:\n", self.tid).as_bytes());
+                        self.trace_stack(cx, pc);
+                    }
                     self.raise(cx, Raised::access_violation(pc, addr, access), &format!("bad access to {addr:#x} ({access:?}) at {pc:#x}"))
                 }
             }
             Some(Stop::Undefined { pc }) => self.raise(cx, Raised::simple(status::ILLEGAL_INSTRUCTION, pc), &format!("illegal instruction at {pc:#x}")),
-            Some(Stop::Breakpoint { pc }) => self.raise(cx, Raised::simple(status::BREAKPOINT, pc), &format!("breakpoint at {pc:#x}")),
+            Some(Stop::Breakpoint { pc }) => {
+                if self.k.options.trace {
+                    self.trace_stack(cx, pc);
+                }
+                self.raise(cx, Raised::simple(status::BREAKPOINT, pc), &format!("breakpoint at {pc:#x}"))
+            }
             Some(Stop::Alignment { pc }) => self.raise(cx, Raised::simple(status::DATATYPE_MISALIGNMENT, pc), &format!("misaligned at {pc:#x}")),
             Some(Stop::DivideError { pc }) => self.raise(cx, Raised::simple(status::INTEGER_DIVIDE_BY_ZERO, pc), &format!("divide by zero at {pc:#x}")),
             Some(Stop::FastFail { pc, code }) => self.die(status::STACK_BUFFER_OVERRUN, &format!("fast fail {code} at {pc:#x}")),
@@ -358,6 +394,7 @@ impl Task {
                 let code = self.query_system_information(cx, a[0] as u32, a[1], a[2], a[3]);
                 self.answer(cx, u64::from(code))
             }
+            call::TRACING => self.answer(cx, u64::from(trace)),
             call::DEBUG_PRINT => {
                 let a = self.args(cx, 2);
                 if let Ok(text) = self.mem(cx, false, |t| user::read_vec(&t.space(), a[0], a[1].min(4096) as usize)) {
@@ -365,6 +402,7 @@ impl Task {
                 }
                 self.answer(cx, 0)
             }
+            nr if self.isa == Isa::X86_64 && (call::NT_SERVICES..call::NT_SERVICES + call::NT_SERVICES_ROOM).contains(&nr) => self.nt_service(cx, nr - call::NT_SERVICES),
             nr if nr >= call::HOST_EXPORTS => {
                 let Some((dll, export)) = os::by_number(nr) else {
                     return self.die(status::INVALID_PARAMETER, &format!("no export has call number {nr:#x}"));
@@ -376,6 +414,9 @@ impl Task {
                             Some((slots, join)) => join(&self.args(cx, slots)),
                             None => self.args(cx, args),
                         };
+                        // Traced, the last error before, to show it when the export changes it.
+                        let error_at = self.control.teb + self.abi().teb.last_error;
+                        let error_before = if trace { self.mem(cx, false, |t| user::read_u32(&t.space(), error_at)).ok() } else { None };
                         let reply = run(self, cx, &a);
                         // A 64-bit result's high half goes in edx on x86.
                         if let Reply::Value(v) = reply
@@ -397,7 +438,12 @@ impl Task {
                                 Reply::ExitThread(code) => format!("(the thread exits, {code})"),
                                 Reply::Ended => "(ending)".to_string(),
                             };
-                            self.k.host.write(host::Stream::Err, format!("[{}] {}!{}({a:x?}) = {shown}\n", self.tid, dll.name, export.name).as_bytes());
+                            let error = self.mem(cx, false, |t| user::read_u32(&t.space(), error_at)).ok();
+                            let changed = match (error_before, error) {
+                                (Some(before), Some(after)) if before != after => format!(", error {after}"),
+                                _ => String::new(),
+                            };
+                            self.k.host.write(host::Stream::Err, format!("[{}] {}!{}({a:x?}) = {shown}{changed}\n", self.tid, dll.name, export.name).as_bytes());
                         }
                         if !lock(&self.k.deferred).is_empty() {
                             let k = self.k.clone();
@@ -454,6 +500,31 @@ impl Task {
             Regs::X86(r) if isa == Isa::X86_32 => r.gpr[RDX] & 0xffff_ffff,
             Regs::X86(r) => r.gpr[R10],
         }
+    }
+
+    /// An x86-64 ntdll stub's `syscall` (`call::NT_SERVICES`): on into the service's body in ntdll, as if the stub
+    /// had called it, its first argument back in `rcx` (the rest are where the caller put them, and its return
+    /// address on top of the stack, since a stub pushes nothing).
+    fn nt_service(&mut self, cx: &mut Cx<'_>, n: u64) -> Flow {
+        let Some((body, name)) = images::nt_services().get(n as usize).and_then(Option::as_ref) else {
+            return self.die(status::INVALID_PARAMETER, &format!("no ntdll service has number {n}"));
+        };
+        let Some(base) = lock(&self.process.state).mapped.get("ntdll.dll").map(|m| m.0) else {
+            return self.die(status::INVALID_PARAMETER, "an ntdll service without ntdll");
+        };
+        let mut regs = cx.turn(|t| t.thread().regs());
+        if self.k.options.trace
+            && let Regs::X86(r) = &regs
+        {
+            let a = [r.gpr[R10], r.gpr[RDX], r.gpr[exec::isa::x86::R8], r.gpr[exec::isa::x86::R9]];
+            self.k.host.write(host::Stream::Err, format!("[{}] ntdll.dll!{name}([{:x}, {:x}, {:x}, {:x}, ...])\n", self.tid, a[0], a[1], a[2], a[3]).as_bytes());
+        }
+        if let Regs::X86(r) = &mut regs {
+            r.gpr[RCX] = r.gpr[R10];
+        }
+        regs.set_pc(base + u64::from(*body));
+        cx.turn(|t| t.thread().set_regs(&regs));
+        Flow::Run
     }
 
     /// The first `count` arguments of the call that trapped, by this ISA's convention. x86-64's stubs keep the first
@@ -528,14 +599,30 @@ impl Task {
 
     /// `VirtualAlloc`: reserves, commits, or both. Gives the base, or None.
     pub fn virtual_alloc(&mut self, cx: &mut Cx<'_>, addr: u64, size: u64, kind: u32, protect: u32) -> Option<u64> {
+        let process = self.process.clone();
+        self.virtual_alloc_in(cx, &process, addr, size, kind, protect)
+    }
+
+    /// Runs `f` on `process`'s space: this thread's own, or another's through `Cx::elsewhere`. The caller holds
+    /// another's `remote` lock (taken before its state, as `write_remote` takes them), so its space stays.
+    pub(crate) fn on_space<R>(&self, cx: &mut Cx<'_>, process: &Process, space: SpaceId, f: impl FnOnce(&mut Turn<'_>) -> R) -> R {
+        if std::ptr::eq(process, &*self.process) { cx.turn(f) } else { cx.elsewhere(space, |cx| cx.turn(f)) }
+    }
+
+    /// `VirtualAllocEx`: `VirtualAlloc` in `process`, this one or another.
+    pub fn virtual_alloc_in(&mut self, cx: &mut Cx<'_>, process: &Arc<Process>, addr: u64, size: u64, kind: u32, protect: u32) -> Option<u64> {
         const MEM_COMMIT: u32 = 0x1000;
         const MEM_RESERVE: u32 = 0x2000;
         let prot = prot_from(protect)?;
         if size == 0 {
             return None;
         }
-        let alloc = self.layout().alloc;
-        let mut state = lock(&self.process.state);
+        let alloc = images::layout(process.isa).alloc;
+        let kept = (!Arc::ptr_eq(process, &self.process)).then(|| lock(&process.remote));
+        if kept.as_ref().is_some_and(|gone| **gone) {
+            return None;
+        }
+        let mut state = lock(&process.state);
         let commit = kind & MEM_COMMIT != 0;
         let guard = commit && protect & PAGE_GUARD != 0;
         let area = Area { guard, ..Area::of(prot, if commit { AreaKind::Committed } else { AreaKind::Reserved }) };
@@ -568,15 +655,26 @@ impl Task {
             a.kind = area.kind;
             a.guard = guard;
         });
-        cx.turn(|t| t.space().protect(range.clone(), if guard { Prot::NONE } else { prot }));
+        let space = state.space;
+        self.on_space(cx, process, space, |t| t.space().protect(range.clone(), if guard { Prot::NONE } else { prot }));
         Some(range.start)
     }
 
     /// `VirtualFree`: decommits, or releases a whole reservation.
     pub fn virtual_free(&mut self, cx: &mut Cx<'_>, addr: u64, size: u64, kind: u32) -> bool {
+        let process = self.process.clone();
+        self.virtual_free_in(cx, &process, addr, size, kind)
+    }
+
+    /// `VirtualFreeEx`: `VirtualFree` in `process`, this one or another.
+    pub fn virtual_free_in(&mut self, cx: &mut Cx<'_>, process: &Arc<Process>, addr: u64, size: u64, kind: u32) -> bool {
         const MEM_DECOMMIT: u32 = 0x4000;
         const MEM_RELEASE: u32 = 0x8000;
-        let mut state = lock(&self.process.state);
+        let kept = (!Arc::ptr_eq(process, &self.process)).then(|| lock(&process.remote));
+        if kept.as_ref().is_some_and(|gone| **gone) {
+            return false;
+        }
+        let mut state = lock(&process.state);
         let Some((range, area)) = state.regions.find(addr).map(|(r, a)| (r, a.clone())) else { return false };
         if matches!(area.kind, AreaKind::Kept | AreaKind::Image | AreaKind::View | AreaKind::System) {
             return false;
@@ -593,7 +691,8 @@ impl Task {
             }
             _ => return false,
         };
-        cx.turn(|t| t.space().unmap(range));
+        let space = state.space;
+        self.on_space(cx, process, space, |t| t.space().unmap(range));
         true
     }
 }
@@ -646,6 +745,17 @@ pub(crate) fn write_remote(k: &Kernel, cx: &mut Cx<'_>, process: &Process, write
     })
 }
 
+/// Reads `len` bytes of another process's memory (or this one's) at `at`, bringing its pages in as its own touch
+/// would. None if the process has ended or the memory isn't readable.
+pub(crate) fn read_remote(k: &Kernel, cx: &mut Cx<'_>, process: &Process, at: u64, len: usize) -> Option<Vec<u8>> {
+    let gone = lock(&process.remote);
+    if *gone {
+        return None;
+    }
+    let space = lock(&process.state).space;
+    cx.elsewhere(space, |cx| user::with_faults(cx, false, |cx, a, access| fault_in(k, process, cx, a, access), |t| user::read_vec(&t.space(), at, len)).ok())
+}
+
 /// A `PAGE_*` protection, or None for one atlas doesn't take.
 pub(crate) fn prot_from(protect: u32) -> Option<Prot> {
     Some(match protect & 0xff {
@@ -660,6 +770,8 @@ pub(crate) fn prot_from(protect: u32) -> Option<Prot> {
 
 /// A Windows path on the machine's disk: `C:\Users\me\app.exe` is `/Users/me/app.exe`.
 pub(crate) fn disk_path(path: &str) -> String {
+    // `\\?\C:\x` and `\??\C:\x` are `C:\x`, as Windows' long-path and NT forms of it.
+    let path = ["\\\\?\\", "\\??\\"].iter().find_map(|p| path.strip_prefix(p)).unwrap_or(path);
     let path = path.replace('\\', "/");
     let path = path.strip_prefix("C:").or_else(|| path.strip_prefix("c:")).unwrap_or(&path);
     if path.starts_with('/') { path.to_string() } else { format!("/{path}") }
@@ -699,6 +811,8 @@ pub(crate) struct Launch {
     pub suspended: bool,
     /// The process starting it, or 0.
     pub parent: u64,
+    /// The token it's to run as (`CreateProcessAsUser`'s); else a copy of its parent's.
+    pub token: Option<Arc<crate::security::Token>>,
 }
 
 /// Starts process 1: `argv[0]` from the disk, loaded with its system DLLs, with the host's console as its standard
@@ -714,12 +828,12 @@ pub(crate) fn start(k: &Arc<Kernel>, cx: &mut Cx<'_>, argv: &[String]) -> Result
     let mut handles = Handles::default();
     let std_handles = [handles.add(Handle::Input), handles.add(Handle::Console(host::Stream::Out)), handles.add(Handle::Console(host::Stream::Err))];
     let environment = crate::environment::block(&crate::environment::first(k, isa));
-    launch(k, cx, Launch { path, bytes, command_line: command_line(argv), environment, cwd: None, handles, std_handles, suspended: false, parent: 0 })
+    launch(k, cx, Launch { path, bytes, command_line: command_line(argv), environment, cwd: None, handles, std_handles, suspended: false, parent: 0, token: None })
 }
 
 /// Starts a process on this host thread (whose CPU becomes its first thread's), giving that thread's task to run.
 pub(crate) fn launch(k: &Arc<Kernel>, cx: &mut Cx<'_>, launch: Launch) -> Result<Task, String> {
-    let Launch { path, bytes, command_line: line, environment, cwd, handles, std_handles, suspended, parent } = launch;
+    let Launch { path, bytes, command_line: line, environment, cwd, handles, std_handles, suspended, parent, token: given } = launch;
     let pe = Pe::parse(&bytes).map_err(|_| format!("{path} isn't a Windows program"))?;
     if pe.is_dll {
         return Err(format!("{path} is a DLL"));
@@ -734,11 +848,14 @@ pub(crate) fn launch(k: &Arc<Kernel>, cx: &mut Cx<'_>, launch: Launch) -> Result
     let pid = k.new_id();
     let tid = k.new_id();
     // Whether its manifest says it knows Windows 10: what `GetVersionEx` tells it.
-    // A copy of its parent's token, so a change to either is its own.
-    let token = Arc::new(k.process(parent).map_or_else(crate::security::Token::administrator, |p| {
-        let token = lock(&p.state).token.clone();
-        token.duplicate(1, 0)
-    }));
+    // A copy of the token it's given, or of its parent's, as a primary token, so a change to either is its own.
+    let token = Arc::new(match given {
+        Some(token) => token.duplicate(1, 0),
+        None => k.process(parent).map_or_else(crate::security::Token::administrator, |p| {
+            let token = lock(&p.state).token.clone();
+            token.duplicate(1, 0)
+        }),
+    });
     let windows10 = pe.resource(&image, 24).is_some_and(|m| String::from_utf8_lossy(m).to_ascii_lowercase().contains(crate::system::WINDOWS_10_GUID));
 
     let mut regions: Regions<Area> = Regions::default();
@@ -869,7 +986,7 @@ pub(crate) fn launch(k: &Arc<Kernel>, cx: &mut Cx<'_>, launch: Launch) -> Result
     let mut threads = BTreeMap::new();
     threads.insert(tid, control.clone());
     let cwd = cwd.unwrap_or_else(|| format!("C:\\{}", exe_dir.trim_start_matches('/').replace('/', "\\")));
-    let state = ProcState { space, dispatcher, thread_start, peb, threads, mapped, exe_dir, cwd, regions, handles, std_handles, command_line: command, exiting: None, windows10, parent, created: crate::files::filetime(k.host.wall()), image: windows_path.clone(), token, error_mode: 0, com: BTreeMap::new() };
+    let state = ProcState { space, dispatcher, thread_start, peb, threads, mapped, exe_dir, dll_directory: None, dll_search: 0, cwd, regions, handles, std_handles, command_line: command, exiting: None, windows10, parent, created: crate::files::filetime(k.host.wall()), image: windows_path.clone(), token, error_mode: 0, com: BTreeMap::new() };
     let object = Object::new(objects_mod::Kind::Process(pid), State::default());
     let process = Arc::new(Process { pid, isa, state: Mutex::new(state), remote: Mutex::new(false), object, ended: (Mutex::new(None), Condvar::new()), net: Mutex::default() });
     k.started(&process);

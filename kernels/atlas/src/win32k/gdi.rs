@@ -87,9 +87,65 @@ pub struct Dc {
     pub bitmap: u64,
 }
 
+/// A font as a LOGFONT describes it: what `CreateFont` was given, and `GetObject` gives back.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LogFont {
+    pub height: i32,
+    pub width: i32,
+    pub escapement: i32,
+    pub orientation: i32,
+    pub weight: i32,
+    /// Italic, underline, strike-out, character set, output precision, clip precision, quality, pitch and family.
+    pub flags: [u8; 8],
+    pub face: String,
+}
+
+impl LogFont {
+    /// LOGFONTW, 92 bytes, or LOGFONTA, 60, its face name cut to 31 characters.
+    pub fn to_bytes(&self, wide: bool) -> Vec<u8> {
+        let mut b = Vec::with_capacity(92);
+        for v in [self.height, self.width, self.escapement, self.orientation, self.weight] {
+            b.extend(v.to_le_bytes());
+        }
+        b.extend(self.flags);
+        let mut face: Vec<u8> = if wide { self.face.encode_utf16().take(31).flat_map(u16::to_le_bytes).collect() } else { crate::ansi::bytes(&self.face).into_iter().take(31).collect() };
+        face.resize(if wide { 64 } else { 32 }, 0);
+        b.extend(face);
+        b
+    }
+
+    /// From a LOGFONTW or LOGFONTA's bytes.
+    pub fn from_bytes(b: &[u8], wide: bool) -> Option<LogFont> {
+        let need = if wide { 92 } else { 60 };
+        if b.len() < need {
+            return None;
+        }
+        let i = |o: usize| i32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let face = if wide {
+            let units: Vec<u16> = b[28..92].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&u| u != 0).collect();
+            String::from_utf16_lossy(&units)
+        } else {
+            crate::ansi::text(&b[28..60].iter().copied().take_while(|&c| c != 0).collect::<Vec<u8>>())
+        };
+        Some(LogFont { height: i(0), width: i(4), escapement: i(8), orientation: i(12), weight: i(16), flags: b[20..28].try_into().ok()?, face })
+    }
+
+    /// The stock fonts': the system's, the GUI's default, a fixed one.
+    fn stock(index: u64) -> LogFont {
+        let (height, face, pitch) = match index {
+            10 | 11 | 16 => (16, "Courier New", 0x31),
+            17 => (-11, "MS Shell Dlg", 0),
+            _ => (16, "System", 0x22),
+        };
+        LogFont { height, weight: if index == 13 || index == 14 { 700 } else { 400 }, flags: [0, 0, 0, 1, 0, 0, 0, pitch], face: face.into(), ..LogFont::default() }
+    }
+}
+
 #[derive(Default)]
 pub struct Gdi {
     objects: HashMap<u64, Object>,
+    /// Fonts' LOGFONTs, by handle.
+    pub fonts: HashMap<u64, LogFont>,
     pub dcs: HashMap<u64, Dc>,
     next: u64,
     /// Bitmaps' pixels, and icons' and cursors'.
@@ -155,7 +211,26 @@ impl Gdi {
     pub fn delete(&mut self, handle: u64) -> bool {
         self.bitmaps.remove(&handle);
         self.icons.remove(&handle);
+        if handle < STOCK {
+            self.fonts.remove(&handle);
+        }
         self.object(handle).is_some() && (self.objects.remove(&handle).is_some() || handle >= STOCK)
+    }
+
+    /// A font, as its LOGFONT says.
+    pub fn create_font(&mut self, font: LogFont) -> u64 {
+        let handle = self.create(Object::Font);
+        self.fonts.insert(handle, font);
+        handle
+    }
+
+    /// A font's LOGFONT: a stock font's, or what it was made with.
+    pub fn log_font(&self, handle: u64) -> Option<LogFont> {
+        match self.object(handle)? {
+            Object::Font if (STOCK..STOCK + 32).contains(&handle) => Some(LogFont::stock(handle - STOCK)),
+            Object::Font => Some(self.fonts.get(&handle).cloned().unwrap_or_default()),
+            _ => None,
+        }
     }
 
     /// A bitmap of these pixels.

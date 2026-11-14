@@ -4,7 +4,8 @@
 // __declspec(thread), each thread's own; DLL_THREAD_ATTACH; auto- and manual-reset events; a wait that times out;
 // semaphores and their maximum; a mutex owned, waited for, released, not owned, and abandoned; an SRW lock and a
 // condition variable; WaitOnAddress; InitOnceExecuteOnce from four threads; CREATE_SUSPENDED and ResumeThread;
-// QueueUserAPC and an alertable SleepEx; named events; TerminateThread; ExitThread; DuplicateHandle of a pseudo-handle
+// QueueUserAPC and an alertable SleepEx; named events; TerminateThread; ExitThread; DuplicateHandle of a pseudo-handle;
+// TLS's expansion slots past the first 64, each thread's own, and a freed slot cleared in every thread
 
 // x86's thread-local variables are found through fs:[__tls_array], which the C runtime defines as 0x2c, the TEB's
 // ThreadLocalStoragePointer; there's none here.
@@ -56,6 +57,7 @@ K void __stdcall LeaveCriticalSection(CRITICAL_SECTION *);
 K DWORD __stdcall TlsAlloc(void);
 K void *__stdcall TlsGetValue(DWORD);
 K BOOL __stdcall TlsSetValue(DWORD, void *);
+K BOOL __stdcall TlsFree(DWORD);
 K void __stdcall InitializeSRWLock(void **);
 K void __stdcall AcquireSRWLockExclusive(void **);
 K void __stdcall ReleaseSRWLockExclusive(void **);
@@ -85,6 +87,16 @@ static HANDLE out;
 static int failures;
 static unsigned len(const char *s) { unsigned n = 0; while (s[n]) n++; return n; }
 static void say(const char *s) { DWORD n; WriteFile(out, s, len(s), &n, 0); }
+static DWORD expansion_slot;
+static volatile int expansion_seen;
+static DWORD __stdcall expansion_thread(void *unused) {
+    (void)unused;
+    int fresh = TlsGetValue(expansion_slot) == 0;
+    TlsSetValue(expansion_slot, (void *)7);
+    expansion_seen = fresh && TlsGetValue(expansion_slot) == (void *)7;
+    return 0;
+}
+
 static void check(int ok, const char *what) {
     say(ok ? "ok      " : "FAILED  ");
     say(what);
@@ -297,6 +309,24 @@ void mainCRTStartup(void) {
     DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &real, 0, 0, 2);
     check(real && GetThreadId(real) == GetCurrentThreadId(), "DuplicateHandle of the current thread's pseudo-handle");
     CloseHandle(real);
+
+    // ---- TLS's expansion slots ----
+    static DWORD many[100];
+    int got_all = 1;
+    for (int i = 0; i < 100; i++) got_all &= (many[i] = TlsAlloc()) != 0xffffffff;
+    DWORD high = many[99];
+    check(got_all && high >= 64 && high < 1088, "a hundred TlsAlloc slots, past the TEB's 64");
+    check(TlsGetValue(high) == 0 && TlsSetValue(high, (void *)0x5eed) && TlsGetValue(high) == (void *)0x5eed, "an expansion slot keeps its value");
+    expansion_slot = high;
+    HANDLE other = CreateThread(0, 0, expansion_thread, 0, 0, 0);
+    WaitForSingleObject(other, 10000);
+    CloseHandle(other);
+    check(expansion_seen == 1 && TlsGetValue(high) == (void *)0x5eed, "another thread's is its own, 0 at first");
+    TlsFree(high);
+    DWORD reissued = TlsAlloc();
+    check(reissued == high && TlsGetValue(reissued) == 0, "a freed slot, given out again, is 0 in every thread");
+    for (int i = 0; i < 99; i++) TlsFree(many[i]);
+    TlsFree(reissued);
 
     ExitProcess(failures);
 }

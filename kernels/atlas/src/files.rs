@@ -129,6 +129,8 @@ pub struct File {
     pub sharing: Sharing,
     /// The kernel whose disk it holds, and the file, while it's open: its name can go, but not its data.
     held: OnceLock<(Weak<crate::Kernel>, Ino)>,
+    /// The kernel that has a watch on this folder handle, for `ReadDirectoryChangesW`: it ends when the handle does.
+    pub(crate) watched: OnceLock<Weak<crate::Kernel>>,
 }
 
 impl Drop for File {
@@ -137,6 +139,9 @@ impl Drop for File {
             && let Some(k) = k.upgrade()
         {
             lock(&k.disk).release(*ino);
+        }
+        if let Some(k) = self.watched.get().and_then(Weak::upgrade) {
+            k.unwatch(self as *const File as usize);
         }
     }
 }
@@ -179,7 +184,7 @@ impl File {
     #[allow(clippy::too_many_arguments)]
     pub fn new(node: Node, read: bool, write: bool, append: bool, path: String, disk: String, delete_on_close: bool, overlapped: bool) -> File {
         let sharing = Sharing { read, write, delete: false, share: FILE_SHARE_ALL };
-        File { node, read, write, append, position: Mutex::new(0), path, disk, delete_on_close, overlapped, port: Mutex::new(None), modes: Default::default(), sharing, held: OnceLock::new() }
+        File { node, read, write, append, position: Mutex::new(0), path, disk, delete_on_close, overlapped, port: Mutex::new(None), modes: Default::default(), sharing, held: OnceLock::new(), watched: OnceLock::new() }
     }
 }
 
@@ -513,6 +518,7 @@ impl Task {
                 let now = self.k.host.wall();
                 let ino = disk.create(dir, name, New::File, Meta { attributes: FILE_ATTRIBUTE_ARCHIVE }, now).map_err(layers_error)?;
                 keep_times(&mut disk, ino, now, now)?;
+                self.k.changed(&path, crate::changes::ADDED, crate::changes::FILE_NAME);
                 (ino, false)
             }
             (Err(e), _) => return Err(layers_error(e)),
@@ -537,6 +543,7 @@ impl Task {
         // CREATE_ALWAYS and TRUNCATE_EXISTING empty it.
         if existed && matches!(disposition, 2 | 5) {
             disk.truncate(ino, 0, self.k.host.wall()).map_err(layers_error)?;
+            self.k.changed(&path, crate::changes::MODIFIED, crate::changes::SIZE | crate::changes::LAST_WRITE);
         }
         let file = make(Node::File(ino), path, disk_path);
         self.opened(&mut disk, ino, &file);
@@ -613,6 +620,8 @@ impl Task {
                 let start = if file.append { disk.stat(*ino).map_err(layers_error)?.size } else { at.unwrap_or(*position) };
                 let n = disk.write(*ino, start, data, self.k.host.wall()).map_err(layers_error)?;
                 *position = start + n as u64;
+                drop(disk);
+                self.k.changed(&file.path, crate::changes::MODIFIED, crate::changes::SIZE | crate::changes::LAST_WRITE);
                 Ok(n)
             }
             Node::Null => Ok(data.len()),
@@ -626,16 +635,22 @@ impl Task {
 
     /// Lets go of a handle to a file: one opened to delete when closed goes, once nothing has it open.
     pub fn closed_file(&self, file: Arc<File>) {
+        if Arc::strong_count(&file) == 1 && matches!(file.node, Node::Dir(_)) {
+            self.k.unwatch(Arc::as_ptr(&file) as usize);
+        }
         if file.delete_on_close && Arc::strong_count(&file) == 1 {
             let mut disk = lock(&self.k.disk);
-            if let Ok((dir, name)) = parent(&disk, &file.disk) {
-                let _ = disk.remove(dir, name, self.k.host.wall());
+            if let Ok((dir, name)) = parent(&disk, &file.disk)
+                && disk.remove(dir, name, self.k.host.wall()).is_ok()
+            {
+                drop(disk);
+                self.k.changed(&file.path, crate::changes::REMOVED, crate::changes::FILE_NAME);
             }
         }
     }
 
     pub fn delete_file(&self, raw: &str) -> Result<(), u32> {
-        let (_, disk_path) = self.resolve(raw)?;
+        let (full, disk_path) = self.resolve(raw)?;
         if self.system_file(&disk_path).is_some() {
             return Err(ERROR_ACCESS_DENIED);
         }
@@ -648,20 +663,26 @@ impl Task {
         }
         // As Windows 10 deletes, the name goes now; what has the file open keeps it until it's closed.
         self.deletable(&disk, &disk_path)?;
-        disk.remove(dir, name, self.k.host.wall()).map_err(layers_error)
+        disk.remove(dir, name, self.k.host.wall()).map_err(layers_error)?;
+        drop(disk);
+        self.k.changed(&full, crate::changes::REMOVED, crate::changes::FILE_NAME);
+        Ok(())
     }
 
     pub fn create_directory(&self, raw: &str) -> Result<(), u32> {
-        let (_, disk_path) = self.resolve(raw)?;
+        let (full, disk_path) = self.resolve(raw)?;
         let mut disk = lock(&self.k.disk);
         let (dir, name) = parent(&disk, &disk_path)?;
         let now = self.k.host.wall();
         let ino = disk.create(dir, name, New::Dir, Meta { attributes: FILE_ATTRIBUTE_DIRECTORY }, now).map_err(layers_error)?;
-        keep_times(&mut disk, ino, now, now)
+        keep_times(&mut disk, ino, now, now)?;
+        drop(disk);
+        self.k.changed(&full, crate::changes::ADDED, crate::changes::DIR_NAME);
+        Ok(())
     }
 
     pub fn remove_directory(&self, raw: &str) -> Result<(), u32> {
-        let (_, disk_path) = self.resolve(raw)?;
+        let (full, disk_path) = self.resolve(raw)?;
         let mut disk = lock(&self.k.disk);
         let (dir, name) = parent(&disk, &disk_path)?;
         let ino = disk.lookup(dir, name).map_err(layers_error)?;
@@ -671,12 +692,15 @@ impl Task {
             return Err(ERROR_DIRECTORY);
         }
         self.deletable(&disk, &disk_path)?;
-        disk.remove(dir, name, self.k.host.wall()).map_err(layers_error)
+        disk.remove(dir, name, self.k.host.wall()).map_err(layers_error)?;
+        drop(disk);
+        self.k.changed(&full, crate::changes::REMOVED, crate::changes::DIR_NAME);
+        Ok(())
     }
 
     /// `MoveFileEx`: renames, replacing a file at the target only if asked.
     pub fn move_file(&self, from: &str, to: &str, replace: bool) -> Result<(), u32> {
-        let ((_, from), (_, to)) = (self.resolve(from)?, self.resolve(to)?);
+        let ((from_full, from), (to_full, to)) = (self.resolve(from)?, self.resolve(to)?);
         let mut disk = lock(&self.k.disk);
         let (from_dir, from_name) = parent(&disk, &from)?;
         disk.lookup(from_dir, from_name).map_err(layers_error)?;
@@ -690,7 +714,19 @@ impl Task {
         }
         // Moving needs what has the file open to share deleting, as on Windows.
         self.deletable(&disk, &from)?;
-        disk.rename(from_dir, from_name, to_dir, to_name, self.k.host.wall()).map_err(layers_error)
+        let what = match disk.lookup(from_dir, from_name).and_then(|i| disk.stat(i)) {
+            Ok(s) if s.kind == Kind::Dir => crate::changes::DIR_NAME,
+            _ => crate::changes::FILE_NAME,
+        };
+        disk.rename(from_dir, from_name, to_dir, to_name, self.k.host.wall()).map_err(layers_error)?;
+        drop(disk);
+        // In one folder, a rename; between two, gone from one and made in the other, as each folder's watches see it.
+        use crate::changes::{ADDED, REMOVED, RENAMED_NEW, RENAMED_OLD};
+        let folder = |p: &str| p.rsplit_once('\\').map(|(d, _)| d.to_lowercase());
+        let (gone, made) = if folder(&from_full) == folder(&to_full) { (RENAMED_OLD, RENAMED_NEW) } else { (REMOVED, ADDED) };
+        self.k.changed(&from_full, gone, what);
+        self.k.changed(&to_full, made, what);
+        Ok(())
     }
 
     pub fn copy_file(&self, from: &str, to: &str, fail_if_exists: bool) -> Result<(), u32> {
@@ -723,7 +759,7 @@ impl Task {
 
     /// `CreateHardLink`: another name for a file (not a folder) on the disk.
     pub fn create_hard_link(&self, new: &str, existing: &str) -> Result<(), u32> {
-        let ((_, new), (_, existing)) = (self.resolve(new)?, self.resolve(existing)?);
+        let ((new_full, new), (_, existing)) = (self.resolve(new)?, self.resolve(existing)?);
         if self.system_file(&existing).is_some() {
             return Err(ERROR_ACCESS_DENIED);
         }
@@ -733,14 +769,17 @@ impl Task {
             return Err(ERROR_ACCESS_DENIED);
         }
         let (dir, name) = parent(&disk, &new)?;
-        disk.link(dir, name, ino, self.k.host.wall()).map_err(|e| if e == layers::Error::Exists { ERROR_ALREADY_EXISTS } else { layers_error(e) })
+        disk.link(dir, name, ino, self.k.host.wall()).map_err(|e| if e == layers::Error::Exists { ERROR_ALREADY_EXISTS } else { layers_error(e) })?;
+        drop(disk);
+        self.k.changed(&new_full, crate::changes::ADDED, crate::changes::FILE_NAME);
+        Ok(())
     }
 
     /// `CreateSymbolicLink`: a link at `link` to `target`, a Windows path, absolute or from the link's folder. A
     /// folder's link (`directory`) is a folder as listings and `RemoveDirectory` see it. Opening through it reaches
     /// its target.
     pub fn create_symbolic_link(&self, link: &str, target: &str, directory: bool) -> Result<(), u32> {
-        let (_, link) = self.resolve(link)?;
+        let (link_full, link) = self.resolve(link)?;
         let absolute = target.starts_with(['\\', '/']) || target.as_bytes().get(1) == Some(&b':');
         let target = if absolute { self.resolve(target)?.1 } else { target.replace('\\', "/") };
         let mut disk = lock(&self.k.disk);
@@ -748,7 +787,10 @@ impl Task {
         let attributes = if directory { FILE_ATTRIBUTE_DIRECTORY } else { 0 };
         let now = self.k.host.wall();
         let ino = disk.create(dir, name, New::Symlink(target), Meta { attributes }, now).map_err(|e| if e == layers::Error::Exists { ERROR_ALREADY_EXISTS } else { layers_error(e) })?;
-        keep_times(&mut disk, ino, now, now)
+        keep_times(&mut disk, ino, now, now)?;
+        drop(disk);
+        self.k.changed(&link_full, crate::changes::ADDED, if directory { crate::changes::DIR_NAME } else { crate::changes::FILE_NAME });
+        Ok(())
     }
 
     /// `SetFileTime`: any of the times it's given (nanoseconds since 1970), of a file open on the disk.
@@ -761,6 +803,12 @@ impl Task {
         }
         if let Some(written) = written {
             disk.set_modified(ino, written).map_err(layers_error)?;
+        }
+        drop(disk);
+        use crate::changes::{CREATION, LAST_ACCESS, LAST_WRITE};
+        let what = if created.is_some() { CREATION } else { 0 } | if accessed.is_some() { LAST_ACCESS } else { 0 } | if written.is_some() { LAST_WRITE } else { 0 };
+        if what != 0 {
+            self.k.changed(&file.path, crate::changes::MODIFIED, what);
         }
         Ok(())
     }

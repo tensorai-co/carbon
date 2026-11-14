@@ -13,6 +13,8 @@ use kernels_core::lock;
 use kernels_core::thread::Cx;
 use kernels_core::user;
 
+use super::fileapi::close_handle;
+use super::synch::{create_event_w, reset_event, set_event, wait_for_multiple_objects_ex};
 use super::{Reply, dll};
 use crate::files::{File, Node};
 use crate::handles::Handle;
@@ -78,25 +80,27 @@ dll! {
     // The process's network thread starts here.
     host AtlasNetPump(1) => net_pump;
     // Not written yet: what larger programs import.
-    missing WSACloseEvent;
-    missing WSACreateEvent;
-    missing WSAEnumNetworkEvents;
-    missing WSAEventSelect;
-    missing WSAResetEvent;
+    host WSACloseEvent(1) => close_handle;
+    host WSACreateEvent(0) => wsa_create_event;
+    host WSAEnumNetworkEvents(3) => wsa_enum_network_events;
+    host WSAEventSelect(3) => wsa_event_select;
+    host WSAResetEvent(1) => reset_event;
     missing WSASendMsg;
-    missing WSASetEvent;
-    missing WSAWaitForMultipleEvents;
+    host WSASetEvent(1) => set_event;
+    host WSAWaitForMultipleEvents(5) => wait_for_multiple_objects_ex;
     missing WSCEnumProtocols;
     missing getnameinfo;
     missing inet_ntop;
     missing inet_pton;
     missing WSADuplicateSocketW;
     missing WSAEnumNameSpaceProvidersW;
-    missing WSALookupServiceBeginW;
-    missing WSALookupServiceEnd;
-    missing WSALookupServiceNextW;
+    host WSALookupServiceBeginW(3) => wsa_lookup_service;
+    host WSALookupServiceEnd(1) => wsa_lookup_service;
+    host WSALookupServiceNextW(4) => wsa_lookup_service;
     missing WSASetServiceW;
     missing WSCGetProviderPath;
+    host WSALookupServiceBeginA(3) => wsa_lookup_service;
+    host WSALookupServiceNextA(4) => wsa_lookup_service;
 }
 
 /// SOCKET_ERROR, as an int.
@@ -257,7 +261,23 @@ impl Task {
     /// Runs a socket operation as the call asks: overlapped (done now, or pending for the network thread), or
     /// blocking (waiting up to `timeout`), or not (WSAEWOULDBLOCK). Its byte count.
     #[allow(clippy::too_many_arguments)]
-    fn socket_io(&mut self, cx: &mut Cx<'_>, file: &Arc<File>, sock: &Arc<Sock>, read: bool, mut work: Work, ov: u64, routine: u64) -> Result<u64, Failed> {
+    fn socket_io(&mut self, cx: &mut Cx<'_>, file: &Arc<File>, sock: &Arc<Sock>, read: bool, work: Work, ov: u64, routine: u64) -> Result<u64, Failed> {
+        // A receive re-enables FD_READ (and a send that would block, FD_WRITE, below).
+        let selected = lock(&sock.selected).is_some();
+        if read && selected {
+            sock.rearm(FD_READ);
+            self.wake_net();
+        }
+        let result = self.socket_io_now(cx, file, sock, read, work, ov, routine);
+        if selected && !read && matches!(result, Err(Failed::Error(WSAEWOULDBLOCK))) {
+            sock.rearm(FD_WRITE);
+            self.wake_net();
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn socket_io_now(&mut self, cx: &mut Cx<'_>, file: &Arc<File>, sock: &Arc<Sock>, read: bool, mut work: Work, ov: u64, routine: u64) -> Result<u64, Failed> {
         if ov != 0 {
             let op = self.socket_op(cx, file, ov, routine, 0);
             return match sock.attempt(&mut work) {
@@ -455,6 +475,7 @@ fn listen(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
             return Err(WSAEOPNOTSUPP.into());
         }
         sock.net().listen(a[1] as u32).map_err(|e| wsa(&e))?;
+        sock.listening.store(true, Ordering::Relaxed);
         Ok(0)
     })();
     answer(task, cx, r)
@@ -469,7 +490,13 @@ fn connect(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
         let socket = sock.net();
         match socket.connect(&net::Addr::Inet(addr)) {
             Ok(()) => Ok(0),
-            Err(net::Error::InProgress) if sock.nonblocking.load(Ordering::Relaxed) => Err(WSAEWOULDBLOCK.into()),
+            Err(net::Error::InProgress) if sock.nonblocking.load(Ordering::Relaxed) => {
+                // FD_CONNECT says how it went.
+                sock.connecting.store(true, Ordering::Relaxed);
+                sock.rearm(FD_CONNECT);
+                task.wake_net();
+                Err(WSAEWOULDBLOCK.into())
+            }
             Err(net::Error::InProgress) => {
                 let s = socket.clone();
                 task.sock_wait(&[socket], None, |_| {
@@ -494,6 +521,8 @@ fn connect(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 fn accept(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let r = (|| -> Result<u64, Failed> {
         let (file, sock) = task.sock(a[0])?;
+        sock.rearm(FD_ACCEPT);
+        task.wake_net();
         let socket = sock.net();
         let take = |_: &mut Task| match socket.accept() {
             Ok(got) => Ok(Some(got)),
@@ -1252,4 +1281,75 @@ fn disconnect_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 
 fn net_pump(task: &mut Task, cx: &mut Cx<'_>, _: &[u64]) -> Reply {
     crate::sockets::pump(task, cx)
+}
+
+/// `WSALookupServiceBegin(&query, flags, &lookup)`, `Next` and `End`: no name-space provider is installed (names are
+/// looked up through `getaddrinfo`, and network location awareness isn't there), so WSASERVICE_NOT_FOUND, as Windows
+/// says for a provider it hasn't.
+fn wsa_lookup_service(task: &mut Task, cx: &mut Cx<'_>, _: &[u64]) -> Reply {
+    task.set_last_error(cx, 10108);
+    Reply::Value(u64::from(u32::MAX))
+}
+
+// ---- Event selection ----
+
+/// `WSACreateEvent()`: a manual-reset event, not set.
+fn wsa_create_event(task: &mut Task, cx: &mut Cx<'_>, _: &[u64]) -> Reply {
+    create_event_w(task, cx, &[0, 1, 0, 0])
+}
+
+impl Task {
+    /// Wakes the process's network thread, if it has one, to look at its sockets again.
+    fn wake_net(&self) {
+        if let Some(w) = &lock(&self.process.net).waiter {
+            w.wake();
+        }
+    }
+}
+
+/// `WSAEventSelect(s, event, events)`: the network events to record and set the event for, as they happen (the
+/// socket becomes non-blocking); no event and none asked stops it.
+fn wsa_event_select(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let r = (|| -> Result<u64, Failed> {
+        let (_, sock) = task.sock(a[0])?;
+        let mask = a[2] as u32;
+        if a[1] == 0 && mask == 0 {
+            *lock(&sock.selected) = None;
+            return Ok(0);
+        }
+        let event = task.object(a[1]).ok_or(Failed::Error(WSAEINVAL))?;
+        sock.nonblocking.store(true, Ordering::Relaxed);
+        *lock(&sock.selected) = Some(Selected { event, mask, recorded: 0, errors: [0; 10], armed: u32::MAX });
+        task.net_watch(cx, &sock);
+        Ok(0)
+    })();
+    answer(task, cx, r)
+}
+
+/// `WSAEnumNetworkEvents(s, event, &events)`: the network events recorded and their errors (WSANETWORKEVENTS), which
+/// it clears, and the event reset if it's given.
+fn wsa_enum_network_events(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let r = (|| -> Result<u64, Failed> {
+        let (_, sock) = task.sock(a[0])?;
+        let (recorded, errors) = match lock(&sock.selected).as_mut() {
+            Some(s) => {
+                let taken = (s.recorded, s.errors);
+                s.recorded = 0;
+                s.errors = [0; 10];
+                taken
+            }
+            None => (0, [0; 10]),
+        };
+        if a[1] != 0 {
+            let event = task.object(a[1]).ok_or(Failed::Error(WSAEINVAL))?;
+            task.k.objects.signal(&event, |s| s.set = false);
+        }
+        let mut b = recorded.to_le_bytes().to_vec();
+        for e in errors {
+            b.extend(e.to_le_bytes());
+        }
+        task.write_at(cx, a[2], &b)?;
+        Ok(0)
+    })();
+    answer(task, cx, r)
 }

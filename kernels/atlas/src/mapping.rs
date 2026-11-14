@@ -97,9 +97,16 @@ impl Task {
             Some(dll) => (dll.to_string(), dll.to_string()),
             None => (raw, name),
         };
+        let new = !lock(&self.process.state).mapped.contains_key(&name);
         let found = self.find_or_map(cx, &raw, &name);
         let (base, path) = match found {
-            Ok(found) => found,
+            Ok(found) => {
+                // Traced, each DLL the first time it's mapped into the process.
+                if self.k.options.trace && new {
+                    self.k.host.write(host::Stream::Err, format!("[{}] maps {raw} at {:#x}: {}\n", self.tid, found.0, found.1).as_bytes());
+                }
+                found
+            }
             Err(code) => {
                 if self.k.options.trace {
                     self.k.host.write(host::Stream::Err, format!("atlas: no DLL {raw} ({code:#x})\n").as_bytes());
@@ -117,6 +124,44 @@ impl Task {
         if wrote.is_err() { status::ACCESS_VIOLATION } else { status::SUCCESS }
     }
 
+    /// Where a DLL named without a path is looked for, as folders on the disk, in order. Windows' standard search: the
+    /// program's folder, `SetDllDirectory`'s, System32 (SysWOW64 for a 32-bit program), Windows, the current directory
+    /// (unless `SetDllDirectory` was called), then each folder in `Path`. After `SetDefaultDllDirectories`, only the
+    /// folders its flags name.
+    fn dll_search_dirs(&mut self, cx: &mut Cx<'_>) -> Vec<String> {
+        let (exe_dir, directory, search, cwd) = {
+            let state = lock(&self.process.state);
+            (state.exe_dir.clone(), state.dll_directory.clone(), state.dll_search, state.cwd.clone())
+        };
+        let system = if self.isa == Isa::X86_32 { "/Windows/SysWOW64" } else { "/Windows/System32" }.to_string();
+        let added = directory.as_deref().filter(|d| !d.is_empty()).map(disk_path);
+        let mut dirs = vec![exe_dir];
+        if search != 0 {
+            let all = search & 0x1000 != 0;
+            if !(all || search & 0x200 != 0) {
+                dirs.clear();
+            }
+            if all || search & 0x400 != 0 {
+                dirs.extend(added);
+            }
+            if all || search & 0x800 != 0 {
+                dirs.push(system);
+            }
+            return dirs;
+        }
+        dirs.extend(added);
+        dirs.push(system);
+        dirs.push("/Windows".to_string());
+        if directory.is_none() {
+            dirs.push(disk_path(&cwd));
+        }
+        dirs.extend(self.path_dirs(cx).iter().map(|d| disk_path(d)));
+        // The same folder once, in its first place.
+        let mut seen = std::collections::HashSet::new();
+        dirs.retain(|d| seen.insert(d.trim_end_matches('/').to_lowercase()));
+        dirs.iter().map(|d| d.trim_end_matches('/').to_string()).collect()
+    }
+
     fn find_or_map(&mut self, cx: &mut Cx<'_>, raw: &str, name: &str) -> Result<(u64, String), u32> {
         if let Some(found) = lock(&self.process.state).mapped.get(name) {
             return Ok(found.clone());
@@ -129,6 +174,10 @@ impl Task {
             let path = format!("C:\\Windows\\System32\\{}", os::DLLS[dll].name);
             let mut state = lock(&self.process.state);
             let state = &mut *state;
+            // Another thread may have mapped it since it was looked for.
+            if let Some(found) = state.mapped.get(name) {
+                return Ok(found.clone());
+            }
             let pe = Pe::parse(&image).map_err(|_| status::INVALID_IMAGE_FORMAT)?;
             if !state.regions.is_free(base..base + image.len() as u64) {
                 return Err(status::INVALID_IMAGE_FORMAT);
@@ -137,14 +186,11 @@ impl Task {
             state.mapped.insert(name.to_string(), (base, path.clone()));
             return Ok((base, path));
         }
-        // A file: by its path, or found as Windows looks: the program's folder, then System32.
+        // A file: by its path, or found as Windows looks.
         let candidates: Vec<String> = if raw.contains(['\\', '/']) {
             vec![disk_path(raw)]
         } else {
-            let dir = lock(&self.process.state).exe_dir.clone();
-            // A 32-bit program's System32 is SysWOW64.
-            let system = if self.isa == Isa::X86_32 { "/Windows/SysWOW64" } else { "/Windows/System32" };
-            vec![format!("{dir}/{raw}"), format!("{system}/{raw}"), format!("{dir}/{name}"), format!("{system}/{name}")]
+            self.dll_search_dirs(cx).iter().flat_map(|dir| [format!("{dir}/{raw}"), format!("{dir}/{name}")]).collect()
         };
         let found = {
             let disk = lock(&self.k.disk);
@@ -161,6 +207,9 @@ impl Task {
         let mut image = pe.layout().map_err(|_| status::INVALID_IMAGE_FORMAT)?;
         let mut state = lock(&self.process.state);
         let state = &mut *state;
+        if let Some(found) = state.mapped.get(name) {
+            return Ok(found.clone());
+        }
         let base = place(&state.regions, &pe, &mut image).map_err(|_| status::NO_MEMORY)?;
         cx.turn(|t| map_image(t, &mut state.regions, &pe, base, &image)).map_err(|_| status::NO_MEMORY)?;
         let windows_path = format!("C:{}", path.replace('/', "\\"));
@@ -194,11 +243,21 @@ impl Task {
 
     /// `VirtualProtect` and `PROTECT`: gives pages a new protection, and writes the old one.
     pub(crate) fn virtual_protect(&mut self, cx: &mut Cx<'_>, addr: u64, size: u64, protect: u32, old_out: u64) -> u32 {
+        let process = self.process.clone();
+        self.virtual_protect_in(cx, &process, addr, size, protect, old_out)
+    }
+
+    /// `VirtualProtectEx`: `VirtualProtect` in `process`, this one or another; the old protection is written here.
+    pub(crate) fn virtual_protect_in(&mut self, cx: &mut Cx<'_>, process: &std::sync::Arc<crate::process::Process>, addr: u64, size: u64, protect: u32, old_out: u64) -> u32 {
         let Some(prot) = crate::process::prot_from(protect) else { return status::INVALID_PARAMETER };
         let guard = protect & crate::process::PAGE_GUARD != 0;
         let range = addr & !(PAGE - 1)..(addr + size.max(1)).next_multiple_of(PAGE);
-        let old = {
-            let mut state = lock(&self.process.state);
+        let kept = (!std::sync::Arc::ptr_eq(process, &self.process)).then(|| lock(&process.remote));
+        if kept.as_ref().is_some_and(|gone| **gone) {
+            return status::INVALID_PARAMETER;
+        }
+        let (old, space) = {
+            let mut state = lock(&process.state);
             let mut at = range.start;
             let mut old = None;
             while at < range.end {
@@ -217,9 +276,10 @@ impl Task {
                 a.prot = prot;
                 a.guard = guard;
             });
-            old.unwrap_or((Prot::NONE, false))
+            (old.unwrap_or((Prot::NONE, false)), state.space)
         };
-        cx.turn(|t| t.space().protect(range, if guard { Prot::NONE } else { prot }));
+        self.on_space(cx, process, space, |t| t.space().protect(range, if guard { Prot::NONE } else { prot }));
+        drop(kept);
         let old = prot_to_page(old.0) | if old.1 { crate::process::PAGE_GUARD } else { 0 };
         if old_out != 0 && self.mem(cx, true, |t| user::write_u32(&mut t.space(), old_out, old)).is_err() {
             return status::ACCESS_VIOLATION;

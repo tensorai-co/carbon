@@ -29,7 +29,7 @@ const E_INVALIDARG: u64 = 0x8007_0057;
 /// A GUID as it's laid out in memory.
 pub type Guid = [u8; 16];
 
-const fn guid(a: u32, b: u16, c: u16, d: [u8; 8]) -> Guid {
+pub const fn guid(a: u32, b: u16, c: u16, d: [u8; 8]) -> Guid {
     let a = a.to_le_bytes();
     let (b, c) = (b.to_le_bytes(), c.to_le_bytes());
     [a[0], a[1], a[2], a[3], b[0], b[1], c[0], c[1], d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]]
@@ -51,6 +51,18 @@ const IID_IPERSISTFILE: Guid = ole(0x0000_010b);
 #[derive(Debug, Clone)]
 pub enum Object {
     ShellLink(ShellLink),
+    /// DirectWrite's (`os/dwrite.rs`): one interface each, the ones it derives from answered by the same pointer.
+    Dwrite(super::dwrite::Dw),
+}
+
+impl Object {
+    /// How many interface pointers its block starts with.
+    fn interfaces(&self) -> u64 {
+        match self {
+            Object::ShellLink(_) => LINK_INTERFACES.len() as u64,
+            Object::Dwrite(_) => 1,
+        }
+    }
 }
 
 /// What's kept of an object: its references and what it is.
@@ -235,19 +247,19 @@ enum Field {
 }
 
 impl Task {
-    fn read_guid(&mut self, cx: &mut Cx<'_>, at: u64) -> Option<Guid> {
+    pub(crate) fn read_guid(&mut self, cx: &mut Cx<'_>, at: u64) -> Option<Guid> {
         let b = self.mem(cx, false, |t| user::read_vec(&t.space(), at, 16)).ok()?;
         b.try_into().ok()
     }
 
-    /// Makes an object with these interfaces: its block, with their vtables of ole32's exports. Its address.
-    fn make_object(&mut self, cx: &mut Cx<'_>, interfaces: &[&[&str]], object: Object) -> Result<u64, Reply> {
+    /// Makes an object with these interfaces: its block, with their vtables of `dll`'s exports. Its address.
+    pub(crate) fn make_object(&mut self, cx: &mut Cx<'_>, dll: &str, interfaces: &[&[&str]], object: Object) -> Result<u64, Reply> {
         let w = self.abi().width;
         let mut addresses = Vec::new();
         for names in interfaces {
             let mut table = Vec::new();
             for name in names.iter() {
-                let Some(at) = self.system_export("ole32.dll", name) else { return Ok(0) };
+                let Some(at) = self.system_export(dll, name) else { return Ok(0) };
                 table.push(at);
             }
             addresses.push(table);
@@ -282,7 +294,7 @@ impl Task {
         if class != CLSID_SHELL_LINK {
             return Ok(None);
         }
-        let base = self.make_object(cx, &LINK_INTERFACES, Object::ShellLink(ShellLink { show: 1, ..ShellLink::default() }))?;
+        let base = self.make_object(cx, "ole32.dll", &LINK_INTERFACES, Object::ShellLink(ShellLink { show: 1, ..ShellLink::default() }))?;
         if base == 0 {
             return Ok(Some(E_FAIL));
         }
@@ -296,23 +308,26 @@ impl Task {
         let w = self.abi().width;
         let state = kernels_core::lock(&self.process.state);
         let (&base, com) = state.com.range(..=this).next_back()?;
-        let count = match com.object {
-            Object::ShellLink(_) => LINK_INTERFACES.len() as u64,
-        };
+        let count = com.object.interfaces();
         let at = this - base;
         (at < count * w && at.is_multiple_of(w)).then_some((base, (at / w) as usize))
     }
 
-    fn query_interface(&mut self, cx: &mut Cx<'_>, this: u64, iid: &Guid, out: u64) -> Result<u64, Reply> {
+    pub(crate) fn query_interface(&mut self, cx: &mut Cx<'_>, this: u64, iid: &Guid, out: u64) -> Result<u64, Reply> {
         if out == 0 {
             return Ok(E_POINTER);
         }
         let Some((base, _)) = self.object_of(this) else { return Ok(E_INVALIDARG) };
         let w = self.abi().width;
-        let found = match *iid {
-            IID_IUNKNOWN | IID_ISHELLLINKW => Some(base),
-            IID_IPERSIST | IID_IPERSISTFILE => Some(base + w),
-            IID_ISHELLLINKA => Some(base + 2 * w),
+        let dw = match &kernels_core::lock(&self.process.state).com.get(&base).map(|c| &c.object) {
+            Some(Object::Dwrite(dw)) => Some(super::dwrite::answers(dw, iid)),
+            _ => None,
+        };
+        let found = match (dw, *iid) {
+            (Some(yes), _) => (yes || *iid == IID_IUNKNOWN).then_some(base),
+            (None, IID_IUNKNOWN | IID_ISHELLLINKW) => Some(base),
+            (None, IID_IPERSIST | IID_IPERSISTFILE) => Some(base + w),
+            (None, IID_ISHELLLINKA) => Some(base + 2 * w),
             _ => None,
         };
         let _ = self.write_ptr(cx, out, found.unwrap_or(0));
@@ -325,7 +340,7 @@ impl Task {
         }
     }
 
-    fn add_ref(&mut self, this: u64) -> u64 {
+    pub(crate) fn add_ref(&mut self, this: u64) -> u64 {
         let Some((base, _)) = self.object_of(this) else { return 0 };
         let mut state = kernels_core::lock(&self.process.state);
         state.com.get_mut(&base).map_or(0, |c| {
@@ -334,7 +349,7 @@ impl Task {
         })
     }
 
-    fn release(&mut self, cx: &mut Cx<'_>, this: u64) -> Result<u64, Reply> {
+    pub(crate) fn release(&mut self, cx: &mut Cx<'_>, this: u64) -> Result<u64, Reply> {
         let Some((base, _)) = self.object_of(this) else { return Ok(0) };
         let left = {
             let mut state = kernels_core::lock(&self.process.state);
@@ -358,6 +373,17 @@ impl Task {
         let mut state = kernels_core::lock(&self.process.state);
         match &mut state.com.get_mut(&base)?.object {
             Object::ShellLink(link) => Some(f(link)),
+            Object::Dwrite(_) => None,
+        }
+    }
+
+    /// Works on the DirectWrite object an interface pointer is.
+    pub(crate) fn dw<R>(&self, this: u64, f: impl FnOnce(&mut super::dwrite::Dw) -> R) -> Option<R> {
+        let (base, _) = self.object_of(this)?;
+        let mut state = kernels_core::lock(&self.process.state);
+        match &mut state.com.get_mut(&base)?.object {
+            Object::Dwrite(dw) => Some(f(dw)),
+            Object::ShellLink(_) => None,
         }
     }
 

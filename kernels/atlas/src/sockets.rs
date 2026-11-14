@@ -205,6 +205,30 @@ pub(crate) struct Sock {
     reads: Mutex<VecDeque<Pending>>,
     writes: Mutex<VecDeque<Pending>>,
     process: Weak<Process>,
+    /// Listening (`listen`), and a non-blocking connect under way: what FD_ACCEPT and FD_CONNECT wait for.
+    pub listening: AtomicBool,
+    pub connecting: AtomicBool,
+    /// `WSAEventSelect`'s.
+    pub selected: Mutex<Option<Selected>>,
+}
+
+/// FD_READ, FD_WRITE, FD_OOB, FD_ACCEPT, FD_CONNECT and FD_CLOSE: the network events `WSAEventSelect` records.
+pub const FD_READ: u32 = 1;
+pub const FD_WRITE: u32 = 2;
+pub const FD_ACCEPT: u32 = 8;
+pub const FD_CONNECT: u32 = 16;
+pub const FD_CLOSE: u32 = 32;
+
+/// What `WSAEventSelect` asked of a socket: its event, the network events wanted, those recorded since
+/// `WSAEnumNetworkEvents` last took them (with an error code for each), and those that may be recorded again. Each is
+/// recorded once, then waits to be re-enabled, as Winsock's are: FD_READ by a receive, FD_ACCEPT by an accept, FD_WRITE
+/// by a send that would block; FD_CONNECT and FD_CLOSE come once.
+pub(crate) struct Selected {
+    pub event: Arc<crate::objects::Object>,
+    pub mask: u32,
+    pub recorded: u32,
+    pub errors: [u32; 10],
+    pub armed: u32,
 }
 
 /// A watch that wakes the process's network thread, which looks at whatever's queued.
@@ -234,6 +258,9 @@ impl Sock {
             reads: Mutex::default(),
             writes: Mutex::default(),
             process,
+            listening: AtomicBool::new(false),
+            connecting: AtomicBool::new(false),
+            selected: Mutex::new(None),
         })
     }
 
@@ -256,9 +283,68 @@ impl Sock {
         lock(if read { &self.reads } else { &self.writes }).push_back(pending);
     }
 
-    /// Whether anything's queued.
+    /// Whether anything's queued, or it has an event selected: what the network thread looks after.
     pub fn busy(&self) -> bool {
-        !lock(&self.reads).is_empty() || !lock(&self.writes).is_empty()
+        !lock(&self.reads).is_empty() || !lock(&self.writes).is_empty() || lock(&self.selected).is_some()
+    }
+
+    /// Network events that may be recorded again (a receive re-enables FD_READ, and so on).
+    pub fn rearm(&self, events: u32) {
+        if let Some(s) = lock(&self.selected).as_mut() {
+            s.armed |= events;
+        }
+    }
+
+    /// Records the selected network events the socket's readiness now says, those that may be, and sets the event if
+    /// any were.
+    fn evaluate(&self, k: &Kernel) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let socket = self.net();
+        let ready = socket.ready();
+        let (listening, connecting) = (self.listening.load(Relaxed), self.connecting.load(Relaxed));
+        let mut now = Vec::new();
+        if connecting && (ready.write || ready.error || ready.hangup) {
+            self.connecting.store(false, Relaxed);
+            let error = socket.take_error().map_or(0, |e| wsa(&e));
+            now.push((FD_CONNECT, 4, error));
+            if error != 0 {
+                now.push((FD_CLOSE, 5, error));
+            }
+        }
+        let connecting = self.connecting.load(Relaxed);
+        if listening {
+            if ready.read {
+                now.push((FD_ACCEPT, 3, 0));
+            }
+        } else if !connecting {
+            if ready.read {
+                now.push((FD_READ, 0, 0));
+            }
+            // A socket that's neither connected nor connecting says it's hung up: it can't write, or close.
+            if ready.write && !ready.hangup {
+                now.push((FD_WRITE, 1, 0));
+            }
+            if self.is_stream() && ready.read && (ready.read_closed || ready.hangup) {
+                now.push((FD_CLOSE, 5, if ready.error { WSAECONNRESET } else { 0 }));
+            }
+        }
+        let event = {
+            let mut selected = lock(&self.selected);
+            let Some(s) = selected.as_mut() else { return };
+            let mut any = false;
+            for (bit, index, error) in now {
+                if s.mask & s.armed & bit != 0 {
+                    s.armed &= !bit;
+                    s.recorded |= bit;
+                    s.errors[index] = error;
+                    any = true;
+                }
+            }
+            any.then(|| s.event.clone())
+        };
+        if let Some(event) = event {
+            k.objects.signal(&event, |s| s.set = true);
+        }
     }
 
     /// Takes every queued operation (a socket closing), each to be finished as aborted.
@@ -436,6 +522,11 @@ impl Task {
     /// Hands a socket's queued operation to the process's network thread, starting it the first time.
     pub(crate) fn net_queue(&mut self, cx: &mut Cx<'_>, sock: &Arc<Sock>, read: bool, pending: Pending) {
         sock.queue(read, pending);
+        self.net_watch(cx, sock);
+    }
+
+    /// Has the process's network thread look after a socket (starting it the first time), and wakes it.
+    pub(crate) fn net_watch(&mut self, cx: &mut Cx<'_>, sock: &Arc<Sock>) {
         let start = {
             let mut pump = lock(&self.process.net);
             if !pump.socks.iter().any(|w| w.as_ptr() == Arc::as_ptr(sock)) {
@@ -467,6 +558,7 @@ pub(crate) fn pump(task: &mut Task, cx: &mut Cx<'_>) -> Reply {
         let mut any = false;
         for s in &socks {
             any |= s.progress(&k, cx);
+            s.evaluate(&k);
         }
         if any {
             continue;

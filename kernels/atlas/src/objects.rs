@@ -51,6 +51,8 @@ pub struct State {
     pub abandoned: bool,
     /// A thread's or process's exit code, once it has ended.
     pub exit: Option<u32>,
+    /// An ended process's creation and exit times (FILETIMEs), which its handles can still ask for.
+    pub times: Option<(u64, u64)>,
     pub waiters: Vec<Arc<Waiter>>,
 }
 
@@ -99,6 +101,12 @@ impl Object {
     }
 }
 
+/// A name as the namespace keeps it: `Local\X` is the session's `X`, and the machine has one session, whose
+/// namespace `Global\X` is too (as sections' names are kept).
+pub fn namespaced(name: &str) -> &str {
+    name.strip_prefix("Local\\").or_else(|| name.strip_prefix("Global\\")).unwrap_or(name)
+}
+
 /// The object manager's part of the kernel.
 #[derive(Default)]
 pub struct Objects {
@@ -119,12 +127,17 @@ impl Objects {
 
     /// The object called `name`, if it still exists.
     pub fn named(&self, name: &str) -> Option<Arc<Object>> {
-        lock(&self.names).get(name).and_then(Weak::upgrade)
+        lock(&self.names).get(namespaced(name)).and_then(Weak::upgrade)
+    }
+
+    /// An object's name, if it has one (as the namespace keeps it: without `Local\` or `Global\`).
+    pub fn name_of(&self, object: &Arc<Object>) -> Option<String> {
+        lock(&self.names).iter().find(|(_, w)| w.upgrade().is_some_and(|o| Arc::ptr_eq(&o, object))).map(|(n, _)| n.clone())
     }
 
     /// Makes an object, or with a name already taken, gives the existing one (and true), if it's of the same kind.
     pub fn create(&self, name: Option<&str>, kind: Kind, state: State) -> Result<(Arc<Object>, bool), ()> {
-        let Some(name) = name else { return Ok((Object::new(kind, state), false)) };
+        let Some(name) = name.map(namespaced) else { return Ok((Object::new(kind, state), false)) };
         let mut names = lock(&self.names);
         if let Some(existing) = names.get(name).and_then(Weak::upgrade) {
             return if std::mem::discriminant(&existing.kind) == std::mem::discriminant(&kind) { Ok((existing, true)) } else { Err(()) };

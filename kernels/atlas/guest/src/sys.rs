@@ -196,3 +196,17 @@ pub fn continue_with(context: &crate::arch::Context) -> ! {
 pub fn debug_print(text: &[u8]) {
     call4(call::DEBUG_PRINT, text.as_ptr() as usize as u64, text.len() as u64, 0, 0);
 }
+
+/// Whether the machine is traced, asked once.
+pub fn tracing() -> bool {
+    use core::sync::atomic::{AtomicU8, Ordering};
+    static TRACING: AtomicU8 = AtomicU8::new(0);
+    match TRACING.load(Ordering::Relaxed) {
+        0 => {
+            let on = call4(call::TRACING, 0, 0, 0, 0) == 1;
+            TRACING.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+        v => v == 2,
+    }
+}

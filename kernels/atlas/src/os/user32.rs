@@ -300,7 +300,7 @@ dll! {
     host GetKeyboardState(1) => get_keyboard_state;
     host GetMessageExtraInfo(0) => get_message_extra_info;
     host GetMessageTime(0) => get_message_time;
-    missing GetPointerInfo;
+    host GetPointerInfo(2) => no_pointer;
     host GetPropW(2) => get_prop_w;
     host GetQueueStatus(1) => get_queue_status;
     missing GetRawInputBuffer;
@@ -311,8 +311,8 @@ dll! {
     host GetUpdateRect(3) => get_update_rect;
     host GetWindowInfo(2) => get_window_info;
     host GetWindowPlacement(2) => get_window_placement;
-    missing InitializeTouchInjection;
-    missing InjectTouchInput;
+    host InitializeTouchInjection(2) => no_touch_injection;
+    host InjectTouchInput(2) => no_touch_injection;
     host IntersectRect(3) => intersect_rect;
     host IsChild(2) => is_child;
     host IsProcessDPIAware(0) => succeed;
@@ -359,7 +359,7 @@ dll! {
     host UnregisterDeviceNotification(1) => succeed;
     host VkKeyScanExA(2) => vk_key_scan_ex;
     host VkKeyScanExW(2) => vk_key_scan_ex;
-    missing WindowFromDC;
+    host WindowFromDC(1) => window_from_dc;
     missing keybd_event;
     host GetClassNameW(3) => get_class_name_w;
     missing BeginDeferWindowPos;
@@ -384,17 +384,17 @@ dll! {
     missing DrawFrameControl;
     missing EndDeferWindowPos;
     missing EnumDisplaySettingsExW;
-    missing EnumThreadWindows;
+    host EnumThreadWindows(3) => enum_thread_windows;
     host EqualRect(2) => equal_rect;
     host GetCaretBlinkTime(0) => get_caret_blink_time;
     host GetGuiResources(2) => zero;
     missing GetLastInputInfo;
     missing GetLayeredWindowAttributes;
     missing GetMenuInfo;
-    missing GetPointerDevice;
-    missing GetPointerDevices;
-    missing GetPointerPenInfo;
-    missing GetPointerType;
+    host GetPointerDevice(2) => no_pointer;
+    host GetPointerDevices(2) => get_pointer_devices;
+    host GetPointerPenInfo(2) => no_pointer;
+    host GetPointerType(2) => no_pointer;
     missing GetRawInputDeviceInfoW;
     missing GetWindowDC;
     missing GetWindowRgn;
@@ -940,7 +940,7 @@ fn get_class_long_ptr_w(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
     let width = task.abi().width;
     let v = {
         let w = task.win32k();
-        let Some(class) = w.windows.get(&a[0]).and_then(|win| w.class_by_name(&win.class)) else { return Reply::Value(0) };
+        let Some(class) = w.window_class(a[0]) else { return Reply::Value(0) };
         match a[1] as i32 {
             -10 => class.background,         // GCLP_HBRBACKGROUND
             -12 => class.cursor,             // GCLP_HCURSOR
@@ -964,12 +964,12 @@ fn class_extra(class: &Class, width: u64) -> usize {
 /// aren't drawn, so they're kept nowhere. What it had before.
 fn set_class_long(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let mut w = task.win32k();
-    let Some(name) = w.windows.get(&a[0]).map(|win| win.class.clone()) else {
+    let Some((pid, name)) = w.windows.get(&a[0]).map(|win| (win.pid, win.class.clone())) else {
         drop(w);
         task.set_last_error(cx, win32k::ERROR_INVALID_WINDOW_HANDLE);
         return Reply::Value(0);
     };
-    let Some(class) = w.class_mut(&name) else { return Reply::Value(0) };
+    let Some(class) = w.class_mut(pid, &name) else { return Reply::Value(0) };
     let new = a[2];
     let old = match a[1] as i32 {
         -10 => std::mem::replace(&mut class.background, new),
@@ -994,7 +994,8 @@ fn set_class_long(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 fn class_info(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], ex: bool, ansi: bool) -> Reply {
     let name = task.class_named_as(cx, a[1], !ansi).unwrap_or_default();
     let width = task.abi().width;
-    let Some(class) = task.win32k().class_by_name(&name).cloned() else {
+    let pid = task.process.pid;
+    let Some(class) = task.win32k().class_by_name(pid, &name).cloned() else {
         task.set_last_error(cx, 1411);
         return Reply::Value(0);
     };
@@ -1520,6 +1521,19 @@ fn enum_windows(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     // Top first, as Windows enumerates them.
     let top = task.win32k().z_order(DESKTOP);
     enumerate(task, cx, top, a[0], a[1])
+}
+
+/// `EnumThreadWindows(thread ID, callback, param)`: that thread's top-level windows, top first, to the callback until
+/// it returns FALSE; FALSE if it had none.
+fn enum_thread_windows(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let mine: Vec<u64> = {
+        let w = task.win32k();
+        w.z_order(DESKTOP).into_iter().filter(|h| w.windows.get(h).is_some_and(|win| win.tid == a[0])).collect()
+    };
+    if mine.is_empty() {
+        return Reply::Value(0);
+    }
+    enumerate(task, cx, mine, a[1], a[2])
 }
 
 /// `GetWindow`: GW_HWNDFIRST, GW_HWNDLAST, GW_HWNDNEXT (the one below) and GW_HWNDPREV (above) among its siblings
@@ -2434,4 +2448,10 @@ fn set_parent(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let old = win.parent;
     win.parent = if a[1] == win32k::DESKTOP { 0 } else { a[1] };
     Reply::Value(if old == 0 { win32k::DESKTOP } else { old })
+}
+
+/// `WindowFromDC(dc)`: the window a DC draws in; NULL for a memory DC's, the screen's, or a DC that isn't one.
+fn window_from_dc(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let w = task.win32k();
+    Reply::Value(w.gdi.dcs.get(&a[0]).filter(|dc| !dc.memory).map_or(0, |dc| dc.hwnd))
 }

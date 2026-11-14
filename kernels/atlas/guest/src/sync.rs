@@ -489,9 +489,14 @@ pub extern "system" fn AtlasQueryDepthSList(head: *mut SListHeader) -> u16 {
     with_slists(|| unsafe { (*head).depth })
 }
 
-// ---- TLS and FLS slots: 64 of each, given out from a bitmap ----
+// ---- TLS slots: 64 in the TEB and 1024 more in its expansion array, as Windows has; FLS slots: 64 ----
 
 static TLS_USED: AtomicU64 = AtomicU64::new(0);
+/// The expansion slots' bitmap: slot 64 + 64 × word + bit.
+static TLS_EXPANSION_USED: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+/// TLS_MINIMUM_AVAILABLE and TLS_EXPANSION_SLOTS.
+const TLS_MINIMUM: u32 = 64;
+const TLS_EXPANSION: u32 = 1024;
 static FLS_USED: AtomicU64 = AtomicU64::new(0);
 const OUT_OF_INDEXES: u32 = u32::MAX;
 const ERROR_INVALID_PARAMETER: u32 = 87;
@@ -518,9 +523,38 @@ fn free_slot(used: &AtomicU64, slot: u32) -> i32 {
     1
 }
 
-fn tls_slot(slot: u32) -> *mut usize {
-    // SAFETY: TlsSlots, 64 of them, in this thread's TEB.
-    unsafe { crate::teb().add(teb::TLS_SLOTS as usize).cast::<usize>().add(slot as usize) }
+/// A thread's TLS slot, by its TEB: one of the 64 in it, or one in its expansion array, which is made if `make` and
+/// there's none yet (else null).
+fn tls_slot_of(teb: *mut u8, slot: u32, make: bool) -> *mut usize {
+    // SAFETY: TlsSlots and TlsExpansionSlots in a live thread's TEB, and the array it points at.
+    unsafe {
+        if slot < TLS_MINIMUM {
+            return teb.add(teb::TLS_SLOTS as usize).cast::<usize>().add(slot as usize);
+        }
+        let array = teb.add(teb::TLS_EXPANSION_SLOTS as usize).cast::<*mut usize>();
+        if (*array).is_null() {
+            if !make {
+                return core::ptr::null_mut();
+            }
+            *array = crate::heap::allocate(TLS_EXPANSION as usize * size_of::<usize>(), true).cast();
+            if (*array).is_null() {
+                return core::ptr::null_mut();
+            }
+        }
+        (*array).add((slot - TLS_MINIMUM) as usize)
+    }
+}
+
+/// This thread's expansion slots, as it ends.
+pub fn release_tls_expansion() {
+    // SAFETY: TlsExpansionSlots in this thread's TEB.
+    unsafe {
+        let array = crate::teb().add(teb::TLS_EXPANSION_SLOTS as usize).cast::<*mut usize>();
+        let slots = core::mem::take(&mut *array);
+        if !slots.is_null() {
+            crate::heap::free(slots.cast());
+        }
+    }
 }
 
 /// An FLS block: two links into the list of every block (so `FlsFree` can reach every thread's and fiber's value),
@@ -623,40 +657,80 @@ pub fn release_thread_fls() {
     release_fls(slots);
 }
 
+/// `TlsAlloc()`: one of the TEB's 64 slots, then one of the 1024 expansion slots; TLS_OUT_OF_INDEXES when all are
+/// taken.
 #[unsafe(no_mangle)]
 pub extern "system" fn AtlasTlsAlloc() -> u32 {
-    alloc_slot(&TLS_USED)
+    if TLS_USED.load(Ordering::Acquire) != u64::MAX {
+        let slot = alloc_slot(&TLS_USED);
+        if slot != OUT_OF_INDEXES {
+            return slot;
+        }
+    }
+    for (i, word) in TLS_EXPANSION_USED.iter().enumerate() {
+        if word.load(Ordering::Acquire) != u64::MAX {
+            let bit = alloc_slot(word);
+            if bit != OUT_OF_INDEXES {
+                return TLS_MINIMUM + 64 * i as u32 + bit;
+            }
+        }
+    }
+    crate::RtlSetLastWin32Error(8); // ERROR_NOT_ENOUGH_MEMORY
+    OUT_OF_INDEXES
 }
 
+/// `TlsFree(slot)`: the slot is free again, and every thread's value in it is 0, as Windows clears it.
 #[unsafe(no_mangle)]
 pub extern "system" fn AtlasTlsFree(slot: u32) -> i32 {
-    free_slot(&TLS_USED, slot)
+    let freed = match slot {
+        s if s < TLS_MINIMUM => free_slot(&TLS_USED, s),
+        s if s < TLS_MINIMUM + TLS_EXPANSION => {
+            let i = s - TLS_MINIMUM;
+            free_slot(&TLS_EXPANSION_USED[(i / 64) as usize], i % 64)
+        }
+        _ => {
+            crate::RtlSetLastWin32Error(ERROR_INVALID_PARAMETER);
+            0
+        }
+    };
+    if freed != 0 {
+        crate::loader::for_each_thread(|teb| {
+            let at = tls_slot_of(teb as usize as *mut u8, slot, false);
+            if !at.is_null() {
+                // SAFETY: the thread's slot, which the loader's lock keeps from going.
+                unsafe { at.write(0) };
+            }
+        });
+    }
+    freed
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn AtlasTlsGetValue(slot: u32) -> usize {
-    let result = (|| -> u64 {
-        if slot >= 64 {
-            crate::RtlSetLastWin32Error(ERROR_INVALID_PARAMETER);
-            return 0;
-        }
-        // TlsGetValue clears the last error when it succeeds, so a zero value can be told from a failure.
-        crate::RtlSetLastWin32Error(0);
-        // SAFETY: a slot in this thread's TEB.
-        unsafe { (tls_slot(slot).read()) as u64 }
-    })();
-    result as usize
+    if slot >= TLS_MINIMUM + TLS_EXPANSION {
+        crate::RtlSetLastWin32Error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // TlsGetValue clears the last error when it succeeds, so a zero value can be told from a failure.
+    crate::RtlSetLastWin32Error(0);
+    let at = tls_slot_of(crate::teb(), slot, false);
+    // SAFETY: a slot of this thread's; an expansion slot never set is 0.
+    if at.is_null() { 0 } else { unsafe { at.read() } }
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn AtlasTlsSetValue(slot: u32, value: usize) -> i32 {
-    let value = value as u64;
-    if slot >= 64 {
+    if slot >= TLS_MINIMUM + TLS_EXPANSION {
         crate::RtlSetLastWin32Error(ERROR_INVALID_PARAMETER);
         return 0;
     }
+    let at = tls_slot_of(crate::teb(), slot, true);
+    if at.is_null() {
+        crate::RtlSetLastWin32Error(8); // ERROR_NOT_ENOUGH_MEMORY
+        return 0;
+    }
     // SAFETY: as above.
-    unsafe { tls_slot(slot).write(value as usize) };
+    unsafe { at.write(value) };
     1
 }
 

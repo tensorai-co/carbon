@@ -336,6 +336,47 @@ pub fn get_user_geo_id(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
     Reply::Value(244)
 }
 
+/// `GetGeoInfoW(geo ID, type, buffer, room, language)`: what Windows says of the United States (244), the one place
+/// the machine knows: as text, its length with the NUL, or the room it needs when `room` is 0.
+pub fn get_geo_info_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    const ERROR_INVALID_PARAMETER: u32 = 87;
+    const ERROR_INVALID_FLAGS: u32 = 1004;
+    if a[0] as u32 != 244 {
+        return task.fail(cx, ERROR_INVALID_PARAMETER);
+    }
+    let text = match a[1] as u32 {
+        1 | 18 => "244",          // GEO_NATION, GEO_ID
+        2 => "39.45",             // GEO_LATITUDE
+        3 => "-98.908",           // GEO_LONGITUDE
+        4 | 17 => "US",           // GEO_ISO2, GEO_NAME
+        5 => "USA",               // GEO_ISO3
+        6 => "en-US",             // GEO_RFC1766
+        7 => "00000409",          // GEO_LCID
+        8 => "United States",     // GEO_FRIENDLYNAME
+        9 => "United States",     // GEO_OFFICIALNAME
+        11 => "en",               // GEO_OFFICIALLANGUAGES
+        12 => "840",              // GEO_ISO_UN_NUMBER
+        13 => "39070",            // GEO_PARENT: Northern America's
+        14 => "1",                // GEO_DIALINGCODE
+        15 => "USD",              // GEO_CURRENCYCODE
+        16 => "$",                // GEO_CURRENCYSYMBOL
+        _ => return task.fail(cx, ERROR_INVALID_FLAGS),
+    };
+    let units: Vec<u8> = text.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+    let need = (units.len() / 2) as u64;
+    let room = u64::from(a[3] as u32);
+    if room == 0 {
+        return Reply::Value(need);
+    }
+    if room < need {
+        return task.fail(cx, ERROR_INSUFFICIENT_BUFFER);
+    }
+    if task.mem(cx, true, |t| user::write(&mut t.space(), a[2], &units)).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(need)
+}
+
 /// `GetThreadPreferredUILanguages(flags, &count, out, &room)` (and the user's and process's forms): en-US, one.
 pub fn get_preferred_ui_languages(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let list: Vec<u8> = "en-US\0\0".encode_utf16().flat_map(u16::to_le_bytes).collect();

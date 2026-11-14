@@ -10,7 +10,7 @@
 //! the process ending (`DLL_THREAD_DETACH`, `DLL_PROCESS_DETACH`), in the reverse of the order they started.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use atlas_abi::{ldr, peb, status, teb};
 
@@ -22,6 +22,8 @@ const MOST_MODULES: usize = 128;
 const MOST_TLS: usize = 64;
 const MOST_DEPS: usize = 16;
 const MOST_NOTIFICATIONS: usize = 8;
+/// The most threads whose TEBs the loader keeps, to give a DLL loaded later its static TLS on each.
+const MOST_THREADS: usize = 1024;
 const DLL_PROCESS_DETACH: u32 = 0;
 const DLL_PROCESS_ATTACH: u32 = 1;
 const DLL_THREAD_ATTACH: u32 = 2;
@@ -75,6 +77,8 @@ struct Table {
     ldr: u64,
     /// `LdrRegisterDllNotification`'s callbacks and their contexts; a cookie is its slot plus one.
     notifications: [(u64, u64); MOST_NOTIFICATIONS],
+    /// Every thread's TEB (0 where a slot is free): a DLL with static TLS loaded later gives each its block.
+    threads: [u64; MOST_THREADS],
 }
 
 struct Loader {
@@ -102,7 +106,7 @@ const EMPTY: Module = Module {
 };
 static LOADER: Loader = Loader {
     busy: AtomicBool::new(false),
-    table: UnsafeCell::new(Table { modules: [EMPTY; MOST_MODULES], count: 0, tls_count: 0, next_order: 1, ldr: 0, notifications: [(0, 0); MOST_NOTIFICATIONS] }),
+    table: UnsafeCell::new(Table { modules: [EMPTY; MOST_MODULES], count: 0, tls_count: 0, next_order: 1, ldr: 0, notifications: [(0, 0); MOST_NOTIFICATIONS], threads: [0; MOST_THREADS] }),
 };
 /// Set once the process has begun to end: DLLs have been, or are being, told.
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
@@ -522,14 +526,21 @@ fn set_up_tls(image: Image) {
             core::ptr::write_volatile(index_at as *mut u32, index as u32);
         }
     }
+    // Every thread there is gets its block, as Windows gives a DLL loaded later its TLS on each: under the loader's
+    // lock, so none ends meanwhile or starts without seeing it (a thread starting gives itself the blocks it lacks).
+    with(|t| {
+        for &teb in t.threads.iter().filter(|&&teb| teb != 0) {
+            tls_block_of(teb, index, dir);
+        }
+    });
     tls_block(index, dir);
 }
 
-/// This thread's static TLS slots, made if it has none yet.
-fn tls_slots() -> *mut usize {
-    // SAFETY: this thread's TEB.
+/// A thread's static TLS slots, by its TEB, made if it has none yet.
+fn tls_slots_of(teb: u64) -> *mut usize {
+    // SAFETY: a live thread's TEB, which the loader's lock keeps from ending, or this thread's.
     unsafe {
-        let slots = crate::teb().add(teb::THREAD_LOCAL_STORAGE as usize).cast::<*mut usize>();
+        let slots = (teb as usize as *mut u8).add(teb::THREAD_LOCAL_STORAGE as usize).cast::<*mut usize>();
         if (*slots).is_null() {
             *slots = crate::heap::allocate(MOST_TLS * PTR as usize, true).cast();
         }
@@ -537,16 +548,57 @@ fn tls_slots() -> *mut usize {
     }
 }
 
-/// This thread's block for one module's static TLS: a copy of its template, then zeros.
+/// This thread's block for one module's static TLS, unless it has one: a copy of its template, then zeros.
 fn tls_block(index: usize, dir: u64) {
-    // SAFETY: the TLS directory and its template in a mapped image, and this thread's slots.
+    tls_block_of(crate::teb() as u64, index, dir);
+}
+
+/// A thread's block for one module's static TLS, by its TEB, unless it has one already.
+fn tls_block_of(teb: u64, index: usize, dir: u64) {
+    // SAFETY: the TLS directory and its template in a mapped image, and the thread's slots.
     unsafe {
+        let slot = tls_slots_of(teb).add(index);
+        if *slot != 0 {
+            return;
+        }
         let (start, end) = (ptr_at(dir), ptr_at(dir + PTR));
         let zero_fill = u64::from(u32_at(dir + 4 * PTR));
         let block = crate::heap::allocate(((end - start + zero_fill) as usize).max(16), true);
         core::ptr::copy_nonoverlapping(start as *const u8, block, (end - start) as usize);
-        *tls_slots().add(index) = (block as u64) as usize;
+        *slot = (block as u64) as usize;
     }
+}
+
+/// This thread, among those a DLL loaded later gives static TLS to.
+fn register_thread() {
+    let teb = crate::teb() as u64;
+    with(|t| {
+        if !t.threads.contains(&teb)
+            && let Some(free) = t.threads.iter_mut().find(|s| **s == 0)
+        {
+            *free = teb;
+        }
+    });
+}
+
+/// Runs `f` on every thread's TEB there is, under the loader's lock, so none ends meanwhile: how `TlsFree` clears
+/// a slot in every thread.
+pub fn for_each_thread(mut f: impl FnMut(u64)) {
+    with(|t| {
+        for &teb in t.threads.iter().filter(|&&teb| teb != 0) {
+            f(teb);
+        }
+    });
+}
+
+/// This thread, ending: no DLL loaded from now on gives it TLS.
+fn unregister_thread() {
+    let teb = crate::teb() as u64;
+    with(|t| {
+        if let Some(slot) = t.threads.iter_mut().find(|s| **s == teb) {
+            *slot = 0;
+        }
+    });
 }
 
 /// Lets go of this thread's static TLS blocks, as it ends.
@@ -629,6 +681,7 @@ fn exe() -> Image {
 pub extern "system" fn AtlasThreadStart(start: usize, parameter: usize) -> ! {
     let (start, parameter) = (start as u64, parameter as u64);
     sys::call4(atlas_abi::call::THREAD_STARTED, 0, 0, 0, 0);
+    register_thread();
     let mut at = 0;
     loop {
         let next = with(|t| {
@@ -671,7 +724,9 @@ pub extern "system" fn AtlasExitThread(code: u32) -> ! {
             run_tls_callbacks(Image(base), DLL_THREAD_DETACH);
             dll_main(base, DLL_THREAD_DETACH, 0);
         }
+        unregister_thread();
         free_tls_blocks();
+        crate::sync::release_tls_expansion();
     }
     sys::call4(atlas_abi::call::EXIT_THREAD, u64::from(code), 0, 0, 0);
     sys::terminate(code)
@@ -763,6 +818,7 @@ pub extern "system" fn AtlasProcessStart(peb_at: usize, ntdll: usize) -> ! {
         (exe, path)
     };
     // As on Windows, the program comes first in load order, then ntdll, then kernel32, whatever the program imports.
+    register_thread();
     add(exe, ascii_name(&path), path, true, PINNED);
     let mut ntdll_path = [0u16; 260];
     for (i, b) in b"C:\\Windows\\System32\\ntdll.dll".iter().enumerate() {
@@ -1156,6 +1212,14 @@ pub extern "system" fn RtlCaptureStackBackTrace(_skip: u32, _count: u32, _frames
     0
 }
 
+/// Traced, a lookup by name that found nothing: what the program will get NULL for, and may call anyway. The module
+/// is by its base, as the host's `maps` lines give it.
+fn traced_miss(base: u64, name: &[u8]) {
+    if crate::sys::tracing() {
+        Message::new().text(b"atlas-guest: no export ").text(name).text(b" in the module at ").hex(base).text(b"\n").print();
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn AtlasGetProcAddress(module: usize, name: usize) -> usize {
     let (module, name) = (module as u64, name as u64);
@@ -1170,6 +1234,10 @@ pub extern "system" fn AtlasGetProcAddress(module: usize, name: usize) -> usize 
         // SAFETY: the program's string, if it isn't an ordinal.
         let wanted = if name < 0x1_0000 { Wanted::Ordinal(name as u16) } else { Wanted::Name(unsafe { cstr(name) }) };
         resolve(base, wanted, 0).unwrap_or_else(|| {
+            if name >= 0x1_0000 {
+                // SAFETY: as above.
+                traced_miss(base, unsafe { cstr(name) });
+            }
             set_last_error(ERROR_PROC_NOT_FOUND);
             0
         })
@@ -1303,7 +1371,10 @@ pub extern "system" fn LdrGetProcedureAddress(base: usize, name: usize, ordinal:
     } else {
         // SAFETY: the program's ANSI_STRING, whose buffer needn't end in a NUL.
         let wanted = unsafe { core::slice::from_raw_parts(ptr_at(name + PTR) as usize as *const u8, usize::from(u16_at(name))) };
-        resolve(base, Wanted::Name(wanted), 0).ok_or(status::PROCEDURE_NOT_FOUND)
+        resolve(base, Wanted::Name(wanted), 0).ok_or_else(|| {
+            traced_miss(base, wanted);
+            status::PROCEDURE_NOT_FOUND
+        })
     };
     match found {
         Ok(at) => {
@@ -1346,7 +1417,8 @@ pub extern "system" fn LdrResolveDelayLoadedAPI(parent: usize, descriptor: usize
             let rva = |at: u64| parent + u64::from(u32_at(descriptor + at));
             let dll = cstr(rva(4));
             let (handle_at, iat, names) = (rva(8), rva(12), rva(16));
-            let index = thunk.wrapping_sub(iat) / 8;
+            // Thunks are pointers: 8 bytes, or 4 for a 32-bit program.
+            let index = thunk.wrapping_sub(iat) / PTR;
             let entry = ptr_at(names + index * PTR);
             let (wanted, by_name, name_at) = if entry & ORDINAL != 0 {
                 (Wanted::Ordinal(entry as u16), false, entry & 0xffff)
@@ -1358,12 +1430,13 @@ pub extern "system" fn LdrResolveDelayLoadedAPI(parent: usize, descriptor: usize
             if module == 0 {
                 match load_dynamic(dll) {
                     Ok(base) => {
-                        let slot = &*(handle_at as *const AtomicU64);
+                        // The handle's slot is pointer-sized, as the descriptor's module handle is.
+                        let slot = &*(handle_at as usize as *const core::sync::atomic::AtomicUsize);
                         // Another thread got here first: its reference is the one kept.
-                        if slot.compare_exchange(0, base, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                        if slot.compare_exchange(0, base as usize, Ordering::AcqRel, Ordering::Acquire).is_err() {
                             release(base);
                         }
-                        module = slot.load(Ordering::Acquire);
+                        module = slot.load(Ordering::Acquire) as u64;
                     }
                     Err(_) => {
                         set_last_error(ERROR_MOD_NOT_FOUND);

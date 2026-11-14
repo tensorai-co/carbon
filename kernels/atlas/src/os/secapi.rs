@@ -154,7 +154,7 @@ impl Task {
 
     /// The token a handle is: one of its own, or a pseudo-handle: the process's (-4), the thread's (-5), or
     /// whichever this thread acts as (-6).
-    fn token_of(&mut self, cx: &mut Cx<'_>, handle: u64) -> Result<Arc<Token>, u64> {
+    pub(crate) fn token_of(&mut self, cx: &mut Cx<'_>, handle: u64) -> Result<Arc<Token>, u64> {
         match handle {
             CURRENT_PROCESS_TOKEN => return Ok(lock(&self.process.state).token.clone()),
             CURRENT_THREAD_EFFECTIVE_TOKEN => return Ok(self.effective_token()),
@@ -309,7 +309,7 @@ pub fn get_token_information(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Rep
         let data = match class {
             1 => {
                 let mut b = Blob::new(buffer, Blob::sid_and_attributes_size(w), w);
-                b.sid_and_attributes(0, &s.user, 0);
+                b.sid_and_attributes(0, &s.user, if s.user_deny_only { SE_GROUP_USE_FOR_DENY_ONLY } else { 0 });
                 b.bytes
             }
             2 => groups_blob(buffer, &s.groups, w),
@@ -338,7 +338,8 @@ pub fn get_token_information(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Rep
                 b.set_u64(48, s.modified);
                 b.bytes
             }
-            11 | 30 => groups_blob(buffer, &[], w),
+            11 => groups_blob(buffer, &s.restricted, w),
+            30 => groups_blob(buffer, &[], w),
             12 => u32s(s.session),
             17 => LOGON.to_le_bytes().to_vec(),
             18 => u32s(1),
@@ -502,6 +503,80 @@ pub fn duplicate_token_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply 
         let inheritable = task.inheritable_by(cx, a[2]);
         let handle = task.new_token_handle(token.duplicate(kind, level), inheritable);
         task.put_ptr(cx, a[5], handle)?;
+        Ok(TRUE)
+    })();
+    reply(r)
+}
+
+/// `CreateRestrictedToken(token, flags, disable count, &SIDs to disable, delete count, &privileges to delete, restrict
+/// count, &restricting SIDs, &new)`: a copy of the same kind with those SIDs (the user's too) deny-only, those
+/// privileges gone (all but SeChangeNotifyPrivilege with DISABLE_MAX_PRIVILEGE), and the restricting SIDs added. With
+/// LUA_TOKEN, Administrators is deny-only and the token is at medium integrity with a standard user's privileges.
+pub fn create_restricted_token(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    const DISABLE_MAX_PRIVILEGE: u32 = 0x1;
+    const LUA_TOKEN: u32 = 0x4;
+    const WRITE_RESTRICTED: u32 = 0x8;
+    /// SE_GROUP_ENABLED and SE_GROUP_ENABLED_BY_DEFAULT.
+    const ENABLED: u32 = 0x6;
+    /// SID_AND_ATTRIBUTES' SIDs: a pointer and a DWORD each, two pointers' room.
+    fn sids(task: &mut Task, cx: &mut Cx<'_>, n: u64, at: u64) -> Result<Vec<Sid>, u64> {
+        let w = task.abi().width;
+        let mut out = Vec::new();
+        for i in 0..n.min(1024) {
+            let Ok(p) = task.mem(cx, false, |t| user::read_ptr(&t.space(), at + i * 2 * w, w)) else { return Err(task.failed(cx, 998)) };
+            out.push(task.read_sid(cx, p)?);
+        }
+        Ok(out)
+    }
+    let r = (|| {
+        let token = task.token_of(cx, a[0])?;
+        let flags = a[1] as u32;
+        let disable = sids(task, cx, a[2] as u32 as u64, a[3])?;
+        let mut delete = Vec::new();
+        for i in 0..(a[4] as u32).min(64) {
+            // LUID_AND_ATTRIBUTES: the LUID's low part, its high part, then the attributes.
+            let Ok(luid) = task.mem(cx, false, |t| user::read_u32(&t.space(), a[5] + u64::from(i) * 12)) else { return Err(task.failed(cx, 998)) };
+            delete.push(luid);
+        }
+        let restrict = sids(task, cx, a[6] as u32 as u64, a[7])?;
+        let mut s = lock(&token.state).clone();
+        let deny = |s: &mut TokenState, sid: &Sid| {
+            if *sid == s.user {
+                s.user_deny_only = true;
+            }
+            for g in s.groups.iter_mut().filter(|g| g.0 == *sid && g.1 & SE_GROUP_INTEGRITY == 0) {
+                g.1 = (g.1 & !ENABLED) | SE_GROUP_USE_FOR_DENY_ONLY;
+            }
+        };
+        for sid in &disable {
+            deny(&mut s, sid);
+        }
+        if flags & LUA_TOKEN != 0 {
+            let administrators = Sid::new(5, &[32, 544]);
+            deny(&mut s, &administrators);
+            for g in s.groups.iter_mut().filter(|g| g.1 & SE_GROUP_INTEGRITY != 0) {
+                g.0 = Sid::new(16, &[8192]);
+            }
+            // A standard user's: shutdown, change notify, undock, working set, time zone.
+            s.privileges.retain(|p| matches!(p.0, 19 | 23 | 25 | 33 | 34));
+            if s.owner == administrators {
+                s.owner = s.user.clone();
+            }
+        }
+        if flags & DISABLE_MAX_PRIVILEGE != 0 {
+            s.privileges.retain(|p| p.0 == 23);
+        } else {
+            s.privileges.retain(|p| !delete.contains(&p.0));
+        }
+        for sid in restrict {
+            if !s.restricted.iter().any(|(r, _)| *r == sid) {
+                s.restricted.push((sid, GROUP_DEFAULT));
+            }
+        }
+        s.write_restricted |= flags & WRITE_RESTRICTED != 0;
+        s.modified = new_luid();
+        let handle = task.new_token_handle(Token::with(s), false);
+        task.put_ptr(cx, a[8], handle)?;
         Ok(TRUE)
     })();
     reply(r)
@@ -1245,7 +1320,7 @@ impl Task {
         let found = lock(&self.process.state).handles.get(handle);
         Ok(match found {
             Some(Handle::Object(o)) => Target::Object(o),
-            Some(Handle::Section(s)) => Target::Section(s),
+            Some(Handle::Section(s, _)) => Target::Section(s),
             Some(Handle::File(f)) => Target::File(f.path.to_ascii_lowercase()),
             Some(Handle::Key(id)) => Target::Key(id),
             Some(Handle::Token(t)) => Target::Token(t),

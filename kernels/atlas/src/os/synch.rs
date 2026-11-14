@@ -68,6 +68,10 @@ impl Task {
         let inheritable = self.inheritable_by(cx, attributes);
         match self.k.objects.create(name.as_deref(), kind, state) {
             Ok((object, existed)) => {
+                if self.k.options.trace && let Some(name) = &name {
+                    let how = if existed { "opens" } else { "makes" };
+                    self.k.host.write(host::Stream::Err, format!("[{}] {how} named object {name:?}\n", self.tid).as_bytes());
+                }
                 if !existed && let Some(d) = self.attributes_descriptor(cx, attributes) {
                     let d = d.filled(&lock(&self.effective_token().state)).mapped(&super::secapi::kind_mapping(&object.kind));
                     *lock(&object.security) = Some(d);
@@ -89,7 +93,12 @@ impl Task {
 
     /// `Open*`, by a UTF-16 name or an ANSI one.
     fn open_named(&mut self, cx: &mut Cx<'_>, access: u64, name: u64, wide: bool, kind: fn(&Kind) -> bool, mapping: &crate::security::Mapping) -> Reply {
-        let found = self.name(cx, name, wide).and_then(|n| self.k.objects.named(&n)).filter(|o| kind(&o.kind));
+        let text = self.name(cx, name, wide);
+        let found = text.as_deref().and_then(|n| self.k.objects.named(n)).filter(|o| kind(&o.kind));
+        if self.k.options.trace && let Some(text) = &text {
+            let how = if found.is_some() { "opens" } else { "finds no" };
+            self.k.host.write(host::Stream::Err, format!("[{}] {how} named object {text:?}\n", self.tid).as_bytes());
+        }
         match found {
             Some(object) if !self.allows(&object.security, access as u32, mapping) => {
                 self.set_last_error(cx, 5); // ERROR_ACCESS_DENIED
@@ -409,7 +418,8 @@ pub fn queue_user_apc(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 /// processes: the new handle goes in the target's table, and its value back to the caller.
 pub fn duplicate_handle(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     const DUPLICATE_CLOSE_SOURCE: u64 = 1;
-    let [source_process, source, target_process, out, _, inherit, options] = [a[0], a[1], a[2], a[3], a[4], a[5], a[6]];
+    const DUPLICATE_SAME_ACCESS: u64 = 2;
+    let [source_process, source, target_process, out, access, inherit, options] = [a[0], a[1], a[2], a[3], a[4], a[5], a[6]];
     let (Some(from), Some(to)) = (task.process_of(source_process), task.process_of(target_process)) else {
         task.set_last_error(cx, ERROR_INVALID_HANDLE);
         return Reply::Value(FALSE);
@@ -421,10 +431,22 @@ pub fn duplicate_handle(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
         CURRENT_PROCESS => Some(Handle::Object(from.object.clone())),
         _ => lock(&from.state).handles.get(source),
     };
-    let Some(handle) = handle else {
+    let Some(mut handle) = handle else {
         task.set_last_error(cx, ERROR_INVALID_HANDLE);
         return Reply::Value(FALSE);
     };
+    // A section's new handle has the rights asked for, never more than the source handle's (which is how a
+    // read-only handle is made from a writable one), or with DUPLICATE_SAME_ACCESS the same ones.
+    if let Handle::Section(section, granted) = &handle
+        && options & DUPLICATE_SAME_ACCESS == 0
+    {
+        let wanted = crate::security::map_generic(access as u32, &crate::security::SECTION);
+        if wanted & !granted != 0 {
+            task.set_last_error(cx, 5); // ERROR_ACCESS_DENIED
+            return Reply::Value(FALSE);
+        }
+        handle = Handle::Section(section.clone(), wanted);
+    }
     let new = lock(&to.state).handles.add_with(handle, inherit as u32 != 0);
     if options & DUPLICATE_CLOSE_SOURCE != 0 {
         lock(&from.state).handles.close(source);

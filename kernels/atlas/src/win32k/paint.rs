@@ -58,8 +58,7 @@ impl Task {
     /// WM_ERASEBKGND's default: fills what the DC may draw with the window's class's background. False if it has none.
     pub fn erase_background(&self, hwnd: u64, hdc: u64) -> bool {
         let mut w = self.win32k();
-        let Some(class) = w.windows.get(&hwnd).map(|win| win.class.clone()) else { return false };
-        let Some(class) = w.class_by_name(&class).cloned() else { return false };
+        let Some(class) = w.window_class(hwnd).cloned() else { return false };
         if class.background == 0 {
             return false;
         }

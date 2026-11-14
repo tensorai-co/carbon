@@ -99,7 +99,7 @@ impl Task {
     }
 
     /// The program's environment as it is now (ntdll keeps it, and its changes, in the process parameters).
-    fn environment_now(&mut self, cx: &mut Cx<'_>) -> Vec<u8> {
+    pub(crate) fn environment_now(&mut self, cx: &mut Cx<'_>) -> Vec<u8> {
         let peb_at = lock(&self.process.state).peb;
         let abi = self.abi();
         let at = self.mem(cx, false, |t| {
@@ -107,6 +107,19 @@ impl Task {
             user::read_ptr(&t.space(), params_at + abi.params.environment, abi.width)
         });
         at.ok().and_then(|at| self.wide_block(cx, at)).unwrap_or_else(|| vec![0, 0])
+    }
+
+    /// The folders in the program's `Path` variable, as it is now.
+    pub(crate) fn path_dirs(&mut self, cx: &mut Cx<'_>) -> Vec<String> {
+        let environment = self.environment_now(cx);
+        let units: Vec<u16> = environment.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let mut dirs = Vec::new();
+        for var in units.split(|&u| u == 0).map(String::from_utf16_lossy) {
+            if var.len() > 5 && var[..5].eq_ignore_ascii_case("path=") {
+                dirs.extend(var[5..].split(';').map(str::trim).filter(|d| !d.is_empty()).map(str::to_string));
+            }
+        }
+        dirs
     }
 
     /// A program at a Windows path: its full path, where it is on the disk, and its bytes.
@@ -128,13 +141,7 @@ impl Task {
         }
         let exe_dir = lock(&self.process.state).exe_dir.clone();
         let mut dirs = vec![format!("C:{}", exe_dir.replace('/', "\\")), self.cwd(), "C:\\Windows\\System32".to_string(), "C:\\Windows".to_string()];
-        let environment = self.environment_now(cx);
-        let units: Vec<u16> = environment.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        for var in units.split(|&u| u == 0).map(String::from_utf16_lossy) {
-            if var.len() > 5 && var[..5].eq_ignore_ascii_case("path=") {
-                dirs.extend(var[5..].split(';').filter(|d| !d.is_empty()).map(str::to_string));
-            }
-        }
+        dirs.extend(self.path_dirs(cx));
         dirs.iter().find_map(|dir| self.program_at(&format!("{}\\{name}", dir.trim_end_matches('\\'))))
     }
 }
@@ -148,7 +155,7 @@ fn first_argument(line: &str) -> &str {
     }
 }
 
-fn create_process(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+fn create_process(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool, token: Option<Arc<crate::security::Token>>) -> Reply {
     let [app, line, process_attributes, thread_attributes, environment, directory, startup_info, information] = [a[0], a[1], a[2], a[3], a[6], a[7], a[8], a[9]];
     let (inherit, flags) = (a[4] as u32 != 0, a[5] as u32);
     let app = task.string_arg(cx, app, wide);
@@ -216,7 +223,10 @@ fn create_process(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Re
         (handles, std_handles)
     };
 
-    let launch = Launch { path, bytes, command_line, environment, cwd: Some(cwd), handles, std_handles, suspended: flags & CREATE_SUSPENDED != 0, parent: task.process.pid };
+    if task.k.options.trace {
+        task.k.host.write(host::Stream::Err, format!("[{}] starts {path}: {command_line}\n", task.tid).as_bytes());
+    }
+    let launch = Launch { path, bytes, command_line, environment, cwd: Some(cwd), handles, std_handles, suspended: flags & CREATE_SUSPENDED != 0, parent: task.process.pid, token };
     let k = task.k.clone();
     let (made, child) = std::sync::mpsc::channel();
     let started = kernels_core::thread::spawn(task.k.exec.clone(), "atlas process".to_string(), move |cx| {
@@ -248,11 +258,20 @@ fn create_process(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Re
 }
 
 pub fn create_process_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    create_process(task, cx, a, true)
+    create_process(task, cx, a, true, None)
+}
+
+/// `CreateProcessAsUserW(token, ...CreateProcessW's arguments)`: the process runs as a primary copy of the token.
+pub fn create_process_as_user_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let token = match task.token_of(cx, a[0]) {
+        Ok(token) => token,
+        Err(value) => return Reply::Value(value),
+    };
+    create_process(task, cx, &a[1..], true, Some(token))
 }
 
 pub fn create_process_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    create_process(task, cx, a, false)
+    create_process(task, cx, a, false, None)
 }
 
 /// `OpenProcess(access, inherit, pid)`.
@@ -544,12 +563,18 @@ fn put_times(task: &mut Task, cx: &mut Cx<'_>, outs: &[(u64, u64)]) -> Reply {
     Reply::Value(TRUE)
 }
 
-/// `GetProcessTimes(process, &created, &exited, &kernel, &user)`: when it started; no exit; CPU time isn't counted
-/// per process yet, so none.
+/// `GetProcessTimes(process, &created, &exited, &kernel, &user)`: when it started, and when it ended if it has (0
+/// while it runs); CPU time isn't counted per process yet, so none.
 pub fn get_process_times(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(process) = task.process_of(a[0]) else { return task.fail(cx, ERROR_INVALID_HANDLE) };
-    let created = lock(&process.state).created;
-    put_times(task, cx, &[(a[1], created), (a[2], 0), (a[3], 0), (a[4], 0)])
+    // A process that has ended is still there for its handles: when it started and when it ended.
+    let (created, exited) = match task.process_of(a[0]) {
+        Some(process) => (lock(&process.state).created, 0),
+        None => match task.object(a[0]) {
+            Some(o) if matches!(o.kind, Kind::Process(_)) => lock(&o.state).times.unwrap_or_default(),
+            _ => return task.fail(cx, ERROR_INVALID_HANDLE),
+        },
+    };
+    put_times(task, cx, &[(a[1], created), (a[2], exited), (a[3], 0), (a[4], 0)])
 }
 
 /// `GetThreadTimes(thread, &created, &exited, &kernel, &user)`: the process's start, and no CPU time counted yet.
@@ -581,9 +606,43 @@ pub fn get_thread_group_affinity(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) ->
     Reply::Value(TRUE)
 }
 
+/// `SetDllDirectoryW(folder)` and `A`: a folder searched for DLLs after the program's own, instead of the current
+/// directory; an empty one just leaves the current directory out; NULL puts the standard search back.
+pub fn set_dll_directory_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    set_dll_directory(task, cx, a, true)
+}
+
+pub fn set_dll_directory_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    set_dll_directory(task, cx, a, false)
+}
+
+fn set_dll_directory(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let folder = match task.string_arg(cx, a[0], wide) {
+        None => None,
+        Some(dir) if dir.is_empty() => Some(String::new()),
+        Some(dir) => match task.resolve(&dir) {
+            Ok((full, _)) => Some(full),
+            Err(e) => return task.fail(cx, e),
+        },
+    };
+    lock(&task.process.state).dll_directory = folder;
+    Reply::Value(TRUE)
+}
+
+/// `SetDefaultDllDirectories(flags)`: from now on DLLs are looked for only where the LOAD_LIBRARY_SEARCH_* flags say:
+/// the program's folder (0x200), the folders added (0x400), System32 (0x800), or all three (0x1000).
+pub fn set_default_dll_directories(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let flags = a[0] as u32;
+    if flags & !0x1e00 != 0 || flags == 0 {
+        return task.fail(cx, ERROR_INVALID_PARAMETER);
+    }
+    lock(&task.process.state).dll_search = flags;
+    Reply::Value(TRUE)
+}
+
 /// What returns a value it was given, or a constant, and does nothing else: `SetHandleCount(n)` gives n back;
 /// `GetCurrentProcessorNumber` is 0; `FlushInstructionCache` (the translator sees code change on its own),
-/// `FlushProcessWriteBuffers`, `SetProcessShutdownParameters`, `SetDllDirectory` and `SetThreadErrorMode` succeed.
+/// `FlushProcessWriteBuffers`, `SetProcessShutdownParameters` and `SetThreadErrorMode` succeed.
 pub fn handle_count(_: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
     Reply::Value(a[0] as u32 as u64)
 }

@@ -739,3 +739,28 @@ pub fn register_notification(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
 pub fn get_caret_blink_time(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
     Reply::Value(530)
 }
+
+// ---- Pointers and touch: the machine has a mouse and a keyboard, and no touch screen or pen ----
+
+/// `GetPointerDevices(&count, devices)`: none.
+pub fn get_pointer_devices(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[0] == 0 {
+        task.set_last_error(cx, 87);
+        return Reply::Value(FALSE);
+    }
+    let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[0], 0));
+    Reply::Value(TRUE)
+}
+
+/// `GetPointerDevice`, `GetPointerType`, `GetPointerInfo`, `GetPointerPenInfo`: no pointer device or pointer
+/// message has an ID these know (pointer messages aren't sent), so ERROR_INVALID_PARAMETER.
+pub fn no_pointer(task: &mut Task, cx: &mut Cx<'_>, _: &[u64]) -> Reply {
+    task.set_last_error(cx, 87);
+    Reply::Value(FALSE)
+}
+
+/// `InitializeTouchInjection` and `InjectTouchInput`: there's no touch screen to inject into (ERROR_NOT_SUPPORTED).
+pub fn no_touch_injection(task: &mut Task, cx: &mut Cx<'_>, _: &[u64]) -> Reply {
+    task.set_last_error(cx, 50);
+    Reply::Value(FALSE)
+}

@@ -7,7 +7,11 @@
 // (NtCreateKey, NtOpenKeyEx, NtSetValueKey, NtQueryValueKey in its three forms and when the buffer is short,
 // NtDeleteKey) and the user's key path; GetThreadContext of the calling thread, of a suspended thread running, and of
 // one suspended while it waits; the Windows Runtime's start and strings (HSTRINGs made, by reference, duplicated,
-// compared and taken apart) and its activation finding no class; event tracing's provider calls; and ProcessPrng.
+// compared and taken apart) and its activation finding no class; event tracing's provider calls; ProcessPrng;
+// restricted tokens (deny-only SIDs and the user, privileges taken away, restricting SIDs); the process's handles
+// listed (ProcessHandleInformation) and one's type and name (NtQueryObject); and on x86-64, ntdll's
+// system-call stubs as Windows 10 lays them out, called as they are and through a copy elsewhere, as a sandbox's
+// interceptions call them.
 
 typedef void *HANDLE;
 typedef void *HWND;
@@ -52,6 +56,14 @@ K int __stdcall GetThreadContext(HANDLE, void *);
 K void __stdcall Sleep(DWORD);
 K void *__stdcall LocalFree(void *);
 K HANDLE __stdcall GetModuleHandleW(const WCHAR *);
+K void *__stdcall GetProcAddress(HANDLE, const char *);
+K void *__stdcall VirtualAlloc(void *, UPTR, DWORD, DWORD);
+K HANDLE __stdcall GetCurrentProcess(void);
+K int __stdcall OpenProcessToken(HANDLE, DWORD, HANDLE *);
+K int __stdcall GetTokenInformation(HANDLE, int, void *, DWORD, DWORD *);
+K int __stdcall CreateRestrictedToken(HANDLE, DWORD, DWORD, void *, DWORD, void *, DWORD, void *, HANDLE *);
+K int __stdcall AllocateAndInitializeSid(void *, BYTE, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, void **);
+K void *__stdcall FreeSid(void *);
 
 K HANDLE __stdcall GetProcessWindowStation(void);
 K HANDLE __stdcall GetThreadDesktop(DWORD);
@@ -410,6 +422,91 @@ void mainCRTStartup(void) {
     ok = ProcessPrng(random, sizeof random);
     for (int i = 0; i < 32; i++) nonzero += random[i] != 0;
     check(ok == 1 && nonzero > 8, "ProcessPrng: random bytes");
+
+    // ---- Restricted tokens ----
+    HANDLE token = 0, restricted = 0;
+    static BYTE user_buf[128], groups_buf[512];
+    check(OpenProcessToken(GetCurrentProcess(), 0xf01ff, &token) && GetTokenInformation(token, 1, user_buf, sizeof user_buf, &needed),
+        "the process's token and its user");
+    void *user_sid = *(void **)user_buf;
+    static BYTE nt_authority[6] = {0, 0, 0, 0, 0, 5};
+    void *restricting = 0;
+    check(AllocateAndInitializeSid(nt_authority, 1, 12, 0, 0, 0, 0, 0, 0, 0, &restricting), "the RESTRICTED SID");
+    struct { void *sid; DWORD attributes; } deny = {user_sid, 0}, restricts = {restricting, 0};
+    // DISABLE_MAX_PRIVILEGE: every privilege but SeChangeNotifyPrivilege goes.
+    ok = CreateRestrictedToken(token, 1, 1, &deny, 0, 0, 1, &restricts, &restricted);
+    check(ok && restricted != 0, "CreateRestrictedToken");
+    check(GetTokenInformation(restricted, 1, user_buf, sizeof user_buf, &needed) && *(DWORD *)(user_buf + sizeof(void *)) == 0x10,
+        "its user is deny-only");
+    check(GetTokenInformation(restricted, 11, groups_buf, sizeof groups_buf, &needed) && *(DWORD *)groups_buf == 1,
+        "TokenRestrictedSids: the one restricting SID");
+    check(GetTokenInformation(restricted, 3, groups_buf, sizeof groups_buf, &needed) && *(DWORD *)groups_buf == 1
+            && *(DWORD *)(groups_buf + 4) == 23, "TokenPrivileges: only SeChangeNotifyPrivilege");
+    check(GetTokenInformation(token, 11, groups_buf, sizeof groups_buf, &needed) && *(DWORD *)groups_buf == 0,
+        "the process's own token isn't restricted");
+    CloseHandle(restricted);
+    CloseHandle(token);
+    FreeSid(restricting);
+
+    // ---- The process's own handles, as a sandbox's handle closer lists them ----
+    {
+        typedef DWORD(__stdcall * INFO)(HANDLE, DWORD, void *, DWORD, DWORD *);
+        INFO query_process = (INFO)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess");
+        INFO query_object = (INFO)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryObject");
+        HANDLE named = CreateEventW(0, 1, 0, L"AtlasSandboxNamedEvent");
+        static BYTE snapshot[16384], object[512];
+        DWORD need = 0, status = query_process((HANDLE)-1, 51, snapshot, sizeof snapshot, &need);
+        UPTR count = *(UPTR *)snapshot, each = 3 * sizeof(void *) + 16;
+        int listed = 0;
+        for (UPTR i = 0; status == 0 && i < count; i++) {
+            BYTE *entry = snapshot + 2 * sizeof(void *) + i * each;
+            if (*(HANDLE *)entry == named && *(DWORD *)(entry + 3 * sizeof(void *) + 4) == 16) listed = 1;
+        }
+        check(status == 0 && count > 3 && listed, "ProcessHandleInformation: the event is listed, as an Event (16)");
+        status = query_process((HANDLE)-1, 58, snapshot, sizeof snapshot, &need);
+        int in_table = 0;
+        for (DWORD i = 0; status == 0 && i < need / 4; i++) in_table |= ((DWORD *)snapshot)[i] == (DWORD)(UPTR)named;
+        check(status == 0 && in_table, "ProcessHandleTable: its value among the process's handles");
+        status = query_process((HANDLE)-1, 51, snapshot, 8, &need);
+        check(status == 0xc0000004 && need > 8, "with too little room: STATUS_INFO_LENGTH_MISMATCH and the length needed");
+        status = query_object(named, 2, object, sizeof object, &need);
+        check(status == 0 && weq(*(WCHAR **)(object + sizeof(void *)), "Event"), "NtQueryObject: its type, Event");
+        status = query_object(named, 1, object, sizeof object, &need);
+        const WCHAR *name = *(WCHAR **)(object + sizeof(void *));
+        int ends = 0;
+        if (status == 0 && name) {
+            int n = 0;
+            while (name[n]) n++;
+            ends = n > 22 && weq(name + n - 22, "AtlasSandboxNamedEvent");
+        }
+        check(ends, "and its name, in BaseNamedObjects");
+        CloseHandle(named);
+    }
+
+#if defined(__x86_64__)
+    // ---- ntdll's system-call stubs ----
+    HANDLE ntdll = GetModuleHandleW(L"ntdll.dll");
+    const BYTE *stub = GetProcAddress(ntdll, "NtQueryVirtualMemory");
+    const BYTE *other = GetProcAddress(ntdll, "NtOpenProcess");
+    int shaped = stub && stub[0] == 0x4c && stub[1] == 0x8b && stub[2] == 0xd1 && stub[3] == 0xb8 && stub[8] == 0xf6
+        && stub[9] == 0x04 && stub[10] == 0x25 && *(DWORD *)(stub + 11) == 0x7ffe0308 && stub[16] == 0x75 && stub[17] == 0x03
+        && stub[18] == 0x0f && stub[19] == 0x05 && stub[20] == 0xc3 && stub[21] == 0xcd && stub[22] == 0x2e && stub[23] == 0xc3;
+    check(shaped, "NtQueryVirtualMemory is Windows 10's stub: mov r10, rcx; mov eax; test; jne; syscall; ret; int 2e; ret");
+    check(other && other[0] == 0x4c && *(DWORD *)(other + 4) != *(DWORD *)(stub + 4) && ((UPTR)stub & 31) == 0 && ((UPTR)other & 31) == 0,
+        "each stub has a number of its own, 32 bytes apart");
+    typedef DWORD(__stdcall * QUERY)(HANDLE, void *, int, void *, UPTR, UPTR *);
+    static BYTE mbi[48];
+    UPTR returned = 0;
+    DWORD status = ((QUERY)stub)((HANDLE)-1, (void *)stub, 0, mbi, sizeof mbi, &returned);
+    check(status == 0 && returned == 48 && *(UPTR *)mbi == ((UPTR)stub & ~(UPTR)0xfff), "NtQueryVirtualMemory through its stub");
+    // A copy of the stub, elsewhere, as a sandbox keeps the original when it patches the export.
+    BYTE *stub_copy = VirtualAlloc(0, 4096, 0x3000, 0x40);
+    for (int i = 0; i < 32; i++) stub_copy[i] = stub[i];
+    for (int i = 0; i < 48; i++) mbi[i] = 0;
+    returned = 0;
+    status = ((QUERY)stub_copy)((HANDLE)-1, (void *)stub_copy, 0, mbi, sizeof mbi, &returned);
+    check(status == 0 && returned == 48 && *(UPTR *)mbi == (UPTR)stub_copy, "NtQueryVirtualMemory through a copy of its stub");
+#endif
 
     say(failures ? "some checks failed\n" : "all passed\n");
     ExitProcess(failures);

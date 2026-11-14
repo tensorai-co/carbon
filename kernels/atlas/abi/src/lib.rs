@@ -66,6 +66,9 @@ pub mod call {
     /// The call number of one of kernel32's host exports, by name: `(name, length)`, giving 0 if there's none. ntdll
     /// calls it with that number as a program's stub would, with up to four arguments.
     pub const EXPORT_NUMBER: u64 = 16;
+    /// Whether the machine is traced (`CARBON_TRACE`): 1 or 0, for ntdll to say what only it sees (lookups that
+    /// find nothing).
+    pub const TRACING: u64 = 17;
 
     /// An upcall's callback has returned: this is the trap at the return address atlas gave it.
     pub const UPCALL_RETURN: u64 = 0xfff;
@@ -73,6 +76,12 @@ pub mod call {
     pub const THREAD_RETURN: u64 = 0xffe;
     /// Host exports are numbered from here, in the order atlas declares them.
     pub const HOST_EXPORTS: u64 = 0x1000;
+    /// x86-64 ntdll's system services: each `Nt` export is a stub shaped as Windows 10's, whose `syscall` has this
+    /// plus the service's number (`atlas-guest`'s `services`) in `eax`; atlas runs the export's body, `AtlasImpl` and
+    /// its name in ntdll, as if the stub had called it.
+    pub const NT_SERVICES: u64 = 0x0100_0000;
+    /// How many service numbers there are room for.
+    pub const NT_SERVICES_ROOM: u64 = 0x1000;
 }
 
 /// NTSTATUS values.
@@ -190,6 +199,8 @@ pub mod teb64 {
     pub const DEALLOCATION_STACK: u64 = 0x1478;
     /// `TlsAlloc`'s 64 slots.
     pub const TLS_SLOTS: u64 = 0x1480;
+    /// TlsExpansionSlots: `TlsAlloc`'s next 1024, an array made when one's first set.
+    pub const TLS_EXPANSION_SLOTS: u64 = 0x1780;
     /// FlsData: a block of `FlsAlloc`'s slots, made when first wanted.
     pub const FLS_DATA: u64 = 0x17c8;
     /// SameTebFlags, a u16; `HasFiberData` (4) says the thread is a fiber.
@@ -216,6 +227,7 @@ pub mod teb32 {
     pub const LAST_ERROR: u64 = 0x34;
     pub const DEALLOCATION_STACK: u64 = 0xe0c;
     pub const TLS_SLOTS: u64 = 0xe10;
+    pub const TLS_EXPANSION_SLOTS: u64 = 0xf94;
     pub const FLS_DATA: u64 = 0xfb4;
     pub const SAME_TEB_FLAGS: u64 = 0xfca;
     /// atlas-guest's own, past the TEB's end, as in the 64-bit one.

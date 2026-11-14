@@ -382,6 +382,150 @@ impl Task {
     }
 }
 
+/// Windows 10's object type names, by the numbers `type_of` gives.
+fn type_name(kind: u8) -> &'static str {
+    match kind {
+        5 => "Token",
+        7 => "Process",
+        8 => "Thread",
+        16 => "Event",
+        17 => "Mutant",
+        19 => "Semaphore",
+        20 => "Timer",
+        36 => "IoCompletion",
+        42 => "Section",
+        44 => "Key",
+        _ => "File",
+    }
+}
+
+const INFO_LENGTH_MISMATCH_STATUS: u32 = 0xc000_0004;
+/// OBJ_INHERIT, as handle attributes give it.
+const OBJ_INHERIT: u32 = 0x2;
+
+impl Task {
+    /// `NtQueryInformationProcess`'s ProcessHandleInformation (51) for this process: PROCESS_HANDLE_SNAPSHOT_INFORMATION,
+    /// each handle's value, counts, access, type and attributes. An NTSTATUS; the length needed is written either way.
+    /// Or ProcessHandleTable (58): each handle's value, as a ULONG.
+    pub fn process_handles(&mut self, cx: &mut Cx<'_>, class: u32, out: u64, length: u64, returned: u64) -> u32 {
+        let handles: Vec<(u64, Handle, bool)> = {
+            let state = lock(&self.process.state);
+            state.handles.iter().map(|(v, h)| (v, h.clone(), state.handles.inheritable(v).unwrap_or(false))).collect()
+        };
+        if class == 58 {
+            let table: Vec<u8> = handles.iter().flat_map(|(v, _, _)| (*v as u32).to_le_bytes()).collect();
+            return self.answer_info(cx, &table, out, length, returned);
+        }
+        let w = self.abi().width as usize;
+        let (head, each) = (2 * w, 3 * w + 16);
+        let mut o = Out::new(head + each * handles.len());
+        let put_ptr = |o: &mut Out, at: usize, v: u64| if w == 8 { o.u64(at, v) } else { o.u32(at, v as u32) };
+        put_ptr(&mut o, 0, handles.len() as u64);
+        for (i, (value, handle, inherit)) in handles.iter().enumerate() {
+            let at = head + each * i;
+            let (kind, access) = type_of(handle);
+            put_ptr(&mut o, at, *value);
+            put_ptr(&mut o, at + w, 1);
+            put_ptr(&mut o, at + 2 * w, 1);
+            o.u32(at + 3 * w, access);
+            o.u32(at + 3 * w + 4, u32::from(kind));
+            o.u32(at + 3 * w + 8, if *inherit { OBJ_INHERIT } else { 0 });
+        }
+        self.answer_info(cx, &o.0, out, length, returned)
+    }
+
+    /// Writes `data` to the program's buffer if it fits, and its length to `returned`: STATUS_SUCCESS, or
+    /// STATUS_INFO_LENGTH_MISMATCH when the buffer's too small.
+    fn answer_info(&mut self, cx: &mut Cx<'_>, data: &[u8], out: u64, length: u64, returned: u64) -> u32 {
+        if returned != 0 {
+            let _ = self.mem(cx, true, |t| user::write_u32(&mut t.space(), returned, data.len() as u32));
+        }
+        if (length as usize) < data.len() {
+            return INFO_LENGTH_MISMATCH_STATUS;
+        }
+        match self.mem(cx, true, |t| user::write(&mut t.space(), out, data)) {
+            Ok(()) => status::SUCCESS,
+            Err(_) => status::ACCESS_VIOLATION,
+        }
+    }
+
+    /// A handle's object's name, as Windows' object manager gives it: a file's on its volume's device, a named
+    /// object's in the session's BaseNamedObjects; empty for one without a name.
+    fn object_name(&self, handle: &Handle) -> String {
+        match handle {
+            Handle::File(f) if f.path.starts_with("\\") => f.path.clone(),
+            Handle::File(f) => {
+                let rest = f.path.strip_prefix("C:").or_else(|| f.path.strip_prefix("c:")).unwrap_or(&f.path);
+                format!("\\Device\\HarddiskVolume3{rest}")
+            }
+            Handle::Console(_) | Handle::Input => "\\Device\\ConDrv".to_string(),
+            Handle::Object(o) => self.k.objects.name_of(o).map(|n| format!("\\Sessions\\1\\BaseNamedObjects\\{n}")).unwrap_or_default(),
+            Handle::Section(s, _) => lock(&self.k.sections)
+                .iter()
+                .find(|(_, w)| w.upgrade().is_some_and(|x| Arc::ptr_eq(&x, s)))
+                .map(|(n, _)| format!("\\Sessions\\1\\BaseNamedObjects\\{n}"))
+                .unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
+    /// `NtQueryObject(handle, class, out, length, &returned)`: ObjectBasicInformation (0: its attributes and access),
+    /// ObjectNameInformation (1: a UNICODE_STRING and the name after it) and ObjectTypeInformation (2: the type's
+    /// name, number and access mask). An NTSTATUS.
+    pub fn query_object(&mut self, cx: &mut Cx<'_>, handle: u64, class: u32, out: u64, length: u64, returned: u64) -> u32 {
+        let found = {
+            let state = lock(&self.process.state);
+            state.handles.get(handle).map(|h| (h, state.handles.inheritable(handle).unwrap_or(false)))
+        };
+        let (handle, inherit) = match (handle, found) {
+            (crate::handles::CURRENT_PROCESS, _) => (Handle::Object(self.process.object.clone()), false),
+            (crate::handles::CURRENT_THREAD, _) => (Handle::Object(self.control.object.clone()), false),
+            (_, Some(found)) => found,
+            _ => return status::INVALID_HANDLE,
+        };
+        let (kind, access) = type_of(&handle);
+        let w = self.abi().width as usize;
+        // A UNICODE_STRING (lengths, then the buffer's pointer) at the start, its text after `fixed` bytes.
+        let unicode = |fixed: usize, text: &str| -> Vec<u8> {
+            let units: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            let mut b = vec![0u8; fixed];
+            let len = units.len() as u16;
+            b[0..2].copy_from_slice(&len.to_le_bytes());
+            b[2..4].copy_from_slice(&(len + 2).to_le_bytes());
+            let at = out + fixed as u64;
+            b[w..2 * w].copy_from_slice(&at.to_le_bytes()[..w]);
+            b.extend(units);
+            b.extend([0, 0]);
+            b
+        };
+        let data = match class {
+            0 => {
+                let mut o = Out::new(56);
+                o.u32(0, if inherit { OBJ_INHERIT } else { 0 });
+                o.u32(4, access);
+                o.u32(8, 1);
+                o.u32(12, 1);
+                o.0
+            }
+            1 => {
+                let name = self.object_name(&handle);
+                if name.is_empty() { vec![0u8; 2 * w] } else { unicode(2 * w, &name) }
+            }
+            2 => {
+                let fixed = if w == 8 { 104 } else { 96 };
+                let mut b = unicode(fixed, type_name(kind));
+                let base = 2 * w;
+                b[base + 48..base + 52].copy_from_slice(&0u32.to_le_bytes());
+                b[base + 68..base + 72].copy_from_slice(&access.to_le_bytes());
+                b[base + 74] = kind;
+                b
+            }
+            _ => return 0xc000_0003, // STATUS_INVALID_INFO_CLASS
+        };
+        self.answer_info(cx, &data, out, length, returned)
+    }
+}
+
 /// A handle's object type (by Windows 10's numbers) and the access it's given (all of its type's).
 fn type_of(handle: &Handle) -> (u8, u32) {
     match handle {
@@ -396,7 +540,7 @@ fn type_of(handle: &Handle) -> (u8, u32) {
         Handle::Port(_) => (36, 0x1f_0003),
         Handle::Token(_) => (5, 0xf_01ff),
         Handle::Console(_) | Handle::Input | Handle::File(_) | Handle::Find(_) | Handle::Snapshot(_) => (37, 0x12_019f),
-        Handle::Section(_) => (42, 0xf_001f),
+        Handle::Section(_, access) => (42, *access),
         Handle::Key(_) => (44, 0xf_003f),
     }
 }
@@ -407,7 +551,7 @@ fn object_address(handle: &Handle) -> u64 {
         Handle::Object(o) => Arc::as_ptr(o) as u64,
         Handle::File(f) => Arc::as_ptr(f) as u64,
         Handle::Find(f) => Arc::as_ptr(f) as u64,
-        Handle::Section(s) => Arc::as_ptr(s) as u64,
+        Handle::Section(s, _) => Arc::as_ptr(s) as u64,
         Handle::Port(p) => Arc::as_ptr(p) as u64,
         Handle::Token(t) => Arc::as_ptr(t) as u64,
         Handle::Snapshot(s) => Arc::as_ptr(s) as u64,

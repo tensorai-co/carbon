@@ -344,3 +344,7 @@ ProcessIdToSessionId
 SetUnhandledExceptionFilter
 SuspendThread
 GetThreadContext
+SetDllDirectoryW
+LoadLibraryW
+GetProcessTimes
+TlsFree

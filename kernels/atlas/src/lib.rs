@@ -10,10 +10,13 @@
 //! itself, so the next thing to write is obvious). Host code can call the program back with an upcall.
 
 mod abi;
+mod changes;
+mod crypto;
 pub mod ansi;
 mod environment;
 mod exceptions;
 mod files;
+mod fonts;
 mod handles;
 mod images;
 pub mod imports;
@@ -141,6 +144,7 @@ pub fn boot(exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&str]
         console_cp: std::sync::atomic::AtomicU32::new(ansi::OEMCP),
         file_security: Mutex::new(HashMap::new()),
         key_security: Mutex::new(HashMap::new()),
+        changes: Mutex::new(changes::Watches::default()),
         user_security: Mutex::new(HashMap::new()),
         live: (Mutex::new(0), Condvar::new()),
         net: ::net::Network::on_this_host(::net::Config { hostname: os::sysapi::computer_name().to_string(), dns: None }),
@@ -211,6 +215,8 @@ pub(crate) struct Kernel {
     /// Descriptors set on files (by full Windows path, lower case) and registry keys (by ID). Others have the default.
     file_security: Mutex<HashMap<String, security::Descriptor>>,
     key_security: Mutex<HashMap<u64, security::Descriptor>>,
+    /// Watches on folders, for `ReadDirectoryChangesW`.
+    changes: Mutex<changes::Watches>,
     /// What's been set on the window station and the desktop, by their handles.
     user_security: Mutex<HashMap<u64, security::Descriptor>>,
     /// The machine's network, which every socket is on.

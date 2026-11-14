@@ -362,6 +362,16 @@ pub extern "system" fn RtlRaiseException(record: *mut Record) {
     if record.address == 0 {
         record.address = c.pc as usize;
     }
+    // Traced, every software exception (a C++ throw, RaiseException), where it's raised from.
+    if sys::tracing() {
+        crate::strings::Message::new()
+            .text(b"atlas-guest: raises ")
+            .hex(u64::from(record.code))
+            .text(b" at ")
+            .hex(record.address as u64)
+            .text(b"\n")
+            .print();
+    }
     // This returns when a handler says to carry on: the dispatcher continues at `c`, which is this call's return.
     // The compiler mustn't see that it never returns otherwise, or its caller's code after the call is gone.
     if core::hint::black_box(true) {

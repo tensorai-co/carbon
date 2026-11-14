@@ -89,6 +89,7 @@ pub fn api_set(dll: &str) -> Option<&'static str> {
         ("ntuser-", "user32.dll"),
         ("rtcore-ntuser-", "user32.dll"),
         ("downlevel-", "kernel32.dll"),
+        ("power-", "powrprof.dll"),
     ];
     SETS.iter().find(|(prefix, _)| rest.starts_with(prefix)).map(|(_, dll)| *dll)
 }

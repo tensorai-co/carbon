@@ -8,6 +8,8 @@
 #![no_std]
 #![allow(non_snake_case)]
 
+#[macro_use]
+mod services;
 mod arch;
 mod com;
 mod crt;
@@ -278,10 +280,11 @@ pub extern "system" fn RtlGetNtVersionNumbers(major: *mut u32, minor: *mut u32, 
     }
 }
 
+service! {
 /// `NtQuerySystemInformation(class, buffer, length, &return length)`: atlas answers it.
-#[unsafe(no_mangle)]
 pub extern "system" fn NtQuerySystemInformation(class: u32, buffer: *mut c_void, length: u32, returned: *mut u32) -> u32 {
     sys::call4(atlas_abi::call::QUERY_SYSTEM_INFORMATION, u64::from(class), buffer as usize as u64, u64::from(length), returned as usize as u64) as u32
+}
 }
 
 #[unsafe(no_mangle)]
@@ -356,20 +359,40 @@ fn answer_fields(fields: &[usize], out: *mut usize, length: u32, returned: *mut 
     0
 }
 
+sys::host!(query_process, b"AtlasQueryProcess", (h, out));
+sys::host!(process_handles, b"AtlasProcessHandles", (class, out, length, returned));
+
+service! {
 /// `NtQueryInformationProcess(process, class, out, length, &returned)`, for this process: ProcessBasicInformation
-/// (its PEB and ID; its parent's ID isn't known here, so 0), ProcessDebugPort (none), ProcessWow64Information (the
-/// 32-bit PEB a WoW64 process has: none, as this isn't one of those from inside), ProcessDebugFlags (no debugger:
-/// 1). Another process's, and other classes, aren't answered yet.
-#[unsafe(no_mangle)]
+/// (its PEB, its ID, and its parent's, from the host), ProcessDebugPort (none), ProcessWow64Information (the
+/// 32-bit PEB a WoW64 process has: none, as this isn't one of those from inside), ProcessHandleInformation (its
+/// handles, from the host; ProcessHandleTable, their values), ProcessDebugFlags (no debugger:
+/// 1). For another process, ProcessBasicInformation from the host (with its exit status and parent); its other
+/// classes aren't answered yet.
 pub extern "system" fn NtQueryInformationProcess(process: usize, class: u32, out: *mut usize, length: u32, returned: *mut u32) -> u32 {
     if process != usize::MAX {
-        return STATUS_NOT_IMPLEMENTED;
+        if class != 0 {
+            return STATUS_NOT_IMPLEMENTED;
+        }
+        let mut info = [0u64; 4];
+        let status = query_process(process as u64, info.as_mut_ptr() as u64) as u32;
+        if status != 0 {
+            return status;
+        }
+        let [exit, peb, pid, parent] = info.map(|v| v as usize);
+        return answer_fields(&[exit, peb, 1, 8, pid, parent], out, length, returned);
     }
     let pid = sync::AtlasGetCurrentProcessId() as usize;
     match class {
-        // STILL_ACTIVE, the PEB, affinity, base priority, the ID, the parent's.
-        0 => answer_fields(&[0x103, peb() as usize, 1, 8, pid, 0], out, length, returned),
+        // STILL_ACTIVE, the PEB, affinity, base priority, the ID, and the parent's, which only the host knows.
+        0 => {
+            let mut info = [0u64; 4];
+            let parent = if query_process(usize::MAX as u64, info.as_mut_ptr() as u64) == 0 { info[3] as usize } else { 0 };
+            answer_fields(&[0x103, peb() as usize, 1, 8, pid, parent], out, length, returned)
+        }
         7 | 26 => answer_fields(&[0], out, length, returned),
+        // ProcessHandleInformation and ProcessHandleTable: this process's handles, from the host.
+        51 | 58 => process_handles(u64::from(class), out as usize as u64, u64::from(length), returned as usize as u64) as u32,
         31 => {
             if length < 4 {
                 return STATUS_INFO_LENGTH_MISMATCH;
@@ -385,10 +408,11 @@ pub extern "system" fn NtQueryInformationProcess(process: usize, class: u32, out
         _ => STATUS_INVALID_INFO_CLASS,
     }
 }
+}
 
+service! {
 /// `NtQueryInformationThread(thread, class, out, length, &returned)`, for this thread: ThreadBasicInformation (exit
 /// status, its TEB, its process's and its own ID, affinity, priority).
-#[unsafe(no_mangle)]
 pub extern "system" fn NtQueryInformationThread(thread: usize, class: u32, out: *mut usize, length: u32, returned: *mut u32) -> u32 {
     if thread != usize::MAX - 1 {
         return STATUS_NOT_IMPLEMENTED;
@@ -406,4 +430,5 @@ pub extern "system" fn NtQueryInformationThread(thread: usize, class: u32, out: 
         }
         _ => STATUS_INVALID_INFO_CLASS,
     }
+}
 }

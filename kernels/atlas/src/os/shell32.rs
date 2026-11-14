@@ -539,7 +539,7 @@ pub(crate) fn split_command_line(line: &[u16]) -> Vec<Vec<u16>> {
 
 /// `CommandLineToArgvW(line, &count)`: the arguments, in one block `LocalFree` frees: their pointers (a null after the
 /// last), then their text. An empty line gives the program's path alone.
-fn command_line_to_argv_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+pub(crate) fn command_line_to_argv_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     if a[1] == 0 {
         task.set_last_error(cx, 87);
         return Reply::Value(0);

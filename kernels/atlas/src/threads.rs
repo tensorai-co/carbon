@@ -209,6 +209,8 @@ impl Task {
             *gone = true;
             cx.turn(|t| t.destroy_space(space));
             drop(gone);
+            let created = lock(&self.process.state).created;
+            lock(&self.process.object.state).times = Some((created, crate::files::filetime(self.k.host.wall())));
             self.k.exited(&self.process.object, code);
             if self.k.options.trace {
                 self.k.host.write(host::Stream::Err, format!("[{}] process {} ends, {code:#x}\n", self.tid, self.process.pid).as_bytes());
@@ -218,6 +220,8 @@ impl Task {
             done.notify_all();
             self.k.ended(self.process.pid);
             self.win32k().stations.forget(self.process.pid);
+            self.win32k().forget_classes(self.process.pid);
+            crate::os::dwrite::forget(self.process.pid);
         }
     }
 }

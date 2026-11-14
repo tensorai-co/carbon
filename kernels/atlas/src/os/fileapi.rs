@@ -477,6 +477,7 @@ pub fn set_end_of_file(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     }
     let at = *lock(&file.position);
     let _ = lock(&task.k.disk).truncate(ino, at, task.k.host.wall());
+    task.k.changed(&file.path, crate::changes::MODIFIED, crate::changes::SIZE | crate::changes::LAST_WRITE);
     Reply::Value(TRUE)
 }
 
@@ -547,15 +548,19 @@ pub fn set_file_attributes_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Rep
 
 fn set_file_attributes(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
     let Some(path) = task.path_arg(cx, a[0], wide) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
-    let found = task.resolve(&path).and_then(|(_, disk_path)| {
+    let found = task.resolve(&path).and_then(|(full, disk_path)| {
         let mut disk = lock(&task.k.disk);
         let ino = disk.resolve(layers::ROOT, &disk_path, true).map_err(|_| files::ERROR_FILE_NOT_FOUND)?;
         let directory = disk.meta(ino).map(|m| m.attributes & files::FILE_ATTRIBUTE_DIRECTORY).unwrap_or(0);
         let wanted = (a[1] as u32) & !files::FILE_ATTRIBUTE_DIRECTORY & !files::FILE_ATTRIBUTE_NORMAL;
-        disk.set_meta(ino, crate::Meta { attributes: wanted | directory }).map_err(|_| files::ERROR_FILE_NOT_FOUND)
+        disk.set_meta(ino, crate::Meta { attributes: wanted | directory }).map_err(|_| files::ERROR_FILE_NOT_FOUND)?;
+        Ok(full)
     });
     match found {
-        Ok(()) => Reply::Value(TRUE),
+        Ok(full) => {
+            task.k.changed(&full, crate::changes::MODIFIED, crate::changes::ATTRIBUTES);
+            Reply::Value(TRUE)
+        }
         Err(e) => task.fail(cx, e),
     }
 }
@@ -1317,4 +1322,95 @@ pub fn delete_file_transacted_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> 
 /// `MoveFileTransactedW(from, to, progress, its data, flags, transaction)`: as `MoveFileExW`, now.
 pub fn move_file_transacted_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     move_file_ex_w(task, cx, &[a[0], a[1], a[4]])
+}
+
+/// `ReadDirectoryChangesW(folder, buffer, length, subtree, filter, &returned, &overlapped, routine)`: the changes
+/// recorded since the last read (the first starts the watch), as FILE_NOTIFY_INFORMATION records: at once if there are
+/// some, else when there are, waiting or (overlapped) finishing later. More than fit is ERROR_NOTIFY_ENUM_DIR, and no
+/// records.
+pub fn read_directory_changes_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    use crate::changes::{ERROR_NOTIFY_ENUM_DIR, Watch, Waiting, encode};
+    let Some(file) = task.file_handle(a[0]) else { return task.fail(cx, ERROR_INVALID_HANDLE) };
+    if !matches!(file.node, Node::Dir(_)) || a[4] as u32 == 0 || a[2] as u32 == 0 {
+        return task.fail(cx, ERROR_INVALID_PARAMETER);
+    }
+    let key = Arc::as_ptr(&file) as usize;
+    let (room, subtree, filter) = (a[2] as u32, a[3] as u32 != 0, a[4] as u32);
+    let take = |task: &mut Task| -> Option<Vec<(u32, String)>> {
+        let mut watches = lock(&task.k.changes);
+        let w = match watches.list.iter().position(|w| w.key == key) {
+            Some(i) => &mut watches.list[i],
+            None => {
+                let dir = file.path.trim_end_matches('\\').to_lowercase();
+                let _ = file.watched.set(Arc::downgrade(&task.k));
+                watches.list.push(Watch { key, dir, subtree, filter, records: Vec::new(), waiting: None });
+                watches.list.last_mut()?
+            }
+        };
+        w.subtree = subtree;
+        w.filter = filter;
+        if w.records.is_empty() { None } else { Some(std::mem::take(&mut w.records)) }
+    };
+    let ready = take(task);
+    // Overlapped: done now, or left for the next change.
+    if file.overlapped && a[6] != 0 {
+        let abi = task.abi();
+        let event = task.mem(cx, false, |t| user::read_ptr(&t.space(), a[6] + abi.overlapped_event(), abi.width)).ok().filter(|&e| e != 0).and_then(|e| task.object(e));
+        if let Some(event) = &event {
+            task.k.objects.signal(event, |s| s.set = false);
+        }
+        let notify = if a[7] != 0 { Notify::Routine(a[7]) } else { Notify::Plain };
+        let op = task.new_op(&file, a[6], a[1], event, notify);
+        match ready {
+            Some(records) => {
+                let (data, error) = match encode(&records, room as usize) {
+                    Some(d) => (d, 0),
+                    None => (Vec::new(), ERROR_NOTIFY_ENUM_DIR),
+                };
+                let k = task.k.clone();
+                k.finish(cx, &op, &[(a[1], &data)], data.len() as u64, error);
+            }
+            None => {
+                let pending = task.abi().overlapped_result(crate::ports::STATUS_PENDING, 0);
+                let _ = task.mem(cx, true, |t| user::write(&mut t.space(), a[6], &pending));
+                let mut watches = lock(&task.k.changes);
+                if let Some(w) = watches.list.iter_mut().find(|w| w.key == key) {
+                    w.waiting = Some(Waiting::Overlapped(op, room));
+                }
+            }
+        }
+        return Reply::Value(TRUE);
+    }
+    let records = match ready {
+        Some(r) => r,
+        None => loop {
+            task.waiter.reset();
+            {
+                let k = task.k.clone();
+                let mut watches = lock(&k.changes);
+                let Some(w) = watches.list.iter_mut().find(|w| w.key == key) else {
+                    drop(watches);
+                    return task.fail(cx, 995);
+                };
+                if !w.records.is_empty() {
+                    break std::mem::take(&mut w.records);
+                }
+                w.waiting = Some(Waiting::Blocking(task.waiter.clone()));
+            }
+            if task.waiter.wait(None) == kernels_core::wait::Woke::Interrupted && task.ending() {
+                return Reply::Ended;
+            }
+        },
+    };
+    match encode(&records, room as usize) {
+        Some(data) => {
+            let _ = task.mem(cx, true, |t| user::write(&mut t.space(), a[1], &data));
+            let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[5], data.len() as u32));
+            Reply::Value(TRUE)
+        }
+        None => {
+            let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[5], 0));
+            task.fail(cx, ERROR_NOTIFY_ENUM_DIR)
+        }
+    }
 }

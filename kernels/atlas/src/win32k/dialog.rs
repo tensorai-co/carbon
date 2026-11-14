@@ -89,7 +89,7 @@ pub struct Template {
     pub menu: Id,
     pub class: Id,
     pub title: String,
-    /// Its font: points and typeface. There's one font, so it only says the dialog has one.
+    /// Its font: points and typeface.
     pub font: Option<(u16, String)>,
     pub items: Vec<Item>,
 }
@@ -343,8 +343,9 @@ impl Task {
             Id::None => "#32770".to_string(),
             Id::Name(name) => name.clone(),
             Id::Num(atom) => {
+                let pid = self.process.pid;
                 let w = self.win32k();
-                match w.class_by_atom(*atom) {
+                match w.class_by_atom(pid, *atom) {
                     Some(name) => name,
                     None => return Ok(0),
                 }
@@ -380,7 +381,14 @@ impl Task {
         if hwnd == 0 {
             return Ok(0);
         }
-        let font = if t.font.is_some() { self.win32k().gdi.create(gdi::Object::Font) } else { 0 };
+        // The template's font: its points as a height at 96 DPI (negative, the character height), and its face.
+        let font = match &t.font {
+            Some((points, face)) => {
+                let height = -((i32::from(*points) * 96 + 36) / 72);
+                self.win32k().gdi.create_font(gdi::LogFont { height, weight: 400, flags: [0, 0, 0, 1, 0, 0, 0, 0], face: face.clone(), ..gdi::LogFont::default() })
+            }
+            None => 0,
+        };
         self.win32k().dialogs.insert(hwnd, Dialog { font, ..Dialog::default() });
         let (_, dlgproc, _) = dwlp(self.abi().width);
         self.set_window_extra(hwnd, dlgproc, proc);

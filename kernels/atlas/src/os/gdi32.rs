@@ -6,7 +6,7 @@ use display::{Rect, font};
 
 use super::{Reply, dll};
 use crate::process::Task;
-use crate::win32k::gdi::{Gdi, Object, swap};
+use crate::win32k::gdi::{Gdi, LogFont, Object, swap};
 
 dll! {
     "GDI32.dll";
@@ -14,8 +14,8 @@ dll! {
     host CreateSolidBrush(1) => create_solid_brush;
     host CreateBrushIndirect(1) => create_brush_indirect;
     host CreatePen(3) => create_pen;
-    host CreateFontW(14) => create_font;
-    host CreateFontIndirectW(1) => create_font;
+    host CreateFontW(14) => create_font_w;
+    host CreateFontIndirectW(1) => create_font_indirect_w;
     host SelectObject(2) => select_object;
     host DeleteObject(1) => delete_object;
     host SetTextColor(2) => set_text_color;
@@ -37,8 +37,8 @@ dll! {
     host DeleteDC(1) => delete_dc;
     host CreateCompatibleBitmap(3) => create_compatible_bitmap;
     host CreateBitmap(5) => create_bitmap;
-    host GetObjectW(3) => get_object;
-    host GetObjectA(3) => get_object;
+    host GetObjectW(3) => get_object_w;
+    host GetObjectA(3) => get_object_a;
     host SetStretchBltMode(2) => set_stretch_blt_mode;
     missing CreateDIBSection;
     missing StretchDIBits;
@@ -56,8 +56,8 @@ dll! {
     missing AddFontResourceExA;
     host CombineRgn(4) => combine_rgn;
     host CreateDCW(4) => create_dc_w;
-    host CreateFontA(14) => create_font;
-    host CreateFontIndirectA(1) => create_font;
+    host CreateFontA(14) => create_font_a;
+    host CreateFontIndirectA(1) => create_font_indirect_a;
     host CreateRectRgn(4) => create_rect_rgn;
     missing DescribePixelFormat;
     host EnumFontFamiliesExA(5) => enum_font_families_ex_a;
@@ -69,7 +69,7 @@ dll! {
     missing GetCharABCWidthsW;
     host GetClipBox(2) => get_clip_box;
     host GetCurrentObject(2) => get_current_object;
-    missing GetDIBits;
+    host GetDIBits(7) => get_di_bits;
     host GetDeviceGammaRamp(2) => nothing;
     missing GetFontData;
     host GetICMProfileW(3) => nothing;
@@ -127,7 +127,7 @@ dll! {
     missing SetAbortProc;
     missing SetArcDirection;
     missing SetDCPenColor;
-    missing SetDIBits;
+    host SetDIBits(7) => set_di_bits;
     missing SetEnhMetaFileBits;
     missing SetGraphicsMode;
     missing SetMiterLimit;
@@ -170,8 +170,42 @@ fn create_pen(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
 }
 
 /// Any font asked for is the one font.
-fn create_font(task: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
-    Reply::Value(task.win32k().gdi.create(Object::Font))
+/// `CreateFontW(height, width, escapement, orientation, weight, italic, underline, strike_out, charset, out_precision,
+/// clip_precision, quality, pitch_and_family, face)` and `A`: a font that keeps what it's given.
+fn create_font(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let mut flags = [0u8; 8];
+    for (f, v) in flags.iter_mut().zip(&a[5..13]) {
+        *f = *v as u8;
+    }
+    let face = if a[13] == 0 { String::new() } else { task.text_arg(cx, a[13], wide) };
+    let [height, width, escapement, orientation, weight] = [a[0], a[1], a[2], a[3], a[4]].map(|v| v as u32 as i32);
+    Reply::Value(task.win32k().gdi.create_font(LogFont { height, width, escapement, orientation, weight, flags, face }))
+}
+
+fn create_font_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    create_font(task, cx, a, true)
+}
+
+fn create_font_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    create_font(task, cx, a, false)
+}
+
+/// `CreateFontIndirectW(&logfont)` and `A`.
+fn create_font_indirect(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let size = if wide { 92 } else { 60 };
+    let bytes = task.mem(cx, false, |t| user::read_vec(&t.space(), a[0], size)).unwrap_or_default();
+    match LogFont::from_bytes(&bytes, wide) {
+        Some(font) => Reply::Value(task.win32k().gdi.create_font(font)),
+        None => Reply::Value(0),
+    }
+}
+
+fn create_font_indirect_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    create_font_indirect(task, cx, a, true)
+}
+
+fn create_font_indirect_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    create_font_indirect(task, cx, a, false)
 }
 
 /// `CreateCompatibleDC(dc)`: a memory DC, drawing into the bitmap selected into it.
@@ -217,9 +251,29 @@ fn create_bitmap(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     Reply::Value(task.win32k().gdi.create_bitmap(s))
 }
 
-/// `GetObject(object, size, &out)`: a bitmap's BITMAP (type, width, height, bytes a row, planes, bits a pixel, no
-/// bits of its own here); the size it needs with no buffer. Other objects aren't described yet.
-fn get_object(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+fn get_object_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    get_object(task, cx, a, true)
+}
+
+fn get_object_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    get_object(task, cx, a, false)
+}
+
+/// `GetObject(object, size, &out)`: a font's LOGFONT (W or A), or a bitmap's BITMAP (type, width, height, bytes a
+/// row, planes, bits a pixel, no bits of its own here); with no buffer, the size. Other objects aren't described yet.
+fn get_object(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    let font = task.win32k().gdi.log_font(a[0]);
+    if let Some(font) = font {
+        let b = font.to_bytes(wide);
+        if a[2] == 0 {
+            return Reply::Value(b.len() as u64);
+        }
+        let n = b.len().min(a[1] as u32 as usize);
+        if task.mem(cx, true, |t| user::write(&mut t.space(), a[2], &b[..n])).is_err() {
+            return Reply::Value(0);
+        }
+        return Reply::Value(n as u64);
+    }
     let w = task.abi().width as usize;
     let size = if w == 8 { 32 } else { 24 };
     let Some((width, height)) = task.win32k().gdi.bitmaps.get(&a[0]).map(|s| (s.width, s.height)) else { return Reply::Value(0) };
@@ -595,4 +649,200 @@ fn get_text_metrics_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 
 fn get_text_metrics_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     get_text_metrics(task, cx, a, false)
+}
+
+// ---- Device-independent bitmaps ----
+
+/// What a BITMAPINFOHEADER says of a DIB's pixels: its size (the height negative for one top row first), bits per
+/// pixel, and, for 16 and 32 bits, the red, green and blue masks (BI_BITFIELDS', or BI_RGB's own).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DibFormat {
+    width: i32,
+    height: i32,
+    bits: u16,
+    masks: [u32; 3],
+}
+
+impl DibFormat {
+    /// From the header's bytes and the masks after it. None for a depth atlas doesn't convert (palettes) or a
+    /// compression it doesn't take.
+    fn parse(header: &[u8], after: &[u8]) -> Option<DibFormat> {
+        let u32_at = |b: &[u8], at: usize| b.get(at..at + 4).map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]));
+        let (width, height) = (u32_at(header, 4)? as i32, u32_at(header, 8)? as i32);
+        let bits = u16::from_le_bytes([*header.get(14)?, *header.get(15)?]);
+        let compression = u32_at(header, 16)?;
+        let masks = match (bits, compression) {
+            (16, 0) => [0x7c00, 0x03e0, 0x001f],
+            (24 | 32, 0) => [0xff_0000, 0xff00, 0xff],
+            (16 | 32, 3) => [u32_at(after, 0)?, u32_at(after, 4)?, u32_at(after, 8)?],
+            _ => return None,
+        };
+        (width > 0 && height != 0 && width <= 16384 && height.unsigned_abs() <= 16384).then_some(DibFormat { width, height, bits, masks })
+    }
+
+    /// Bytes in a row, padded to four.
+    fn stride(&self) -> usize {
+        (self.width as usize * usize::from(self.bits)).div_ceil(32) * 4
+    }
+
+    /// The bitmap's row for DIB scan line `line` (0 is the bottom one, unless the DIB is top row first).
+    fn row(&self, line: usize, bitmap_height: i32) -> i32 {
+        if self.height < 0 { line as i32 } else { bitmap_height - 1 - line as i32 }
+    }
+}
+
+/// A channel, scaled from its mask's bits to eight.
+fn channel(value: u32, mask: u32) -> u32 {
+    if mask == 0 {
+        return 0;
+    }
+    let (shift, width) = (mask.trailing_zeros(), mask.count_ones());
+    let v = (value & mask) >> shift;
+    if width >= 8 { v >> (width - 8) } else { (v << (8 - width)) | (v >> (2 * width).saturating_sub(8).min(31)) }
+}
+
+/// A pixel (0x00RRGGBB) as the DIB stores it.
+fn to_dib(rgb: u32, f: &DibFormat, out: &mut Vec<u8>) {
+    let (r, g, b) = (rgb >> 16 & 0xff, rgb >> 8 & 0xff, rgb & 0xff);
+    // An 8-bit channel, scaled to its mask's width and moved to its place.
+    let put = |c: u32, mask: u32| {
+        let width = mask.count_ones();
+        let v = if width >= 8 { c << (width - 8) } else { c >> (8 - width) };
+        (v << mask.trailing_zeros()) & mask
+    };
+    match f.bits {
+        24 => out.extend([b as u8, g as u8, r as u8]),
+        16 => out.extend(((put(r, f.masks[0]) | put(g, f.masks[1]) | put(b, f.masks[2])) as u16).to_le_bytes()),
+        _ => out.extend((put(r, f.masks[0]) | put(g, f.masks[1]) | put(b, f.masks[2])).to_le_bytes()),
+    }
+}
+
+/// A DIB's pixel at `x` of `row` as 0x00RRGGBB.
+fn from_dib(row: &[u8], x: usize, f: &DibFormat) -> u32 {
+    let v = match f.bits {
+        24 => return u32::from(row[3 * x + 2]) << 16 | u32::from(row[3 * x + 1]) << 8 | u32::from(row[3 * x]),
+        16 => u32::from(u16::from_le_bytes([row[2 * x], row[2 * x + 1]])),
+        _ => u32::from_le_bytes([row[4 * x], row[4 * x + 1], row[4 * x + 2], row[4 * x + 3]]),
+    };
+    channel(v, f.masks[0]) << 16 | channel(v, f.masks[1]) << 8 | channel(v, f.masks[2])
+}
+
+/// The BITMAPINFO at `at`: its header's bytes, and the 12 after them (BI_BITFIELDS' masks).
+fn read_info(task: &mut Task, cx: &mut Cx<'_>, at: u64) -> Option<(Vec<u8>, Vec<u8>)> {
+    let size = task.mem(cx, false, |t| user::read_u32(&t.space(), at)).ok()? as u64;
+    if !(40..=124).contains(&size) {
+        return None;
+    }
+    let header = task.mem(cx, false, |t| user::read_vec(&t.space(), at, size as usize)).ok()?;
+    // A BITMAPINFOHEADER's masks come after it; a V4 or V5 header has them inside, at the same place.
+    let after = task.mem(cx, false, |t| user::read_vec(&t.space(), at + 40, 12)).unwrap_or_default();
+    Some((header, after))
+}
+
+/// `GetDIBits(dc, bitmap, first line, lines, &bits, &info, usage)`: a bitmap's pixels as the DIB `info` describes,
+/// from scan line `first` on; how many lines it wrote. With no `bits`, it fills `info`'s header in instead: the
+/// bitmap's size and, if its depth was 0, 32 bits (the screen's).
+fn get_di_bits(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    const ERROR_INVALID_PARAMETER: u32 = 87;
+    let (bitmap, first, lines, bits_at, info_at) = (a[1], a[2] as u32 as usize, a[3] as u32 as usize, a[4], a[5]);
+    let Some(surface) = task.win32k().gdi.bitmaps.get(&bitmap).cloned() else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
+    let Some((header, after)) = read_info(task, cx, info_at) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
+    if bits_at == 0 {
+        let mut bits = u16::from_le_bytes([header[14], header[15]]);
+        if bits == 0 {
+            bits = 32;
+        }
+        let stride = (surface.width as usize * usize::from(bits)).div_ceil(32) * 4;
+        let mut h = header[..40].to_vec();
+        h[4..8].copy_from_slice(&surface.width.to_le_bytes());
+        h[8..12].copy_from_slice(&surface.height.to_le_bytes());
+        h[12..14].copy_from_slice(&1u16.to_le_bytes());
+        h[14..16].copy_from_slice(&bits.to_le_bytes());
+        if u32::from_le_bytes([h[16], h[17], h[18], h[19]]) != 3 {
+            h[16..20].copy_from_slice(&0u32.to_le_bytes());
+        }
+        h[20..24].copy_from_slice(&((stride * surface.height as usize) as u32).to_le_bytes());
+        if task.mem(cx, true, |t| user::write(&mut t.space(), info_at + 4, &h[4..])).is_err() {
+            return task.fail(cx, 998);
+        }
+        return Reply::Value(1);
+    }
+    let Some(f) = DibFormat::parse(&header, &after) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
+    let lines = lines.min((f.height.unsigned_abs() as usize).saturating_sub(first));
+    let mut out = Vec::with_capacity(lines * f.stride());
+    for line in first..first + lines {
+        let row = f.row(line, surface.height);
+        let start = out.len();
+        for x in 0..f.width {
+            let rgb = if (0..surface.height).contains(&row) && x < surface.width { surface.pixels[(row * surface.width + x) as usize] } else { 0 };
+            to_dib(rgb & 0xff_ffff, &f, &mut out);
+        }
+        out.resize(start + f.stride(), 0);
+    }
+    if task.mem(cx, true, |t| user::write(&mut t.space(), bits_at, &out)).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(lines as u64)
+}
+
+/// `SetDIBits(dc, bitmap, first line, lines, &bits, &info, usage)`: a bitmap's pixels from the DIB `info` describes,
+/// from scan line `first` on; how many lines it took.
+fn set_di_bits(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    const ERROR_INVALID_PARAMETER: u32 = 87;
+    let (bitmap, first, lines, bits_at, info_at) = (a[1], a[2] as u32 as usize, a[3] as u32 as usize, a[4], a[5]);
+    let Some(height) = task.win32k().gdi.bitmaps.get(&bitmap).map(|s| s.height) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
+    let Some((header, after)) = read_info(task, cx, info_at) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
+    let Some(f) = DibFormat::parse(&header, &after) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
+    let lines = lines.min((f.height.unsigned_abs() as usize).saturating_sub(first));
+    let Ok(bits) = task.mem(cx, false, |t| user::read_vec(&t.space(), bits_at, lines * f.stride())) else { return task.fail(cx, 998) };
+    let mut w = task.win32k();
+    let Some(surface) = w.gdi.bitmaps.get_mut(&bitmap) else { return Reply::Value(0) };
+    for i in 0..lines {
+        let row = f.row(first + i, height);
+        if !(0..surface.height).contains(&row) {
+            continue;
+        }
+        let src = &bits[i * f.stride()..(i + 1) * f.stride()];
+        for x in 0..f.width.min(surface.width) {
+            surface.pixels[(row * surface.width + x) as usize] = from_dib(src, x as usize, &f);
+        }
+    }
+    Reply::Value(lines as u64)
+}
+
+#[cfg(test)]
+mod dib_tests {
+    use super::*;
+
+    fn header(width: i32, height: i32, bits: u16, compression: u32) -> Vec<u8> {
+        let mut h = vec![0u8; 40];
+        h[0..4].copy_from_slice(&40u32.to_le_bytes());
+        h[4..8].copy_from_slice(&width.to_le_bytes());
+        h[8..12].copy_from_slice(&height.to_le_bytes());
+        h[14..16].copy_from_slice(&bits.to_le_bytes());
+        h[16..20].copy_from_slice(&compression.to_le_bytes());
+        h
+    }
+
+    #[test]
+    fn pixels_both_ways() {
+        let rgb = 0x12_80_f0;
+        for (bits, compression, masks) in [(32, 0, vec![]), (24, 0, vec![]), (16, 0, vec![]), (16, 3, [0xf800u32, 0x07e0, 0x001f].iter().flat_map(|m| m.to_le_bytes()).collect())] {
+            let f = DibFormat::parse(&header(3, 2, bits, compression), &masks).unwrap();
+            let mut row = Vec::new();
+            to_dib(rgb, &f, &mut row);
+            let back = from_dib(&row, 0, &f);
+            // 16 bits keep five or six of each channel's eight.
+            let close = |a: u32, b: u32, s: u32| (a >> s & 0xff).abs_diff(b >> s & 0xff) <= 8;
+            assert!(close(back, rgb, 16) && close(back, rgb, 8) && close(back, rgb, 0), "{bits} bits: {back:06x}");
+        }
+        let f = DibFormat::parse(&header(3, 2, 32, 0), &[]).unwrap();
+        let mut row = Vec::new();
+        to_dib(rgb, &f, &mut row);
+        assert_eq!(row, [0xf0, 0x80, 0x12, 0]);
+        assert_eq!((f.stride(), DibFormat::parse(&header(3, 2, 24, 0), &[]).unwrap().stride()), (12, 12));
+        // Bottom-up: line 0 is the last row; top-down (negative height): the first.
+        assert_eq!((f.row(0, 2), DibFormat::parse(&header(3, -2, 32, 0), &[]).unwrap().row(0, 2)), (1, 0));
+        assert!(DibFormat::parse(&header(3, 2, 8, 0), &[]).is_none());
+    }
 }
