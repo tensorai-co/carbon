@@ -27,6 +27,7 @@ pub mod etw;
 pub mod fileapi;
 pub mod fontsub;
 pub mod gdi32;
+pub mod gfx;
 pub mod hid;
 pub mod imagehlp;
 pub mod imm32;

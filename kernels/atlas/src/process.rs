@@ -197,33 +197,48 @@ impl Task {
         }
     }
 
-    /// Traced: a breakpoint's place, and the words on the stack that point into modules (return addresses, and some
-    /// that only look like them), nearest first: a backtrace by scanning, for programs without symbols.
-    fn trace_stack(&mut self, cx: &mut Cx<'_>, pc: u64) {
-        let sp = cx.turn(|t| t.thread().regs().sp());
-        let width = self.abi().width as usize;
-        let words = self.mem(cx, false, |t| user::read_vec(&t.space(), sp, 512 * width)).unwrap_or_default();
-        let lowest = lock(&self.process.state).mapped.values().map(|m| m.0).min().unwrap_or(u64::MAX);
-        let mut shown = vec![format!("{pc:#x} ({})", self.where_is(pc))];
+    /// Formats module+offset for `addr` under an already-held process state.
+    pub(crate) fn where_in(state: &ProcState, addr: u64) -> String {
+        match state.mapped.iter().filter(|(_, (base, _))| *base <= addr).max_by_key(|(_, (base, _))| *base) {
+            Some((name, (base, _))) => format!("{name}+{:#x}", addr - base),
+            None => "no module".to_string(),
+        }
+    }
+
+    /// Scans `sp`'s stack in `process` for return-address-like pointers into mapped image regions.
+    pub(crate) fn stack_frames(&mut self, cx: &mut Cx<'_>, process: &Arc<Process>, pc: u64, sp: u64) -> Vec<String> {
+        let width = Abi::of(process.isa).width as usize;
+        let words = if Arc::ptr_eq(process, &self.process) {
+            self.mem(cx, false, |t| user::read_vec(&t.space(), sp, 512 * width)).unwrap_or_default()
+        } else {
+            read_remote(&self.k, cx, process, sp, 512 * width).unwrap_or_default()
+        };
+        let state = lock(&process.state);
+        let mut shown = vec![format!("{pc:#x} ({})", Self::where_in(&state, pc))];
         for w in words.chunks(width) {
             let v = if width == 8 { u64::from_le_bytes(w.try_into().unwrap_or_default()) } else { u64::from(u32::from_le_bytes(w.try_into().unwrap_or_default())) };
-            if v >= lowest && v < lowest + (1 << 40) {
-                let place = self.where_is(v);
+            if state.regions.find(v).is_some_and(|(_, a)| a.kind == AreaKind::Image) {
+                let place = Self::where_in(&state, v);
                 if !place.starts_with("no module") && shown.len() < 24 {
                     shown.push(format!("{v:#x} ({place})"));
                 }
             }
         }
+        shown
+    }
+
+    /// Traced: a breakpoint's place, and the words on the stack that point into modules (return addresses, and some
+    /// that only look like them), nearest first: a backtrace by scanning, for programs without symbols.
+    pub(crate) fn trace_stack(&mut self, cx: &mut Cx<'_>, pc: u64) {
+        let sp = cx.turn(|t| t.thread().regs().sp());
+        let process = self.process.clone();
+        let shown = self.stack_frames(cx, &process, pc, sp);
         self.k.host.write(host::Stream::Err, format!("[{}] breakpoint; on the stack: {}\n", self.tid, shown.join(", ")).as_bytes());
     }
 
     /// Which module `addr` is in, and how far in: the mapped image with the nearest base below it.
     pub fn where_is(&self, addr: u64) -> String {
-        let state = lock(&self.process.state);
-        match state.mapped.iter().filter(|(_, (base, _))| *base <= addr).max_by_key(|(_, (base, _))| *base) {
-            Some((name, (base, _))) => format!("{name}+{:#x}", addr - base),
-            None => "no module".to_string(),
-        }
+        Self::where_in(&lock(&self.process.state), addr)
     }
 
     /// Deals with one stop. Also used while an upcall runs the program.
@@ -249,10 +264,12 @@ impl Task {
                 if self.fault(cx, addr, access) {
                     Flow::Run
                 } else {
-                    // Traced, a jump into the first page (a call through a null pointer), or a touch of the first 64 KiB
-                    // (a null pointer's field), or of the kernel's half (a pointer gone wrong), gets the stack's backtrace.
-                    if self.k.options.trace && (pc < 0x1000 || addr < 0x1_0000 || addr >= 0xffff_8000_0000_0000) {
-                        let what = if pc < 0x1000 { format!("a jump to {pc:#x}") } else { format!("a touch of {addr:#x} at {pc:#x} ({})", self.where_is(pc)) };
+                    // Traced, a jump into the first page (a call through a null pointer) or anywhere that isn't code, or a
+                    // touch of the first 64 KiB (a null pointer's field), or of the kernel's half (a pointer gone wrong),
+                    // gets the stack's backtrace.
+                    let jumped = pc == addr;
+                    if self.k.options.trace && (pc < 0x1000 || jumped || addr < 0x1_0000 || addr >= 0xffff_8000_0000_0000) {
+                        let what = if pc < 0x1000 || jumped { format!("a jump to {pc:#x}") } else { format!("a touch of {addr:#x} at {pc:#x} ({})", self.where_is(pc)) };
                         self.k.host.write(host::Stream::Err, format!("[{}] {what}:\n", self.tid).as_bytes());
                         self.trace_stack(cx, pc);
                     }
@@ -266,7 +283,14 @@ impl Task {
                 }
                 self.raise(cx, Raised::simple(status::BREAKPOINT, pc), &format!("breakpoint at {pc:#x}"))
             }
-            Some(Stop::Alignment { pc }) => self.raise(cx, Raised::simple(status::DATATYPE_MISALIGNMENT, pc), &format!("misaligned at {pc:#x}")),
+            Some(Stop::Alignment { pc }) => {
+                if self.k.options.trace {
+                    let regs = cx.turn(|t| t.thread().regs());
+                    self.k.host.write(host::Stream::Err, format!("[{}] misaligned at {pc:#x} ({}), with {regs:x?}\n", self.tid, self.where_is(pc)).as_bytes());
+                    self.trace_stack(cx, pc);
+                }
+                self.raise(cx, Raised::simple(status::DATATYPE_MISALIGNMENT, pc), &format!("misaligned at {pc:#x}"))
+            }
             Some(Stop::DivideError { pc }) => self.raise(cx, Raised::simple(status::INTEGER_DIVIDE_BY_ZERO, pc), &format!("divide by zero at {pc:#x}")),
             Some(Stop::FastFail { pc, code }) => self.die(status::STACK_BUFFER_OVERRUN, &format!("fast fail {code} at {pc:#x}")),
             Some(Stop::Internal { pc, detail }) => self.die(status::ILLEGAL_INSTRUCTION, &format!("exec couldn't run it at {pc:#x} ({detail:#x})")),
@@ -458,7 +482,16 @@ impl Task {
                     Kind::Guest(target) => {
                         self.die(status::NOT_IMPLEMENTED, &format!("{}!{} is guest code (ntdll!{target}), and atlas-guest isn't built yet", dll.name, export.name))
                     }
-                    Kind::Missing => self.die(status::NOT_IMPLEMENTED, &format!("{}!{} isn't written yet", dll.name, export.name)),
+                    Kind::Missing => {
+                        let (pc, sp) = cx.turn(|t| {
+                            let r = t.thread().regs();
+                            (r.pc(), r.sp())
+                        });
+                        let process = self.process.clone();
+                        let frames = self.stack_frames(cx, &process, pc, sp);
+                        self.k.host.write(host::Stream::Err, format!("[{}] pid={} missing {}!{}; stack: {}\n", self.tid, self.process.pid, dll.name, export.name, frames.join(", ")).as_bytes());
+                        self.die(status::NOT_IMPLEMENTED, &format!("{}!{} isn't written yet", dll.name, export.name))
+                    }
                 }
             }
             _ => self.answer(cx, u64::from(status::NOT_IMPLEMENTED)),

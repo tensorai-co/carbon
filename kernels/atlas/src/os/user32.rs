@@ -2450,8 +2450,9 @@ fn set_parent(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     Reply::Value(if old == 0 { win32k::DESKTOP } else { old })
 }
 
-/// `WindowFromDC(dc)`: the window a DC draws in; NULL for a memory DC's, the screen's, or a DC that isn't one.
+/// `WindowFromDC(dc)`: the window a DC draws in; the desktop window for the screen's (`GetDC(NULL)`'s), as Windows
+/// gives it; NULL for a memory DC's, or a DC that isn't one.
 fn window_from_dc(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
     let w = task.win32k();
-    Reply::Value(w.gdi.dcs.get(&a[0]).filter(|dc| !dc.memory).map_or(0, |dc| dc.hwnd))
+    Reply::Value(w.gdi.dcs.get(&a[0]).filter(|dc| !dc.memory).map_or(0, |dc| if dc.hwnd == 0 { DESKTOP } else { dc.hwnd }))
 }

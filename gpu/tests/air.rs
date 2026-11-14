@@ -1,6 +1,6 @@
 //! The AIR backend held to Apple's toolchain, where it's installed: every suite program's library passes
 //! `air-validate`, and its module disassembles with `air-opt`: the compute kernels, and the draw tests' vertex and
-//! fragment shaders (a vertex shader with a layout giving each of its inputs an attribute). Skipped, saying why, on a machine without the Metal
+//! fragment shaders (a vertex shader with a layout giving each of its inputs an attribute), from SPIR-V and DXBC. Skipped, saying why, on a machine without the Metal
 //! toolchain (`xcodebuild -downloadComponent MetalToolchain`).
 //!
 //! `GPU_AIR_DUMP=dir` keeps each program's `.air` and `.metallib` there, for a closer look.
@@ -74,9 +74,17 @@ fn apples_tools_accept_every_program() {
     std::fs::create_dir_all(&at).unwrap();
     let mut failures = Vec::new();
     let mut checked = 0;
+    let mut entries = Vec::new();
     for (program, spirv) in suite::PROGRAMS.iter().chain(suite::SHADERS).copied() {
         let module = gpu_frontend::spirv::read(spirv).unwrap_or_else(|e| panic!("{program}: {e}"));
-        for entry in &module.entries {
+        entries.extend(module.entries.into_iter().map(|e| (program.to_string(), e)));
+    }
+    for (program, dxbc) in suite::DXBC.iter().copied() {
+        let shader = gpu_frontend::dxbc::read(dxbc).unwrap_or_else(|e| panic!("{program}: {e}"));
+        entries.push((format!("{program}.dxbc"), shader.entry));
+    }
+    for (program, entry) in &entries {
+        {
             let name = format!("{program}-{}", entry.name);
             match gpu_backend::air::write_with(entry, Some(&layout(entry))) {
                 Ok(lib) => {

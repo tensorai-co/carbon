@@ -486,7 +486,7 @@ impl Task {
     /// The floating-point argument at `index` (counting every argument, `this` too), which is `float` among the
     /// floating-point ones: in xmm`index` on x86-64 (on the stack past the fourth), in v`float` on ARM64, on the stack
     /// on x86.
-    fn f32_arg(&mut self, cx: &mut Cx<'_>, a: &[u64], index: usize, float: usize) -> f32 {
+    pub(crate) fn f32_arg(&mut self, cx: &mut Cx<'_>, a: &[u64], index: usize, float: usize) -> f32 {
         let fp = cx.turn(|t| t.thread().fp());
         match (self.isa, fp) {
             (Isa::X86_64, FpRegs::X86(f)) if index < 4 => {

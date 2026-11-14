@@ -15,6 +15,7 @@ dependencies = [
  "atlas-abi",
  "display",
  "exec",
+ "gpu-api",
  "host",
  "kernels-core",
  "layers",

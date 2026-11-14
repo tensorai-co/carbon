@@ -15,7 +15,7 @@ use gpu_ir::Entry;
 
 use crate::{
     Backend, Command, Error, Fence, GraphicsDesc, Image, ImageDesc, Info, Kind, Load, Memory, Pipeline, Range, Rect,
-    Sampler, SamplerDesc, Submit, Viewport, err,
+    Sampler, SamplerDesc, Sub, Submit, Viewport, err,
 };
 use texel::Texels;
 
@@ -60,7 +60,7 @@ impl cpu::Textures for Tex<'_> {
         let missing = || gpu_backend::Error { message: format!("image {image} or sampler {sampler} is gone") };
         let i = self.images.get(image as usize).and_then(|i| i.as_ref()).ok_or_else(missing)?;
         let s = self.samplers.get(sampler as usize).ok_or_else(missing)?;
-        Ok(i.sample(s, coord, lod))
+        Ok(i.sample(s, coord, lod, None))
     }
 }
 
@@ -135,16 +135,15 @@ impl Software {
         }
     }
 
-    /// Bytes between memory and an image's region, `row_pixels` to a row in memory.
-    fn copy_image(&mut self, range: Range, row_pixels: u32, image: Image, region: Rect, to_image: bool) -> Result<(), Error> {
+    /// Bytes between memory and a region of one level of one layer of an image, `row_pixels` to a row in memory.
+    fn copy_image(&mut self, range: Range, row_pixels: u32, image: Image, sub: Sub, region: Rect, to_image: bool) -> Result<(), Error> {
         let addr = self.addresses[&range.memory] + range.offset;
         let bpp = self.texels(image)?.desc.format.bytes() as u64;
         let row = row_pixels.max(region.width) as u64;
-        let width = self.texels(image)?.desc.width as u64;
         for y in 0..region.height as u64 {
             let len = region.width as u64 * bpp;
             let mem = addr + y * row * bpp;
-            let at = (((region.y as u64 + y) * width + region.x as u64) * bpp) as usize;
+            let at = self.texels(image)?.at(sub, region.x, region.y + y as u32);
             let mut bytes = vec![0u8; len as usize];
             if to_image {
                 cpu::Memory::read(&mut Space(&mut self.memory), mem, &mut bytes)?;
@@ -170,29 +169,19 @@ impl Software {
                 Command::BeginRender { colors, depth } => {
                     for a in colors {
                         if let Load::Clear(c) = a.load {
-                            let t = self.texels(a.image)?;
-                            for y in 0..t.desc.height {
-                                for x in 0..t.desc.width {
-                                    t.write(x, y, c);
-                                }
-                            }
+                            self.texels(a.image)?.clear(a.sub, c);
                         }
                     }
                     if let Some(d) = depth
                         && let Load::Clear(z) = d.load {
-                            let t = self.texels(d.image)?;
-                            for y in 0..t.desc.height {
-                                for x in 0..t.desc.width {
-                                    t.write(x, y, [z, 0.0, 0.0, 1.0]);
-                                }
-                            }
+                            self.texels(d.image)?.clear(d.sub, [z, 0.0, 0.0, 1.0]);
                         }
-                    let first = colors.first().map(|a| a.image).or(depth.map(|d| d.image)).unwrap_or(Image(0));
-                    let desc = self.texels(first)?.desc;
-                    let (w, h) = (desc.width, desc.height);
+                    let (first, sub) = colors.first().map(|a| (a.image, a.sub)).or(depth.map(|d| (d.image, d.sub))).unwrap_or((Image(0), Sub::default()));
+                    let (w, h) = self.texels(first)?.desc.size(sub.level);
                     pass = Some(raster::Target {
-                        colors: colors.iter().map(|a| a.image.0).collect(),
-                        depth: depth.map(|d| d.image.0),
+                        colors: colors.iter().map(|a| (a.image.0, a.sub)).collect(),
+                        depth: depth.map(|d| (d.image.0, d.sub)),
+                        size: (w, h),
                         viewport: Viewport { x: 0.0, y: 0.0, width: w as f32, height: h as f32, min_depth: 0.0, max_depth: 1.0 },
                         scissor: Rect { x: 0, y: 0, width: w, height: h },
                     });
@@ -220,8 +209,9 @@ impl Software {
                     dev.draw(g, d, target)?;
                 }
                 Command::EndRender => pass = None,
-                Command::CopyBufferToImage { from, row_pixels, to, region } => self.copy_image(*from, *row_pixels, *to, *region, true)?,
-                Command::CopyImageToBuffer { from, region, to, row_pixels } => self.copy_image(*to, *row_pixels, *from, *region, false)?,
+                Command::CopyBufferToImage { from, row_pixels, to, sub, region } => self.copy_image(*from, *row_pixels, *to, *sub, *region, true)?,
+                Command::CopyImageToBuffer { from, sub, region, to, row_pixels } => self.copy_image(*to, *row_pixels, *from, *sub, *region, false)?,
+                Command::GenerateMips(image) => self.texels(*image)?.generate_mips(),
                 Command::Copy { from, to, at } => {
                     let (o, n) = (from.offset as usize, from.size as usize);
                     let data = self.bytes(from.memory)?[o..o + n].to_vec();

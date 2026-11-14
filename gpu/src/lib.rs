@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
 
+pub use gpu_frontend::dxbc;
 pub use gpu_ir as ir;
 
 mod graphics;
@@ -55,6 +56,8 @@ pub fn spirv(bytes: &[u8]) -> Result<ir::Module, Error> {
 
 /// An image's largest side.
 pub const MAX_IMAGE: u32 = 16384;
+/// An image's most array layers.
+pub const MAX_LAYERS: u32 = 2048;
 
 /// Whether two stages' declarations of one binding agree: the same kind (a buffer's writability may differ).
 fn same_kind(a: ir::BindingKind, b: ir::BindingKind) -> bool {
@@ -153,7 +156,8 @@ pub enum Command {
     Copy { from: Range, to: Memory, at: u64 },
     /// The range filled with a 32-bit pattern; offset and size are multiples of 4.
     Fill { range: Range, value: u32 },
-    /// Starts a render pass: its attachments, all the same size, loaded or cleared. The viewport and scissor start
+    /// Starts a render pass: its attachments (each one level of one layer of an image), all the same size, loaded or
+    /// cleared. The viewport and scissor start
     /// as the whole attachment.
     BeginRender { colors: Vec<ColorAttachment>, depth: Option<DepthAttachment> },
     SetViewport(Viewport),
@@ -161,9 +165,13 @@ pub enum Command {
     /// Triangles, in a render pass, with a graphics pipeline made for its attachments' formats.
     Draw(Draw),
     EndRender,
-    /// Texels from memory, `row_pixels` to a row (0: the region's width), tightly packed in the image's format.
-    CopyBufferToImage { from: Range, row_pixels: u32, to: Image, region: Rect },
-    CopyImageToBuffer { from: Image, region: Rect, to: Range, row_pixels: u32 },
+    /// Texels from memory, `row_pixels` to a row (0: the region's width), tightly packed in the image's format, into
+    /// a region of one level of one layer.
+    CopyBufferToImage { from: Range, row_pixels: u32, to: Image, sub: Sub, region: Rect },
+    CopyImageToBuffer { from: Image, sub: Sub, region: Rect, to: Range, row_pixels: u32 },
+    /// Every level of every layer after the first made from the one before, each texel the average of the four it
+    /// covers (a colour image's).
+    GenerateMips(Image),
 }
 
 /// A list of commands for the queue, with the fences it waits for first and signals when it's done.
@@ -336,6 +344,13 @@ impl Device {
         if desc.width == 0 || desc.height == 0 || desc.width > MAX_IMAGE || desc.height > MAX_IMAGE {
             return err(format!("an image of {}×{}: each side is 1 to {MAX_IMAGE}", desc.width, desc.height));
         }
+        let most = ImageDesc::most_levels(desc.width, desc.height);
+        if desc.levels == 0 || desc.levels > most {
+            return err(format!("an image of {}×{} with {} levels: it has 1 to {most}", desc.width, desc.height, desc.levels));
+        }
+        if desc.layers == 0 || desc.layers > MAX_LAYERS {
+            return err(format!("an image of {} layers: it has 1 to {MAX_LAYERS}", desc.layers));
+        }
         let image = self.backend.image(&desc)?;
         self.images.insert(image, desc);
         Ok(image)
@@ -397,6 +412,9 @@ impl Device {
         if desc.colors.iter().any(|c| c.format.is_depth()) || desc.depth_format.is_some_and(|d| !d.is_depth()) {
             return err("a colour attachment of a depth format, or the reverse");
         }
+        if let Some(c) = desc.colors.iter().find(|c| !c.format.is_renderable()) {
+            return err(format!("{:?} images can't be drawn into", c.format));
+        }
         if desc.depth.is_some() && desc.depth_format.is_none() {
             return err("a depth test with no depth attachment");
         }
@@ -423,12 +441,21 @@ impl Device {
         }
     }
 
-    /// A copy between memory and an image: the region inside the image, and the bytes inside the range.
-    fn check_copy(&self, range: Range, row_pixels: u32, image: Image, region: Rect) -> Result<(), Error> {
-        self.check(range)?;
+    /// One level of one layer of an image: its width and height.
+    fn check_sub(&self, image: Image, sub: Sub) -> Result<(ImageDesc, (u32, u32)), Error> {
         let desc = self.check_image(image)?;
-        if region.width == 0 || region.height == 0 || region.x + region.width > desc.width || region.y + region.height > desc.height {
-            return err(format!("{region:?} isn't inside {image:?}'s {}×{}", desc.width, desc.height));
+        if sub.level >= desc.levels || sub.layer >= desc.layers {
+            return err(format!("{sub:?} of {image:?}, which has {} levels and {} layers", desc.levels, desc.layers));
+        }
+        Ok((desc, desc.size(sub.level)))
+    }
+
+    /// A copy between memory and an image: the region inside the level, and the bytes inside the range.
+    fn check_copy(&self, range: Range, row_pixels: u32, image: Image, sub: Sub, region: Rect) -> Result<(), Error> {
+        self.check(range)?;
+        let (desc, (w, h)) = self.check_sub(image, sub)?;
+        if region.width == 0 || region.height == 0 || region.x as u64 + region.width as u64 > w as u64 || region.y as u64 + region.height as u64 > h as u64 {
+            return err(format!("{region:?} isn't inside {image:?}'s {w}×{h} at {sub:?}"));
         }
         let row = row_pixels.max(region.width) as u64;
         let needed = (row * (region.height as u64 - 1) + region.width as u64) * desc.format.bytes() as u64;
@@ -504,12 +531,12 @@ impl Device {
                     }
                     let mut size = None;
                     let mut formats = Vec::new();
-                    for image in colors.iter().map(|a| a.image).chain(depth.map(|d| d.image)) {
-                        let d = self.check_image(image)?;
-                        if size.is_some_and(|s| s != (d.width, d.height)) {
+                    for (image, sub) in colors.iter().map(|a| (a.image, a.sub)).chain(depth.map(|d| (d.image, d.sub))) {
+                        let (d, at) = self.check_sub(image, sub)?;
+                        if size.is_some_and(|s| s != at) {
                             return err("a render pass's attachments of different sizes");
                         }
-                        size = Some((d.width, d.height));
+                        size = Some(at);
                         formats.push(d.format);
                     }
                     if size.is_none() {
@@ -519,6 +546,9 @@ impl Device {
                     let color_formats: Vec<Format> = formats[..colors.len()].to_vec();
                     if color_formats.iter().any(|f| f.is_depth()) || depth_format.is_some_and(|f| !f.is_depth()) {
                         return err("a colour attachment of a depth format, or the reverse");
+                    }
+                    if let Some(f) = color_formats.iter().find(|f| !f.is_renderable()) {
+                        return err(format!("{f:?} images can't be drawn into"));
                     }
                     pass = Some(Pass { colors: color_formats, depth: depth_format });
                 }
@@ -530,8 +560,14 @@ impl Device {
                 }
                 Command::SetScissor(_) => {}
                 Command::Draw(d) => self.check_draw(d, pass.as_ref().ok_or_else(|| Error { message: "a draw outside a pass".into() })?)?,
-                Command::CopyBufferToImage { from, row_pixels, to, region } => self.check_copy(*from, *row_pixels, *to, *region)?,
-                Command::CopyImageToBuffer { from, region, to, row_pixels } => self.check_copy(*to, *row_pixels, *from, *region)?,
+                Command::CopyBufferToImage { from, row_pixels, to, sub, region } => self.check_copy(*from, *row_pixels, *to, *sub, *region)?,
+                Command::CopyImageToBuffer { from, sub, region, to, row_pixels } => self.check_copy(*to, *row_pixels, *from, *sub, *region)?,
+                Command::GenerateMips(image) => {
+                    let desc = self.check_image(*image)?;
+                    if desc.format.is_depth() || !desc.format.is_renderable() {
+                        return err(format!("mip levels made for a {:?} image", desc.format));
+                    }
+                }
                 Command::Dispatch { pipeline, bindings, groups } => {
                     let Some(Program::Compute { bindings: needs }) = self.programs.get(pipeline) else {
                         return err(format!("{pipeline:?} isn't one of this device's compute pipelines"));

@@ -5,15 +5,18 @@
 //! kernels get (cloned for each that needs it); what they ask of the device runs on the service ([`Gpu::run`]) and
 //! comes back.
 //!
-//! Built so far: the device's description, for lambda's render node, and [`vulkan`]: a Vulkan driver's records
-//! lowered onto the device (memory, compute pipelines, dispatches, copies and fills).
+//! Built so far: the device's description, for lambda's render node; [`vulkan`], a Vulkan driver's records lowered
+//! onto the device; and [`d3d11`], Direct3D 11's devices and immediate contexts, for atlas.
 
+pub mod d3d11;
 pub mod vulkan;
 
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 pub use gpu::{Choice, Info, Kind};
+/// The Carbon GPU's vendor and device IDs, which every API's adapter reports.
+pub use gpu_wire::{DEVICE_ID, VENDOR_ID};
 
 /// Work for the service: something to do with the device.
 type Job = Box<dyn FnOnce(&mut gpu::Device) + Send>;

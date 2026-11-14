@@ -626,7 +626,8 @@ impl Machines {
                 let headless = matches!(run.display, Display::Headless(..));
                 let _clock = desktop.clone().filter(|_| headless).map(|d| display::clock::Clock::start(d, 60));
                 let env = env.iter().filter_map(|e| e.split_once('=')).map(|(k, v)| (k.to_string(), v.to_string())).collect();
-                let options = atlas::Options { stop, env, display: desktop, trace: std::env::var_os("CARBON_TRACE").is_some() };
+                let gpu = open_gpu(run.gpu)?;
+                let options = atlas::Options { stop, env, display: desktop, trace: std::env::var_os("CARBON_TRACE").is_some(), gpu };
                 let argv: Vec<&str> = args.iter().map(String::as_str).collect();
                 atlas::boot(exec, cpu, disk, host, &argv, options).map(|ended| ended.code as i32)
             }
@@ -635,8 +636,7 @@ impl Machines {
 }
 
 /// Opens the machine's GPU on its own thread: the device `--gpu` asks for, or none. `auto` takes the host's GPU where
-/// there is one, and says so, as `--isolation auto` does, when it has to take the CPU device instead. (Only lambda has a
-/// driver for it yet; atlas's DXGI comes later.)
+/// there is one, and says so, as `--isolation auto` does, when it has to take the CPU device instead.
 fn open_gpu(choice: Gpu) -> Result<Option<gpu_api::Gpu>, String> {
     let gpu = gpu_api::Gpu::open(choice).map_err(|e| format!("--gpu: {}", e.message))?;
     if let Some(why) = gpu.as_ref().and_then(|g| g.info().why.as_ref()) {

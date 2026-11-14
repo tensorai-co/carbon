@@ -323,6 +323,30 @@ impl Win32k {
         true
     }
 
+    /// A swap chain's present: `pixels`, `width` by `height` (0x00RRGGBB), into a window's client area from its top
+    /// left, clipped to it, and shown. False for a window that isn't there.
+    pub fn present(&mut self, hwnd: u64, width: i32, height: i32, pixels: &[display::Rgb]) -> bool {
+        let Some((top, dx, dy)) = self.origin(hwnd) else { return false };
+        let Some(client) = self.windows.get(&hwnd).map(|w| w.client()) else { return false };
+        let Some(shown) = self.windows.get(&top).map(|w| w.shown).filter(|&s| s != 0) else { return false };
+        let Some(canvas) = self.canvases.get(&shown) else { return false };
+        let clip = client.intersect(&Rect::new(0, 0, width, height)).offset(dx, dy);
+        canvas.draw(|s| {
+            let clip = clip.intersect(&s.bounds());
+            for y in clip.top..clip.bottom {
+                let (from, to) = (((y - dy) * width + clip.left - dx) as usize, (y * s.width + clip.left) as usize);
+                let n = (clip.right - clip.left).max(0) as usize;
+                if let (Some(src), Some(dst)) = (pixels.get(from..from + n), s.pixels.get_mut(to..to + n)) {
+                    dst.copy_from_slice(src);
+                }
+            }
+        });
+        let mut d = display::desktop::lock(&self.display);
+        d.damage(shown, clip);
+        d.commit(shown);
+        true
+    }
+
     pub fn fill_rect(&mut self, hdc: u64, rect: Rect, brush: u64) -> bool {
         let Some(color) = self.gdi.brush_color(brush) else { return self.gdi.object(brush).is_some() };
         self.draw(hdc, |s, (dx, dy), clip, _| s.fill(&rect.offset(dx, dy), color, clip))

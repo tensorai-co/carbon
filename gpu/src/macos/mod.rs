@@ -120,6 +120,9 @@ impl Drop for Metal {
         }
         self.pipelines.clear();
         for t in self.textures.values() {
+            if let Some(v) = t.view {
+                release(v);
+            }
             release(t.texture);
         }
         for s in &self.samplers {
@@ -421,8 +424,9 @@ impl Backend for Metal {
                             msg!((); enc, "endEncoding");
                         }
                     }
-                    Command::CopyBufferToImage { from, row_pixels, to, region } => self.copy_to_texture(cb, *from, *row_pixels, *to, *region)?,
-                    Command::CopyImageToBuffer { from, region, to, row_pixels } => self.copy_from_texture(cb, *from, *region, *to, *row_pixels)?,
+                    Command::CopyBufferToImage { from, row_pixels, to, sub, region } => self.copy_to_texture(cb, *from, *row_pixels, *to, *sub, *region)?,
+                    Command::CopyImageToBuffer { from, sub, region, to, row_pixels } => self.copy_from_texture(cb, *from, *sub, *region, *to, *row_pixels)?,
+                    Command::GenerateMips(image) => self.generate_mips(cb, *image)?,
                 }
             }
             for (f, v) in s.signal {

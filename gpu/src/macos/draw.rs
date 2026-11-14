@@ -15,7 +15,7 @@ use gpu_ir::Entry;
 
 use super::Metal;
 use super::objc::{Id, class, error_text, msg, pooled, release};
-use crate::{Address, Bind, Blend, BlendOp, Compare, Cull, Draw, Error, Factor, Filter, Format, FrontFace, GraphicsDesc, Image, ImageDesc, IndexType, Load, Rect, Sampler, SamplerDesc, Topology, VertexFormat, Viewport, err};
+use crate::{Address, Bind, Blend, BlendOp, Border, Compare, Cull, Draw, Error, Factor, Filter, Format, FrontFace, GraphicsDesc, Image, ImageDesc, IndexType, Load, Rect, Sampler, SamplerDesc, Sub, Topology, VertexFormat, Viewport, err};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -48,6 +48,13 @@ struct ClearColor {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct NsRange {
+    location: usize,
+    length: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct Origin {
     x: usize,
     y: usize,
@@ -61,13 +68,24 @@ const LOAD_DONT_CARE: usize = 0;
 const LOAD_LOAD: usize = 1;
 const LOAD_CLEAR: usize = 2;
 const STORE_STORE: usize = 1;
+const TEXTURE_2D: usize = 2;
+const TEXTURE_2D_ARRAY: usize = 3;
 const PRIMITIVE_TRIANGLE: usize = 3;
 const PRIMITIVE_TRIANGLE_STRIP: usize = 4;
 
-/// A texture, and what it was made as.
+/// A texture, and what it was made as; an array's layer 0 as a 2D view, which is what shaders sample (they read
+/// `texture2d`s).
 pub(super) struct Texture {
     pub(super) texture: Id,
     pub(super) desc: ImageDesc,
+    pub(super) view: Option<Id>,
+}
+
+impl Texture {
+    /// What a draw binds for sampling.
+    fn sampled(&self) -> Id {
+        self.view.unwrap_or(self.texture)
+    }
 }
 
 /// A render pipeline state and the fixed-function state Metal sets on the encoder, with each stage's bindings in
@@ -96,6 +114,13 @@ fn pixel_format(f: Format) -> usize {
         Format::Rgba8Srgb => 71,
         Format::Bgra8Unorm => 80,
         Format::Bgra8Srgb => 81,
+        Format::A8Unorm => 1,
+        Format::R8Unorm => 10,
+        Format::Rg8Unorm => 30,
+        Format::R32Float => 55,
+        Format::Rgb10a2Unorm => 90,
+        Format::Rg11b10Float => 92,
+        Format::Rgba16Float => 115,
         Format::Rgba32Float => 125,
         Format::D16Unorm => 250,
         Format::D32Float => 252,
@@ -150,24 +175,43 @@ impl Metal {
     }
 
     pub(super) fn make_image(&mut self, desc: &ImageDesc) -> Result<Image, Error> {
-        let texture = pooled(|| {
-            let d = msg!(Id; class("MTLTextureDescriptor"), "texture2DDescriptorWithPixelFormat:width:height:mipmapped:",
-                pixel_format(desc.format) => usize, desc.width as usize => usize, desc.height as usize => usize, false => bool);
+        let format = pixel_format(desc.format);
+        let array = desc.layers > 1;
+        let usage = USAGE_SHADER_READ | if desc.format.is_renderable() { USAGE_RENDER_TARGET } else { 0 };
+        let (texture, view) = pooled(|| {
+            let d = msg!(Id; msg!(Id; class("MTLTextureDescriptor"), "alloc"), "init");
+            msg!((); d, "setTextureType:", if array { TEXTURE_2D_ARRAY } else { TEXTURE_2D } => usize);
+            msg!((); d, "setPixelFormat:", format => usize);
+            msg!((); d, "setWidth:", desc.width as usize => usize);
+            msg!((); d, "setHeight:", desc.height as usize => usize);
+            msg!((); d, "setMipmapLevelCount:", desc.levels as usize => usize);
+            msg!((); d, "setArrayLength:", desc.layers as usize => usize);
             msg!((); d, "setStorageMode:", STORAGE_PRIVATE => usize);
-            msg!((); d, "setUsage:", USAGE_SHADER_READ | USAGE_RENDER_TARGET => usize);
-            msg!(Id; self.device, "newTextureWithDescriptor:", d => Id)
+            msg!((); d, "setUsage:", usage => usize);
+            let t = msg!(Id; self.device, "newTextureWithDescriptor:", d => Id);
+            release(d);
+            let view = (array && !t.is_null()).then(|| {
+                let levels = NsRange { location: 0, length: desc.levels as usize };
+                let slices = NsRange { location: 0, length: 1 };
+                msg!(Id; t, "newTextureViewWithPixelFormat:textureType:levels:slices:", format => usize, TEXTURE_2D => usize, levels => NsRange, slices => NsRange)
+            });
+            (t, view)
         });
-        if texture.is_null() {
-            return err(format!("Metal couldn't make a {}×{} {:?} texture", desc.width, desc.height, desc.format));
+        if texture.is_null() || view.is_some_and(|v| v.is_null()) {
+            release(texture);
+            return err(format!("Metal couldn't make a {}×{} {:?} texture of {} levels and {} layers", desc.width, desc.height, desc.format, desc.levels, desc.layers));
         }
         let image = Image(self.next_image);
         self.next_image += 1;
-        self.textures.insert(image, Texture { texture, desc: *desc });
+        self.textures.insert(image, Texture { texture, desc: *desc, view });
         Ok(image)
     }
 
     pub(super) fn drop_image(&mut self, image: Image) {
         if let Some(t) = self.textures.remove(&image) {
+            if let Some(v) = t.view {
+                release(v);
+            }
             release(t.texture);
         }
     }
@@ -178,6 +222,14 @@ impl Metal {
             Address::ClampToEdge => 0usize,
             Address::Repeat => 2,
             Address::MirroredRepeat => 3,
+            Address::ClampToBorder => 5,
+        };
+        // Metal's mip filters: not mipmapped 0, nearest 1, linear 2.
+        let mip = if desc.mipmap == Filter::Linear { 2usize } else { 1 };
+        let border = match desc.border {
+            Border::TransparentBlack => 0usize,
+            Border::OpaqueBlack => 1,
+            Border::OpaqueWhite => 2,
         };
         let state = pooled(|| {
             let d = msg!(Id; msg!(Id; class("MTLSamplerDescriptor"), "alloc"), "init");
@@ -185,6 +237,13 @@ impl Metal {
             msg!((); d, "setMagFilter:", filter(desc.mag) => usize);
             msg!((); d, "setSAddressMode:", address(desc.address[0]) => usize);
             msg!((); d, "setTAddressMode:", address(desc.address[1]) => usize);
+            msg!((); d, "setMipFilter:", mip => usize);
+            msg!((); d, "setLodMinClamp:", desc.lod[0] => f32);
+            msg!((); d, "setLodMaxClamp:", desc.lod[1] => f32);
+            msg!((); d, "setBorderColor:", border => usize);
+            if let Some(c) = desc.compare {
+                msg!((); d, "setCompareFunction:", compare(c) => usize);
+            }
             let s = msg!(Id; self.device, "newSamplerStateWithDescriptor:", d => Id);
             release(d);
             s
@@ -288,6 +347,8 @@ impl Metal {
         for (i, c) in colors.iter().enumerate() {
             let a = msg!(Id; attachments, "objectAtIndexedSubscript:", i => usize);
             msg!((); a, "setTexture:", self.texture(c.image)?.texture => Id);
+            msg!((); a, "setLevel:", c.sub.level as usize => usize);
+            msg!((); a, "setSlice:", c.sub.layer as usize => usize);
             let action = match c.load {
                 Load::Load => LOAD_LOAD,
                 Load::Clear(v) => {
@@ -302,6 +363,8 @@ impl Metal {
         if let Some(z) = depth {
             let a = msg!(Id; d, "depthAttachment");
             msg!((); a, "setTexture:", self.texture(z.image)?.texture => Id);
+            msg!((); a, "setLevel:", z.sub.level as usize => usize);
+            msg!((); a, "setSlice:", z.sub.layer as usize => usize);
             let action = match z.load {
                 Load::Load => LOAD_LOAD,
                 Load::Clear(v) => {
@@ -347,10 +410,10 @@ impl Metal {
                         let (buffer, _) = self.buffer(r.memory)?;
                         msg!((); enc, &format!("set{stage}Buffer:offset:atIndex:"), buffer => Id, r.offset as usize => usize, slot => usize);
                     }
-                    Bind::Image(i) => msg!((); enc, &format!("set{stage}Texture:atIndex:"), self.texture(i)?.texture => Id, slot => usize),
+                    Bind::Image(i) => msg!((); enc, &format!("set{stage}Texture:atIndex:"), self.texture(i)?.sampled() => Id, slot => usize),
                     Bind::Sampler(s) => msg!((); enc, &format!("set{stage}SamplerState:atIndex:"), self.samplers[s.0 as usize] => Id, slot => usize),
                     Bind::Combined(i, s) => {
-                        msg!((); enc, &format!("set{stage}Texture:atIndex:"), self.texture(i)?.texture => Id, slot => usize);
+                        msg!((); enc, &format!("set{stage}Texture:atIndex:"), self.texture(i)?.sampled() => Id, slot => usize);
                         msg!((); enc, &format!("set{stage}SamplerState:atIndex:"), self.samplers[s.0 as usize] => Id, slot => usize);
                     }
                 }
@@ -415,8 +478,9 @@ impl Metal {
         Ok(())
     }
 
-    /// Texels from a buffer into a region of a texture, `row` texels to a row (0: the region's width).
-    pub(super) fn copy_to_texture(&self, cb: Id, from: crate::Range, row: u32, to: Image, region: Rect) -> Result<(), Error> {
+    /// Texels from a buffer into a region of one level of one layer of a texture, `row` texels to a row (0: the
+    /// region's width).
+    pub(super) fn copy_to_texture(&self, cb: Id, from: crate::Range, row: u32, to: Image, sub: Sub, region: Rect) -> Result<(), Error> {
         let t = self.texture(to)?;
         let (buffer, _) = self.buffer(from.memory)?;
         let bytes_per_row = row.max(region.width) as usize * t.desc.format.bytes() as usize;
@@ -425,13 +489,13 @@ impl Metal {
         let enc = msg!(Id; cb, "blitCommandEncoder");
         msg!((); enc, "copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:",
             buffer => Id, from.offset as usize => usize, bytes_per_row => usize, bytes_per_row * region.height as usize => usize, size => super::Size,
-            t.texture => Id, 0usize => usize, 0usize => usize, origin => Origin);
+            t.texture => Id, sub.layer as usize => usize, sub.level as usize => usize, origin => Origin);
         msg!((); enc, "endEncoding");
         Ok(())
     }
 
-    /// A region of a texture into a buffer: what a present reads back.
-    pub(super) fn copy_from_texture(&self, cb: Id, from: Image, region: Rect, to: crate::Range, row: u32) -> Result<(), Error> {
+    /// A region of one level of one layer of a texture into a buffer: what a present reads back.
+    pub(super) fn copy_from_texture(&self, cb: Id, from: Image, sub: Sub, region: Rect, to: crate::Range, row: u32) -> Result<(), Error> {
         let t = self.texture(from)?;
         let (buffer, _) = self.buffer(to.memory)?;
         let bytes_per_row = row.max(region.width) as usize * t.desc.format.bytes() as usize;
@@ -439,8 +503,20 @@ impl Metal {
         let origin = Origin { x: region.x as usize, y: region.y as usize, z: 0 };
         let enc = msg!(Id; cb, "blitCommandEncoder");
         msg!((); enc, "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toBuffer:destinationOffset:destinationBytesPerRow:destinationBytesPerImage:",
-            t.texture => Id, 0usize => usize, 0usize => usize, origin => Origin, size => super::Size,
+            t.texture => Id, sub.layer as usize => usize, sub.level as usize => usize, origin => Origin, size => super::Size,
             buffer => Id, to.offset as usize => usize, bytes_per_row => usize, bytes_per_row * region.height as usize => usize);
+        msg!((); enc, "endEncoding");
+        Ok(())
+    }
+
+    /// Every level after the first, from the one before, in every layer: Metal's own blit.
+    pub(super) fn generate_mips(&self, cb: Id, image: Image) -> Result<(), Error> {
+        let t = self.texture(image)?;
+        if t.desc.levels == 1 {
+            return Ok(());
+        }
+        let enc = msg!(Id; cb, "blitCommandEncoder");
+        msg!((); enc, "generateMipmapsForTexture:", t.texture => Id);
         msg!((); enc, "endEncoding");
         Ok(())
     }

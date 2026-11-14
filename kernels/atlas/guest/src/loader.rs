@@ -1041,6 +1041,7 @@ fn load_library(at: u64, wide: bool) -> u64 {
             0
         }
         Err(_) => {
+            Message::new().text(b"atlas-guest: can't load ").text(&name[..n]).text(b"\n").print();
             set_last_error(ERROR_MOD_NOT_FOUND);
             0
         }

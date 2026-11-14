@@ -41,10 +41,22 @@ pub const SHADERS: &[(&str, &[u8])] = &[
     ("textured.frag", include_bytes!("programs/textured.frag.spv")),
     ("cube.vert", include_bytes!("programs/cube.vert.spv")),
     ("cube.frag", include_bytes!("programs/cube.frag.spv")),
+    ("levels.frag", include_bytes!("programs/levels.frag.spv")),
+];
+
+/// The DXBC programs vkd3d's compiler wrote from `programs/*.hlsl`.
+pub const DXBC: &[(&str, &[u8])] = &[
+    ("arith", include_bytes!("programs/arith.dxbc")),
+    ("flow", include_bytes!("programs/flow.dxbc")),
+    ("shared", include_bytes!("programs/shared.dxbc")),
+    ("quad.vs", include_bytes!("programs/quad.vs.dxbc")),
+    ("quad.ps", include_bytes!("programs/quad.ps.dxbc")),
 ];
 
 #[path = "draws.rs"]
 mod draws;
+#[path = "dxbc.rs"]
+mod dxbc;
 
 const TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -63,6 +75,17 @@ pub fn run(device: &mut Device) -> Vec<Outcome> {
         ("depth", draws::depth),
         ("texture", draws::texture),
         ("cube", draws::cube),
+        ("formats", draws::formats),
+        ("mips", draws::mips),
+        ("border", draws::border),
+        ("dxbc arith", dxbc::arith),
+        ("dxbc flow", dxbc::flow),
+        ("dxbc shared", dxbc::shared),
+        ("dxbc draw", dxbc::draw),
+        ("hlsl arith", dxbc::hlsl_arith),
+        ("hlsl flow", dxbc::hlsl_flow),
+        ("hlsl shared", dxbc::hlsl_shared),
+        ("hlsl draw", dxbc::hlsl_draw),
     ];
     tests.iter().map(|(name, test)| Outcome { name, result: test(device) }).collect()
 }

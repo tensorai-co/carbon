@@ -7,7 +7,7 @@ out="${1:-.}"
 llvm="${LLVM:-/opt/homebrew/opt/llvm/bin}"
 for arch in aarch64 x86_64; do
     machine=$([ $arch = aarch64 ] && echo arm64 || echo i386:x86-64)
-    for dll in kernel32 user32 ntdll advapi32 gdi32 shell32 version ucrtbase ole32 comctl32 psapi oleaut32 bcrypt ws2_32 combase bcryptprimitives; do
+    for dll in kernel32 user32 ntdll advapi32 gdi32 shell32 version ucrtbase ole32 comctl32 psapi oleaut32 bcrypt ws2_32 combase bcryptprimitives d3d11 dxgi; do
         "$llvm/llvm-dlltool" -m "$machine" -d $dll.def -l "$out/$dll-$arch.lib"
     done
     # Unwind tables for every function, as MSVC makes them: SEH walks the stack by them.
@@ -71,6 +71,10 @@ for arch in aarch64 x86_64; do
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console sandbox.c "$out/kernel32-$arch.lib" "$out/user32-$arch.lib" "$out/advapi32-$arch.lib" \
         "$out/ntdll-$arch.lib" "$out/combase-$arch.lib" "$out/bcryptprimitives-$arch.lib" -o "$out/loader-$arch/sandbox.exe"
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:windows desktop.c "$out/kernel32-$arch.lib" "$out/user32-$arch.lib" "$out/shell32-$arch.lib" -o "$out/loader-$arch/desktop.exe"
+    $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:windows d3d11.c "$out/kernel32-$arch.lib" "$out/user32-$arch.lib" "$out/gdi32-$arch.lib" \
+        "$out/d3d11-$arch.lib" "$out/dxgi-$arch.lib" -o "$out/loader-$arch/d3d11.exe"
+    $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:windows cube.c "$out/kernel32-$arch.lib" "$out/user32-$arch.lib" "$out/gdi32-$arch.lib" \
+        "$out/d3d11-$arch.lib" -o "$out/loader-$arch/cube.exe"
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:windows windows.c "$out/kernel32-$arch.lib" "$out/user32-$arch.lib" "$out/gdi32-$arch.lib" \
         -o "$out/loader-$arch/windows.exe"
 done

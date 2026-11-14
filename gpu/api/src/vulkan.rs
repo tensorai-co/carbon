@@ -277,7 +277,7 @@ impl Context {
                 records::IMAGE => {
                     let (id, memory, offset) = (p.u64().map_err(malformed)?, p.u64().map_err(malformed)?, p.u64().map_err(malformed)?);
                     let (f, width, height, linear) = (p.u32().map_err(malformed)?, p.u32().map_err(malformed)?, p.u32().map_err(malformed)?, p.u32().map_err(malformed)? != 0);
-                    let desc = gpu::ImageDesc { format: format(f)?, width, height };
+                    let desc = gpu::ImageDesc::new(format(f)?, width, height);
                     let device = self.gpu.run(move |d| d.image(desc)).map_err(device_error)?.map_err(device_error)?;
                     if let Some(old) = state.images.insert(id, Image { device, desc, memory, offset, linear }) {
                         let _ = self.gpu.run(move |d| d.free_image(old.device));
@@ -291,7 +291,7 @@ impl Context {
                 records::SAMPLER => {
                     let id = p.u64().map_err(malformed)?;
                     let (mag, min, u, v) = (p.u32().map_err(malformed)?, p.u32().map_err(malformed)?, p.u32().map_err(malformed)?, p.u32().map_err(malformed)?);
-                    let desc = gpu::SamplerDesc { mag: filter(mag), min: filter(min), address: [address(u), address(v)] };
+                    let desc = gpu::SamplerDesc::new(filter(mag), filter(min), [address(u), address(v)]);
                     let device = self.gpu.run(move |d| d.sampler(desc)).map_err(device_error)?.map_err(device_error)?;
                     state.samplers.insert(id, device);
                 }
@@ -436,10 +436,10 @@ impl Context {
                     for _ in 0..n {
                         let (id, op) = (p.u64().map_err(malformed)?, p.u32().map_err(malformed)?);
                         let clear = [p.f32().map_err(malformed)?, p.f32().map_err(malformed)?, p.f32().map_err(malformed)?, p.f32().map_err(malformed)?];
-                        colors.push(gpu::ColorAttachment { image: image(state, id)?, load: load(op, clear) });
+                        colors.push(gpu::ColorAttachment { image: image(state, id)?, sub: gpu::Sub::default(), load: load(op, clear) });
                     }
                     let (id, op, clear) = (p.u64().map_err(malformed)?, p.u32().map_err(malformed)?, p.f32().map_err(malformed)?);
-                    let depth = if id == 0 { None } else { Some(gpu::DepthAttachment { image: image(state, id)?, load: load(op, clear) }) };
+                    let depth = if id == 0 { None } else { Some(gpu::DepthAttachment { image: image(state, id)?, sub: gpu::Sub::default(), load: load(op, clear) }) };
                     plan.push(Planned::Begin { colors, depth });
                 }
                 records::VIEWPORT => {
@@ -627,8 +627,8 @@ fn run(
                     draw.index = index.map(|(s, t)| (range(s), t));
                     gpu::Command::Draw(draw)
                 }
-                Planned::ToImage { from, row, to, region } => gpu::Command::CopyBufferToImage { from: range(*from), row_pixels: *row, to: *to, region: *region },
-                Planned::FromImage { from, region, to, row } => gpu::Command::CopyImageToBuffer { from: *from, region: *region, to: range(*to), row_pixels: *row },
+                Planned::ToImage { from, row, to, region } => gpu::Command::CopyBufferToImage { from: range(*from), row_pixels: *row, to: *to, sub: gpu::Sub::default(), region: *region },
+                Planned::FromImage { from, region, to, row } => gpu::Command::CopyImageToBuffer { from: *from, sub: gpu::Sub::default(), region: *region, to: range(*to), row_pixels: *row },
             })
             .collect();
         d.submit(gpu::Submit { commands: &commands, wait: &[], signal: &[(fence, value)] }).map_err(device_error)?;

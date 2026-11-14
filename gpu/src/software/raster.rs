@@ -20,7 +20,7 @@ use super::texel::Texels;
 use super::{Space, Tex};
 use crate::{
     Attribute, Bind, Blend, BlendOp, ColorTarget, Cull, DepthState, Draw, Error, Factor, FrontFace, IndexType, Memory,
-    Rect, SamplerDesc, Topology, VertexBuffer, VertexFormat, Viewport, err,
+    Rect, SamplerDesc, Sub, Topology, VertexBuffer, VertexFormat, Viewport, err,
 };
 
 /// A graphics pipeline as the CPU device keeps it.
@@ -38,8 +38,11 @@ pub(crate) struct Graphics {
 
 /// The render pass a draw is in.
 pub(crate) struct Target {
-    pub colors: Vec<u32>,
-    pub depth: Option<u32>,
+    /// Each attachment's image and the level and layer drawn into.
+    pub colors: Vec<(u32, Sub)>,
+    pub depth: Option<(u32, Sub)>,
+    /// The attachments' width and height, at their levels.
+    pub size: (u32, u32),
     pub viewport: Viewport,
     pub scissor: Rect,
 }
@@ -329,8 +332,7 @@ impl Device<'_> {
             let (dx, dy) = (b.0 - a.0, b.1 - a.1);
             (dy == 0 && dx > 0) || dy < 0
         });
-        let first = t.colors.first().copied().or(t.depth).unwrap_or(0);
-        let (w, h) = self.images[first as usize].as_ref().map_or((0, 0), |i| (i.desc.width, i.desc.height));
+        let (w, h) = t.size;
         let sx0 = t.scissor.x.min(w);
         let sy0 = t.scissor.y.min(h);
         let sx1 = (t.scissor.x + t.scissor.width).min(w);
@@ -417,15 +419,15 @@ impl Device<'_> {
                 continue;
             }
             let o = &out.outputs[lane * n_out..(lane + 1) * n_out];
-            if let (Some(state), Some(depth)) = (g.depth, t.depth) {
+            if let (Some(state), Some((depth, sub))) = (g.depth, t.depth) {
                 let z = depth_out.map_or(f.z, |i| float(o[i][0]));
                 let image = self.images[depth as usize].as_mut().ok_or_else(|| Error { message: "no depth image".into() })?;
-                let old = image.read(f.x, f.y)[0];
+                let old = image.read(sub, f.x, f.y)[0];
                 if !state.compare.passes(z, old) {
                     continue;
                 }
                 if state.write {
-                    image.write(f.x, f.y, [z, 0.0, 0.0, 1.0]);
+                    image.write(sub, f.x, f.y, [z, 0.0, 0.0, 1.0]);
                 }
             }
             for (j, target) in g.colors.iter().enumerate() {
@@ -435,8 +437,9 @@ impl Device<'_> {
                 for (c, v) in src.iter_mut().enumerate().take(lanes) {
                     *v = float(o[i][c]);
                 }
-                let image = self.images[t.colors[j] as usize].as_mut().ok_or_else(|| Error { message: "no colour image".into() })?;
-                let dst = image.read(f.x, f.y);
+                let (index, sub) = t.colors[j];
+                let image = self.images[index as usize].as_mut().ok_or_else(|| Error { message: "no colour image".into() })?;
+                let dst = image.read(sub, f.x, f.y);
                 let mut c = match target.blend {
                     Some(b) => blend(&b, src, dst),
                     None => src,
@@ -446,7 +449,7 @@ impl Device<'_> {
                         c[k] = dst[k];
                     }
                 }
-                image.write(f.x, f.y, c);
+                image.write(sub, f.x, f.y, c);
             }
         }
         *batch = Batch::default();

@@ -96,6 +96,8 @@ opening comment says what it checks. `crt.exe` (and `crt-mingw.exe`) want the ar
 | atlas's `dialog.c`, both ISAs and i686, with `dialog.rc` | Dialogs: the dialog class as `GetClassInfoEx` gives it and a class of the program's own from it; templates in memory and a `DIALOGEX` resource, their controls, IDs and text; `WM_INITDIALOG` and the focus; `DWLP_DLGPROC`; `Get`/`SetDlgItemText` and `Int`; check boxes and an automatic radio group; `WM_COMMAND` and `EN_CHANGE`; `DM_GETDEFID`; Tab, Enter, Escape and typing through `IsDialogMessage`; `EnableWindow`; a control's procedure through `CallWindowProc`; what the controls paint, read with `GetPixel`, in a `WM_CTLCOLORSTATIC` brush; modal dialogs, their owner disabled, ended by Enter and by `WM_CLOSE` |
 | atlas's `windows.c`, both ISAs | Window classes, creation and its messages, painting and GDI, timers, and messages between threads |
 | atlas's `desktop.c`, both ISAs | Windows on the desktop: activation and focus, coordinates, input through `SendInput`, capture, the clipboard, stacking |
+| atlas's `d3d11.c`, both ISAs, with `d3d11_shaders.h` (vkd3d's DXBC for gpu's `color.*.hlsl` and `flow.hlsl`); run with `CARBON_GPU=software` or `host` | DXGI and Direct3D 11: the factory, its one adapter (the Carbon GPU's vendor ID) and output; `D3D11CreateDeviceAndSwapChain` on a window, the device as an `IDXGIDevice`; the back buffer and a render target view; a clear and a triangle (shaders, an input layout, a vertex buffer, a dynamic constant buffer mapped with `WRITE_DISCARD`); `Present`, and the window's pixels after it with `GetPixel`; a staging texture's read-back; a compute shader writing a raw buffer through a UAV; an event query; `IDXGIDevice2` and the screen DC's window. With no GPU, only that DXGI isn't there |
+| atlas's `cube.c`, both ISAs, with `d3d11_shaders.h` (gpu's `cube.*.hlsl`); run with `CARBON_GPU` | Three frames of a textured cube on a flip-model swap chain sized by its window: a dynamic constant buffer mapped each frame, colour and D24S8 depth clears, 16-bit indices, a texture through a shader resource view and a point sampler, no culling (depth hides the far faces); the last frame's near face read back with `GetPixel`, its four texels in its quadrants; `ResizeBuffers` and the new back buffer |
 | atlas's `crt.c`, both ISAs, and built by MinGW-w64 (x86-64) | The C runtime: printf's conversions, snprintf, strings, strtol and strtod, qsort, the heap, getenv, the arguments, files in text and binary mode, rand, atexit |
 | atlas's `ansiwin.c`, both ISAs | ANSI windows: a class and window made with the `*A` functions, its `WndProc` given names, text and characters in 1252 however they're sent; a Unicode window driven by the `*A` functions; `GetMessageA` and `DispatchMessageA`; `WndProc`s set by `SetWindowLongPtrA` and `W` |
 | atlas's `ansi.c`, both ISAs | Code pages: `MultiByteToWideChar` and `WideCharToMultiByte` in 1252, 437 and UTF-8; `*A` functions with é in their names, as the `*W` ones see them: files, paths, the registry, the environment, objects, accounts, locales and version information |
@@ -882,7 +884,8 @@ By layer, bottom up. Items are host Rust unless marked **[guest]** (ntdll), or a
 - **The graphics driver and composition** **[gpu]** **[display]**: behind Direct3D, DXGI and flip-model swap chains;
   `dwmapi`'s queries answered from the desktop. In `gpu`'s order of work: step 0 first (a program's own software
   renderer, such as ANGLE on SwiftShader, runs on `--gpu none`), then step 5 (DXGI, Direct3D 11 through `dxbc`,
-  `vulkan-1`), then step 7 (Direct3D 12, Direct3D 9, `nvcuda`, WGL).
+  `vulkan-1`), then step 7 (Direct3D 12, Direct3D 9, `nvcuda`, WGL). DXGI and Direct3D 11 are begun (`os/gfx.rs`,
+  below).
 - **The rest** (input injection, pointer and touch, power), as programs reach it.
 
 ### 3. The services
@@ -943,7 +946,7 @@ interface is the to-do, not each export.
 | C runtime | ucrtbase, msvcrt | **[guest]** ucrtbase's rest, as a MinGW C++ program asks: `setjmp`/`longjmp`, `_beginthreadex`, low-level I/O (`_read`, `_write`, `_fstat64`), wide stdio, `strftime`, the multibyte conversions, math; then msvcrt.dll for older MinGW programs |
 | COM and RPC | combase, ole32, oleaut32, rpcrt4, propsys, urlmon | apartments, the class registry, in-process servers, marshalling, `IStream` and compound files (MSI needs them), OLE automation; WinRT refused cleanly |
 | Shell and common UI | comctl32, comdlg32, uxtheme, dwmapi, riched20, imm32, usp10, windowscodecs, gdiplus | comctl32 6's controls and `TaskDialog`, the common dialogs, flat themes, RichEdit, Uniscribe, WIC's decoders, GDI+ |
-| Graphics | dxgi, d3d9/11/12, d2d1, dwrite, opengl32, vulkan-1, nvcuda | **[gpu]** DXGI and Direct3D 11 first with a software path, then 9 and 12, Direct2D, DirectWrite, WGL, Vulkan; `nvcuda` for CUDA programs |
+| Graphics | dxgi, d3d9/11/12, d2d1, dwrite, opengl32, vulkan-1, nvcuda | **[gpu]** DXGI and Direct3D 11 first (begun, on the machine's GPU or the CPU device), then 9 and 12, Direct2D, DirectWrite, WGL, Vulkan; `nvcuda` for CUDA programs |
 | Networking | ws2_32, mswsock, iphlpapi, dnsapi, winhttp, wininet, netapi32 | **[net]** Winsock with overlapped I/O, `AcceptEx` and `ConnectEx`; addresses; DNS; WinHTTP and WinINet with TLS checked against `host`'s certificates; `URLDownloadToFile` |
 | Security and crypto | bcrypt, ncrypt, crypt32, wintrust, secur32 | bcrypt's algorithms first, certificate stores from the host's roots, `WinVerifyTrust`, schannel, DPAPI |
 | Media | winmm, dsound, mmdevapi, xaudio2, mf | **[audio]** `waveOut`, `PlaySound` and winmm's timers, WASAPI, DirectSound and XAudio2 over it, later Media Foundation |
@@ -1083,7 +1086,28 @@ Settled while building:
   each would be an exit. So atlas's `dxgi`, `d3d11`, `d3d12`, `vulkan-1` and `nvcuda` will be thin guest drivers
   that encode each call onto `gpu`'s ring, with a doorbell exit only on submit, fence wait and present; the state and
   hazard tracking and every shader compile happen host-side, in `gpu`
-  ([thin drivers, lowered on the host](../../gpu/README.md#guest-drivers-lowered-on-the-host-to-come)).
+  ([thin drivers, lowered on the host](../../gpu/README.md#guest-drivers-lowered-on-the-host-to-come)). DXGI and
+  Direct3D 11 come first as host exports (each COM method a trap, as DirectWrite's are), calling
+  `gpu_api::d3d11`; a ring of thin guest drivers replaces them if profiles show the traps cost.
+
+- **DXGI and Direct3D 11** (`os/gfx.rs`, declared by `os/dxgi.rs` and `os/d3d11.rs`): COM objects of atlas's whose
+  methods read their arguments from the program's memory and call `gpu_api::d3d11`, which is Direct3D 11 on the
+  machine's GPU. A factory (`IDXGIFactory` to `6`) with one adapter, the Carbon GPU (its vendor and device IDs, the
+  host device's name, the software flag for the CPU device), whose one output is the desktop's screen; swap chains on
+  a window whose back buffer is a Direct3D 11 texture and whose `Present` reads it back into the window's canvas (at
+  60 Hz when asked to wait; full screen refused); `D3D11CreateDevice` and `D3D11CreateDeviceAndSwapChain` at feature
+  levels 10_0 to 11_0; the device (also an `IDXGIDevice`), its immediate context, buffers, 2D textures (also
+  `IDXGISurface`s), views, states, shaders from DXBC, input layouts and queries (done as soon as they're asked, since
+  the context waits for its work). Every graphics method is declared in both DLLs, so an object's vtables are in the
+  DLL that made it (or its parent), which the program has loaded. The interfaces' tables are each interface's
+  methods in d3d11.h's and dxgi.h's order; a method not written yet is `missing` and ends the process naming it (the
+  context's `Get*` methods, indirect draws, UAV clears, resolves, command lists), and some answer `E_NOTIMPL`
+  (geometry and tessellation shaders, 1D and 3D textures, deferred contexts, shared resources). With no GPU
+  (`--gpu none`), making a factory or a device is `DXGI_ERROR_UNSUPPORTED`, as on a Windows without one.
+  `tests/programs/d3d11.c` and `cube.c` draw, present, read back and compute through it (on ARM64 and x86-64, on
+  the CPU device and the M1). A browser engine's GPU process gets through ANGLE's Direct3D 11 initialization (the
+  device, its DXGI 1.2 check, format support) and makes its first buffers; it needed `WindowFromDC(GetDC(NULL))` to
+  be the desktop window, and `IDXGIDevice2`.
 
 - **ucrtbase** is atlas's own, as it's an OS DLL since Windows 10, and atlas's DLLs win; all of it runs in the
   program, reaching kernel32's host exports by number for files.

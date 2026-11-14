@@ -172,3 +172,5 @@ OpenDesktopW
 CloseDesktop
 SetThreadDesktop
 GetThreadDesktop
+WindowFromDC
+GetDesktopWindow

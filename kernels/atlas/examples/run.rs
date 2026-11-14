@@ -1,6 +1,7 @@
 //! Runs a Windows program from the host's disk on atlas, in this host's `vm` backend. Its machine's disk has the
 //! program at `C:\<name>`, with any DLLs and other programs from the same folder beside it. Set `CARBON_TRACE=1` to see every host
-//! export, and `CARBON_ISOLATION=sandbox` (or `auto`) to use the sandbox. With `CARBON_SCREENSHOTS=<folder>`, the
+//! export, `CARBON_ISOLATION=sandbox` (or `auto`) to use the sandbox, and `CARBON_GPU=host` (or `software`, `auto`) to give
+//! it a GPU. With `CARBON_SCREENSHOTS=<folder>`, the
 //! desktop as the machine stopped is saved there as `screen.png`, and each top-level window's last picture beside it.
 //!
 //! ```sh
@@ -54,7 +55,18 @@ fn main() {
     let path = format!("C:\\{name}");
     let mut argv: Vec<&str> = vec![&path];
     argv.extend(args.iter().skip(1).map(String::as_str));
-    let options = atlas::Options { trace: std::env::var_os("CARBON_TRACE").is_some(), ..Default::default() };
+    // CARBON_GPU=host, software or auto gives the machine a GPU; none by default.
+    let gpu = match std::env::var("CARBON_GPU").as_deref() {
+        Ok("host") => gpu_api::Gpu::open(gpu_api::Choice::Host),
+        Ok("software") => gpu_api::Gpu::open(gpu_api::Choice::Software),
+        Ok("auto") => gpu_api::Gpu::open(gpu_api::Choice::Auto),
+        _ => Ok(None),
+    }
+    .unwrap_or_else(|e| {
+        eprintln!("CARBON_GPU: {e}");
+        std::process::exit(2)
+    });
+    let options = atlas::Options { trace: std::env::var_os("CARBON_TRACE").is_some(), gpu, ..Default::default() };
     match atlas::boot(exec, cpu, disk, Arc::new(host::Std::new()), &argv, options) {
         Ok(ended) => {
             if let Ok(folder) = std::env::var("CARBON_SCREENSHOTS") {

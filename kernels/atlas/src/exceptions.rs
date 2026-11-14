@@ -46,9 +46,24 @@ impl Task {
     pub fn raise(&mut self, cx: &mut Cx<'_>, raised: Raised, what: &str) -> Flow {
         let dispatcher = lock(&self.process.state).dispatcher;
         // Traced, every exception atlas raises (a fault, an illegal instruction, a breakpoint), handled or not.
-        if self.k.options.trace {
+        if self.k.options.trace || std::env::var_os("CARBON_CRASH_TRACE").is_some() {
             let pc = raised.address;
-            self.k.host.write(host::Stream::Err, format!("[{}] raises {:#x}: {what} ({})\n", self.tid, raised.code, self.where_is(pc)).as_bytes());
+            let regs = cx.turn(|t| t.thread().regs());
+            let sp = regs.sp();
+            let process = self.process.clone();
+            let frames = self.stack_frames(cx, &process, pc, sp);
+            let regs_str = if let exec::Regs::X86(x) = regs {
+                format!(
+                    " rax={:#x} rcx={:#x} rdx={:#x} rbx={:#x} rsp={:#x} rbp={:#x} rsi={:#x} rdi={:#x} r8={:#x} r9={:#x} r12={:#x} r14={:#x} r15={:#x} rflags={:#x}",
+                    x.gpr[0], x.gpr[1], x.gpr[2], x.gpr[3], x.gpr[4], x.gpr[5], x.gpr[6], x.gpr[7], x.gpr[8], x.gpr[9], x.gpr[12], x.gpr[14], x.gpr[15], x.rflags
+                )
+            } else {
+                String::new()
+            };
+            self.k.host.write(
+                host::Stream::Err,
+                format!("[{}] pid={} raises {:#x}: {what} ({}) [{}]{regs_str}\n", self.tid, self.process.pid, raised.code, self.where_is(pc), frames.join(", ")).as_bytes(),
+            );
         }
         self.nested += 1;
         if dispatcher == 0 || self.nested > MOST_NESTED {

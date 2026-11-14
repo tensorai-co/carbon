@@ -53,6 +53,8 @@ pub enum Object {
     ShellLink(ShellLink),
     /// DirectWrite's (`os/dwrite.rs`): one interface each, the ones it derives from answered by the same pointer.
     Dwrite(super::dwrite::Dw),
+    /// DXGI's and Direct3D 11's (`os/gfx.rs`).
+    Gfx(super::gfx::Gfx),
 }
 
 impl Object {
@@ -61,6 +63,7 @@ impl Object {
         match self {
             Object::ShellLink(_) => LINK_INTERFACES.len() as u64,
             Object::Dwrite(_) => 1,
+            Object::Gfx(g) => super::gfx::tables_of(&g.kind).len() as u64,
         }
     }
 }
@@ -319,11 +322,13 @@ impl Task {
         }
         let Some((base, _)) = self.object_of(this) else { return Ok(E_INVALIDARG) };
         let w = self.abi().width;
-        let dw = match &kernels_core::lock(&self.process.state).com.get(&base).map(|c| &c.object) {
-            Some(Object::Dwrite(dw)) => Some(super::dwrite::answers(dw, iid)),
-            _ => None,
+        let (dw, gfx) = match &kernels_core::lock(&self.process.state).com.get(&base).map(|c| &c.object) {
+            Some(Object::Dwrite(dw)) => (Some(super::dwrite::answers(dw, iid)), None),
+            Some(Object::Gfx(g)) => (None, Some(super::gfx::answers(g, iid))),
+            _ => (None, None),
         };
         let found = match (dw, *iid) {
+            _ if gfx.is_some() => gfx.flatten().map(|i| base + i as u64 * w),
             (Some(yes), _) => (yes || *iid == IID_IUNKNOWN).then_some(base),
             (None, IID_IUNKNOWN | IID_ISHELLLINKW) => Some(base),
             (None, IID_IPERSIST | IID_IPERSISTFILE) => Some(base + w),
@@ -331,6 +336,19 @@ impl Task {
             _ => None,
         };
         let _ = self.write_ptr(cx, out, found.unwrap_or(0));
+        if found.is_none() && self.k.options.trace {
+            let g = iid;
+            let text = format!(
+                "atlas: QueryInterface refuses {{{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{}}}\n",
+                u32::from_le_bytes([g[0], g[1], g[2], g[3]]),
+                u16::from_le_bytes([g[4], g[5]]),
+                u16::from_le_bytes([g[6], g[7]]),
+                g[8],
+                g[9],
+                g[10..].iter().map(|b| format!("{b:02x}")).collect::<String>()
+            );
+            self.k.host.write(host::Stream::Err, text.as_bytes());
+        }
         match found {
             Some(_) => {
                 self.add_ref(base);
@@ -351,18 +369,19 @@ impl Task {
 
     pub(crate) fn release(&mut self, cx: &mut Cx<'_>, this: u64) -> Result<u64, Reply> {
         let Some((base, _)) = self.object_of(this) else { return Ok(0) };
-        let left = {
+        let (left, gone) = {
             let mut state = kernels_core::lock(&self.process.state);
             let Some(c) = state.com.get_mut(&base) else { return Ok(0) };
-            c.refs -= 1;
+            c.refs = c.refs.saturating_sub(1);
             let left = c.refs;
-            if left == 0 {
-                state.com.remove(&base);
-            }
-            left
+            let gone = if left == 0 { state.com.remove(&base) } else { None };
+            (left, gone)
         };
         if left == 0 {
             self.task_free(cx, base)?;
+            if let Some(Com { object: Object::Gfx(g), .. }) = gone {
+                super::gfx::released(self, cx, g)?;
+            }
         }
         Ok(u64::from(left))
     }
@@ -373,7 +392,7 @@ impl Task {
         let mut state = kernels_core::lock(&self.process.state);
         match &mut state.com.get_mut(&base)?.object {
             Object::ShellLink(link) => Some(f(link)),
-            Object::Dwrite(_) => None,
+            Object::Dwrite(_) | Object::Gfx(_) => None,
         }
     }
 
@@ -383,8 +402,27 @@ impl Task {
         let mut state = kernels_core::lock(&self.process.state);
         match &mut state.com.get_mut(&base)?.object {
             Object::Dwrite(dw) => Some(f(dw)),
-            Object::ShellLink(_) => None,
+            Object::ShellLink(_) | Object::Gfx(_) => None,
         }
+    }
+
+    /// The DXGI or Direct3D 11 object an interface pointer is part of, as it is now.
+    pub(crate) fn gfx(&self, this: u64) -> Option<super::gfx::Gfx> {
+        self.gfx_mut(this, |g| g.clone())
+    }
+
+    pub(crate) fn gfx_mut<R>(&self, this: u64, f: impl FnOnce(&mut super::gfx::Gfx) -> R) -> Option<R> {
+        let (base, _) = self.object_of(this)?;
+        let mut state = kernels_core::lock(&self.process.state);
+        match &mut state.com.get_mut(&base)?.object {
+            Object::Gfx(g) => Some(f(g)),
+            _ => None,
+        }
+    }
+
+    /// The block an interface pointer's object is.
+    pub(crate) fn object_base(&self, this: u64) -> Option<u64> {
+        self.object_of(this).map(|(base, _)| base)
     }
 
     /// Writes a string into a buffer of `room` characters, UTF-16 or ANSI, cut and terminated.

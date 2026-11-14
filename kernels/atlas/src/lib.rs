@@ -81,6 +81,8 @@ pub struct Options {
     pub display: Option<display::desktop::Shared>,
     /// The way in for stopping the machine from outside it.
     pub stop: Stop,
+    /// The machine's GPU, if it has one: what DXGI's adapter and Direct3D's devices are.
+    pub gpu: Option<gpu_api::Gpu>,
 }
 
 /// A running machine, from outside it: how `carbon stop` reaches in, from any thread.
