@@ -1,0 +1,10 @@
+[package]
+name = "gpu-ir"
+description = "gpu's IR: every program a device runs, whatever API it came from, between a frontend and a backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

@@ -77,6 +77,8 @@ impl Task {
                     && epoll.live().iter().any(|(interest, file)| Task::interest_report(interest, self.ready(file, u32::MAX, depth + 1), false) != 0);
                 (any, false, false, false)
             }
+            // The render node has no events to read yet.
+            Node::Drm(_) => (false, true, false, false),
             _ => (true, true, false, false),
         };
         let mut got = 0;

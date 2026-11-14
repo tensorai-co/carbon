@@ -1,0 +1,13 @@
+[package]
+name = "gpu-frontend"
+description = "gpu's frontends: the GPU code APIs hand a driver (SPIR-V first), turned into gpu's IR"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+gpu-ir.workspace = true

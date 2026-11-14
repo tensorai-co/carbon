@@ -82,6 +82,8 @@ pub(crate) enum Node {
     /// The new mount API's filesystem context (`fsopen`, `fspick`) and detached mount (`fsmount`, `open_tree`).
     FsContext(Arc<std::sync::Mutex<mount::FsContext>>),
     MountFd(Arc<std::sync::Mutex<Option<mount::Detached>>>),
+    /// The render node, `/dev/dri/renderD128`: the machine's GPU (`os::gpu`).
+    Drm(Arc<os::gpu::Drm>),
 }
 
 /// An open file: shared by every descriptor `dup`ed or inherited from the one that opened it.
@@ -293,7 +295,8 @@ fn stat_of_open(disk: &Disk, open: &Open) -> Result<Stat, Errno> {
         // On a device of their own, as Linux's pipefs, each with its own inode.
         Node::Pipe(pipe, _) => Ok(Stat { dev: 0xd, ino: pipe.ino, mode: S_IFIFO | 0o600, nlink: 1, blksize: 4096, ..Stat::default() }),
         // Opened from its file on the disk: that file's stat. Made otherwise (no file): a device of its own.
-        Node::Null | Node::Zero | Node::Random if let Some(hold) = &open._hold => stat_of(disk, hold.ino),
+        Node::Null | Node::Zero | Node::Random | Node::Drm(_) if let Some(hold) = &open._hold => stat_of(disk, hold.ino),
+        Node::Drm(_) => Ok(device(os::gpu::RDEV)),
         Node::Null => Ok(device(1 << 8 | 3)),
         Node::Zero => Ok(device(1 << 8 | 5)),
         Node::Random => Ok(device(1 << 8 | 9)),
@@ -446,7 +449,7 @@ impl Task {
                 let value = self.wait_or_not(open, |task| Ok(timer.take(task.timer_now(timer.realtime))))?;
                 Ok(value.to_le_bytes().to_vec())
             }
-            Node::Epoll(_) | Node::Pidfd(_) | Node::Ns(_) | Node::FsContext(_) | Node::MountFd(_) => Err(EINVAL),
+            Node::Epoll(_) | Node::Pidfd(_) | Node::Ns(_) | Node::FsContext(_) | Node::MountFd(_) | Node::Drm(_) => Err(EINVAL),
             Node::Inotify(inotify) => self.wait_or_not(open, |_| inotify.take(len)),
             Node::Fanotify(group) => {
                 let group = group.clone();
@@ -634,7 +637,7 @@ impl Task {
                 n.request(&self.k.net, data, self.process.pid as u32);
                 Ok(data.len())
             }
-            Node::Signalfd(_) | Node::Timerfd(_) | Node::Epoll(_) | Node::Pidfd(_) | Node::Mqueue(_) | Node::Inotify(_) | Node::Fanotify(_) | Node::Ns(_) | Node::FsContext(_) | Node::MountFd(_) => Err(EINVAL),
+            Node::Signalfd(_) | Node::Timerfd(_) | Node::Epoll(_) | Node::Pidfd(_) | Node::Mqueue(_) | Node::Inotify(_) | Node::Fanotify(_) | Node::Ns(_) | Node::FsContext(_) | Node::MountFd(_) | Node::Drm(_) => Err(EINVAL),
             Node::Stdin | Node::Dir(_) | Node::Listing(_) | Node::Pipe(_, false) | Node::Made(_) => Err(EBADF),
         }
     }
@@ -723,7 +726,12 @@ impl Task {
                 }
                 return Some(made);
             }
-            let ino = view.mounts.cover(disk.lookup(here, &word).ok()?);
+            // Past the disk: the system layer's, if it has the rest (`/lib/<triple>/` reaching its driver).
+            let Ok(found) = disk.lookup(here, &word) else {
+                let made = rest.iter().fold(at, |path, w| path + "/" + w);
+                return os::system::lookup(self, &made).is_some().then_some(made);
+            };
+            let ino = view.mounts.cover(found);
             if disk.stat(ino).ok()?.kind == Kind::Symlink && (follow_last || !rest.is_empty()) {
                 links += 1;
                 if links > MOST_LINKS {
@@ -858,6 +866,9 @@ impl Task {
     }
 
     fn open_on_disk(&self, view: &mount::View, dir: Ino, path: &str, absolute: &str, flags: u32, mode: u32) -> Result<Arc<Open>, Errno> {
+        if flags & O_CREAT != 0 {
+            os::system::copy_up(self, absolute);
+        }
         let umask = lock(&self.process.state).umask;
         // On a read-only mount: nothing opened for writing, truncated or made.
         let read_only = self.writable(absolute).is_err();
@@ -900,6 +911,7 @@ impl Task {
                 0x103 => Node::Null,
                 0x105 => Node::Zero,
                 0x108 | 0x109 => Node::Random,
+                os::gpu::RDEV => Node::Drm(os::gpu::Drm::new(self.k.options.gpu.clone().ok_or(ENXIO)?)),
                 // /dev/tty: the process's controlling terminal.
                 0x500 => match lock(&self.process.state).ctty.clone() {
                     Some(tty) => {
@@ -940,7 +952,7 @@ impl Task {
                 disk.hold(ino);
                 Some(Hold { k: Arc::downgrade(&self.k), ino, quiet: false })
             }
-            Node::Null | Node::Zero | Node::Random => {
+            Node::Null | Node::Zero | Node::Random | Node::Drm(_) => {
                 disk.hold(ino);
                 Some(Hold { k: Arc::downgrade(&self.k), ino, quiet: false })
             }
@@ -1048,6 +1060,9 @@ impl Task {
     /// `stat` for a path lambda makes, or None if it isn't one. Followed, `/proc/<pid>/fd/<n>` is the file it's open
     /// on (so two pipes are two files), and ENOENT if nothing is.
     fn made_stat(&self, path: &str, follow: bool) -> Option<Result<Stat, Errno>> {
+        if let Some(stat) = os::system::stat(self, path) {
+            return Some(Ok(stat));
+        }
         if os::sysfs::is_sys(path) {
             return Some(match os::sysfs::lookup(&self.k, path, follow) {
                 Some((real, _)) => os::stat(&self.k, &real).ok_or(ENOENT),
@@ -1099,6 +1114,13 @@ impl Task {
                     Kind::File => DT_REG,
                 };
                 entries.push((name, child, kind));
+            }
+        }
+        // The system layer's files in it, after the disk's.
+        for (name, kind) in os::system::listing(self, &open.path) {
+            if !entries.iter().any(|(n, _, _)| *n == name) {
+                let id = os::made_identity(&format!("{}/{name}", open.path)).1;
+                entries.push((name, id, kind));
             }
         }
         self.write_dirents(cx, &open, entries, buf, size, old)
@@ -1157,6 +1179,7 @@ impl Task {
                 Ok(0)
             }
             Node::Socket(_) | Node::Netlink(_) => self.socket_ioctl(cx, &open, request, arg),
+            Node::Drm(drm) => self.drm_ioctl(cx, drm, request, arg),
             Node::Inotify(inotify) if request == FIONREAD => {
                 let n = inotify.available() as u32;
                 self.mem(cx, true, |t| user::write_u32(&mut t.space(), arg, n))?;
@@ -1401,14 +1424,14 @@ impl Task {
         let path = self.read_path(cx, path_at)?;
         let (dir, dir_path) = self.start_dir(dirfd)?;
         let absolute = exe_path(&dir_path, &path);
-        if os::stat(&self.k, &absolute).is_some() {
+        if os::stat(&self.k, &absolute).is_some() || os::system::stat(self, &absolute).is_some() {
             return Ok(0);
         }
         let view = self.view();
         let found = view.resolve(&lock(&self.k.disk), dir, &path, true).map_err(Errno::from);
         match found {
             Ok(_) => Ok(0),
-            Err(e) if not_on_disk(e) && self.through_links(&absolute, true).is_some() => Ok(0),
+            Err(e) if not_on_disk(e) && self.through_links(&absolute, true).is_some_and(|made| os::stat(&self.k, &made).is_some() || os::system::stat(self, &made).is_some()) => Ok(0),
             Err(e) => Err(e),
         }
     }
@@ -1443,6 +1466,7 @@ impl Task {
         let umask = lock(&self.process.state).umask;
         let view = self.view();
         let read_only = self.writable(&exe_path(&dir_path, &path));
+        os::system::copy_up(self, &exe_path(&dir_path, &path));
         let mut disk = lock(&self.k.disk);
         // `/`, `.` and `..` are always there, as `tar` and `dpkg-deb` find making the directory they extract into.
         if path.trim_end_matches('/').is_empty() {
@@ -1507,6 +1531,7 @@ impl Task {
         let path = self.read_path(cx, path_at)?;
         let (dir, dir_path) = self.start_dir(dirfd)?;
         self.writable(&crate::process::exe_path(&dir_path, &path))?;
+        os::system::copy_up(self, &crate::process::exe_path(&dir_path, &path));
         let umask = lock(&self.process.state).umask;
         let view = self.view();
         let mut disk = lock(&self.k.disk);
@@ -1552,6 +1577,7 @@ impl Task {
         let (old, new) = (self.read_path(cx, old_at)?, self.read_path(cx, new_at)?);
         let ((from_dir, from_path), (to_dir, to_path)) = (self.start_dir(olddirfd)?, self.start_dir(newdirfd)?);
         let (old_abs, new_abs) = (exe_path(&from_path, &old), exe_path(&to_path, &new));
+        os::system::copy_up(self, &new_abs);
         self.writable(&old_abs)?;
         self.writable(&new_abs)?;
         // Not from one mount to another, even of the same file system, as on Linux.
@@ -1570,6 +1596,7 @@ impl Task {
         let (target, path) = (self.read_path(cx, target_at)?, self.read_path(cx, path_at)?);
         let (dir, dir_path) = self.start_dir(dirfd)?;
         self.writable(&exe_path(&dir_path, &path))?;
+        os::system::copy_up(self, &exe_path(&dir_path, &path));
         let view = self.view();
         let mut disk = lock(&self.k.disk);
         let (parent, name) = view.resolve_parent(&disk, dir, &path)?;

@@ -1,9 +1,12 @@
 //! What Linux itself provides beyond system calls: the device files in `/dev`, put on the disk when a machine boots,
 //! `/proc`, made each time it's read, and the machine's own `/etc/resolv.conf`, `/etc/hosts` and `/etc/hostname`.
 //!
-//! `/sys` is `sysfs`, the Wayland server `wayland`, the X server `x11`, and the vDSO and its clock page `vdso`.
+//! `/sys` is `sysfs`, the Wayland server `wayland`, the X server `x11`, the vDSO and its clock page `vdso`, the render
+//! node `gpu`, and the files lambda lends every image (its Vulkan driver) `system`.
 
+pub(crate) mod gpu;
 pub(crate) mod sysfs;
+pub(crate) mod system;
 pub(crate) mod vdso;
 pub(crate) mod wayland;
 pub(crate) mod x11;
@@ -19,12 +22,22 @@ use crate::mm::Backing;
 use crate::process::{Process, Task};
 use crate::{Disk, Kernel, Meta};
 
-/// Puts what every Linux machine has onto the disk, where the image hasn't: `/dev`'s devices, `/proc`, `/tmp`.
-pub(crate) fn populate(disk: &mut Disk) {
+/// Puts what every Linux machine has onto the disk, where the image hasn't: `/dev`'s devices, `/proc`, `/tmp`; and
+/// for a machine with a GPU, its render node.
+pub(crate) fn populate(disk: &mut Disk, gpu: bool) {
     let dir = Meta::dir(0o755);
     let devices = [("/dev/null", 1, 3), ("/dev/zero", 1, 5), ("/dev/random", 1, 8), ("/dev/urandom", 1, 9), ("/dev/tty", 5, 0), ("/dev/console", 5, 1), ("/dev/ptmx", 5, 2)];
     for (path, major, minor) in devices {
         let _ = disk.put(path, New::File, &[], Meta::device(major, minor), dir);
+    }
+    if gpu {
+        let _ = disk.put(gpu::PATH, New::File, &[], Meta::device(gpu::MAJOR, gpu::MINOR), dir);
+    } else if let Ok(dri) = disk.resolve(layers::ROOT, "/dev/dri", false)
+        && let Ok(node) = disk.lookup(dri, "renderD128")
+        && disk.meta(node).is_ok_and(|m| m.rdev == gpu::RDEV)
+    {
+        // Left from a start with a GPU: a machine started again without one has no render node.
+        let _ = disk.remove(dri, "renderD128", 0);
     }
     for (link, target) in [("/dev/stdin", "/proc/self/fd/0"), ("/dev/stdout", "/proc/self/fd/1"), ("/dev/stderr", "/proc/self/fd/2"), ("/dev/fd", "/proc/self/fd")] {
         let _ = disk.put(link, New::Symlink(target.to_string()), &[], Meta::file(0o777), dir);
@@ -168,6 +181,11 @@ pub(crate) fn open(task: &Task, path: &str) -> Option<Result<Arc<Open>, Errno>> 
             Some(tty) => tty.open_slave().map(|()| Open::new(Node::Tty(tty), O_RDWR, path)),
             None => Err(ENOENT),
         });
+    }
+    match system::open(task, path) {
+        Some(system::Entry::File(mem)) => return Some(Ok(Open::new(Node::Memfd(mem, false), 0, path))),
+        Some(system::Entry::Dir(list)) => return Some(Ok(Open::new(Node::Listing(list), O_DIRECTORY, path))),
+        None => {}
     }
     if sysfs::is_sys(path) {
         return Some(match sysfs::lookup(&task.k, path, true) {

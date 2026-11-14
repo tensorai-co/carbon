@@ -15,6 +15,7 @@ layers.workspace = true
 images.workspace = true
 host.workspace = true
 display.workspace = true
+gpu-api.workspace = true
 lambda.workspace = true
 atlas.workspace = true
 serde_json.workspace = true

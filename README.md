@@ -74,6 +74,7 @@ Everything is kept in `CARBON_HOME`, or `~/.carbon`. [`cli`](cli/README.md) has 
 | The OS | [`kernels`](kernels/README.md) | lambda (Linux) and atlas (Windows), on a shared `kernels-core`; [obsidian](kernels/obsidian/README.md) (Android) later | Being built |
 | The disk | [`layers`](layers/README.md) | The file system programs see: an image's index, merged, with the machine's own log on top | Built |
 | The screen | [`display`](display/README.md) | The desktop both kernels' windows go on: frames, stacking, focus and input, on a screen in memory or the host's windows | The desktop is built, and shown on macOS, whole or a Mac window for each window |
+| The GPU | [`gpu`](gpu/README.md) | One device both kernels' graphics and compute APIs lower onto: the host's GPU, or one on the CPU | Built: SPIR-V compute and draws on Metal and the CPU device; Vulkan in Linux machines (vkcube on the M1) |
 | The sound | [`audio`](audio/README.md) | The mixer every program's sound goes into, and the microphone | Not started |
 | The network | [`net`](net/README.md) | Every socket: the machine's addresses, loopback, Unix sockets and DNS, out through the host's sockets | Out works; in, policy and Winsock to do |
 | The host | [`host`](host/README.md) | Standard streams, clocks, randomness, memory, the terminal, certificate trust | Built |
@@ -89,7 +90,7 @@ Around them:
 | [`sdk`](sdk/README.md) | Carbon as a Rust library | Not started |
 
 ```
-cli, sdk ──► machine ──► kernels ──► exec, layers, display, audio, net, host
+cli, sdk ──► machine ──► kernels ──► exec, layers, display, gpu, audio, net, host
    │            │        (core ◄── lambda, atlas)
    │            └──────► remote ──► display, audio
    └──► images ──► layers
@@ -107,7 +108,7 @@ For the whole project:
    builds, installs or reads back. atlas's DLLs and lambda's `/proc` are made in memory. An image's own files (glibc,
    an app's DLLs) are used as they are.
 2. **One host, two backends, per host-facing module.** Each host has exactly one `vm` and one `sandbox` backend in
-   `exec`. `display`, `audio`, `net` and `host` follow the same pattern: a shared part on top, one folder per host,
+   `exec`. `display`, `gpu`, `audio`, `net` and `host` follow the same pattern: a shared part on top, one folder per host,
    and every host-specific line inside its host's folder.
 3. **Dependencies point one way**, as drawn above. Nothing outside `machine/` depends on a kernel, no kernel knows
    `remote` exists, and `exec` depends on nothing of Carbon's.
@@ -145,6 +146,8 @@ For the whole project:
 | **upcall** | atlas running the program's callback from host Rust, nested, and coming back |
 | **system layer** | The `C:\Windows` atlas makes for every machine, since there's no Windows image to bring |
 | **desktop** | `display::Desktop`: a machine's top-level windows, their frames, stacking, focus and input, whichever kernel made them |
+| **device** | `gpu::Device`: a machine's GPU, the host's or the CPU device, with its memory, programs, queue and fences |
+| **IR** | `gpu-ir`: every GPU program between the frontend that read it (SPIR-V, later DXBC, DXIL, PTX) and a backend |
 | **mixer** | `audio`'s: every program's sound streams, converted and mixed for each output |
 | **viewer** | `carbon connect`, showing a machine's desktop from another computer |
 | **network** | `net::Network`: a machine's addresses, loopback, ports and policy; a named one (`--net lab`) is shared by machines |
@@ -164,6 +167,9 @@ target/release/examples/conformance
 
 # net's conformance suite: sockets out through this host's own
 cargo run -p net --example net-conformance
+
+# gpu's conformance suite: the same programs on the CPU device and on this host's GPU
+cargo run -p gpu --example gpu-conformance
 
 # Linux and Windows programs on lambda and atlas, without a machine around them
 cargo build --example run --example run-windows
@@ -192,6 +198,12 @@ programs and how to build them are in [lambda's](kernels/lambda/README.md#runnin
   work in `debian:13` on all three hosts.
 - **display** has the desktop on a screen in memory, and on a Mac's screen: whole in one window (`--display host`), or
   each window in a Mac window of its own (`--display host-windows`). **audio**, **remote** and **sdk** are designed, not started.
+- **gpu** reads SPIR-V compute shaders into an IR of its own and runs them on the Mac's GPU through Metal (written as
+  AIR libraries, so no shader source is compiled) and on a CPU device, with the same results on its conformance suite.
+  Vertex and fragment shaders draw on both too, by Vulkan's rasterization rules, vkcube's among them. `--gpu` gives a
+  Linux machine a render node and lambda's own Vulkan driver, so `vulkaninfo` in `debian:13` lists a Carbon GPU (the
+  M1's, or the CPU device), which runs Vulkan compute programs and draws: Debian's `vkcube` spins on the headless
+  display, on Wayland and X11, drawn by the M1.
 
 ## The order of work
 
@@ -259,7 +271,9 @@ another process on Windows hosts; a worker process per machine.
 4. GDI: DIB sections with shared pages, regions and shapes, real fonts. (Bitmaps, memory DCs, `BitBlt` and icons are
    done.)
 5. lambda's Wayland and X11 servers, so GTK, Qt and Firefox run.
-6. Graphics APIs: OpenGL, Direct3D and DXGI, and how they reach the host's GPU.
+6. The GPU ([gpu](gpu/README.md#the-order-of-work)): lambda's Vulkan driver grown (Vulkan 1.1, Zink and GL), then
+   CUDA, then atlas's DXGI and Direct3D 11. (The IR, SPIR-V, compute and draws on Metal and the CPU device, and lambda's
+   Vulkan driver as far as compute and vkcube, are done.)
 
 **6. Networks** ([net](net/README.md#to-do))
 
@@ -298,7 +312,8 @@ Each blocks the work named; the README linked has the details and a recommendati
 | Syscall User Dispatch on Linux ARM64, or rewriting? | Linux ARM64 | [exec](exec/README.md#open-questions) |
 | `get-task-allow` on macOS, or another way to take the stub's task? | the macOS sandbox | [exec](exec/README.md#open-questions) |
 | How the Windows driver is signed (EV certificate, attestation) | shipping winkvm | [exec](exec/README.md#open-questions) |
-| Graphics APIs: host exports, guest code, or a GPU protocol? | graphics | [atlas](kernels/atlas/README.md#open-questions) |
+| The GPU guests see: a Carbon GPU or a known vendor's ID, and which vendor ID | lambda's Vulkan driver | [gpu](gpu/README.md#decisions-to-make) |
+| Libraries made only of one vendor's machine code (cuBLAS, cuDNN): replaced by ours? | CUDA | [gpu](gpu/README.md#decisions-to-make) |
 | QUIC and TLS for remote: `quinn` and `rustls`, or our own? | remote's first picture | [remote](remote/README.md#open-questions) |
 | One remote port per machine or a host gateway; 4433 or 443 by default | remote | [remote](remote/README.md#open-questions) |
 | TLS for atlas's WinHTTP and Schannel: `rustls` in one crate, or our own? | Winsock's HTTPS | [net](net/README.md#open-questions) |

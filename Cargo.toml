@@ -15,6 +15,13 @@ members = [
     "display/macos",
     "host",
     "net",
+    "gpu",
+    "gpu/ir",
+    "gpu/frontend",
+    "gpu/backend",
+    "gpu/wire",
+    "gpu/wire/gen",
+    "gpu/api",
     "kernels/core",
     "kernels/lambda",
     "kernels/atlas",
@@ -43,6 +50,12 @@ display = { path = "display" }
 display-macos = { path = "display/macos" }
 host = { path = "host" }
 net = { path = "net" }
+gpu = { path = "gpu" }
+gpu-ir = { path = "gpu/ir" }
+gpu-frontend = { path = "gpu/frontend" }
+gpu-backend = { path = "gpu/backend" }
+gpu-wire = { path = "gpu/wire" }
+gpu-api = { path = "gpu/api" }
 kernels-core = { path = "kernels/core" }
 lambda = { path = "kernels/lambda" }
 atlas = { path = "kernels/atlas" }

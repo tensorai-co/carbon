@@ -106,6 +106,9 @@ pub struct Options {
     /// The desktop its windows go on, if it has one: the kernel answers `$XDG_RUNTIME_DIR/wayland-0` with a Wayland
     /// compositor on it, and the first program's environment says where (`XDG_RUNTIME_DIR`, `WAYLAND_DISPLAY`).
     pub display: Option<display::desktop::Shared>,
+    /// The machine's GPU, if it has one: the render node `/dev/dri/renderD128` reaches it, and the system layer puts
+    /// lambda's Vulkan driver where the image's Vulkan loader looks.
+    pub gpu: Option<gpu_api::Gpu>,
 }
 
 /// A running machine, from outside it: how `carbon stop` reaches in, from any thread.
@@ -149,6 +152,7 @@ impl Default for Options {
             stop: Stop::default(),
             network: None,
             display: None,
+            gpu: None,
         }
     }
 }
@@ -190,7 +194,7 @@ pub fn boot(mut exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&
             }
         }
     }
-    os::populate(&mut disk);
+    os::populate(&mut disk, options.gpu.is_some());
     let mount_ns = fs::mount::MountNs::new(fs::mount::Mounts::boot(&disk));
     let boot_ns = ns::Namespaces::boot(mount_ns, admin::Names { host: options.hostname.clone(), domain: "(none)".to_string() });
     let watches = fs::inotify::Registry::default();
@@ -223,6 +227,7 @@ pub fn boot(mut exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&
         fifos: Mutex::new(BTreeMap::new()),
         boot_ns,
         klog: Mutex::new(klog),
+        system: Mutex::new(BTreeMap::new()),
     });
     os::vdso::start(&kernel);
     if let Some(desktop) = kernel.options.display.clone() {
@@ -313,6 +318,8 @@ pub(crate) struct Kernel {
     boot_ns: ns::Namespaces,
     /// The kernel's log, the machine's whatever its namespaces.
     klog: Mutex<admin::Klog>,
+    /// The system layer's files, made as they're first opened (`os::system`).
+    system: Mutex<BTreeMap<String, Arc<mm::shared::SharedMem>>>,
 }
 
 /// Feeds the host's keyboard to the console, sending the signals it asks for, and keeps its size the terminal's.

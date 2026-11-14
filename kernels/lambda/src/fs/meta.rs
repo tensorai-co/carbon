@@ -158,6 +158,7 @@ impl Task {
         let new = self.read_path(cx, new_at)?;
         let (dir, dir_path) = self.start_dir(newdirfd)?;
         self.writable(&crate::process::exe_path(&dir_path, &new))?;
+        crate::os::system::copy_up(self, &crate::process::exe_path(&dir_path, &new));
         let view = self.view();
         let mut disk = lock(&self.k.disk);
         if disk.stat(ino)?.kind == Kind::Dir {

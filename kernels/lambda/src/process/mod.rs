@@ -287,7 +287,12 @@ impl Task {
             Some(Stop::Syscall { nr, args }) => self.syscall(cx, nr, args),
             Some(Stop::Fault { addr, access, pc }) => {
                 if self.fault(cx, addr, access).is_err() {
-                    self.fault_signal(SIGSEGV, addr, &format!("bad access to {addr:#x} ({access:?}) at {pc:#x}"));
+                    // A jump to nowhere (a null function pointer): on ARM64 the link register says who called it.
+                    let caller = match cx.turn(|t| t.thread().regs()) {
+                        exec::Regs::Arm64(r) if pc == addr => format!(", called from {:#x}", r.x[30]),
+                        _ => String::new(),
+                    };
+                    self.fault_signal(SIGSEGV, addr, &format!("bad access to {addr:#x} ({access:?}) at {pc:#x}{caller}"));
                 }
                 Outcome::Keep
             }

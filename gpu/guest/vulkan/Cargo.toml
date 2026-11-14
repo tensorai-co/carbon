@@ -1,0 +1,24 @@
+[package]
+name = "vulkan_carbon"
+description = "lambda's Vulkan driver: the ICD the image's Vulkan loader loads into programs, encoding onto the render node"
+version = "0.2.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+# Built by lambda's build.rs for Linux targets, not with the workspace.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+gpu-wire = { path = "../../wire" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+
+[profile.dev]
+panic = "abort"

@@ -1,0 +1,10 @@
+[package]
+name = "gpu-wire-gen"
+description = "Writes gpu-wire's Vulkan types from Khronos's registry, vk.xml"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

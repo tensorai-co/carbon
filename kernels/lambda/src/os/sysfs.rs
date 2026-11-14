@@ -2,8 +2,8 @@
 //! (online, possible, present, each one's topology), memory's NUMA node, the network interfaces (each one's address,
 //! MTU, state, index and type, with `/sys/class/net`'s links to them), the character devices lambda has (each one's
 //! `dev` and `uevent`, with `/sys/dev/char`'s links by number, which libudev goes through from a device file), the
-//! classes a device scan looks in (`drm`, `input`, `block`, all empty until there are such devices), and transparent
-//! huge pages' setting. Its links point within it, and are followed here.
+//! classes a device scan looks in (`drm`, with the render node on a machine with a GPU; `input` and `block`, empty
+//! until there are such devices), and transparent huge pages' setting. Its links point within it, and are followed here.
 
 use crate::Kernel;
 use crate::abi::*;
@@ -17,7 +17,7 @@ pub(crate) enum Entry {
     Link(String),
 }
 
-/// The character devices lambda has: each one's name, class, number, and the directory of devices it's in.
+/// The character devices every machine has: each one's name, class and number.
 const DEVICES: [(&str, &str, u32, u32); 7] = [
     ("null", "mem", 1, 3),
     ("zero", "mem", 1, 5),
@@ -27,6 +27,27 @@ const DEVICES: [(&str, &str, u32, u32); 7] = [
     ("console", "tty", 5, 1),
     ("ptmx", "tty", 5, 2),
 ];
+
+/// The character devices this machine has: every machine's, and the render node if it has a GPU.
+fn devices(k: &Kernel) -> Vec<(&'static str, &'static str, u32, u32)> {
+    let mut all = DEVICES.to_vec();
+    if k.options.gpu.is_some() {
+        all.push(("renderD128", "drm", crate::os::gpu::MAJOR as u32, crate::os::gpu::MINOR as u32));
+    }
+    all
+}
+
+/// The classes of device, for `/sys/devices/virtual`: those this machine has a device of.
+fn classes(devices: &[(&str, &str, u32, u32)]) -> Vec<(String, u8)> {
+    let mut names = vec!["net".to_string()];
+    for d in devices {
+        if !names.iter().any(|n| n == d.1) {
+            names.push(d.1.to_string());
+        }
+    }
+    names.sort();
+    names.into_iter().map(|n| (n, DT_DIR)).collect()
+}
 
 fn dir(names: &[&str]) -> Entry {
     Entry::Dir(names.iter().map(|n| (n.to_string(), DT_DIR)).collect())
@@ -56,6 +77,7 @@ fn cpu_mask(cpus: impl Iterator<Item = usize>, count: usize) -> String {
 fn entry(k: &Kernel, path: &str) -> Option<Entry> {
     let cpus = k.host.cpus().max(1);
     let interfaces = k.net.interfaces();
+    let devices = devices(k);
     let parts: Vec<&str> = path.trim_start_matches("/sys").split('/').filter(|p| !p.is_empty()).collect();
     Some(match parts.as_slice() {
         [] => dir(&["block", "bus", "class", "dev", "devices", "firmware", "fs", "kernel", "module", "power"]),
@@ -70,26 +92,26 @@ fn entry(k: &Kernel, path: &str) -> Option<Entry> {
         ["kernel", "mm", "transparent_hugepage", "enabled"] => Entry::File("always madvise [never]\n".into()),
         ["kernel", "mm", "transparent_hugepage", "defrag"] => Entry::File("always defer defer+madvise madvise [never]\n".into()),
         ["class"] => dir(&["block", "drm", "input", "mem", "net", "tty"]),
-        ["class", "block" | "drm" | "input"] => Entry::Dir(Vec::new()),
+        ["class", "block" | "input"] => Entry::Dir(Vec::new()),
         ["class", "net"] => Entry::Dir(interfaces.iter().map(|i| (i.name.to_string(), DT_LNK)).collect()),
         ["class", "net", name] => {
             interfaces.iter().find(|i| i.name == *name)?;
             Entry::Link(format!("../../devices/virtual/net/{name}"))
         }
-        ["class", class @ ("mem" | "tty")] => Entry::Dir(DEVICES.iter().filter(|d| d.1 == *class).map(|d| (d.0.to_string(), DT_LNK)).collect()),
-        ["class", class @ ("mem" | "tty"), name] => {
-            DEVICES.iter().find(|d| d.1 == *class && d.0 == *name)?;
+        ["class", class @ ("mem" | "tty" | "drm")] => Entry::Dir(devices.iter().filter(|d| d.1 == *class).map(|d| (d.0.to_string(), DT_LNK)).collect()),
+        ["class", class @ ("mem" | "tty" | "drm"), name] => {
+            devices.iter().find(|d| d.1 == *class && d.0 == *name)?;
             Entry::Link(format!("../../devices/virtual/{class}/{name}"))
         }
         ["dev"] => dir(&["block", "char"]),
         ["dev", "block"] => Entry::Dir(Vec::new()),
-        ["dev", "char"] => Entry::Dir(DEVICES.iter().map(|d| (format!("{}:{}", d.2, d.3), DT_LNK)).collect()),
+        ["dev", "char"] => Entry::Dir(devices.iter().map(|d| (format!("{}:{}", d.2, d.3), DT_LNK)).collect()),
         ["dev", "char", number] => {
-            let d = DEVICES.iter().find(|d| format!("{}:{}", d.2, d.3) == *number)?;
+            let d = devices.iter().find(|d| format!("{}:{}", d.2, d.3) == *number)?;
             Entry::Link(format!("../../devices/virtual/{}/{}", d.1, d.0))
         }
         ["devices"] => dir(&["system", "virtual"]),
-        ["devices", "virtual"] => dir(&["mem", "net", "tty"]),
+        ["devices", "virtual"] => Entry::Dir(classes(&devices)),
         ["devices", "virtual", "net"] => Entry::Dir(interfaces.iter().map(|i| (i.name.to_string(), DT_DIR)).collect()),
         ["devices", "virtual", "net", name] => {
             interfaces.iter().find(|i| i.name == *name)?;
@@ -113,15 +135,16 @@ fn entry(k: &Kernel, path: &str) -> Option<Entry> {
                 _ => return None,
             })
         }
-        ["devices", "virtual", class @ ("mem" | "tty")] => Entry::Dir(DEVICES.iter().filter(|d| d.1 == *class).map(|d| (d.0.to_string(), DT_DIR)).collect()),
-        ["devices", "virtual", class @ ("mem" | "tty"), name] => {
-            DEVICES.iter().find(|d| d.1 == *class && d.0 == *name)?;
+        ["devices", "virtual", class @ ("mem" | "tty" | "drm")] => Entry::Dir(devices.iter().filter(|d| d.1 == *class).map(|d| (d.0.to_string(), DT_DIR)).collect()),
+        ["devices", "virtual", class @ ("mem" | "tty" | "drm"), name] => {
+            devices.iter().find(|d| d.1 == *class && d.0 == *name)?;
             Entry::Dir(files(&["dev", "uevent"]))
         }
-        ["devices", "virtual", class @ ("mem" | "tty"), name, attribute] => {
-            let d = DEVICES.iter().find(|d| d.1 == *class && d.0 == *name)?;
+        ["devices", "virtual", class @ ("mem" | "tty" | "drm"), name, attribute] => {
+            let d = devices.iter().find(|d| d.1 == *class && d.0 == *name)?;
             Entry::File(match *attribute {
                 "dev" => format!("{}:{}\n", d.2, d.3),
+                "uevent" if d.1 == "drm" => format!("MAJOR={}\nMINOR={}\nDEVNAME=dri/{}\nDEVTYPE=drm_minor\nDEVMODE=0666\n", d.2, d.3, d.0),
                 "uevent" => format!("MAJOR={}\nMINOR={}\nDEVNAME={}\nDEVMODE=0666\n", d.2, d.3, d.0),
                 _ => return None,
             })

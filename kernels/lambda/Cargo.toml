@@ -16,6 +16,8 @@ layers.workspace = true
 host.workspace = true
 net.workspace = true
 display.workspace = true
+gpu-api.workspace = true
+gpu-wire.workspace = true
 
 [dev-dependencies]
 layers.workspace = true

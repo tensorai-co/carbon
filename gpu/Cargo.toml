@@ -1,0 +1,20 @@
+[package]
+name = "gpu"
+description = "A machine's GPU: one device model both kernels' graphics and compute APIs lower onto, on the host's GPU or the CPU"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+autoexamples = false
+
+[lints]
+workspace = true
+
+[dependencies]
+gpu-ir.workspace = true
+gpu-frontend.workspace = true
+gpu-backend.workspace = true
+
+[[example]]
+name = "gpu-conformance"
+path = "examples/conformance.rs"

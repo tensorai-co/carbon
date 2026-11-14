@@ -5,6 +5,8 @@
 //! carbon run --name dev debian:13           # named, to start again later with `carbon run --name dev`
 //! carbon run --isolation vm debian:13 -- ./untrusted.sh
 //! carbon run setup.exe                      # a Windows program, with atlas
+//! carbon run --gpu host debian:13 -- vulkaninfo --summary   # the Mac's GPU, as a Carbon GPU
+//! carbon gpu                                # the devices a machine's GPU can be
 //! carbon ls | stop NAME | rm NAME | freeze NAME IMAGE
 //! carbon display screenshot NAME -o screen.png
 //! carbon display windows NAME
@@ -22,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 
 use images::Platform;
-use machine::{Display, Isolation, Machines, Run, Source};
+use machine::{Display, Gpu, Isolation, Machines, Run, Source};
 
 const USAGE: &str = "\
 usage: carbon <command> ...
@@ -36,14 +38,19 @@ usage: carbon <command> ...
                                              where its windows go: a screen in memory (headless=1280x800 by
                                              default; @2 for 2×), the whole desktop in a window on this Mac's
                                              screen, or each of its windows in a Mac window of its own
+      --gpu auto|host|software|none          its GPU: the host's, else the CPU device (auto, the default; said if
+                                             it's the CPU device), the host's or fail, the CPU device, or none
       --audio none                           where its sound goes (only none, until audio is there)
       -e, --env NAME=VALUE                   an environment variable, over the image's
       --memory SIZE                          how much memory it may use, as 512m or 4g (4g by default)
   ls                                         the machines, and which are running
+  gpu                                        the devices a machine's GPU can be: this host's, and the CPU device
   stop NAME                                  stop a running machine (SIGTERM, then everything after 10s)
   rm NAME                                    remove a stopped machine and its files
   freeze NAME IMAGE                          make an image of a stopped machine's disk
   cp NAME:PATH DIR                           copy a stopped machine's file or folder into DIR on this host
+  cp PATH NAME:DIR                           copy this host's file or folder into a stopped machine's DIR (PATH/.
+                                             for what's in a folder)
   display screenshot NAME [-o FILE]          a running machine's screen, as a PNG (screen.png by default)
   display windows NAME                       a running machine's windows, top first: ID, place, size, state, title
   display move NAME X Y                      moves its pointer
@@ -134,6 +141,15 @@ fn run(machines: &Machines, mut args: impl Iterator<Item = String>) -> ! {
                 let text = value("--display");
                 spec.display = display(&text).unwrap_or_else(|| fail(format!("--display is headless=WxH, headless=WxH@SCALE, host, host=WxH, host-windows or none, not {text}")));
             }
+            "--gpu" => {
+                spec.gpu = match value("--gpu").as_str() {
+                    "auto" => Gpu::Auto,
+                    "host" => Gpu::Host,
+                    "software" => Gpu::Software,
+                    "none" => Gpu::None,
+                    other => fail(format!("--gpu is auto, host, software or none, not {other}")),
+                }
+            }
             "--audio" => match value("--audio").as_str() {
                 "none" => {}
                 other => fail(format!("--audio {other} needs audio, which isn't there yet: use none")),
@@ -208,12 +224,27 @@ fn main() {
     match command.as_str() {
         "run" => run(&machines, args),
         "ls" | "ps" => ls(&machines),
+        "gpu" => {
+            println!("{:<10} {:<24} {:<10} SUBGROUP", "KIND", "NAME", "BACKEND");
+            for (kind, device) in ["host", "software"].into_iter().zip(machine::gpus()) {
+                match device {
+                    Ok(info) => println!("{kind:<10} {:<24} {:<10} {}", info.name, info.backend, info.subgroup_size),
+                    Err(why) => println!("{kind:<10} -- ({why})"),
+                }
+            }
+        }
         "stop" => machines.stop(&one("a machine's name")).unwrap_or_else(|e| fail(e)),
         "rm" => machines.remove(&one("a machine's name")).unwrap_or_else(|e| fail(e)),
         "cp" => {
-            let (from, to) = (one("NAME:PATH"), one("a folder on this host"));
-            let (name, path) = from.split_once(':').unwrap_or_else(|| fail("cp copies from NAME:PATH, as web:/etc/hosts".to_string()));
-            let n = machines.copy_out(name, path, std::path::Path::new(&to)).unwrap_or_else(|e| fail(e));
+            let (from, to) = (one("NAME:PATH or a path on this host"), one("a folder on this host or NAME:PATH"));
+            // Out of a machine when the first names one, as web:/etc/hosts; else into the machine the second names.
+            let machine = |arg: &str| arg.split_once(':').filter(|(name, _)| machines.record(name).is_some()).map(|(n, p)| (n.to_string(), p.to_string()));
+            let n = match (machine(&from), machine(&to)) {
+                (Some((name, path)), _) => machines.copy_out(&name, &path, std::path::Path::new(&to)),
+                (None, Some((name, path))) => machines.copy_in(&name, std::path::Path::new(&from), &path),
+                (None, None) => fail("cp copies NAME:PATH DIR out of a machine, or PATH NAME:DIR into one, as web:/etc/hosts".to_string()),
+            }
+            .unwrap_or_else(|e| fail(e));
             println!("{n} files");
         }
         "freeze" => {

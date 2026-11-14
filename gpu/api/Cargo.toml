@@ -1,0 +1,15 @@
+[package]
+name = "gpu-api"
+description = "Each API's guest calls lowered onto a machine's gpu device, host-side, on a thread of the device's own"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+gpu.workspace = true
+gpu-ir.workspace = true
+gpu-wire.workspace = true

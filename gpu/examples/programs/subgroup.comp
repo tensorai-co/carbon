@@ -1,0 +1,21 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// A sum across each subgroup by shuffles (xor butterfly), checked against the subgroup's own reduction.
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) readonly buffer Src { uint src[]; };
+layout(set = 0, binding = 1) writeonly buffer Dst { uint dst[]; };
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint v = src[i];
+    uint sum = v;
+    for (uint mask = 1u; mask < gl_SubgroupSize; mask <<= 1) {
+        sum += subgroupShuffleXor(sum, mask);
+    }
+    uint reduced = subgroupAdd(v);
+    uint neighbour = subgroupShuffle(v, (gl_SubgroupInvocationID + 1u) % gl_SubgroupSize);
+    dst[3 * i] = sum;
+    dst[3 * i + 1] = reduced;
+    dst[3 * i + 2] = neighbour;
+}

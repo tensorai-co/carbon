@@ -1,0 +1,11 @@
+#version 450
+// A histogram of sixteen bins, a running total and a maximum, all by atomics on one buffer.
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) readonly buffer Src { uint src[]; };
+layout(set = 0, binding = 1) buffer Hist { uint total; uint maximum; uint bins[16]; };
+void main() {
+    uint v = src[gl_GlobalInvocationID.x];
+    atomicAdd(bins[v & 15u], 1u);
+    atomicAdd(total, v);
+    atomicMax(maximum, v);
+}

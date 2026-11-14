@@ -1,0 +1,20 @@
+#version 450
+// A sum per workgroup, through workgroup memory and barriers: a tree, halving each step.
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0) readonly buffer Src { uint src[]; };
+layout(set = 0, binding = 1) buffer Dst { uint sums[]; };
+shared uint partial[128];
+void main() {
+    uint l = gl_LocalInvocationID.x;
+    partial[l] = src[gl_GlobalInvocationID.x];
+    barrier();
+    for (uint stride = 64u; stride > 0u; stride >>= 1) {
+        if (l < stride) {
+            partial[l] += partial[l + stride];
+        }
+        barrier();
+    }
+    if (l == 0u) {
+        sums[gl_WorkGroupID.x] = partial[0];
+    }
+}

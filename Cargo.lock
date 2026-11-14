@@ -224,6 +224,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpu"
+version = "0.2.0"
+dependencies = [
+ "gpu-backend",
+ "gpu-frontend",
+ "gpu-ir",
+]
+
+[[package]]
+name = "gpu-api"
+version = "0.2.0"
+dependencies = [
+ "gpu",
+ "gpu-ir",
+ "gpu-wire",
+]
+
+[[package]]
+name = "gpu-backend"
+version = "0.2.0"
+dependencies = [
+ "gpu-ir",
+]
+
+[[package]]
+name = "gpu-frontend"
+version = "0.2.0"
+dependencies = [
+ "gpu-ir",
+]
+
+[[package]]
+name = "gpu-ir"
+version = "0.2.0"
+
+[[package]]
+name = "gpu-wire"
+version = "0.2.0"
+
+[[package]]
+name = "gpu-wire-gen"
+version = "0.2.0"
+
+[[package]]
 name = "host"
 version = "0.2.0"
 dependencies = [
@@ -369,6 +413,8 @@ version = "0.2.0"
 dependencies = [
  "display",
  "exec",
+ "gpu-api",
+ "gpu-wire",
  "host",
  "kernels-core",
  "layers",
@@ -405,6 +451,7 @@ dependencies = [
  "display",
  "display-macos",
  "exec",
+ "gpu-api",
  "host",
  "images",
  "lambda",

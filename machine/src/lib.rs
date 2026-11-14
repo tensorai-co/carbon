@@ -32,6 +32,8 @@ pub enum Source {
 
 /// `WxH` or `WxH@SCALE`, as `--display headless=` and `carbon display resize` take it.
 pub use display::output::parse_size as parse_display_size;
+/// Which GPU a machine gets (`--gpu`): the host's, the CPU device, the host's if there is one (the default), or none.
+pub use gpu_api::Choice as Gpu;
 
 /// Where a machine's windows go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,13 +80,14 @@ pub struct Run {
     /// `NAME=value`, over the image's.
     pub env: Vec<String>,
     pub display: Display,
+    pub gpu: Gpu,
     /// How much memory it may use (only what's touched is taken).
     pub memory: u64,
 }
 
 impl Default for Run {
     fn default() -> Run {
-        Run { name: None, source: None, args: Vec::new(), isolation: Isolation::Auto, platform: None, env: Vec::new(), display: Display::Headless(1280, 800, display::output::SCALE_1X), memory: 4 << 30 }
+        Run { name: None, source: None, args: Vec::new(), isolation: Isolation::Auto, platform: None, env: Vec::new(), display: Display::Headless(1280, 800, display::output::SCALE_1X), gpu: Gpu::Auto, memory: 4 << 30 }
     }
 }
 
@@ -343,6 +346,36 @@ impl Machines {
         }
     }
 
+    /// Copies the host's file, or folder and all in it, at `from` into a stopped machine's folder `path` (as
+    /// `copy_out` names it), under its own name; a `from` that ends in `/.` copies what's in the folder instead. A
+    /// file already there is replaced, a folder already there is added to. How many files it copied.
+    pub fn copy_in(&self, name: &str, from: &Path, path: &str) -> Result<usize, String> {
+        let record = self.record(name).ok_or_else(|| format!("there's no machine called {name}"))?;
+        if record.running() {
+            return Err(format!("{name} is running: stop it first"));
+        }
+        let contents = from.as_os_str().to_string_lossy().ends_with("/.");
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
+        match record.kernel {
+            Kernel::Lambda => {
+                let mut disk = self.disk::<lambda::Meta>(&record, lambda::Meta::dir(0o755), false)?;
+                let metas = (lambda::Meta::dir(0o755), lambda::Meta::file(0o644));
+                let n = copy_tree_in(&mut disk, from, path, contents, &metas, now)?;
+                disk.sync().map_err(|e| format!("saving {name}'s disk: {e}"))?;
+                Ok(n)
+            }
+            Kernel::Atlas => {
+                let path = path.strip_prefix("C:").or_else(|| path.strip_prefix("c:")).unwrap_or(path).replace('\\', "/");
+                let mut disk = self.disk::<atlas::Meta>(&record, atlas::Meta { attributes: 0x10 }, true)?;
+                // FILE_ATTRIBUTE_DIRECTORY and FILE_ATTRIBUTE_ARCHIVE, as atlas makes them.
+                let metas = (atlas::Meta { attributes: 0x10 }, atlas::Meta { attributes: 0x20 });
+                let n = copy_tree_in(&mut disk, from, &path, contents, &metas, now)?;
+                disk.sync().map_err(|e| format!("saving {name}'s disk: {e}"))?;
+                Ok(n)
+            }
+        }
+    }
+
     /// A machine's disk: its image's index, if it has one, under its own log.
     fn disk<M: Persist>(&self, record: &Record, root: M, fold: bool) -> Result<Fs<M>, String> {
         let index = match &record.index {
@@ -556,7 +589,8 @@ impl Machines {
                 let headless = matches!(run.display, Display::Headless(..));
                 let _clock = desktop.clone().filter(|_| headless).map(|d| display::clock::Clock::start(d, 60));
                 let _control = control::serve(self.images.machine_dir(&record.name), desktop.clone());
-                let mut options = lambda::Options { stop, display: desktop.clone(), ..lambda::Options::default() };
+                let gpu = open_gpu(run.gpu)?;
+                let mut options = lambda::Options { stop, display: desktop.clone(), gpu, ..lambda::Options::default() };
                 if !env.is_empty() {
                     options.env = env;
                 }
@@ -598,6 +632,22 @@ impl Machines {
             }
         }
     }
+}
+
+/// Opens the machine's GPU on its own thread: the device `--gpu` asks for, or none. `auto` takes the host's GPU where
+/// there is one, and says so, as `--isolation auto` does, when it has to take the CPU device instead. (Only lambda has a
+/// driver for it yet; atlas's DXGI comes later.)
+fn open_gpu(choice: Gpu) -> Result<Option<gpu_api::Gpu>, String> {
+    let gpu = gpu_api::Gpu::open(choice).map_err(|e| format!("--gpu: {}", e.message))?;
+    if let Some(why) = gpu.as_ref().and_then(|g| g.info().why.as_ref()) {
+        eprintln!("carbon: no GPU here to use ({why}), the machine's GPU is the CPU device");
+    }
+    Ok(gpu)
+}
+
+/// The host's devices a machine could have, as `carbon gpu` lists them: its GPU if it has one, and the CPU device.
+pub fn gpus() -> Vec<Result<gpu_api::Info, String>> {
+    [Gpu::Host, Gpu::Software].into_iter().map(|choice| gpu_api::Gpu::open(choice).map_err(|e| e.message).and_then(|g| g.map(|g| g.info().clone()).ok_or_else(|| "none".to_string()))).collect()
 }
 
 /// Opens exec with the isolation asked for. `auto` takes a hardware VM where there is one, and says so, loudly, with
@@ -656,6 +706,58 @@ fn copy_tree<M: Persist>(disk: &Fs<M>, path: &str, to: &Path) -> Result<usize, S
     walk(disk, ino, &to.join(name))
 }
 
+/// The host's `from`, and all in it, copied into the folder `path` on `disk` (or what's in `from`, if `contents`),
+/// folders and files made with `metas`. How many files. Symbolic links are left out.
+fn copy_tree_in<M: Persist + Clone>(disk: &mut Fs<M>, from: &Path, path: &str, contents: bool, metas: &(M, M), now: u64) -> Result<usize, String> {
+    let into = disk.resolve(ROOT, path, true).map_err(|e| format!("{path}: {e:?}"))?;
+    fn walk<M: Persist + Clone>(disk: &mut Fs<M>, from: &Path, dir: layers::Ino, name: Option<&str>, metas: &(M, M), now: u64) -> Result<usize, String> {
+        let at = |e: &dyn std::fmt::Display| format!("{}: {e}", from.display());
+        let kind = fs::symlink_metadata(from).map_err(|e| at(&e))?.file_type();
+        if kind.is_symlink() {
+            return Ok(0);
+        }
+        // Where it goes: the folder itself, or a new or existing entry in it.
+        let place = |disk: &mut Fs<M>, new: layers::New, meta: &M| -> Result<layers::Ino, String> {
+            let Some(name) = name else { return Ok(dir) };
+            match disk.resolve(dir, name, false) {
+                Ok(ino) => Ok(ino),
+                Err(_) => disk.create(dir, name, new, meta.clone(), now).map_err(|e| at(&e)),
+            }
+        };
+        if kind.is_dir() {
+            let ino = place(disk, layers::New::Dir, &metas.0)?;
+            let mut n = 0;
+            let mut entries: Vec<_> = fs::read_dir(from).map_err(|e| at(&e))?.filter_map(Result::ok).collect();
+            entries.sort_by_key(|e| e.file_name());
+            for entry in entries {
+                let child = entry.file_name().to_string_lossy().into_owned();
+                n += walk(disk, &entry.path(), ino, Some(&child), metas, now)?;
+            }
+            return Ok(n);
+        }
+        let ino = place(disk, layers::New::File, &metas.1)?;
+        disk.truncate(ino, 0, now).map_err(|e| at(&e))?;
+        let mut file = fs::File::open(from).map_err(|e| at(&e))?;
+        let mut buffer = vec![0u8; 4 << 20];
+        let mut offset = 0u64;
+        loop {
+            let got = std::io::Read::read(&mut file, &mut buffer).map_err(|e| at(&e))?;
+            if got == 0 {
+                break;
+            }
+            disk.write(ino, offset, &buffer[..got], now).map_err(|e| at(&e))?;
+            offset += got as u64;
+        }
+        Ok(1)
+    }
+    if contents {
+        walk(disk, from, into, None, metas, now)
+    } else {
+        let name = from.file_name().map(|n| n.to_string_lossy().into_owned()).ok_or_else(|| format!("{}: no name to copy it in as", from.display()))?;
+        walk(disk, from, into, Some(&name), metas, now)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,5 +787,27 @@ mod tests {
         assert_eq!(find_program(&disk, "bash", &env).as_deref(), Some("/usr/bin/bash"));
         assert_eq!(find_program(&disk, "zsh", &env), None);
         assert_eq!(find_program(&disk, "/bin/sh", &env).as_deref(), Some("/bin/sh"));
+    }
+
+    #[test]
+    fn host_folders_copy_in_and_out_again() {
+        let host = std::env::temp_dir().join(format!("carbon-copy-in-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&host);
+        fs::create_dir_all(host.join("app/sub")).unwrap();
+        fs::write(host.join("app/a.txt"), b"one").unwrap();
+        fs::write(host.join("app/sub/b.bin"), vec![7u8; 5 << 20]).unwrap();
+        let mut disk = lambda::Disk::new(lambda::Meta::dir(0o755), false);
+        disk.put("/opt/a.txt", layers::New::File, b"older and longer", lambda::Meta::file(0o644), lambda::Meta::dir(0o755)).unwrap();
+        let metas = (lambda::Meta::dir(0o755), lambda::Meta::file(0o644));
+        // The folder by name, then what's in it over a file already there.
+        assert_eq!(copy_tree_in(&mut disk, &host.join("app"), "/", false, &metas, 1).unwrap(), 2);
+        assert_eq!(copy_tree_in(&mut disk, &host.join("app/."), "/opt", true, &metas, 1).unwrap(), 2);
+        assert_eq!(disk.contents(disk.resolve(ROOT, "/app/a.txt", false).unwrap()).unwrap(), b"one");
+        assert_eq!(disk.contents(disk.resolve(ROOT, "/opt/a.txt", false).unwrap()).unwrap(), b"one");
+        assert_eq!(disk.contents(disk.resolve(ROOT, "/opt/sub/b.bin", false).unwrap()).unwrap(), vec![7u8; 5 << 20]);
+        let out = host.join("out");
+        assert_eq!(copy_tree(&disk, "/app", &out).unwrap(), 2);
+        assert_eq!(fs::read(out.join("app/sub/b.bin")).unwrap().len(), 5 << 20);
+        let _ = fs::remove_dir_all(&host);
     }
 }

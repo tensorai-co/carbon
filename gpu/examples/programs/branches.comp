@@ -1,0 +1,31 @@
+#version 450
+// Divergent loops and branches: each invocation counts its own Collatz steps, with an early return,
+// signed arithmetic, a float path and a local array.
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) readonly buffer Src { uint src[]; };
+layout(set = 0, binding = 1) writeonly buffer Steps { uint steps[]; };
+layout(set = 0, binding = 3) writeonly buffer Signed { int signed_out[]; };
+layout(set = 0, binding = 2) writeonly buffer Floats { vec4 floats[]; };
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint n = src[i] + 1u;
+    uint count = 0u;
+    while (n != 1u) {
+        if ((n & 1u) == 0u) { n /= 2u; } else { n = 3u * n + 1u; }
+        count++;
+        if (count > 1000u) break;
+    }
+    steps[i] = count;
+    int s = int(i) - 32;
+    int local_values[4] = int[4](s, -s, s / 3, s % 5);
+    int acc = 0;
+    for (int k = 0; k < 4; k++) {
+        if (local_values[k] < 0) continue;
+        acc += local_values[k] * (k + 1);
+    }
+    signed_out[i] = acc;
+    float f = float(i) * 0.5;
+    floats[i] = vec4(f, f * f, i % 2u == 0u ? f + 1.0 : -f, float(acc));
+    if (i % 7u == 3u) return;
+    floats[i].w = 99.0;
+}
