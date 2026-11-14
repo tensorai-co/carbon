@@ -27,7 +27,7 @@ cargo test -p gpu -p gpu-ir -p gpu-frontend -p gpu-backend
  guest drivers      Carbon's own, running in the program, thin: they encode and the host lowers (to do)
                       atlas:  dxgi, d3d11, d3d12, vulkan-1, nvcuda (d3d9, opengl32 later)
                       lambda: a Vulkan driver (ICD) and libcuda.so behind a render node;
-                              GL is the image's Zink on our Vulkan
+                              and a GL vendor library (libGLX_carbon) for GLVND
                     │  one ring per device in the program's memory; a doorbell exit on submit,
                     │  fence wait and present, never per call
                     ▼
@@ -111,8 +111,8 @@ sits:
 | API | What its programs hand the driver | Frontend | State |
 | --- | --- | --- | --- |
 | Vulkan (both kernels) | SPIR-V | `spirv` | Compute built; vertex and fragment shaders built |
-| OpenGL and GLES on Linux | GLSL, compiled by the image's Mesa (Zink) to SPIR-V over our Vulkan | `spirv` | With graphics |
-| Direct3D 10 and 11 | DXBC | `dxbc` | To do |
+| OpenGL and GLES (both kernels) | GLSL source, compiled by a GLSL frontend of our own | `glsl` | Vertex and fragment shaders and compute kernels, held to glslang; GL 3.3's draws and the compatibility profile built, Luanti's menu drawn |
+| Direct3D 10 and 11 | DXBC | `dxbc` | Vertex, pixel and compute shaders (most of shader model 5.0) |
 | Direct3D 12 | DXIL (LLVM bitcode) | `dxil`, a bitcode reader of our own, not LLVM | To do |
 | Direct3D 9 | shader model 2 and 3 bytecode | `d3d9` | Later |
 | CUDA | PTX, inside fat binaries | `ptx` | To do |
@@ -226,8 +226,70 @@ offsets on samples, clip and cull distances, stage inputs and outputs that are s
 floats, `OpSpecConstantOp`, ballots, clustered reductions, and a branch from a nested selection out to an outer one's
 merge.
 
-To come: `dxbc` (Direct3D 10 and 11), `dxil` (Direct3D 12, LLVM bitcode read by a reader of our own), `ptx` (CUDA),
-and later `d3d9`.
+**DXBC** (`frontend/src/dxbc/`), Direct3D 10 and 11's shader models 4.0 to 5.0: vertex, pixel and compute shaders.
+
+- **The container** (`container.rs`): its chunks; the program (`SHEX` or `SHDR`) and the input and output signatures
+  (`ISGN`/`ISG1`, `OSGN`/`OSG5`/`OSG1`), each element's semantic, index, system value, component type, register and
+  mask. The checksum isn't checked.
+- **Tokens** (`tokens.rs`): opcode tokens and their extended tokens (sample offsets), operands with masks, swizzles,
+  select-1, modifiers, up to three indices each immediate or relative, immediates, declarations' own words, and the
+  immediate constant buffer's custom data.
+- **Translation** (`translate.rs`): registers are typeless, so each `r#` is a `vec4<u32>` variable and every
+  instruction bitcasts what it reads, one destination component at a time; inputs are read once at the start, and
+  outputs written out at each `ret` and the end. A stage's input or output is at the location of its register, so a
+  vertex shader's outputs and a pixel shader's inputs meet as D3D's linkage puts them, and an input layout's
+  elements are attributes at their registers; the signatures come back with the entry point for the API to link by
+  semantic. `SV_Position` (the pixel shader's with D3D's w, the reciprocal of Vulkan's), `SV_VertexID`,
+  `SV_InstanceID`, `SV_IsFrontFace`, `SV_Target#`, `SV_Depth` and the compute thread ids. Constant buffers
+  (dynamically indexed too), the immediate constant buffer and indexable temps (private memory), group-shared memory.
+  The float, integer, bit, conversion and comparison instructions (comparisons give all ones or zero; `udiv` by zero
+  gives all ones; `imul` and `umul`'s high words through 64-bit products); `if`/`else`, `loop`, `break(c)`,
+  `continue(c)`, `ret(c)`, `discard`, and `switch` as a loop run once whose cases are tests in order (falling
+  through), a `continue` inside it a flag the loop turns into the real one. `sample`, `sample_l` and `sample_b` on 2D
+  textures; raw and structured buffers (SRVs and UAVs), their atomics, and `sync`.
+- **Bindings**: each stage has its own tables of slots, so a binding's set is the kind (`b#` constant buffers 0,
+  `t#` resources 1, `s#` samplers 2, `u#` UAVs 3) and its binding the slot.
+
+Not read yet, each refused naming it: `ld` and `resinfo` (the IR has no texel fetch or image size yet), comparison and
+gradient samples, texel offsets, texture arrays, cubes and 3D textures, typed buffers and UAVs, clip and cull
+distances, geometry and tessellation stages, doubles, shader model 5.1, and `f16tof32`, `firstbit` and the bit-field
+instructions. The suite runs DXBC two ways: assembled by hand (`examples/dxbc_asm.rs`), for what HLSL compilers won't
+write (a `continue` inside a `switch`, `ftou` and `utof` beside `ftoi`), and compiled from HLSL by vkd3d's compiler
+(`examples/programs/*.hlsl`), which holds the reading to a real compiler's output. vkd3d 2.1 miscompiles two casts
+(`asuint((float)b)` comes out as `b`, and `(uint)a` as `(int)a`'s `ftoi` when both are in a program), so the HLSL
+programs leave them out.
+
+**GLSL** (`frontend/src/glsl/`), OpenGL's and OpenGL ES's source, as programs hand it to `glShaderSource`: GLSL 1.10
+to 4.60 and ES 1.00 to 3.20 are read, for vertex and fragment shaders and compute kernels. It's Carbon's GL's
+compiler, so no SPIR-V is made on the way: GLSL is structured, as the IR is.
+
+- **The preprocessor and lexer** (`pp.rs`), one pass: comments and line continuations, `#version` (and ES's default
+  without one), object- and function-like macros with `##` and arguments over several lines, the conditionals with
+  `defined`, `#extension` (those it has, and `require` of others refused), `#error`, and the predefined macros.
+- **The parser** (`parse.rs`, `ast.rs`): declarations with every qualifier and `layout`, structs, uniform and buffer
+  blocks, functions and prototypes, every statement, and expressions by precedence; a name is a type if GLSL's or a
+  struct's declared before it.
+- **Lowering** (`lower.rs`, `expr.rs`, `builtins.rs`), type-checking as it goes, one entry for `main`. Every call is
+  inlined (GLSL has no recursion; recursion is an error): parameters are variables, `out` and `inout` copied back, the
+  body a loop run once whose `return` sets a flag and breaks, each loop it left followed by a check that breaks
+  again. Composites are trees of IR values and variables (a matrix its columns), and indexing by a value selects
+  among the elements (or addresses memory). `switch` is a loop run once with fallthrough guards, a `continue` inside
+  it a flag. Operators as GLSL types them, implicit conversions as each version has them (none in ES), constructors,
+  swizzles, short-circuits and `?:` that evaluate only their side when it has effects. The built-ins: angle,
+  exponential, common, geometric, matrix (`determinant` and `inverse` by cofactors), vector-relational, bit casts,
+  `texture`/`texture2D` (with `Lod` and `Proj`), derivatives, barriers and atomics; `asin`, `acos` and `atan` are
+  Abramowitz and Stegun's polynomials (within 4e-8).
+- **The interface**: inputs, outputs, built-in variables per stage (`gl_Position`, `gl_FragColor`, `gl_FragData`,
+  `gl_FragCoord`, `gl_VertexID`, the compute ids…), plain uniforms in a default block laid out std430 with GL's names
+  for its members (`lights[1].color`), samplers, and std140/std430 uniform and buffer blocks, row-major too. `link`
+  matches a vertex shader's outputs to a fragment shader's inputs by name, and numbers samplers and blocks across the
+  program; each stage's default block is a binding of its own.
+
+Not there yet, each refused naming it: samplers other than `sampler2D` (the IR's images are 2D), `texelFetch` and
+`textureSize`, `in`/`out` blocks and arrays of blocks, doubles, a runtime array's `.length()`, images, subroutines,
+geometry and tessellation stages, and `gl_PointCoord` and clip distances.
+
+To come: `dxil` (Direct3D 12, LLVM bitcode read by a reader of our own), `ptx` (CUDA), and later `d3d9`.
 
 ## Backends (`gpu-backend`)
 
@@ -281,10 +343,10 @@ This crate uses `std`: the CPU backend needs the host's float functions, and bot
 | Part | What it is |
 | --- | --- |
 | `Memory` | An allocation; `write` and `read` copy into and out of memory no submission in flight uses |
-| `Image` | A 2D image in one format (RGBA8 and BGRA8, unorm and sRGB; RGBA32 float; D32 float, D16 unorm) |
-| `Sampler` | Nearest or linear filtering (magnified and minified), and repeat, mirrored repeat or clamp addressing |
+| `Image` | A 2D image in one format (RGBA8 and BGRA8, unorm and sRGB; R8, RG8 and A8 unorm; R32 and RGBA16 float; RGB10A2 unorm; RG11B10 float; RGBA32 float; D32 float, D16 unorm), with mip levels and array layers. An attachment or a copy is one level of one layer (`Sub`); sampling reads layer 0. A8 can't be drawn into, since Metal can't |
+| `Sampler` | Nearest or linear filtering (magnified, minified, and between mip levels), a range of levels of detail, repeat, mirrored repeat, clamp or border addressing with one of three border colours, and a comparison for depth images (the CPU device's sampling does it; shaders reach it with the `dxbc` frontend's `sample_c`) |
 | `Pipeline` | A compute program (`pipeline`, `pipeline_spirv`), or a graphics one (`graphics`): a vertex and a fragment entry point, the vertex buffers' layout and attributes, triangle lists, strips or fans, culling and front face, a depth test, and each colour attachment's format, blend and write mask (`src/graphics.rs`) |
-| `Command` | `Dispatch` (a pipeline, its bindings as ranges, a grid of workgroups), `Copy`, `Fill` (a 32-bit pattern); `BeginRender` (colour and depth attachments, loaded or cleared), `SetViewport`, `SetScissor`, `Draw` (bindings by set and binding, vertex buffers, an optional 16- or 32-bit index buffer, instances), `EndRender`; copies between memory and images |
+| `Command` | `Dispatch` (a pipeline, its bindings as ranges, a grid of workgroups), `Copy`, `Fill` (a 32-bit pattern); `BeginRender` (colour and depth attachments, loaded or cleared), `SetViewport`, `SetScissor`, `Draw` (bindings by set and binding, vertex buffers, an optional 16- or 32-bit index buffer, instances), `EndRender`; copies between memory and one level of one layer of an image; `GenerateMips` (each level a box filter of the one before) |
 | `Submit` | Commands for the one queue, in order, after the fences it waits for, raising the fences it signals |
 | `Fence` | A 64-bit timeline: raised by submissions or by the host (`signal`), waited on by both (`wait`) |
 
@@ -293,8 +355,8 @@ matching its pipeline, workgroups within the device's limit; a graphics pipeline
 and with its attributes and attachments; draws only inside a render pass, with every binding the pipeline's stages
 use bound to something of its kind, and attachments the pipeline's formats; copies inside their image and range), so a
 backend only implements the contract. `gpu::spirv` reads a module's shaders for `graphics`. The rest of the model
-comes with the APIs that need it: one GPU address space per context, mip levels and arrays, more than one queue,
-barriers and timestamps in command lists, lines and points.
+comes with the APIs that need it: one GPU address space per context, sampling image arrays and views of parts of
+images, more than one queue, barriers and timestamps in command lists, lines and points.
 
 - **Metal** (`src/macos/`): shared buffers (on Apple silicon the GPU and CPU share memory), pipelines loaded from
   AIR libraries (IEEE math, said in the library), one command queue, a command buffer per submission with a compute
@@ -337,6 +399,39 @@ heavy in them pays for it. So they only encode: each API call becomes a record o
 
 The guest drivers live with their kernels and build on `gpu-wire`: atlas's in `atlas/guest`, lambda's in a system
 layer it adds to every image, which is new for lambda.
+
+**Direct3D 11** (`api/src/d3d11.rs`) is the first API lowered this way without a wire: atlas's COM methods are host
+exports already (as its DirectWrite is), so they read a call's arguments from the program's memory and call
+`gpu_api::d3d11::Device` directly, with Direct3D's own structures and numbers. A `Device` is a device and its
+immediate context:
+
+- **Resources**: buffers are device memory (constant buffers at Direct3D's largest, 64 KiB, so a shader reading past
+  a small one's end reads zeroes rather than faulting); 2D textures are images with their levels and slices; staging
+  textures are memory with their subresources tightly packed; dynamic resources keep a host copy for `Map`. Formats:
+  RGBA8 and BGRA8 (unorm, sRGB, and BGRX as BGRA), RGBA16 and RGBA32 float, RGB10A2, RG11B10, RG8, R8, A8, R32
+  float, D32, D16, and D24S8 as D32. Views: shader resources of textures and of raw or structured buffers, render
+  targets and depth-stencils of one level of one slice, UAVs of buffers.
+- **States** with Direct3D's defaults: samplers (`D3D11_FILTER` decoded into the device's filters, address modes,
+  the nearest of the device's three border colours, comparison), blend (per target, independent or not), depth, and
+  rasterizer (cull, front face, scissor).
+- **Shaders** from DXBC (`gpu::dxbc`), input layouts checked against the vertex shader's signature, appended offsets
+  resolved.
+- **The immediate context**: all of a draw's state; draws (indexed, instanced) and dispatches; clears;
+  `UpdateSubresource`, `CopyResource`, `CopySubresourceRegion` (an image to an image through memory the submission
+  makes), `GenerateMips`, `Map`/`Unmap` and a read-back for presents. Commands are recorded and submitted when
+  something needs their results; updates are uploads among them, so a constant buffer mapped with `WRITE_DISCARD`
+  between draws is seen by each as it was. Consecutive draws to the same targets are one render pass. A pipeline is
+  made at the draw from the state that shapes it and kept; the pixel shader's bindings are moved to sets 4 to 7 (each
+  of Direct3D's stages has its own slot tables, the device's two stages share theirs), its inputs linked to the
+  vertex shader's outputs by semantic, and unbound slots get zeroes, a transparent black image and a sampler. The
+  viewport is flipped (Direct3D's y is up in normalized device coordinates), so windings on the screen are
+  Direct3D's.
+
+Not yet: stencil, multisampling, sampling arrays and cubes, views that reinterpret formats, typed buffers and texture
+UAVs, lines and points, deferred contexts, queries, and `SV_InstanceID` not counting `StartInstanceLocation` (the
+IR's instance index does). `api/tests/d3d11.rs` draws a textured quad, depth with a scissor, culling and a constant
+buffer changed between draws, copies and maps, a compute dispatch and mip generation, from HLSL, on the CPU device
+and the M1.
 
 ## Memory is the machine's memory (to come)
 
@@ -389,24 +484,33 @@ gpu/
     graphics.rs     images, samplers, graphics pipelines and draws
     software/       the CPU device: memory and its queue (mod.rs), draws (raster.rs), texels and sampling (texel.rs)
   ir/               gpu-ir: the IR, its validator, its text form (no_std)
-  frontend/         gpu-frontend: spirv (no_std); dxbc, dxil, ptx, d3d9 to come
+  frontend/         gpu-frontend: spirv, dxbc and glsl (no_std); dxil, ptx, d3d9 to come
   backend/          gpu-backend: air (lower, bitcode, metallib), cpu; spirv to come
   examples/
     conformance.rs  the suite on every device this host has
-    suite.rs        the suite itself, shared with tests/; its draw tests are in draws.rs
-    programs/       its GLSL (kernels, and vertex and fragment shaders), and the SPIR-V build.sh makes of it with
-                    glslang (checked in)
-  tests/            the suite, the device's checks, and the AIR libraries against Apple's tools, in cargo test
+    suite.rs        the suite itself, shared with tests/; its draw tests are in draws.rs, its DXBC ones in dxbc.rs
+                    (with dxbc_asm.rs, a small assembler)
+    programs/       its GLSL and HLSL, and the SPIR-V and DXBC build.sh makes of them with glslang and vkd3d's
+                    compiler (checked in)
+  tests/            the suite, the device's checks, the AIR libraries against Apple's tools, and GLSL against
+                    glslang (glsl.rs, its programs and their SPIR-V in glsl/), in cargo test
 ```
 
 Beside them, begun: `wire/` (`gpu-wire`, `no_std`: Vulkan's types, written by `wire/gen` from Khronos's `vk.xml` for
 the commands the driver has, and the render node's commands; the ring to come), `api/` (`gpu-api`: the service thread
-that owns a machine's device; Vulkan, Direct3D 11 and 12 and CUDA lowered onto it to come), and `guest/vulkan`
-(lambda's Vulkan driver, a `no_std` shared library built by lambda's `build.rs` for ARM64 and x86-64 Linux). To come:
+that owns a machine's device; Vulkan, Direct3D 11 and OpenGL lowered onto it, Direct3D 12 and CUDA to come), and
+`guest/vulkan` and `guest/gl` (lambda's Vulkan driver and GL vendor library, `no_std` shared libraries built by
+lambda's `build.rs` for ARM64 and x86-64 Linux). To come:
 cuBLAS and cuDNN's kernels, and the Linux and Windows backends in folders of their own. The CPU device moves into a folder of its own as
 rasterization joins it.
 
 ## Testing
+
+`programs/build.sh` needs `glslangValidator` and vkd3d's `vkd3d-compiler` (on `PATH`, or `VKD3D_COMPILER=...`), only
+for changing a program. On a Mac, vkd3d's release tarball builds the compiler alone: configure it with
+`CPPFLAGS=-I/opt/homebrew/include` (SPIR-V's headers), a stub `libvulkan.dylib` on `LDFLAGS` (configure wants a Vulkan
+loader for its Direct3D 12 library, which the compiler doesn't use), and Homebrew's bison (`BISON=...` for `make`); make
+its generated headers (`include/private/vkd3d_version.h` and the `.tab.h` files) first, then `make vkd3d-compiler`.
 
 The conformance suite (`examples/suite.rs`): each test's results are computed in Rust and compared word for word.
 
@@ -423,6 +527,14 @@ The conformance suite (`examples/suite.rs`): each test's results are computed in
 | triangles | the fill rule (two triangles sharing a diagonal through pixel centres, added together: each pixel drawn once), smooth and flat interpolation, the provoking vertex, discard, additive blending, two colour attachments |
 | depth | three indexed quads (16-bit indices, the vertex offset choosing each) at depths 0.5, 0.25 and 0.75 with `Less`: the middle one seen and its depth kept; back-face culling with clockwise front faces |
 | texture | a 4×4 texture through separate image and sampler bindings, two pixels a texel with nearest filtering, a triangle strip, the coordinate's derivatives and `gl_FragCoord` |
+| formats | each new colour format drawn (flat) into level 1 of layer 1 of an image of two levels and two layers, and cleared into level 0 of layer 1, texel bytes exact; layer 0 kept; A8 refused as an attachment |
+| mips | an 8×8 RGBA16 float texture's levels made by `GenerateMips`, read back exact; sampled at an explicit level of detail (`programs/levels.frag`) with nearest and linear mipmap filters and a sampler's range |
+| border | `ClampToBorder` with opaque white around a 2×2 texture whose coordinates run past both edges |
+| dxbc arith | a `cs_5_0` program's float arithmetic with modifiers and saturation, rounding, conversions (saturating), integer rules (`udiv` by zero, `imul`'s high word, shifts past 31), comparisons, `movc` and `dp4`, 30 words a thread |
+| dxbc flow | a loop filling an indexable temp, a `switch` in a loop with a `continue`, fall-through into the default and the immediate constant buffer, if/else, and a conditional `ret` |
+| dxbc shared | group-shared memory and `sync`, structured buffers in and out, `imm_atomic_iadd` and `atomic_umax` |
+| dxbc draw | a textured quad from DXBC vertex and pixel shaders: a constant buffer, attributes by register, `sample`, `SV_Position` in the pixel shader and a derivative |
+| hlsl arith, flow, shared, draw | the same from HLSL (`programs/arith.hlsl`, `flow.hlsl`, `shared.hlsl`, `quad.vs.hlsl`, `quad.ps.hlsl`) compiled by vkd3d's compiler: arith with its own 25 words a thread, the others giving the hand-assembled tests' results |
 | cube | vkcube's shaders (`programs/cube.*`, as Vulkan-Tools writes them), one frame: its uniform buffer of an MVP matrix and 36 vertices, a combined image sampler, D16 depth, and an orthographic view of one face, whose every pixel is the light's 0.707 times the texture |
 
 Passing on the CPU device, and on an Apple M1's GPU through Metal, draws included. A device without draws would
@@ -430,7 +542,16 @@ report them as not there yet (`--` in the example's output) rather than failing.
 arguments, and that a program reading past its buffer faults on the CPU device; `tests/air.rs` that every suite
 program's library passes Apple's `air-validate` and disassembles with `air-opt` (skipped without the Metal toolchain;
 `GPU_AIR_DUMP=dir` keeps the files); `ir/src/tests.rs` checks what the validator refuses; `frontend/src/tests.rs` that
-every program reads. The suite is run without a machine; DXBC and PTX programs join it with their frontends.
+every program reads, and DXBC's signatures and refusals; `tests/air.rs` checks the DXBC programs' libraries too.
+`tests/glsl.rs` holds the GLSL compiler to glslang: `tests/glsl/`'s programs (integers and control flow; float
+built-ins and matrices; shared memory, barriers and atomics) compiled by both, glslang's SPIR-V (from `build.sh`, its
+returns merged and functions inlined by `spirv-opt`) read by the SPIR-V frontend, run on the same input, and every
+word compared (floats within 1e-5); the built-ins glslang's side can't be lowered for (inverse trigonometry,
+hyperbolics, `determinant` and `inverse`, `refract`, `modf`, `isnan`) and returns from nested loops and `continue`
+inside `switch` are checked against Rust; and a GLSL 1.10 program draws a textured quad placed by its uniforms. All
+on the CPU device and the M1. `frontend/src/glsl/tests.rs` checks the preprocessor, the interface and linking, and
+errors' lines. The suite is run without a machine; PTX programs join it
+with their frontend.
 
 ## The order of work
 
@@ -472,24 +593,73 @@ PyTorch's tensor operations on `cuda`, then a small model's inference, on the Ma
 
 **4. Graphics.** The device model's draw half: render pipelines, rasterization and blending on Metal and in the CPU
 device, images and samplers, and window-system surfaces presenting to `display`. *Done means:* `vkcube` in
-`debian:13`, then GTK 4 and Firefox with WebRender on the image's Zink. Done so far: the IR's stages, the SPIR-V
+`debian:13`, then OpenGL of our own (below), then GTK 4 and Firefox with WebRender on it. Done so far: the IR's stages, the SPIR-V
 frontend's vertex and fragment shaders, and the device model's draw half on the CPU device, vkcube's shaders drawing
 their frame exactly; and lambda's Vulkan driver's graphics (images, samplers, render passes, framebuffers, graphics
 pipelines, draws, copies between buffers and images) and its swapchains on Wayland and X11 (above): Debian's own
 `vkcube` spins on `--display headless`, on `--wsi wayland` and `--wsi xcb`: at about 18 frames a second at 500×500 on
 the CPU device, and drawn by the M1 through Metal (the AIR writer's vertex and fragment functions, Metal's render
-pipelines and textures, held to the CPU device by the draw tests) at the display's 60 Hz. Left: mip levels, image
-arrays and views of parts of images; lines and points; GTK 4 and Firefox on Zink.
+pipelines and textures, held to the CPU device by the draw tests) at the display's 60 Hz. The device model's mip levels, array layers, more formats, border colours and comparison
+samplers are done (for Direct3D 11 first; lambda's driver still makes images of one level and layer). Left: sampling
+image arrays and views of parts of images; lines and points; GTK 4 and Firefox on our GL.
+
+**OpenGL of our own.** `gpu_api::gl`, lowered on the host as Direct3D 11 is, for both kernels: lambda's through a
+thin `libGLX_carbon.so.0` (and an EGL vendor) in the system layer, which the image's GLVND loads because lambda's X
+server names `carbon` as the screen's vendor; atlas's through `opengl32` and WGL. A `glsl` frontend into the IR; GL
+3.3 core and ES 3.0 first, then the compatibility profile's fixed function as programs ask. Calls are recorded in the
+guest and sent on the ring, as every API's are; the state programs read back most is answered there. *Done means:*
+Luanti, Debian's `minetest`, plays on the M1 with no Mesa in the image's path. Done so far:
+- GLX in lambda's X server (configs, contexts, GLX drawables), with the image's Mesa (llvmpipe) as the oracle:
+  `glxinfo`, `glxgears` and Luanti's main menu render through it.
+- `libGLX_carbon.so.0` (`guest/gl`): GLVND's vendor ABI (`__glx_Main`), all of GLX 1.4 that GLVND requires (configs
+  read from the server and chosen by GLX's rules, contexts, GLX windows, pixmaps and pbuffers made on the server,
+  making current on a window, swaps through `PutImage`), and GL's first calls recorded onto the render node's GL
+  doorbell (`gpu_wire::gl`).
+- `gpu_api::gl`: contexts, each drawable's default framebuffer (rows kept as GL numbers them, turned up at a swap),
+  clears whole, scissored and through the write masks, viewport, scissor, capabilities, `glGet*`, errors and
+  `glReadPixels`. `kernels/lambda/tests/programs/gl` checks it on both devices: `glxinfo` says `Carbon GPU (Apple
+  M1)`, and its 30 checks pass.
+- The `glsl` frontend (above), held to glslang on both devices.
+- GL 3.3's drawing (`api/src/gl/`): shaders compiled by the `glsl` frontend with GL's info logs, programs linked
+  (attributes at their layout's, `glBindAttribLocation`'s or the next free location; the position moved to the
+  device's depth range; `gl_FragData` kept to the framebuffer's attachments), uniforms by GL's locations and names
+  (`glGetActiveUniform` too), buffers, vertex arrays with any of GL's attribute types (those the device doesn't read
+  converted, and the program's own arrays read as the draw waits), generic attribute values, 2D textures from
+  every 8-bit, packed, sRGB and float format GL has, mipmaps, filtering and wrapping, and draws, indexed or not,
+  instanced, with depth, culling, blending and the write masks. Draws stay in one render pass until something has
+  to wait; what each reads that can change (uniforms, copied arrays, converted indices) is copied into the batch's
+  arena as it's recorded. `kernels/lambda/tests/programs/gl/draw.c` checks it on both devices (20 checks), and the
+  host's own tests draw through the records on the CPU device.
+- The compatibility profile (`api/src/gl/compat.rs`, `guest/gl/src/compat.rs`): GLSL 1.20's built-ins in the
+  compiler (`gl_Vertex`, `gl_Color`, `gl_Normal`, `gl_MultiTexCoord<n>` at the generic attributes NVIDIA's drivers
+  alias them to; the matrices, inverses and transposes, `gl_NormalMatrix` and `gl_TextureMatrix[]` as uniforms GL
+  fills at each draw; `gl_FrontColor`, `gl_TexCoord[]` and `gl_FogFragCoord` passed on; `ftransform()`), and GL 2.1's
+  state on the host: the matrix stacks, the conventional arrays and current values (as those attributes), each
+  unit's texture environment (MODULATE, REPLACE, DECAL, BLEND, ADD and COMBINE's every function, source and operand),
+  the alpha test, fog, and `glRectf`. Fixed function is GLSL: a program written from the state that shapes it,
+  compiled by the `glsl` frontend and kept by that shape. `GL_EXTENSIONS` lists what's built (VBOs, non-power-of-two
+  textures, the combine environments, BGRA arrays…). `kernels/lambda/tests/programs/gl/compat.c` checks it as
+  Irrlicht draws (11 checks), and Luanti's main menu renders on it exactly as on Mesa.
+- Left, in order: playing in a world in Luanti (what its 3D draws ask for: framebuffer objects, likely); points and
+  lines; lighting and materials; uniform blocks; stencil; flat shading; drawing faster (draws batched across rings,
+  not sent one by one); then the X server names `carbon` for machines with a GPU. Until then a program asks for it
+  with `__GLX_VENDOR_LIBRARY_NAME=carbon`; GL says 3.3, of which this is what's there.
 
 **5. atlas: DXGI, Direct3D 11 and Vulkan.** DXGI's factory, adapters and flip-model swap chains, the `dxbc` frontend
 and the Direct3D 11 lowering, and `vulkan-1`. *Done means:* the browser-engine program on its default path (ANGLE on
-Direct3D 11), with no flags.
+Direct3D 11), with no flags. Done so far: atlas's machines get the machine's GPU (`atlas::Options.gpu`); the
+device model's mip levels, array layers, formats and samplers Direct3D 11 needs first; and the `dxbc` frontend's
+vertex, pixel and compute shaders, held to both devices by the suite. vkd3d's HLSL compiler is the
+test oracle (`programs/build.sh`), and `gpu_api::d3d11` is Direct3D 11's devices and immediate contexts on the device.
+atlas's DXGI and `d3d11.dll` are COM objects over it (`kernels/atlas/src/os/gfx.rs`), presenting into windows, with
+a Direct3D 11 cube test (`kernels/atlas/tests/programs/cube.c`) on both devices. A browser engine's GPU process gets
+through ANGLE's Direct3D 11 initialization. Next: the browser engine drawing on its default path.
 
 **6. Linux and Windows hosts.** The `spirv` backend against the host's Vulkan driver; until then those hosts get the
 CPU device. *Done means:* the conformance suite passes on each host's GPU.
 
 **7. The rest:** Direct3D 12 with `dxil`, Direct3D 9, `nvcuda.dll` for Windows programs, cuDNN, the CPU device
-compiled instead of interpreted, and WGL and an OpenGL of our own if the image's Zink isn't enough.
+compiled instead of interpreted.
 
 **8. Faster:** zero-copy presentation to host windows, Vulkan Video and Media Foundation's hardware decode.
 
@@ -526,7 +696,7 @@ Each of these could change a step, so each gets a small test before the step tha
 | Its vendor ID | one of our own; virtio's; none (0) | `0x1c0de` for now (`gpu_wire::VENDOR_ID`): above 0xffff, in Khronos's range, so no PCI vendor's workarounds match it; Khronos's registered IDs are the way to make it official | step 2 |
 | Where APIs are lowered | host-side, from records on the ring; in the guest drivers | host-side: native speed under translation, one place per API | step 2 |
 | Vendor-only libraries (cuBLAS, cuDNN) | replaced by ours, by name, said at start; not supported | replaced: PyTorch can't multiply matrices without cuBLAS | step 3 |
-| OpenGL on Linux | the image's Zink on our Vulkan; a GL of our own | Zink: it's the image's software, and GL is enormous | step 4 |
+| OpenGL | the image's Zink on our Vulkan; a GL of our own | Decided: our own. GL's driver is the OS's (rule 1); atlas needs one anyway, since Windows programs bring no Mesa; and Zink would ask more of our Vulkan driver, DRI3 of the X server, and translate every shader twice | step 4 |
 | Windows host backend | Vulkan through the host's loader; Direct3D 12 | Vulkan first (every desktop GPU's driver has it), Direct3D 12 later | step 6 |
 | CUDA or graphics first | step 3 before 4; 4 and 5 first | whichever milestone is closer: neither needs the other | step 3 |
 | `--gpu auto`'s fallback | loud, as built; never fall back | the same answer as `--isolation auto`'s | the CLI |
@@ -555,7 +725,7 @@ Prior art for each part, read for how it's done and none of it a dependency:
 | **device** | `gpu::Device`: memory, pipelines, a queue and fences, on one backend |
 | **CPU device** | The software backend: the IR interpreted on the host's CPU |
 | **IR** | `gpu-ir`: every program between a frontend and a backend |
-| **frontend** | Reads one API's GPU code into the IR: `spirv`, later `dxbc`, `dxil`, `ptx` |
+| **frontend** | Reads one API's GPU code into the IR: `spirv`, `dxbc`, later `dxil`, `ptx` |
 | **backend** | Takes the IR somewhere: `air` for Metal, `cpu` for the CPU device, later `spirv` for Vulkan |
 | **AIR** | Apple's GPU IR: LLVM IR in Apple's dialect, which Metal loads as `.metallib` libraries |
 | **guest driver** | Carbon's driver in the program (a Vulkan ICD, `libcuda.so`, `d3d11`), encoding calls onto the ring |

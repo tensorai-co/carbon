@@ -1,4 +1,4 @@
-//! The extensions' table (RENDER's, XKEYBOARD's, RANDR's and XFIXES' requests are in their own modules), and the
+//! The extensions' table (RENDER's, XKEYBOARD's, RANDR's, XFIXES' and GLX's requests are in their own modules), and the
 //! small ones:
 //! BIG-REQUESTS (requests past 256 KiB), XC-MISC (resource IDs), SHAPE (shaped and input-shaped
 //! windows: a top-level's bounding shape is its backing's transparency, its input shape the desktop's input region),
@@ -10,6 +10,7 @@ use display::Rect;
 use kernels_core::lock;
 
 use super::draw::{self, Region};
+use super::glx::{GLX, GLX_ERROR, GLX_EVENT};
 use super::render::{RENDER, RENDER_ERROR};
 use super::randr::{RANDR, RANDR_ERROR, RANDR_EVENT};
 use super::xfixes::{XFIXES, XFIXES_ERROR, XFIXES_EVENT};
@@ -37,6 +38,7 @@ pub const EXTENSIONS: &[(&str, u8, u8, u8)] = &[
     ("XKEYBOARD", XKEYBOARD, XKB_EVENT, XKB_ERROR),
     ("RANDR", RANDR, RANDR_EVENT, RANDR_ERROR),
     ("XFIXES", XFIXES, XFIXES_EVENT, XFIXES_ERROR),
+    ("GLX", GLX, GLX_EVENT, GLX_ERROR),
 ];
 
 impl Server {
@@ -57,6 +59,7 @@ impl Server {
             XKEYBOARD => self.xkb(ci, r),
             RANDR => self.randr(ci, r),
             XFIXES => self.xfixes(ci, r),
+            GLX => self.glx(ci, r),
             _ => self.error(ci, err::REQUEST, 0),
         }
     }

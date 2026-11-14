@@ -34,7 +34,7 @@ kernels/lambda/src/
                   manager's part) answering /tmp/.X11-unix/X0 on the same desktop
                   vdso.rs, the vDSO and its clock page; sysfs.rs, /sys made each time it's read
                   gpu.rs, the render node /dev/dri/renderD128, on a machine with --gpu
-                  system.rs, the system layer: files lent to every image (the Vulkan driver)
+                  system.rs, the system layer: files lent to every image (the Vulkan driver, the GL vendor library)
                   to come: pulse/ (a PulseAudio server)
 ```
 
@@ -90,6 +90,9 @@ On this Mac, through hvf, all of them pass. Each program's opening comment says 
 | lambda's `attrs.c`, both ISAs | Extended attributes, `mknod`, and `openat2` |
 | lambda's `ptrace.c`, both ISAs | `ptrace`'s stops, memory and system calls, and `process_vm_readv`/`writev` |
 | lambda's `marks.c`, both ISAs | fanotify, `statmount`/`listmount`, `remap_file_pages` and x86-64's old calls |
+| lambda's `gl/gl.c`, ARM64, built in `debian:13` | GL through Carbon's vendor library on the machine's GPU: GLVND loading it, a config chosen, a GLX window and context, clears whole, scissored and masked read back as RGBA, BGRA and packed RGB, gets, errors and a swap; on `--gpu host` and `--gpu software`, with `__GLX_VENDOR_LIBRARY_NAME=carbon` |
+| lambda's `gl/draw.c`, ARM64, built in `debian:13` | GL 3.3 draws through Carbon's GL: a shader that doesn't compile and says its line, a program linked and its locations, a vertex array with vertex and element buffers, a texture, uniforms, an indexed textured quad read back pixel by pixel, blending, and a swap; on `--gpu host` and `--gpu software` |
+| lambda's `gl/compat.c`, ARM64, built in `debian:13` | The compatibility profile as Luanti's Irrlicht draws: an orthographic projection, the program's own arrays with BGRA colours, a texture through `GL_COMBINE`, the alpha test, a GLSL 1.20 program with Luanti's header under a pushed matrix, and `glRectf` in the current colour; on `--gpu host` and `--gpu software` |
 | lambda's `vulkan/vulkan.c`, ARM64, built in `debian:13` | Vulkan compute through lambda's driver on the machine's GPU: memory, buffers, descriptor sets with a dynamic offset, push constants, a pipeline, a fill, a dispatch, an update and a copy, submitted twice; on `--gpu host` and `--gpu software` |
 
 The x86-64 programs are built as they come, SSE and SSE2 included. Two of lambda's check the translator bit for bit,
@@ -374,7 +377,10 @@ only a faster one.
   dashes, `GraphicsExpose`, and the image's own PCF fonts in place of the one 6×13 font.
 - Extensions: SHAPE's `ShapeNotify`, MIT-SHM's pixmaps, RENDER's non-separable blends, alpha maps, filters and indexed
   formats, the rest of XKEYBOARD and RANDR, XFIXES' cursor events and barriers, then DAMAGE, SYNC, XInput 2, the
-  Generic Event Extension and COMPOSITE; for the GPU, `Present`, `DRI3` and GLX.
+  Generic Event Extension and COMPOSITE; for the GPU, `Present` and `DRI3`. GLX is built (`glx.rs`): the screen's
+  configs (each visual's, single- and double-buffered at depths 24 and 32, and framebuffer configs beside them), the
+  server's strings with the GLVND vendor, direct contexts, and GLX windows, pixmaps and pbuffers; indirect contexts
+  are refused, as Xorg without `+iglx` does.
 - To run: SDL, a Java Swing program, later Wine's X11 driver.
 
 **Graphics, software first:**
@@ -390,8 +396,12 @@ only a faster one.
   in it, as overlayfs copies one up, so dpkg installs Mesa's drivers beside it). The driver lists the Carbon GPU to
   `vulkaninfo`, beside Mesa's llvmpipe when that's installed, runs Vulkan compute on it (`tests/programs/vulkan`), and
   draws: Debian's `vkcube` spins on the headless display, on Wayland and on X11, drawn by the M1 (`--gpu host`) or the
-  CPU device, presented through the program's own `wl_shm` buffers or `PutImage` (the GPU README's Presenting). OpenGL is the image's own Mesa as Zink on
-  our Vulkan. A window's swapchain image is a `gpu` image the desktop composites, named by its Wayland or X11 id, so no
+  CPU device, presented through the program's own `wl_shm` buffers or `PutImage` (the GPU README's Presenting). OpenGL is
+  becoming Carbon's own (`gpu`'s step 4): `libGLX_carbon.so.0` is in the system layer, and GLVND loads it with
+  `__GLX_VENDOR_LIBRARY_NAME=carbon`; it draws with GL 3.3's shaders, buffers, vertex arrays and textures (`tests/programs/gl`), compiled by `gpu`'s GLSL
+  compiler, and the compatibility profile (fixed function as generated GLSL): Luanti's main menu renders on it as it
+  does on Mesa. Until it does,
+  the X server names `mesa`, and the image's llvmpipe draws: `glxgears` and Luanti's menu run. A window's swapchain image is a `gpu` image the desktop composites, named by its Wayland or X11 id, so no
   buffer goes through lambda's servers. Mesa's Venus over virtio-gpu's ioctls is no longer the path. Later, VA-API
   and Vulkan Video.
 

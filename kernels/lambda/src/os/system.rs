@@ -1,8 +1,10 @@
 //! The system layer: files lambda lends every image, because the image's own software looks for them as files though
-//! they're the OS's. Today that's lambda's Vulkan driver, on a machine with a GPU: the driver for each ISA
-//! (`/usr/lib/<triple>/libvulkan_carbon.so`, built by `build.rs` from `gpu/guest/vulkan`) and the manifest the
+//! they're the OS's. Today that's lambda's GPU drivers, on a machine with a GPU, each built by `build.rs` for each
+//! ISA: the Vulkan driver (`/usr/lib/<triple>/libvulkan_carbon.so`, from `gpu/guest/vulkan`) and the manifest the
 //! image's Vulkan loader finds it by (`/usr/share/vulkan/icd.d/carbon_icd.json`, naming the driver for the ISA of the
-//! process reading it). NVIDIA's container toolkit puts its driver into containers the same way.
+//! process reading it); and the GL vendor library (`/usr/lib/<triple>/libGLX_carbon.so.0`, from `gpu/guest/gl`),
+//! which the image's GLVND loads by that name. NVIDIA's container toolkit puts its drivers into containers the same
+//! way.
 //!
 //! They're made in memory and never on the disk: never logged in the machine's layer, frozen, or copied out, and
 //! sealed, so no program can change them. A directory the image has too lists both its files and these; one the image
@@ -23,8 +25,12 @@ use crate::Meta;
 /// The driver, for each ISA a Linux program can be: empty where `build.rs` couldn't build it.
 static DRIVER_AARCH64: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libvulkan_carbon-aarch64.so"));
 static DRIVER_X86_64: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libvulkan_carbon-x86_64.so"));
+/// The GL vendor library, the same way.
+static GLX_AARCH64: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libGLX_carbon-aarch64.so"));
+static GLX_X86_64: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libGLX_carbon-x86_64.so"));
 
 const DRIVER: &str = "libvulkan_carbon.so";
+const GLX: &str = "libGLX_carbon.so.0";
 const MANIFEST: &str = "/usr/share/vulkan/icd.d/carbon_icd.json";
 
 /// What's at a path of the system layer.
@@ -54,6 +60,11 @@ fn files(task: &Task) -> Vec<(String, Cow<'static, [u8]>)> {
     for (isa, bytes) in [(Isa::Arm64, DRIVER_AARCH64), (Isa::X86_64, DRIVER_X86_64)] {
         if !bytes.is_empty() {
             out.push((driver_path(isa), Cow::Borrowed(bytes)));
+        }
+    }
+    for (isa, bytes) in [(Isa::Arm64, GLX_AARCH64), (Isa::X86_64, GLX_X86_64)] {
+        if !bytes.is_empty() {
+            out.push((format!("/usr/lib/{}/{GLX}", triple(isa)), Cow::Borrowed(bytes)));
         }
     }
     let own = if task.isa == Isa::Arm64 { DRIVER_AARCH64 } else { DRIVER_X86_64 };

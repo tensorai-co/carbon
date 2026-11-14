@@ -203,7 +203,11 @@ programs and how to build them are in [lambda's](kernels/lambda/README.md#runnin
   Vertex and fragment shaders draw on both too, by Vulkan's rasterization rules, vkcube's among them. `--gpu` gives a
   Linux machine a render node and lambda's own Vulkan driver, so `vulkaninfo` in `debian:13` lists a Carbon GPU (the
   M1's, or the CPU device), which runs Vulkan compute programs and draws: Debian's `vkcube` spins on the headless
-  display, on Wayland and X11, drawn by the M1.
+  display, on Wayland and X11, drawn by the M1. OpenGL of Carbon's own is begun: lambda's X server has GLX,
+  GLVND loads Carbon's GL vendor library, whose contexts draw with GL 3.3's shaders, buffers, vertex arrays and
+  textures and with the compatibility profile's fixed function on the M1 (Luanti's main menu renders on it), its GLSL compiler turning GLSL 1.10 to 4.60 and ES into the IR, held to glslang's results on
+  both devices; until it draws, the
+  image's Mesa renders through the same GLX, so Luanti's menu runs.
 
 ## The order of work
 
@@ -271,9 +275,10 @@ another process on Windows hosts; a worker process per machine.
 4. GDI: DIB sections with shared pages, regions and shapes, real fonts. (Bitmaps, memory DCs, `BitBlt` and icons are
    done.)
 5. lambda's Wayland and X11 servers, so GTK, Qt and Firefox run.
-6. The GPU ([gpu](gpu/README.md#the-order-of-work)): lambda's Vulkan driver grown (Vulkan 1.1, Zink and GL), then
-   CUDA, then atlas's DXGI and Direct3D 11. (The IR, SPIR-V, compute and draws on Metal and the CPU device, and lambda's
-   Vulkan driver as far as compute and vkcube, are done.)
+6. The GPU ([gpu](gpu/README.md#the-order-of-work)): lambda's Vulkan driver grown (Vulkan 1.1), OpenGL of our own for both kernels, then
+   CUDA, then atlas's DXGI and Direct3D 11. (The IR, SPIR-V, compute and draws on Metal and the CPU device, lambda's
+   Vulkan driver as far as compute and vkcube, the DXBC reader, and atlas's DXGI and Direct3D 11 as far as a program's
+   draws, presents and compute, are done.)
 
 **6. Networks** ([net](net/README.md#to-do))
 

@@ -238,6 +238,7 @@ name = "gpu-api"
 version = "0.2.0"
 dependencies = [
  "gpu",
+ "gpu-frontend",
  "gpu-ir",
  "gpu-wire",
 ]

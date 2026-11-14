@@ -6,9 +6,11 @@
 //! comes back.
 //!
 //! Built so far: the device's description, for lambda's render node; [`vulkan`], a Vulkan driver's records lowered
-//! onto the device; and [`d3d11`], Direct3D 11's devices and immediate contexts, for atlas.
+//! onto the device; [`d3d11`], Direct3D 11's devices and immediate contexts, for atlas; and [`gl`], OpenGL's
+//! contexts and default framebuffers, for both kernels.
 
 pub mod d3d11;
+pub mod gl;
 pub mod vulkan;
 
 use std::sync::mpsc;

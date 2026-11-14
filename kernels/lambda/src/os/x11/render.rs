@@ -13,7 +13,7 @@ use kernels_core::lock;
 
 use super::draw::{self, Region};
 use super::wire::{Reply, Req, err};
-use super::{Res, Server, Target, TargetSurface, VISUAL, VISUAL_ARGB};
+use super::{Res, Server, Target, TargetSurface, VISUALS};
 
 pub const RENDER: u8 = 132;
 /// RENDER's errors, from here: PictFormat, Picture, PictOp, GlyphSet, Glyph.
@@ -820,14 +820,10 @@ impl Server {
         }
         rep.u32(depths.len() as u32).u32(X8R8G8B8);
         for d in depths {
-            let visual = match d {
-                24 => Some((VISUAL, X8R8G8B8)),
-                32 => Some((VISUAL_ARGB, A8R8G8B8)),
-                _ => None,
-            };
-            rep.u8(d).skip(1).u16(u16::from(visual.is_some())).skip(4);
-            if let Some((v, f)) = visual {
-                rep.u32(v).u32(f);
+            let visuals: Vec<u32> = VISUALS.iter().filter(|v| v.1 == d).map(|v| v.0).collect();
+            rep.u8(d).skip(1).u16(visuals.len() as u16).skip(4);
+            for v in visuals {
+                rep.u32(v).u32(if d == 32 { A8R8G8B8 } else { X8R8G8B8 });
             }
         }
         rep.u32(0);

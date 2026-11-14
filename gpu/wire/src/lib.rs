@@ -5,11 +5,13 @@
 //! - The render node's protocol: lambda's `/dev/dri/renderD128` answers DRM's version query, as any DRM driver
 //!   does, and the driver's own commands from DRM's driver range: [`INFO`], the device's description, and
 //!   [`SUBMIT_IOCTL`], the doorbell that hands the host the [`records`] the driver has collected.
+//! - [`gl`]: OpenGL's records, which Carbon's GL vendor library rings through the render node's second doorbell.
 //!
 //! `no_std`, with no `unsafe`: plain data both sides agree on, in the C ABI's layout, the same on ARM64 and x86-64.
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod gl;
 pub mod records;
 pub mod vk;
 

@@ -16,6 +16,7 @@
 
 mod draw;
 mod ext;
+mod glx;
 mod randr;
 mod render;
 mod wire;
@@ -55,6 +56,11 @@ const WM_CHECK: u32 = 0x101;
 const COLORMAP: u32 = 0x20;
 const VISUAL: u32 = 0x21;
 const VISUAL_ARGB: u32 = 0x22;
+const VISUAL_SINGLE: u32 = 0x23;
+const VISUAL_ARGB_SINGLE: u32 = 0x24;
+/// The screen's visuals (all TrueColor): each its ID, its depth, and whether GLX's config for it is double-buffered.
+/// A depth's first is the one windows get by default.
+const VISUALS: [(u32, u8, bool); 4] = [(VISUAL, 24, true), (VISUAL_SINGLE, 24, false), (VISUAL_ARGB, 32, true), (VISUAL_ARGB_SINGLE, 32, false)];
 /// Each client's resource IDs: its index above these bits, its own below.
 const SHIFT: u32 = 21;
 const ID_MASK: u32 = (1 << SHIFT) - 1;
@@ -233,6 +239,8 @@ enum Res {
     GlyphSet(Arc<Mutex<render::GlyphSet>>),
     /// XFIXES'.
     Region(Region),
+    /// GLX's contexts and drawables.
+    Glx(glx::Glx),
 }
 
 /// A pointer grab, the client's own (`GrabPointer`) or the one a press makes.
@@ -610,15 +618,11 @@ impl Server {
         put32(&mut r, VISUAL);
         r.extend([0, 0, 24, draw::DEPTHS.len() as u8]);
         for d in draw::DEPTHS {
-            let visual = match d {
-                24 => Some(VISUAL),
-                32 => Some(VISUAL_ARGB),
-                _ => None,
-            };
+            let visuals: Vec<u32> = VISUALS.iter().filter(|v| v.1 == d).map(|v| v.0).collect();
             r.extend([d, 0]);
-            put16(&mut r, u16::from(visual.is_some()));
+            put16(&mut r, visuals.len() as u16);
             put32(&mut r, 0);
-            if let Some(v) = visual {
+            for v in visuals {
                 put32(&mut r, v);
                 r.extend([4, 8]);
                 put16(&mut r, 256);

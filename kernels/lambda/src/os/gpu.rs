@@ -1,8 +1,8 @@
 //! The machine's GPU, as Linux programs reach one: the render node `/dev/dri/renderD128` (character device 226:128),
 //! which lambda's Vulkan driver opens. It answers DRM's version query, as every DRM driver does (`drmGetVersion`
 //! says `carbon`), and the driver's own commands from DRM's driver range (`gpu_wire`): the device's description, and
-//! the doorbell, which hands the records the driver collected to its Vulkan context (`gpu_api::vulkan`), one for each
-//! open of the node. The device itself is `gpu_api`'s, on a thread of its own; this is only the way in, and the
+//! the doorbells, which hand the records a driver collected to its Vulkan context (`gpu_api::vulkan`) or, from
+//! Carbon's GL vendor library, its GL (`gpu_api::gl`), one of each for every open of the node. The device itself is `gpu_api`'s, on a thread of its own; this is only the way in, and the
 //! guest's memory the context reads and writes is the ringing process's.
 //!
 //! The node is put in `/dev/dri` at boot when the machine has a GPU (`--gpu` other than `none`), with its sysfs entry
@@ -27,15 +27,17 @@ const VERSION: (i32, i32, i32) = (1, 0, 0);
 /// The most records one doorbell may hand over.
 const MOST_RECORDS: u64 = 1 << 30;
 
-/// An open of the render node: the machine's GPU, and the Vulkan objects the driver that opened it made.
+/// An open of the render node: the machine's GPU, and the Vulkan objects or GL contexts the driver that opened it
+/// made.
 pub(crate) struct Drm {
     gpu: gpu_api::Gpu,
     vulkan: gpu_api::vulkan::Context,
+    gl: gpu_api::gl::Gl,
 }
 
 impl Drm {
     pub(crate) fn new(gpu: gpu_api::Gpu) -> Arc<Drm> {
-        Arc::new(Drm { vulkan: gpu_api::vulkan::Context::new(gpu.clone()), gpu })
+        Arc::new(Drm { vulkan: gpu_api::vulkan::Context::new(gpu.clone()), gl: gpu_api::gl::Gl::new(gpu.clone()), gpu })
     }
 }
 
@@ -104,6 +106,22 @@ impl Task {
                         Ok(message.len().max(1) as u64)
                     }
                 }
+            }
+            gpu_wire::gl::GL_SUBMIT_IOCTL => {
+                let words = self.mem(cx, false, |t| user::read_vec(&t.space(), arg, gpu_wire::SUBMIT_SIZE))?;
+                let word = |i: usize| u64::from_le_bytes(words[i * 8..i * 8 + 8].try_into().unwrap_or_default());
+                let (at, len, reply, room) = (word(0), word(1), word(2), word(3));
+                if len > MOST_RECORDS {
+                    return Err(E2BIG);
+                }
+                let records = self.mem(cx, false, |t| user::read_vec(&t.space(), at, len as usize))?;
+                let answer = drm.gl.execute(&records, &mut Ringing { task: self, cx });
+                // The reply, as far as the driver made room for it: its length is the ioctl's answer.
+                let n = answer.len().min(room as usize);
+                if n > 0 && reply != 0 {
+                    self.mem(cx, true, |t| user::write(&mut t.space(), reply, &answer[..n]))?;
+                }
+                Ok(answer.len() as u64)
             }
             // DRM's other ioctls (capabilities, authentication, GEM, KMS) and other drivers': this one has none of them.
             _ if (request >> 8) & 0xff == u64::from(gpu_wire::DRM_TYPE) => Err(EINVAL),

@@ -1,0 +1,91 @@
+// Integers, control flow, functions, structs and arrays: each invocation writes 16 words from its input and its
+// neighbour's. Division and remainder take only non-negative operands, where GLSL defines them.
+#version 430
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer In { int data[]; };
+layout(std430, binding = 1) buffer Out { uint words[]; };
+
+struct Acc { int sum; uint bits; ivec2 pair; };
+const int K = 16;
+
+int tri(int n) {
+    int s = 0;
+    for (int i = 0; i <= n; i++) {
+        if (i == 7) continue;
+        s += i;
+        if (s > 100) break;
+    }
+    return s;
+}
+
+// Returns from inside loops are `control` in glsl.rs: the SPIR-V frontend can't read spirv-opt's merged returns.
+int first_negative(int xs[4]) {
+    int found = -1;
+    for (int i = 0; i < 4 && found < 0; i++) {
+        for (int j = 0; j < 2; j++) {
+            if (xs[i] + j < 0) { found = i * 2 + j; break; }
+        }
+    }
+    return found;
+}
+
+void accumulate(inout Acc a, int x) {
+    a.sum += x;
+    a.bits ^= uint(x) << 3;
+    a.pair = a.pair.yx + ivec2(x, -x);
+}
+
+int classify(int x) {
+    int r = 0;
+    switch (x & 7) {
+        case 0: r = 100;
+        case 1: r += 10; break;
+        case 2:
+        case 3: r = 2; break;
+        default: r = -1;
+    }
+    return r;
+}
+
+void split(int x, out int high, out int low) {
+    high = x >> 4;
+    low = x & 15;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    int x = data[i];
+    int y = data[(i + 1u) % 64u];
+    uint base = i * uint(K);
+    int ax = abs(x), ay = abs(y) + 1;
+    words[base + 0u] = uint(x + y);
+    words[base + 1u] = uint(x * y - 7);
+    words[base + 2u] = uint(ax / ay);
+    words[base + 3u] = uint(ax % ay);
+    words[base + 4u] = uint(x << 3) ^ (uint(y) >> 2) ^ uint(x >> 1);
+    words[base + 5u] = uint(tri(ax % 20));
+    int xs[4] = int[4](x, y, -x, x - y);
+    words[base + 6u] = uint(first_negative(xs));
+    Acc a = Acc(0, 0u, ivec2(1, 2));
+    for (int k = 0; k < 4; k++) accumulate(a, xs[k]);
+    words[base + 7u] = uint(a.sum) + a.bits + uint(a.pair.x * 3 + a.pair.y);
+    words[base + 8u] = uint(classify(x)) + uint(classify(y)) * 1000u;
+    int hi, lo;
+    split(x, hi, lo);
+    words[base + 9u] = uint(hi * 100 + lo);
+    ivec3 v = ivec3(x, y, x ^ y);
+    bvec3 big = greaterThan(v, ivec3(0));
+    words[base + 10u] = uint(any(big)) + uint(all(big)) * 2u + uint(min(v.x, v.y)) * 4u;
+    uvec2 u = uvec2(uint(x), uint(y));
+    words[base + 11u] = max(u.x, u.y) - min(u.x, u.y) + clamp(u.x, 10u, 20u);
+    int w = 0;
+    int n = ax % 9;
+    while (n > 0) { w += n * n; n--; }
+    do { w += 1; } while (w % 5 != 0);
+    words[base + 12u] = uint(w);
+    words[base + 13u] = uint(x > y ? x - y : y - x) + uint(x == y || x < 0 && y < 0);
+    int idx = int(i) % 4;
+    xs[idx] = 77;
+    words[base + 14u] = uint(xs[0] + xs[1] * 3 + xs[2] * 5 + xs[3] * 7 + xs[(idx + 1) % 4]);
+    words[base + 15u] = uint(bitCount(uint(x))) + uint(float(x) * 0.25) + uint(x < 0 ? -1 : 1);
+}

@@ -12,4 +12,5 @@ workspace = true
 [dependencies]
 gpu.workspace = true
 gpu-ir.workspace = true
+gpu-frontend.workspace = true
 gpu-wire.workspace = true
