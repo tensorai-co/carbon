@@ -57,7 +57,8 @@ end through `carbon`.
 - [ ] **Sound and networks**, as [`audio`](../audio/README.md) and [`net`](../net/README.md)'s phases 3 and 5 come:
       `--audio`, `--net`, `--publish`; and `--remote`, attaching a [`remote`](../remote/README.md) listener to the
       desktop and mixer. The host's display on Linux and Windows comes with [`display`](../display/README.md)'s.
-- [ ] **The image's working directory and user** for its first process (lambda starts it in `/`, as root).
+- [ ] **The image's working directory and user** for its first process (lambda starts it in `/`, as root). Its `HOME`
+      is done: the image's, or its user's home from the image's `/etc/passwd`, as runc decides it.
 - [ ] **A worker process per machine**, once one `carbon` process runs several (a daemon, or the SDK): hvf allows one
       VM per process.
 - [ ] **`msiexec` for an `.msi`**, once atlas has it.

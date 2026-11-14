@@ -568,6 +568,13 @@ impl Machines {
                 if let (Some(bytes), Some(path)) = (&program, &record.program) {
                     disk.put(path, layers::New::File, bytes, lambda::Meta::file(0o755), lambda::Meta::dir(0o755)).map_err(|e| format!("putting {path} on the disk: {e}"))?;
                 }
+                // An image's own environment takes the place of lambda's, and few set HOME: it's the image user's home
+                // from its passwd file, as a container runtime makes it.
+                let mut env = if env.is_empty() { lambda::Options::default().env } else { env };
+                if !env.iter().any(|e| e.starts_with("HOME=")) {
+                    let passwd = disk.resolve(ROOT, "/etc/passwd", true).and_then(|ino| disk.contents(ino)).unwrap_or_default();
+                    env.push(format!("HOME={}", home_of(&String::from_utf8_lossy(&passwd), &record.config.user)));
+                }
                 let program = find_program(&disk, &args[0], &env).ok_or_else(|| format!("{}: not found on the machine's disk", args[0]))?;
                 let argv: Vec<&str> = std::iter::once(program.as_str()).chain(args[1..].iter().map(String::as_str)).collect();
                 let stop = lambda::Stop::default();
@@ -590,10 +597,7 @@ impl Machines {
                 let _clock = desktop.clone().filter(|_| headless).map(|d| display::clock::Clock::start(d, 60));
                 let _control = control::serve(self.images.machine_dir(&record.name), desktop.clone());
                 let gpu = open_gpu(run.gpu)?;
-                let mut options = lambda::Options { stop, display: desktop.clone(), gpu, ..lambda::Options::default() };
-                if !env.is_empty() {
-                    options.env = env;
-                }
+                let mut options = lambda::Options { stop, display: desktop.clone(), gpu, env, ..lambda::Options::default() };
                 options.hostname = record.name.clone();
                 lambda::boot(exec, cpu, disk, host, &argv, options).map(lambda::Status::code)
             }
@@ -677,6 +681,19 @@ fn find_program(disk: &lambda::Disk, program: &str, env: &[String]) -> Option<St
     path.split(':').map(|dir| format!("{}/{program}", dir.trim_end_matches('/'))).find(|candidate| {
         disk.resolve(ROOT, candidate, true).and_then(|ino| disk.stat(ino)).is_ok_and(|stat| stat.kind == layers::Kind::File)
     })
+}
+
+/// The home folder of an image's `user` (`name` or `uid`, with an optional `:group`; root when empty) in a passwd
+/// file's text, or `/` when it isn't there, as runc decides HOME.
+fn home_of(passwd: &str, user: &str) -> String {
+    let user = user.split(':').next().filter(|u| !u.is_empty()).unwrap_or("root");
+    let root = user == "root" || user == "0";
+    passwd
+        .lines()
+        .map(|line| line.split(':').collect::<Vec<_>>())
+        .find(|f| f.len() >= 6 && (f[0] == user || f[2] == user))
+        .map(|f| f[5].to_string())
+        .unwrap_or_else(|| if root { "/root" } else { "/" }.to_string())
 }
 
 /// `path` on `disk`, and all in it, copied into the host's folder `to`. How many files.
@@ -787,6 +804,16 @@ mod tests {
         assert_eq!(find_program(&disk, "bash", &env).as_deref(), Some("/usr/bin/bash"));
         assert_eq!(find_program(&disk, "zsh", &env), None);
         assert_eq!(find_program(&disk, "/bin/sh", &env).as_deref(), Some("/bin/sh"));
+    }
+
+    #[test]
+    fn home_is_the_image_users() {
+        let passwd = "root:x:0:0:root:/root:/bin/bash\nwww-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\n";
+        assert_eq!(home_of(passwd, ""), "/root");
+        assert_eq!(home_of(passwd, "www-data"), "/var/www");
+        assert_eq!(home_of(passwd, "33:33"), "/var/www");
+        assert_eq!(home_of(passwd, "nobody"), "/");
+        assert_eq!(home_of("", "0"), "/root");
     }
 
     #[test]
