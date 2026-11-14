@@ -462,9 +462,12 @@ impl<M: Clone> Fs<M> {
             let (number, within) = ((at / CHUNK) as usize, (at % CHUNK) as usize);
             let part = (count - done).min(CHUNK as usize - within);
             let target = &mut buffer[done..done + part];
+            // A chunk holds only as far as it was written: past that, up to the file's size, it reads zeroes.
             let fill = |bytes: &[u8], target: &mut [u8]| {
                 let have = bytes.len().saturating_sub(within).min(target.len());
-                target[..have].copy_from_slice(&bytes[within..within + have]);
+                if have > 0 {
+                    target[..have].copy_from_slice(&bytes[within..within + have]);
+                }
                 target[have..].fill(0);
             };
             match file.chunks.get(number) {
@@ -1200,6 +1203,21 @@ mod tests {
         assert_eq!(fs.read(hello, 0, &mut buffer), Ok(2));
         assert_eq!(fs.resolve_parent(ROOT, "/usr/bin/new"), Ok((fs.resolve(ROOT, "/usr/bin", true).unwrap(), "new")));
         assert_eq!(fs.resolve_parent(ROOT, "/top"), Ok((ROOT, "top")));
+    }
+
+    /// A file grown past what its last chunk holds (by `truncate`, or a write further on, as linkers write their output)
+    /// reads zeroes there, not a slice past the chunk's bytes.
+    #[test]
+    fn reads_past_a_short_chunk_are_zeroes() {
+        let mut fs = Fs::new(0u32, false);
+        let file = fs.put("/out", New::File, &[7; 100], 1, 2).unwrap();
+        fs.truncate(file, 200_000, 0).unwrap();
+        let mut buffer = [1u8; 4096];
+        assert_eq!(fs.read(file, 61_440, &mut buffer), Ok(4096));
+        assert!(buffer.iter().all(|b| *b == 0));
+        let mut edge = [1u8; 8];
+        assert_eq!(fs.read(file, 96, &mut edge), Ok(8));
+        assert_eq!(edge, [7, 7, 7, 7, 0, 0, 0, 0]);
     }
 
     #[test]
