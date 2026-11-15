@@ -1,10 +1,11 @@
 //! What Linux itself provides beyond system calls: the device files in `/dev`, put on the disk when a machine boots,
 //! `/proc`, made each time it's read, and the machine's own `/etc/resolv.conf`, `/etc/hosts` and `/etc/hostname`.
 //!
-//! `/sys` is `sysfs`, the Wayland server `wayland`, the X server `x11`, the vDSO and its clock page `vdso`, the render
-//! node `gpu`, and the files lambda lends every image (its Vulkan driver) `system`.
+//! `/sys` is `sysfs`, the Wayland server `wayland`, the X server `x11`, the PulseAudio server `pulse`, the vDSO and its
+//! clock page `vdso`, the render node `gpu`, and the files lambda lends every image (its Vulkan driver) `system`.
 
 pub(crate) mod gpu;
+pub(crate) mod pulse;
 pub(crate) mod sysfs;
 pub(crate) mod system;
 pub(crate) mod vdso;

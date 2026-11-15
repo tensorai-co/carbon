@@ -75,7 +75,7 @@ Everything is kept in `CARBON_HOME`, or `~/.carbon`. [`cli`](cli/README.md) has 
 | The disk | [`layers`](layers/README.md) | The file system programs see: an image's index, merged, with the machine's own log on top | Built |
 | The screen | [`display`](display/README.md) | The desktop both kernels' windows go on: frames, stacking, focus and input, on a screen in memory or the host's windows | The desktop is built, and shown on macOS, whole or a Mac window for each window |
 | The GPU | [`gpu`](gpu/README.md) | One device both kernels' graphics and compute APIs lower onto: the host's GPU, or one on the CPU | Built: SPIR-V compute and draws on Metal and the CPU device; Vulkan in Linux machines (vkcube on the M1) |
-| The sound | [`audio`](audio/README.md) | The mixer every program's sound goes into, and the microphone | Not started |
+| The sound | [`audio`](audio/README.md) | The mixer every program's sound goes into, and the microphone | Playback built: the mixer, the Mac's speakers, lambda's PulseAudio server |
 | The network | [`net`](net/README.md) | Every socket: the machine's addresses, loopback, Unix sockets and DNS, out through the host's sockets | Out works; in, policy and Winsock to do |
 | The host | [`host`](host/README.md) | Standard streams, clocks, randomness, memory, the terminal, certificate trust | Built |
 
@@ -197,7 +197,9 @@ programs and how to build them are in [lambda's](kernels/lambda/README.md#runnin
 - **net** gives each machine its own network out through the host's sockets: `apt-get update` and `curl https://`
   work in `debian:13` on all three hosts.
 - **display** has the desktop on a screen in memory, and on a Mac's screen: whole in one window (`--display host`), or
-  each window in a Mac window of its own (`--display host-windows`). **audio**, **remote** and **sdk** are designed, not started.
+  each window in a Mac window of its own (`--display host-windows`). **audio** plays: every stream mixed to 48 kHz
+  stereo on the Mac's speakers (or a WAV file), and lambda answers PulseAudio's protocol itself, so Linux programs
+  play through their own libpulse and OpenAL. **remote** and **sdk** are designed, not started.
 - **gpu** reads SPIR-V compute shaders into an IR of its own and runs them on the Mac's GPU through Metal (written as
   AIR libraries, so no shader source is compiled) and on a CPU device, with the same results on its conformance suite.
   Vertex and fragment shaders draw on both too, by Vulkan's rasterization rules, vkcube's among them. `--gpu` gives a

@@ -109,6 +109,9 @@ pub struct Options {
     /// The machine's GPU, if it has one: the render node `/dev/dri/renderD128` reaches it, and the system layer puts
     /// lambda's Vulkan driver where the image's Vulkan loader looks.
     pub gpu: Option<gpu_api::Gpu>,
+    /// The machine's mixer, if it has sound: the kernel answers `$XDG_RUNTIME_DIR/pulse/native` with a PulseAudio
+    /// server playing into it.
+    pub audio: Option<audio::Mixer>,
 }
 
 /// A running machine, from outside it: how `carbon stop` reaches in, from any thread.
@@ -153,6 +156,7 @@ impl Default for Options {
             network: None,
             display: None,
             gpu: None,
+            audio: None,
         }
     }
 }
@@ -187,11 +191,17 @@ impl Status {
 pub fn boot(mut exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&str], options: Options) -> Result<Status, String> {
     let mut disk = disk;
     let mut options = options;
+    let pulse_server = format!("unix:{}", os::pulse::SOCKET);
+    let mut wanted: Vec<(&str, &str)> = Vec::new();
     if options.display.is_some() {
-        for (key, value) in [("XDG_RUNTIME_DIR", os::wayland::RUNTIME_DIR), ("WAYLAND_DISPLAY", os::wayland::DISPLAY), ("DISPLAY", os::x11::DISPLAY)] {
-            if !options.env.iter().any(|e| e.split('=').next() == Some(key)) {
-                options.env.push(format!("{key}={value}"));
-            }
+        wanted.extend([("XDG_RUNTIME_DIR", os::wayland::RUNTIME_DIR), ("WAYLAND_DISPLAY", os::wayland::DISPLAY), ("DISPLAY", os::x11::DISPLAY)]);
+    }
+    if options.audio.is_some() {
+        wanted.extend([("XDG_RUNTIME_DIR", os::wayland::RUNTIME_DIR), ("PULSE_SERVER", pulse_server.as_str())]);
+    }
+    for (key, value) in wanted {
+        if !options.env.iter().any(|e| e.split('=').next() == Some(key)) {
+            options.env.push(format!("{key}={value}"));
         }
     }
     os::populate(&mut disk, options.gpu.is_some());
@@ -237,6 +247,11 @@ pub fn boot(mut exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&
         if let Err(e) = os::x11::start(&kernel, desktop) {
             kernel.host.write(host::Stream::Err, format!("lambda: the X server: {e}\n").as_bytes());
         }
+    }
+    if let Some(mixer) = kernel.options.audio.clone()
+        && let Err(e) = os::pulse::start(&kernel, mixer)
+    {
+        kernel.host.write(host::Stream::Err, format!("lambda: the sound server: {e}\n").as_bytes());
     }
     let watchers = kernel.stdin_watchers.clone();
     kernel.host.watch_input(Arc::new(move || watchers.notify()));
