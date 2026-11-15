@@ -16,7 +16,10 @@ use gpu::ir::{Scalar, Slot};
 use gpu_frontend::glsl;
 use gpu_wire::gl as wire;
 
-use super::{ATTRIBS, BLEND, CULL_FACE, DEPTH_TEST, Gl, INVALID_ENUM, INVALID_OPERATION, INVALID_VALUE, LONGEST, Objects, R, SCISSOR_TEST, Step, UNITS, context, device_error, framebuffer_of, intersect};
+use super::{
+    ATTRIBS, BLEND, CULL_FACE, DEPTH_TEST, Gl, INVALID_ENUM, INVALID_FRAMEBUFFER_OPERATION, INVALID_OPERATION, INVALID_VALUE, LONGEST, Objects, R, SCISSOR_TEST, Step, UNITS,
+    context, device_error, framebuffer_of, intersect,
+};
 use crate::vulkan::Guest;
 
 const ARRAY_BUFFER: u32 = 0x8892;
@@ -101,6 +104,14 @@ pub(super) struct Texture {
     max_level: u32,
 }
 
+impl Texture {
+    /// A level's image, format and size, if the texture has that level.
+    pub(super) fn level(&self, level: u32) -> Option<(Image, Format, u32, u32)> {
+        let image = self.image?;
+        (level < ImageDesc::most_levels(self.width, self.height)).then(|| (image, self.format, (self.width >> level).max(1), (self.height >> level).max(1)))
+    }
+}
+
 impl Default for Texture {
     fn default() -> Texture {
         // NEAREST_MIPMAP_LINEAR, LINEAR, REPEAT.
@@ -128,6 +139,10 @@ pub(super) struct PipelineKey {
     front: FrontFace,
     depth: Option<DepthState>,
     depth_attachment: bool,
+    /// The colour attachment's format.
+    color: Format,
+    /// The compatibility profile's alpha test, on a program of the program's own: its function and reference's bits.
+    alpha: Option<(u32, u32)>,
     blend: Option<Blend>,
     write: [bool; 4],
 }
@@ -359,6 +374,8 @@ impl Gl {
                 let c = context(o, current)?;
                 let name = c.units[c.unit as usize];
                 match o.textures.get_mut(&name).and_then(|t| t.image.map(|i| (t, i))) {
+                    // A depth texture's levels aren't made: the device makes only colour images'.
+                    Some((t, _)) if t.format.is_depth() || !t.format.is_renderable() => t.defined |= 1,
                     Some((t, image)) => {
                         t.defined = u32::MAX;
                         self.steps(o, vec![Step::Mips(image)])?;
@@ -532,13 +549,22 @@ impl Gl {
     /// `rect`: immediate mode's four corners (`glRectf`), each a `vec4`: the position, with every other attribute its
     /// current value.
     fn draw(&self, o: &mut Objects, current: u64, mode: u32, first: u32, count: u32, instances: u32, elements: Option<(u32, u64, i32)>, rect: Option<[f32; 16]>, guest: &mut dyn Guest) -> Result<(), String> {
-        let Some(fb) = framebuffer_of(o, current) else { return Ok(()) };
+        let Some(fb) = framebuffer_of(o, current, false) else {
+            let c = context(o, current)?;
+            if c.draw_fbo != 0 {
+                c.fail(INVALID_FRAMEBUFFER_OPERATION);
+            }
+            return Ok(());
+        };
         let topology = match mode {
             4 => Topology::TriangleList,
             5 => Topology::TriangleStrip,
             6 => Topology::TriangleFan,
-            0..=3 => {
-                not_yet("a point or line", 2);
+            1 => Topology::LineList,
+            // A line loop is a strip with its first vertex again at the end, through indices made for it.
+            2 | 3 => Topology::LineStrip,
+            0 => {
+                not_yet("a point", 2);
                 return Ok(());
             }
             _ => {
@@ -571,23 +597,34 @@ impl Gl {
         let units = c.units;
         let viewport = c.viewport;
         let scissor = if c.is_enabled(SCISSOR_TEST) { c.scissor } else { [0, 0, fb.width as i32, fb.height as i32] };
-        let cull = if c.is_enabled(CULL_FACE) {
+        let looped = mode == 2;
+        let cull = if topology.is_line() || !c.is_enabled(CULL_FACE) {
+            // Lines aren't culled.
+            Cull::None
+        } else {
             match c.cull_mode {
                 0x0404 => Cull::Front,
                 0x0405 => Cull::Back,
                 _ => return Ok(()),
             }
-        } else {
-            Cull::None
         };
         // GL's counter-clockwise is the device's clockwise: rows are kept GL's way up.
         let front = if c.front_face == 0x0901 { FrontFace::Clockwise } else { FrontFace::CounterClockwise };
         let depth = (c.is_enabled(DEPTH_TEST) && fb.depth.is_some()).then(|| DepthState { compare: compare(c.depth_func).unwrap_or(Compare::Less), write: c.depth_mask });
         let blend = c.is_enabled(BLEND).then(|| blend_state(c.blend, c.equation));
+        // Fixed function's programs test alpha themselves; a program's own is tested as it writes its colour.
+        let alpha = match c.compat.alpha() {
+            (func, reference) if bound != 0 && c.is_enabled(super::compat::ALPHA_TEST) && func != 0x0207 => Some((func, reference.to_bits())),
+            _ => None,
+        };
         let mut write = c.color_mask;
         if !fb.alpha {
             // An alpha the buffer hasn't stays 1.
             write[3] = false;
+        }
+        if fb.color.is_none() {
+            // Only depth to draw into: the colour outputs go to a scratch image, written to nowhere.
+            write = [false; 4];
         }
         // The compatibility profile's built-ins (and fixed function's own uniforms), as the state is now.
         if let (Some(ctx), Some(l)) = (o.contexts.get(&current), o.programs.get_mut(&program).and_then(|p| p.linked.as_mut())) {
@@ -616,6 +653,14 @@ impl Gl {
             .collect();
         let sampler_units = linked.units.clone();
         let blocks = linked.blocks.clone();
+        // Anything that sends the batch is done before its arena is taken for this draw: draws waiting on another
+        // framebuffer, and the texture an incomplete one reads (made once).
+        if o.batch.target != fb.key && !o.batch.items.is_empty() {
+            self.flush(o)?;
+        }
+        if !sampler_units.is_empty() {
+            self.black(o)?;
+        }
         let mut arena = std::mem::take(&mut o.batch.arena);
         let result = (|| -> Result<Option<Box<Planned>>, String> {
             // Indices: from the element buffer if the device reads them there, else copied.
@@ -645,6 +690,22 @@ impl Gl {
                         index = Some((src, ty));
                     }
                 }
+            }
+            if looped {
+                let mut values = match (index_values.take(), elements) {
+                    (Some(v), _) => v,
+                    (None, Some((kind, at, _))) => {
+                        let b = if vao.elements != 0 { o.buffers.get(&vao.elements).and_then(|b| b.memory) } else { None };
+                        indices(&self.read_source(b, at, u64::from(count) * u64::from(kind_size(kind)), guest)?, kind)
+                    }
+                    (None, None) => (first..first + count).collect(),
+                };
+                if let Some(&start) = values.first() {
+                    values.push(start);
+                }
+                let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+                index = Some((put(&mut arena, &bytes, 4), IndexType::U32));
+                index_values = Some(values);
             }
             // How many vertices a copied array needs.
             let mut vertices = |me: &Self, guest: &mut dyn Guest| -> Result<u64, String> {
@@ -712,7 +773,9 @@ impl Gl {
                     }
                 }
             }
-            let key = PipelineKey { attributes: key_attrs, topology, cull, front, depth, depth_attachment: fb.depth.is_some(), blend, write };
+            let color = if fb.color.is_some() { fb.format } else { Format::Rgba8Unorm };
+            let blend = if fb.color.is_some() { blend } else { None };
+            let key = PipelineKey { attributes: key_attrs, topology, cull, front, depth, depth_attachment: fb.depth.is_some(), color, alpha, blend, write };
             let pipeline = self.pipeline(o, program, &key)?;
             let Some(pipeline) = pipeline else { return Ok(None) };
             // Uniforms as they are now, and the textures each sampler's unit has.
@@ -743,21 +806,24 @@ impl Gl {
             }
             let (first, vertex_offset) = match elements {
                 Some((_, _, base)) => (0, base),
+                None if looped => (0, 0),
                 None => (first, 0),
             };
+            let count = count + u32::from(looped);
             let draw = Draw { pipeline, bindings: Vec::new(), vertex_buffers: Vec::new(), index: None, first, count, vertex_offset, first_instance: 0, instances };
             Ok(Some(Box::new(Planned { draw, buffers, images, vertex, index })))
         })();
         o.batch.arena = arena;
         let Some(planned) = result? else { return Ok(()) };
-        // In the drawable's render pass, open since the last draw on it or begun now.
-        if o.batch.drawable != c_drawable(o, current) && !o.batch.items.is_empty() {
-            self.flush(o)?;
-        }
+        // In the framebuffer's render pass, open since the last draw on it (sent above if it was another's) or begun now.
         if o.batch.items.is_empty() {
-            o.batch.drawable = c_drawable(o, current);
-            let depth = fb.depth.map(|image| DepthAttachment { image, sub: Sub::default(), load: Load::Load });
-            o.batch.items.push(Item::Command(Command::BeginRender { colors: vec![ColorAttachment { image: fb.color, sub: Sub::default(), load: Load::Load }], depth }));
+            let color = match fb.color {
+                Some(c) => c,
+                None => (self.scratch(o, fb.width, fb.height)?, Sub::default()),
+            };
+            o.batch.target = fb.key;
+            let depth = fb.depth.map(|(image, sub)| DepthAttachment { image, sub, load: Load::Load });
+            o.batch.items.push(Item::Command(Command::BeginRender { colors: vec![ColorAttachment { image: color.0, sub: color.1, load: Load::Load }], depth }));
         }
         o.batch.items.push(Item::Command(Command::SetViewport(Viewport { x: viewport[0] as f32, y: viewport[1] as f32, width: viewport[2] as f32, height: viewport[3] as f32, min_depth: 0.0, max_depth: 1.0 })));
         o.batch.items.push(Item::Command(Command::SetScissor(Rect { x: area[0] as u32, y: area[1] as u32, width: area[2] as u32, height: area[3] as u32 })));
@@ -790,13 +856,16 @@ impl Gl {
         if let Some(&p) = linked.pipelines.get(key) {
             return Ok(Some(p));
         }
-        let (vertex, fragment, k) = (linked.vertex.clone(), linked.fragment.clone(), key.clone());
+        let (vertex, mut fragment, k) = (linked.vertex.clone(), linked.fragment.clone(), key.clone());
+        if let Some((func, reference)) = key.alpha {
+            glsl::alpha_test(&mut fragment, func, f32::from_bits(reference));
+        }
         let made = self
             .gpu
             .run(move |d| {
                 let buffers: Vec<VertexBuffer> = k.attributes.iter().map(|a| VertexBuffer { stride: a.2, per_instance: a.3 }).collect();
                 let attributes: Vec<Attribute> = k.attributes.iter().enumerate().map(|(i, a)| Attribute { location: a.0, buffer: i as u32, offset: 0, format: a.1 }).collect();
-                let colors = [ColorTarget { format: Format::Bgra8Unorm, blend: k.blend, write: k.write }];
+                let colors = [ColorTarget { format: k.color, blend: k.blend, write: k.write }];
                 d.graphics(&GraphicsDesc {
                     vertex: &vertex,
                     fragment: &fragment,
@@ -875,8 +944,16 @@ impl Gl {
     }
 }
 
-fn c_drawable(o: &Objects, current: u64) -> u64 {
-    o.contexts.get(&current).map_or(0, |c| c.drawable)
+impl Gl {
+    /// A colour image of a size that nothing is written to, for a pass with only depth to draw into.
+    fn scratch(&self, o: &mut Objects, width: u32, height: u32) -> Result<Image, String> {
+        if let Some(&i) = o.scratch.get(&(width, height)) {
+            return Ok(i);
+        }
+        let i = self.gpu.run(move |d| d.image(ImageDesc::new(Format::Rgba8Unorm, width, height))).map_err(device_error)?.map_err(device_error)?;
+        o.scratch.insert((width, height), i);
+        Ok(i)
+    }
 }
 
 /// Bytes put in the arena at an alignment: where.
@@ -960,7 +1037,7 @@ fn norm(x: f64, max: f64, normalized: bool, signed: bool) -> f64 {
 }
 
 /// An IEEE half's value.
-fn half(h: u16) -> f64 {
+pub(super) fn half(h: u16) -> f64 {
     let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
     let e = i32::from((h >> 10) & 0x1f);
     let m = f64::from(h & 0x3ff);
@@ -972,9 +1049,81 @@ fn half(h: u16) -> f64 {
     }
 }
 
+/// A float as the nearest IEEE half (too large is infinite, too small is zero or subnormal).
+pub(super) fn to_half(f: f32) -> u16 {
+    let bits = f.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let mant = bits & 0x7f_ffff;
+    if exp == 0xff {
+        return sign | 0x7c00 | if mant != 0 { 0x200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 31 {
+        return sign | 0x7c00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        // Subnormal: the implicit bit made explicit, shifted down, rounded to nearest.
+        let m = mant | 0x80_0000;
+        let shift = (14 - e) as u32;
+        let half = (m >> shift) + ((m >> (shift - 1)) & 1);
+        return sign | half as u16;
+    }
+    let rounded = (mant >> 13) + ((mant >> 12) & 1);
+    // A carry out of the mantissa moves the exponent up, as it should.
+    sign | (((e as u32) << 10) + rounded) as u16
+}
+
+/// GL's internal formats with float components (16- and 32-bit), as the device's format for them.
+fn float_internal(internal: u32) -> Option<Format> {
+    match internal {
+        // RGBA16F, RGB16F, R16F, RG16F, R11F_G11F_B10F.
+        0x881a | 0x881b | 0x822d | 0x822f | 0x8c3a => Some(Format::Rgba16Float),
+        // RGBA32F, RGB32F, R32F, RG32F.
+        0x8814 | 0x8815 | 0x822e | 0x8230 => Some(Format::Rgba32Float),
+        _ => None,
+    }
+}
+
+/// Depth texels as the program gives them (`GL_DEPTH_COMPONENT` or `GL_DEPTH_STENCIL`), as `D32Float`'s: stencil isn't
+/// on the device, so it's left out.
+fn depth_texels(ty: u32, n: usize, data: &[u8]) -> Result<(Format, Vec<u8>), u32> {
+    let size = match ty {
+        UNSIGNED_SHORT => 2,
+        // UNSIGNED_INT, FLOAT, UNSIGNED_INT_24_8.
+        UNSIGNED_INT | FLOAT | 0x84fa => 4,
+        // FLOAT_32_UNSIGNED_INT_24_8_REV.
+        0x8dad => 8,
+        _ => return Err(INVALID_ENUM),
+    };
+    if data.len() < n * size {
+        return Err(INVALID_VALUE);
+    }
+    let mut out = Vec::with_capacity(n * 4);
+    for t in data[..n * size].chunks_exact(size) {
+        let word = |at: usize| u32::from_le_bytes([t[at], t[at + 1], t[at + 2], t[at + 3]]);
+        let z = match ty {
+            UNSIGNED_SHORT => f32::from(u16::from_le_bytes([t[0], t[1]])) / 65535.0,
+            UNSIGNED_INT => (f64::from(word(0)) / 4_294_967_295.0) as f32,
+            0x84fa => (word(0) >> 8) as f32 / 16_777_215.0,
+            _ => f32::from_bits(word(0)),
+        };
+        out.extend(z.to_le_bytes());
+    }
+    Ok((Format::D32Float, out))
+}
+
 /// Texels as the program gives them (rows tightly packed) made the device's: each format's components spread to
-/// RGBA, as GL reads them (luminance to red, green and blue; alpha alone with black), in 8-bit, sRGB or float images.
+/// RGBA, as GL reads them (luminance to red, green and blue; alpha alone with black), in 8-bit, sRGB, half- or
+/// full-float images; depth as `D32Float`.
 fn texels(format: u32, ty: u32, internal: u32, width: u32, height: u32, data: &[u8]) -> Result<(Format, Vec<u8>), u32> {
+    // DEPTH_COMPONENT, DEPTH_STENCIL.
+    if matches!(format, 0x1902 | 0x84f9) {
+        return depth_texels(ty, (width * height) as usize, data);
+    }
     // RED, RG, RGB, BGR, RGBA, BGRA, ALPHA, LUMINANCE, LUMINANCE_ALPHA.
     let comps = match format {
         0x1903 | 0x1906 | 0x1909 => 1,
@@ -985,15 +1134,15 @@ fn texels(format: u32, ty: u32, internal: u32, width: u32, height: u32, data: &[
     };
     let srgb = matches!(internal, 0x8c40..=0x8c43);
     let (fmt, size) = match ty {
-        UNSIGNED_BYTE => (if srgb { Format::Rgba8Srgb } else { Format::Rgba8Unorm }, 1),
-        FLOAT => (Format::Rgba32Float, 4),
+        UNSIGNED_BYTE => (float_internal(internal).unwrap_or(if srgb { Format::Rgba8Srgb } else { Format::Rgba8Unorm }), 1),
+        FLOAT => (float_internal(internal).unwrap_or(Format::Rgba32Float), 4),
+        HALF_FLOAT | 0x8d61 => (float_internal(internal).unwrap_or(Format::Rgba16Float), 2),
         // The packed kinds: 5-6-5, 4-4-4-4, 5-5-5-1, and 8-8-8-8 reversed.
         0x8363 | 0x8033 | 0x8034 | 0x8367 => (Format::Rgba8Unorm, 0),
         _ => return Err(INVALID_ENUM),
     };
     let n = (width * height) as usize;
     let mut out = Vec::with_capacity(n * fmt.bytes() as usize);
-    let float = fmt == Format::Rgba32Float;
     if size == 0 {
         let unit = if ty == 0x8367 { 4 } else { 2 };
         if data.len() < n * unit {
@@ -1021,7 +1170,7 @@ fn texels(format: u32, ty: u32, internal: u32, width: u32, height: u32, data: &[
             };
             out.extend(rgba);
         }
-        return Ok((fmt, out));
+        return Ok((Format::Rgba8Unorm, out));
     }
     if data.len() < n * comps * size {
         return Err(INVALID_VALUE);
@@ -1029,7 +1178,11 @@ fn texels(format: u32, ty: u32, internal: u32, width: u32, height: u32, data: &[
     for i in 0..n {
         let c = |k: usize| -> f64 {
             let at = (i * comps + k) * size;
-            if size == 1 { f64::from(data[at]) / 255.0 } else { f64::from(f32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]])) }
+            match size {
+                1 => f64::from(data[at]) / 255.0,
+                2 => half(u16::from_le_bytes([data[at], data[at + 1]])),
+                _ => f64::from(f32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]])),
+            }
         };
         let rgba = match format {
             0x1903 => [c(0), 0.0, 0.0, 1.0],
@@ -1043,10 +1196,10 @@ fn texels(format: u32, ty: u32, internal: u32, width: u32, height: u32, data: &[
             _ => [c(2), c(1), c(0), c(3)],
         };
         for v in rgba {
-            if float {
-                out.extend((v as f32).to_le_bytes());
-            } else {
-                out.push((v * 255.0).round().clamp(0.0, 255.0) as u8);
+            match fmt {
+                Format::Rgba32Float => out.extend((v as f32).to_le_bytes()),
+                Format::Rgba16Float => out.extend(to_half(v as f32).to_le_bytes()),
+                _ => out.push((v * 255.0).round().clamp(0.0, 255.0) as u8),
             }
         }
     }

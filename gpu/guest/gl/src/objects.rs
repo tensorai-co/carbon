@@ -1,5 +1,5 @@
 //! GL's objects and draws, as GLVND's dispatch reaches them: shaders and programs, uniforms, buffers, vertex arrays,
-//! textures, the state draws read, and the draws. Names are handed out here (one counter for every kind, so no two
+//! textures, framebuffer objects and renderbuffers, the state draws read, and the draws. Names are handed out here (one counter for every kind, so no two
 //! objects share one); what each names is the host's. Calls that answer wait for the host; data (a buffer's, a
 //! texture's texels packed as `glPixelStore` says) goes with the call, copied, as GL copies it.
 //!
@@ -527,6 +527,75 @@ unsafe extern "C" fn glGenerateMipmap(target: u32) {
     call(wire::GENERATE_MIPMAP, &[target]);
 }
 
+// ---- Framebuffer objects and renderbuffers ----
+
+unsafe extern "C" fn glGenFramebuffers(n: i32, out: *mut u32) {
+    names(n, out, |_, _| {});
+}
+
+unsafe extern "C" fn glDeleteFramebuffers(n: i32, list: *const u32) {
+    each(n, list, wire::DELETE_FRAMEBUFFER);
+}
+
+unsafe extern "C" fn glBindFramebuffer(target: u32, name: u32) {
+    call(wire::BIND_FRAMEBUFFER, &[target, name]);
+}
+
+unsafe extern "C" fn glFramebufferTexture2D(target: u32, attachment: u32, textarget: u32, texture: u32, level: i32) {
+    call(wire::FRAMEBUFFER_TEXTURE, &[target, attachment, textarget, texture, level.max(0) as u32]);
+}
+
+unsafe extern "C" fn glFramebufferTexture(target: u32, attachment: u32, texture: u32, level: i32) {
+    unsafe { glFramebufferTexture2D(target, attachment, 0x0de1, texture, level) }
+}
+
+unsafe extern "C" fn glFramebufferRenderbuffer(target: u32, attachment: u32, rb_target: u32, renderbuffer: u32) {
+    call(wire::FRAMEBUFFER_RENDERBUFFER, &[target, attachment, rb_target, renderbuffer]);
+}
+
+unsafe extern "C" fn glCheckFramebufferStatus(target: u32) -> u32 {
+    ask_int(wire::CHECK_FRAMEBUFFER, &[target], None) as u32
+}
+
+unsafe extern "C" fn glGenRenderbuffers(n: i32, out: *mut u32) {
+    names(n, out, |_, _| {});
+}
+
+unsafe extern "C" fn glDeleteRenderbuffers(n: i32, list: *const u32) {
+    each(n, list, wire::DELETE_RENDERBUFFER);
+}
+
+unsafe extern "C" fn glBindRenderbuffer(target: u32, name: u32) {
+    call(wire::BIND_RENDERBUFFER, &[target, name]);
+}
+
+unsafe extern "C" fn glRenderbufferStorage(target: u32, internal: u32, width: i32, height: i32) {
+    call(wire::RENDERBUFFER_STORAGE, &[target, internal, width.max(0) as u32, height.max(0) as u32]);
+}
+
+/// Multisampled storage: one sample, as `GL_MAX_SAMPLES` is 0.
+unsafe extern "C" fn glRenderbufferStorageMultisample(target: u32, _samples: i32, internal: u32, width: i32, height: i32) {
+    unsafe { glRenderbufferStorage(target, internal, width, height) }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn glBlitFramebuffer(sx0: i32, sy0: i32, sx1: i32, sy1: i32, dx0: i32, dy0: i32, dx1: i32, dy1: i32, mask: u32, filter: u32) {
+    call(wire::BLIT_FRAMEBUFFER, &[sx0 as u32, sy0 as u32, sx1 as u32, sy1 as u32, dx0 as u32, dy0 as u32, dx1 as u32, dy1 as u32, mask, filter]);
+}
+
+/// Where the draw framebuffer's fragment outputs go: the first one is the colour attachment's, or none.
+pub(crate) unsafe extern "C" fn glDrawBuffers(n: i32, list: *const u32) {
+    let Some(c) = context() else { return };
+    let mut words = Vec::new();
+    words.push(n.max(0) as u32);
+    if !list.is_null() {
+        for i in 0..n.max(0) as usize {
+            words.push(unsafe { *list.add(i) });
+        }
+    }
+    record(c, wire::DRAW_BUFFERS, &words, None, None);
+}
+
 // ---- State ----
 
 unsafe extern "C" fn glBlendFunc(src: u32, dst: u32) {
@@ -681,6 +750,20 @@ pub(crate) fn lookup(name: &[u8]) -> Option<*const c_void> {
         entry!(glTexParameteriv),
         entry!(glTexParameterfv),
         entry!(glGenerateMipmap),
+        entry!(glGenFramebuffers),
+        entry!(glDeleteFramebuffers),
+        entry!(glBindFramebuffer),
+        entry!(glFramebufferTexture2D),
+        entry!(glFramebufferTexture),
+        entry!(glFramebufferRenderbuffer),
+        entry!(glCheckFramebufferStatus),
+        entry!(glGenRenderbuffers),
+        entry!(glDeleteRenderbuffers),
+        entry!(glBindRenderbuffer),
+        entry!(glRenderbufferStorage),
+        entry!(glRenderbufferStorageMultisample),
+        entry!(glBlitFramebuffer),
+        entry!(glDrawBuffers),
         entry!(glBlendFunc),
         entry!(glBlendFuncSeparate),
         entry!(glBlendEquation),

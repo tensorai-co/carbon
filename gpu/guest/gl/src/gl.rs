@@ -23,8 +23,16 @@ pub(crate) const VERSION: (u32, u32) = (3, 3);
 const VERSION_STRING: &[u8] = b"3.3 Carbon 0.2.0\0";
 const GLSL_STRING: &[u8] = b"3.30\0";
 const VENDOR_STRING: &[u8] = b"Carbon\0";
-/// The extensions this GL has: each one's whole, as built (no framebuffer objects yet, so none named).
+/// The extensions this GL has: each one's whole, as built. `GL_EXTENSIONS` is these, joined by spaces.
 const EXTENSIONS_LIST: &[&[u8]] = &[
+    b"GL_ARB_framebuffer_object\0",
+    b"GL_EXT_framebuffer_object\0",
+    b"GL_EXT_framebuffer_blit\0",
+    b"GL_ARB_draw_buffers\0",
+    b"GL_ARB_depth_texture\0",
+    b"GL_EXT_packed_depth_stencil\0",
+    b"GL_ARB_texture_float\0",
+    b"GL_ARB_half_float_pixel\0",
     b"GL_ARB_vertex_buffer_object\0",
     b"GL_ARB_vertex_array_object\0",
     b"GL_ARB_texture_non_power_of_two\0",
@@ -45,7 +53,6 @@ const EXTENSIONS_LIST: &[&[u8]] = &[
     b"GL_ARB_explicit_attrib_location\0",
     b"GL_ARB_shading_language_100\0",
 ];
-const EXTENSIONS_STRING: &[u8] = b"GL_ARB_vertex_buffer_object GL_ARB_vertex_array_object GL_ARB_texture_non_power_of_two GL_ARB_multitexture GL_ARB_texture_env_combine GL_EXT_texture_env_combine GL_ARB_texture_env_add GL_EXT_bgra GL_EXT_vertex_array_bgra GL_EXT_blend_func_separate GL_EXT_blend_minmax GL_EXT_blend_subtract GL_ARB_texture_mirrored_repeat GL_ARB_texture_border_clamp GL_EXT_texture_edge_clamp GL_ARB_instanced_arrays GL_ARB_draw_instanced GL_ARB_explicit_attrib_location GL_ARB_shading_language_100\0";
 
 // GL's names this module uses.
 const INVALID_ENUM: u32 = 0x0500;
@@ -201,15 +208,16 @@ unsafe extern "C" fn glDepthMask(flag: u8) {
     }
 }
 
+/// Both send everything recorded to the device and wait for it, so a single-buffered program's frame is drawn.
 unsafe extern "C" fn glFlush() {
-    if let Some(c) = context() {
-        c.sync(&[]);
-    }
+    unsafe { glFinish() }
 }
 
 unsafe extern "C" fn glFinish() {
     if let Some(c) = context() {
-        c.sync(&[]);
+        let mut then = Vec::new();
+        records::record(&mut then, wire::FINISH, &[]);
+        c.sync(&then);
     }
 }
 
@@ -330,13 +338,28 @@ fn as_f64(v: Value) -> f64 {
 
 /// `GL_RENDERER`: the device's name, as Carbon's.
 static RENDERER_STRING: Spin<Vec<u8>> = Spin::new(Vec::new());
+/// `GL_EXTENSIONS`: [`EXTENSIONS_LIST`] as one string.
+static EXTENSIONS_STRING: Spin<Vec<u8>> = Spin::new(Vec::new());
 
 unsafe extern "C" fn glGetString(name: u32) -> *const u8 {
     let Some(c) = context() else { return ptr::null() };
     match name {
         VENDOR => VENDOR_STRING.as_ptr(),
         VERSION_NAME => VERSION_STRING.as_ptr(),
-        EXTENSIONS => EXTENSIONS_STRING.as_ptr(),
+        EXTENSIONS => {
+            let mut s = EXTENSIONS_STRING.lock();
+            if s.is_empty() {
+                for (i, e) in EXTENSIONS_LIST.iter().enumerate() {
+                    if i > 0 {
+                        s.push(b' ');
+                    }
+                    s.extend_from_slice(&e[..e.len() - 1]);
+                }
+                s.push(0);
+            }
+            // Made once and never changed again, so the pointer stays good.
+            s.as_ptr()
+        }
         // SHADING_LANGUAGE_VERSION.
         0x8b8c => GLSL_STRING.as_ptr(),
         RENDERER => {
@@ -406,10 +429,13 @@ unsafe extern "C" fn glGetStringi(name: u32, index: u32) -> *const u8 {
     }
 }
 
-/// Hints, and which buffer draws and reads go to: a default framebuffer's back buffer, the only one there is.
+/// Hints, and which buffer draws and reads go to: a default framebuffer's back buffer, the only one there is, or a
+/// framebuffer object's colour attachment (or none, for draws).
 unsafe extern "C" fn glHint(_target: u32, _mode: u32) {}
 
-unsafe extern "C" fn glDrawBuffer(_mode: u32) {}
+unsafe extern "C" fn glDrawBuffer(mode: u32) {
+    unsafe { crate::objects::glDrawBuffers(1, &mode) }
+}
 
 unsafe extern "C" fn glReadBuffer(_mode: u32) {}
 

@@ -451,3 +451,114 @@ void main() { gl_FragColor = gl_Color; }";
     let px = pixels(&gl, &mut memory);
     assert!(close(px[0], [0, 0, 255, 255]) && close(px[3], [0, 0, 255, 255]) && close(px[4], [0, 0, 0, 255]), "{:?} {:?} {:?}", px[0], px[3], px[4]);
 }
+
+#[test]
+fn a_framebuffer_object_of_a_texture_and_a_depth_renderbuffer_is_drawn_into_and_sampled() {
+    let vs = "#version 120
+attribute vec2 pos;
+varying vec2 uv;
+uniform float z;
+void main() { uv = pos * 0.5 + 0.5; gl_Position = vec4(pos, z, 1.0); }";
+    let fs = "#version 120
+uniform sampler2D tex;
+uniform vec4 tint;
+uniform float sampled;
+varying vec2 uv;
+void main() { gl_FragColor = mix(tint, texture2D(tex, uv), sampled); }";
+    let (gl, mut memory) = with_program(vs, fs);
+    // The left half of the target, and the whole of it.
+    memory.0[1024..1056].copy_from_slice(&f32s(&[-1.0, -1.0, 0.0, -1.0, -1.0, 1.0, 0.0, 1.0]));
+    memory.0[1088..1120].copy_from_slice(&f32s(&[-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0]));
+    let mut c = Calls::new();
+    c.wb(wire::UNIFORM_LOCATION, &[3], b"tex").wb(wire::UNIFORM_LOCATION, &[3], b"tint").wb(wire::UNIFORM_LOCATION, &[3], b"sampled").wb(wire::UNIFORM_LOCATION, &[3], b"z");
+    let a = calls(&gl, &mut memory, &c);
+    let mut r = Reader::new(&a);
+    let (tex, tint, sampled, z) = (r.u32().unwrap(), r.u32().unwrap(), r.u32().unwrap(), r.u32().unwrap());
+    // A 4×4 texture with no texels, and a depth renderbuffer, attached to framebuffer 30.
+    let mut c = Calls::new();
+    c.w(wire::BIND_TEXTURE, &[0x0de1, 20]).wb(wire::TEX_IMAGE, &[0x0de1, 0, RGBA, 4, 4, RGBA, UNSIGNED_BYTE, 0], &[]);
+    c.w(wire::TEX_PARAMETER, &[0x0de1, 0x2801, 0x2600, 0]).w(wire::TEX_PARAMETER, &[0x0de1, 0x2800, 0x2600, 0]);
+    c.w(wire::BIND_FRAMEBUFFER, &[0x8d40, 30]).w(wire::CHECK_FRAMEBUFFER, &[0x8d40]);
+    c.w(wire::FRAMEBUFFER_TEXTURE, &[0x8d40, 0x8ce0, 0x0de1, 20, 0]);
+    c.w(wire::BIND_RENDERBUFFER, &[0x8d41, 40]).w(wire::RENDERBUFFER_STORAGE, &[0x8d41, 0x81a6, 4, 4]);
+    c.w(wire::FRAMEBUFFER_RENDERBUFFER, &[0x8d40, 0x8d00, 0x8d41, 40]).w(wire::CHECK_FRAMEBUFFER, &[0x8d40]);
+    c.w(wire::GET, &[0x8ca6]);
+    let a = calls(&gl, &mut memory, &c);
+    let mut r = Reader::new(&a);
+    assert_eq!((r.u32().unwrap(), r.u32().unwrap()), (0x8cd7, 0x8cd5), "incomplete with nothing attached, then complete");
+    assert_eq!((r.u32().unwrap(), r.u32().unwrap(), r.u64().unwrap()), (1, INT, 30));
+    // Into it, at its own size: cleared blue, then green on its left half, near; then red over all of it, farther,
+    // which the depth test keeps to the right half.
+    let mut c = Calls::new();
+    c.w(wire::VIEWPORT, &[0, 0, 4, 4]).w(wire::CLEAR_COLOR, &[0, 0, 1.0f32.to_bits(), 1.0f32.to_bits()]);
+    c.w(wire::CLEAR, &[COLOR_BUFFER_BIT | DEPTH_BUFFER_BIT]).w(wire::ENABLE, &[DEPTH_TEST]);
+    c.floats(wire::UNIFORM, &[sampled, wire::FLOAT, 1, 1, 1, 0], &[0.0]);
+    c.floats(wire::UNIFORM, &[tint, wire::FLOAT, 4, 1, 1, 0], &[0.0, 1.0, 0.0, 1.0]).floats(wire::UNIFORM, &[z, wire::FLOAT, 1, 1, 1, 0], &[-0.5]);
+    c.w64(wire::ATTRIB_POINTER, &[0, 2, 0x1406, 0, 0, 0], 1024).w(wire::ENABLE_ATTRIB, &[0, 1]).w(wire::DRAW_ARRAYS, &[5, 0, 4, 1]);
+    c.floats(wire::UNIFORM, &[tint, wire::FLOAT, 4, 1, 1, 0], &[1.0, 0.0, 0.0, 1.0]).floats(wire::UNIFORM, &[z, wire::FLOAT, 1, 1, 1, 0], &[0.5]);
+    c.w64(wire::ATTRIB_POINTER, &[0, 2, 0x1406, 0, 0, 0], 1088).w(wire::DRAW_ARRAYS, &[5, 0, 4, 1]);
+    // Then the drawable, with the texture over all of it.
+    c.w(wire::BIND_FRAMEBUFFER, &[0x8d40, 0]).w(wire::VIEWPORT, &[0, 0, 8, 8]).w(wire::DISABLE, &[DEPTH_TEST]);
+    c.wb(wire::UNIFORM, &[tex, wire::INT, 1, 1, 1, 0], &0u32.to_le_bytes()).floats(wire::UNIFORM, &[sampled, wire::FLOAT, 1, 1, 1, 0], &[1.0]);
+    c.w(wire::DRAW_ARRAYS, &[5, 0, 4, 1]).w(wire::GET_ERROR, &[]);
+    let a = calls(&gl, &mut memory, &c);
+    assert_eq!(Reader::new(&a).u32().unwrap(), NO_ERROR);
+    let px = pixels(&gl, &mut memory);
+    for y in 0..8 {
+        for x in 0..8 {
+            let want = if x < 4 { [0, 255, 0, 255] } else { [255, 0, 0, 255] };
+            assert!(close(px[y * 8 + x], want), "({x}, {y}) is {:?}, wanted {want:?}", px[y * 8 + x]);
+        }
+    }
+}
+
+#[test]
+fn lines_are_a_pixel_wide_and_never_culled() {
+    let (gl, mut memory) = bare();
+    // Pixel coordinates: a horizontal line through row 2's centres, and a line strip down column 5's, closed back
+    // to its start as a loop.
+    memory.0[1024..1040].copy_from_slice(&f32s(&[0.0, 2.5, 8.0, 2.5]));
+    memory.0[1088..1112].copy_from_slice(&f32s(&[5.5, 4.0, 5.5, 8.0, 5.5, 6.0]));
+    let mut c = Calls::new();
+    c.w(wire::MATRIX_MODE, &[0x1701]).floats(wire::MATRIX, &[wire::MATRIX_ORTHO], &[0.0, 8.0, 0.0, 8.0, -1.0, 1.0]);
+    c.w(wire::ENABLE, &[CULL_FACE]).w(wire::CULL_FACE, &[0x0408]);
+    c.w64(wire::ATTRIB_POINTER, &[0, 2, 0x1406, 0, 0, 0], 1024).w(wire::ENABLE_ATTRIB, &[0, 1]);
+    c.w(wire::ATTRIB_VALUE, &[3, 1.0f32.to_bits(), 1.0f32.to_bits(), 1.0f32.to_bits(), 1.0f32.to_bits()]);
+    c.w(wire::DRAW_ARRAYS, &[1, 0, 2, 1]);
+    c.w64(wire::ATTRIB_POINTER, &[0, 2, 0x1406, 0, 0, 0], 1088).w(wire::DRAW_ARRAYS, &[2, 0, 3, 1]).w(wire::GET_ERROR, &[]);
+    let a = calls(&gl, &mut memory, &c);
+    assert_eq!(Reader::new(&a).u32().unwrap(), NO_ERROR);
+    let px = pixels(&gl, &mut memory);
+    for y in 0..8 {
+        for x in 0..8 {
+            let lit = y == 2 || (x == 5 && y >= 4);
+            let want = if lit { [255, 255, 255, 255] } else { [0, 0, 0, 255] };
+            assert!(close(px[y * 8 + x], want), "({x}, {y}) is {:?}, wanted {want:?}", px[y * 8 + x]);
+        }
+    }
+}
+
+#[test]
+fn the_alpha_test_applies_to_a_programs_own_colour() {
+    let vs = "#version 120
+attribute vec2 pos;
+varying float a;
+void main() { a = pos.x * 0.5 + 0.5; gl_Position = vec4(pos, 0.0, 1.0); }";
+    let fs = "#version 120
+varying float a;
+void main() { gl_FragColor = vec4(1.0, 1.0, 0.0, a); }";
+    let (gl, mut memory) = with_program(vs, fs);
+    memory.0[1024..1056].copy_from_slice(&f32s(&[-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0]));
+    // Alpha rises left to right: GL_GREATER than a half keeps the right half.
+    let mut c = Calls::new();
+    c.w(wire::ENABLE, &[0x0bc0]).w(wire::ALPHA_FUNC, &[0x0204, 0.5f32.to_bits()]);
+    c.w64(wire::ATTRIB_POINTER, &[0, 2, 0x1406, 0, 0, 0], 1024).w(wire::ENABLE_ATTRIB, &[0, 1]);
+    c.w(wire::DRAW_ARRAYS, &[5, 0, 4, 1]).w(wire::GET_ERROR, &[]);
+    let a = calls(&gl, &mut memory, &c);
+    assert_eq!(Reader::new(&a).u32().unwrap(), NO_ERROR);
+    let px = pixels(&gl, &mut memory);
+    for x in 0..8 {
+        let want = if x >= 4 { [255, 255, 0, 255] } else { [0, 0, 0, 255] };
+        assert!(close(px[3 * 8 + x], want), "({x}, 3) is {:?}, wanted {want:?}", px[3 * 8 + x]);
+    }
+}

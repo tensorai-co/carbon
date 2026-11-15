@@ -205,9 +205,9 @@ programs and how to build them are in [lambda's](kernels/lambda/README.md#runnin
   M1's, or the CPU device), which runs Vulkan compute programs and draws: Debian's `vkcube` spins on the headless
   display, on Wayland and X11, drawn by the M1. OpenGL of Carbon's own is begun: lambda's X server has GLX,
   GLVND loads Carbon's GL vendor library, whose contexts draw with GL 3.3's shaders, buffers, vertex arrays and
-  textures and with the compatibility profile's fixed function on the M1 (Luanti's main menu renders on it), its GLSL compiler turning GLSL 1.10 to 4.60 and ES into the IR, held to glslang's results on
-  both devices; until it draws, the
-  image's Mesa renders through the same GLX, so Luanti's menu runs.
+  textures, framebuffer objects, lines and the compatibility profile's fixed function on the M1 (Luanti plays in a
+  world on it), its GLSL compiler turning GLSL 1.10 to 4.60 and ES into the IR, held to glslang's results on both
+  devices; until it's the default, the image's Mesa renders through the same GLX.
 
 ## The order of work
 

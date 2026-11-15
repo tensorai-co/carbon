@@ -220,11 +220,20 @@ pub struct Attribute {
     pub format: VertexFormat,
 }
 
+/// What a draw's vertices make. Lines are one pixel wide, and never culled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Topology {
     TriangleList,
     TriangleStrip,
     TriangleFan,
+    LineList,
+    LineStrip,
+}
+
+impl Topology {
+    pub const fn is_line(self) -> bool {
+        matches!(self, Topology::LineList | Topology::LineStrip)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

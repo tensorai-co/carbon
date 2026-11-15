@@ -111,7 +111,7 @@ sits:
 | API | What its programs hand the driver | Frontend | State |
 | --- | --- | --- | --- |
 | Vulkan (both kernels) | SPIR-V | `spirv` | Compute built; vertex and fragment shaders built |
-| OpenGL and GLES (both kernels) | GLSL source, compiled by a GLSL frontend of our own | `glsl` | Vertex and fragment shaders and compute kernels, held to glslang; GL 3.3's draws and the compatibility profile built, Luanti's menu drawn |
+| OpenGL and GLES (both kernels) | GLSL source, compiled by a GLSL frontend of our own | `glsl` | Vertex and fragment shaders and compute kernels, held to glslang; GL 3.3's draws, framebuffer objects and the compatibility profile built, Luanti playing in a world |
 | Direct3D 10 and 11 | DXBC | `dxbc` | Vertex, pixel and compute shaders (most of shader model 5.0) |
 | Direct3D 12 | DXIL (LLVM bitcode) | `dxil`, a bitcode reader of our own, not LLVM | To do |
 | Direct3D 9 | shader model 2 and 3 bytecode | `d3d9` | Later |
@@ -601,7 +601,7 @@ pipelines, draws, copies between buffers and images) and its swapchains on Wayla
 the CPU device, and drawn by the M1 through Metal (the AIR writer's vertex and fragment functions, Metal's render
 pipelines and textures, held to the CPU device by the draw tests) at the display's 60 Hz. The device model's mip levels, array layers, more formats, border colours and comparison
 samplers are done (for Direct3D 11 first; lambda's driver still makes images of one level and layer). Left: sampling
-image arrays and views of parts of images; lines and points; GTK 4 and Firefox on our GL.
+image arrays and views of parts of images; points (lines are drawn); GTK 4 and Firefox on our GL.
 
 **OpenGL of our own.** `gpu_api::gl`, lowered on the host as Direct3D 11 is, for both kernels: lambda's through a
 thin `libGLX_carbon.so.0` (and an EGL vendor) in the system layer, which the image's GLVND loads because lambda's X
@@ -640,9 +640,18 @@ Luanti, Debian's `minetest`, plays on the M1 with no Mesa in the image's path. D
   compiled by the `glsl` frontend and kept by that shape. `GL_EXTENSIONS` lists what's built (VBOs, non-power-of-two
   textures, the combine environments, BGRA arrays…). `kernels/lambda/tests/programs/gl/compat.c` checks it as
   Irrlicht draws (11 checks), and Luanti's main menu renders on it exactly as on Mesa.
-- Left, in order: playing in a world in Luanti (what its 3D draws ask for: framebuffer objects, likely); points and
-  lines; lighting and materials; uniform blocks; stencil; flat shading; drawing faster (draws batched across rings,
-  not sent one by one); then the X server names `carbon` for machines with a GPU. Until then a program asks for it
+- Framebuffer objects and renderbuffers (`api/src/gl/framebuffer.rs`): a texture's level or a renderbuffer as the
+  colour attachment, a depth texture or renderbuffer (`D32Float`, whatever depth format is asked for) as the depth
+  one, completeness, `glDrawBuffers` (one buffer, or none: a scratch colour image takes the outputs), and blits that
+  copy without scaling; depth, half- and full-float textures. Lines and line strips and loops, a pixel wide, on both
+  devices (the CPU device draws each as a quad). The compatibility profile's alpha test on a program's own shaders,
+  as GL tests their fragments: Luanti's legacy driver leaves transparent texels to it. With these, Luanti plays in a
+  world as it does on Mesa: the 3D view drawn into a framebuffer object and post-processed, the wielded hand, the
+  selection box and the crosshair. The host's tests draw into a framebuffer object and sample it, draw lines, and
+  test alpha.
+- Left, in order: points (Metal needs the vertex shader's point size); lighting and materials; uniform blocks;
+  stencil; flat shading; more than one colour attachment; drawing faster (draws batched across rings, not sent one by
+  one); then the X server names `carbon` for machines with a GPU. Until then a program asks for it
   with `__GLX_VENDOR_LIBRARY_NAME=carbon`; GL says 3.3, of which this is what's there.
 
 **5. atlas: DXGI, Direct3D 11 and Vulkan.** DXGI's factory, adapters and flip-model swap chains, the `dxbc` frontend

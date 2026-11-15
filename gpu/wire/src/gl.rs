@@ -1,7 +1,8 @@
 //! OpenGL's records: what Carbon's GL vendor library (`libGLX_carbon`, in programs) sends `gpu_api::gl` through the
 //! render node's [`GL_SUBMIT_IOCTL`]. They're GL's calls, encoded as they are and run by the host in order: the guest
 //! records them and rings at the points it has to wait (a call that answers, a swap, `glFinish`, a context made
-//! current), with a [`USE`] first naming the context they're for.
+//! current), with a [`USE`] first naming the context they're for. Draws aren't sent to the device at each ring: they
+//! wait for whatever needs what they drew (a swap, a read, a change to what they read) or a [`FINISH`].
 //!
 //! Records are [`records`](crate::records)'s (two words, kind and length, then the payload). The doorbell's reply is a
 //! status word, [`OK`] or [`FAILED`], then the answers of the records that answer, in order (or what failed, as text).
@@ -41,6 +42,8 @@ pub const IS_ENABLED: u32 = 8;
 pub const SWAP: u32 = 9;
 /// An error the guest found itself (a name `glGetString` hasn't, say): `code`, kept as the context's own.
 pub const ERROR: u32 = 10;
+/// `glFinish` (and `glFlush`): everything recorded runs on the device before the ring returns.
+pub const FINISH: u32 = 11;
 
 /// Four `f32`s' bits.
 pub const CLEAR_COLOR: u32 = 16;
@@ -173,6 +176,28 @@ pub const SHADE_MODEL: u32 = 133;
 /// `glRectf`: x1, y1, x2, y2's bits. Immediate mode: every attribute but the position is its current value, whatever
 /// arrays are on.
 pub const RECT: u32 = 134;
+
+// Framebuffer objects and renderbuffers. Their names are the guest's, as other objects' are.
+
+/// `target` (`GL_FRAMEBUFFER`, `GL_READ_FRAMEBUFFER`, `GL_DRAW_FRAMEBUFFER`), `name` (0 for the default framebuffer).
+pub const BIND_FRAMEBUFFER: u32 = 144;
+pub const DELETE_FRAMEBUFFER: u32 = 145;
+/// `target`, `attachment`, `textarget`, `texture` (0 to detach), `level`.
+pub const FRAMEBUFFER_TEXTURE: u32 = 146;
+/// `target`, `attachment`, `renderbuffer target`, `renderbuffer` (0 to detach).
+pub const FRAMEBUFFER_RENDERBUFFER: u32 = 147;
+/// `target`: answers its status (`GL_FRAMEBUFFER_COMPLETE` or why it isn't).
+pub const CHECK_FRAMEBUFFER: u32 = 148;
+/// `target`, `name`.
+pub const BIND_RENDERBUFFER: u32 = 149;
+/// `target`, `internalformat`, `width`, `height`.
+pub const RENDERBUFFER_STORAGE: u32 = 150;
+pub const DELETE_RENDERBUFFER: u32 = 151;
+/// The read framebuffer's `x0`, `y0`, `x1`, `y1`, the draw framebuffer's, then `mask` and `filter`.
+pub const BLIT_FRAMEBUFFER: u32 = 152;
+/// How many buffers, then each (`GL_NONE`, `GL_COLOR_ATTACHMENT0`, `GL_BACK`…): where the draw framebuffer's
+/// fragment outputs go.
+pub const DRAW_BUFFERS: u32 = 153;
 
 /// [`MATRIX`]'s operations, and the floats each takes.
 pub const MATRIX_IDENTITY: u32 = 0;

@@ -70,6 +70,8 @@ const LOAD_CLEAR: usize = 2;
 const STORE_STORE: usize = 1;
 const TEXTURE_2D: usize = 2;
 const TEXTURE_2D_ARRAY: usize = 3;
+const PRIMITIVE_LINE: usize = 1;
+const PRIMITIVE_LINE_STRIP: usize = 2;
 const PRIMITIVE_TRIANGLE: usize = 3;
 const PRIMITIVE_TRIANGLE_STRIP: usize = 4;
 
@@ -428,7 +430,12 @@ impl Metal {
         if g.topology == Topology::TriangleFan {
             return self.draw_fan(enc, d, made);
         }
-        let primitive = if g.topology == Topology::TriangleStrip { PRIMITIVE_TRIANGLE_STRIP } else { PRIMITIVE_TRIANGLE };
+        let primitive = match g.topology {
+            Topology::TriangleStrip => PRIMITIVE_TRIANGLE_STRIP,
+            Topology::LineList => PRIMITIVE_LINE,
+            Topology::LineStrip => PRIMITIVE_LINE_STRIP,
+            _ => PRIMITIVE_TRIANGLE,
+        };
         match d.index {
             None => msg!((); enc, "drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:",
                 primitive => usize, d.first as usize => usize, d.count as usize => usize, instances => usize, d.first_instance as usize => usize),

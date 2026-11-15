@@ -399,8 +399,8 @@ only a faster one.
   CPU device, presented through the program's own `wl_shm` buffers or `PutImage` (the GPU README's Presenting). OpenGL is
   becoming Carbon's own (`gpu`'s step 4): `libGLX_carbon.so.0` is in the system layer, and GLVND loads it with
   `__GLX_VENDOR_LIBRARY_NAME=carbon`; it draws with GL 3.3's shaders, buffers, vertex arrays and textures (`tests/programs/gl`), compiled by `gpu`'s GLSL
-  compiler, and the compatibility profile (fixed function as generated GLSL): Luanti's main menu renders on it as it
-  does on Mesa. Until it does,
+  compiler, the compatibility profile (fixed function as generated GLSL), framebuffer objects and lines: Luanti plays
+  in a world on it as it does on Mesa. Until it does,
   the X server names `mesa`, and the image's llvmpipe draws: `glxgears` and Luanti's menu run. A window's swapchain image is a `gpu` image the desktop composites, named by its Wayland or X11 id, so no
   buffer goes through lambda's servers. Mesa's Venus over virtio-gpu's ioctls is no longer the path. Later, VA-API
   and Vulkan Video.

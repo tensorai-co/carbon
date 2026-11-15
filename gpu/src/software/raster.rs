@@ -3,7 +3,8 @@
 //! - **Vertices** are fetched from their buffers by the pipeline's attributes and shaded 32 at a time by the
 //!   interpreter, each vertex once a draw instance however many triangles share it.
 //! - **Triangles** are assembled (lists, strips, fans; the provoking vertex is each one's first), clipped in clip
-//!   space to `0 <= z <= w` and a guard band in x and y, and taken to framebuffer coordinates by the viewport. Their
+//!   space to `0 <= z <= w` and a guard band in x and y, and taken to framebuffer coordinates by the viewport.
+//!   **Lines** (lists and strips) are clipped to `0 <= z <= w` and drawn as two triangles a pixel wide, never culled. Their
 //!   facing is Vulkan's: the sign of `-½ Σ (xᵢ yᵢ₊₁ − xᵢ₊₁ yᵢ)` in framebuffer coordinates (y down).
 //! - **Coverage** is tested at pixel centres with edge functions in fixed point, 8 bits of subpixel precision, and
 //!   the top-left rule, so pixels on an edge two triangles share are drawn once.
@@ -181,6 +182,15 @@ impl Device<'_> {
         }
         for instance in d.first_instance..d.first_instance + d.instances {
             let verts = self.vertices(g, d, &vbound, &order, instance, position, &from)?;
+            if g.topology.is_line() {
+                let mut batch = Batch::default();
+                let step = if g.topology == Topology::LineList { 2 } else { 1 };
+                for k in (0..verts.len().saturating_sub(1)).step_by(step) {
+                    self.line(g, &fbound, t, [&verts[k], &verts[k + 1]], &mut batch)?;
+                }
+                self.flush(g, &fbound, t, &mut batch)?;
+                continue;
+            }
             let mut tris = Vec::new();
             match g.topology {
                 Topology::TriangleList => {
@@ -198,14 +208,14 @@ impl Device<'_> {
                         tris.push([k, k + 1, 0]);
                     }
                 }
+                Topology::LineList | Topology::LineStrip => {}
             }
             let mut batch = Batch::default();
             for (n, tri) in tris.iter().enumerate() {
                 // Vulkan's provoking vertex: the first of the triangle as the topology numbers them.
                 let provoking = match g.topology {
                     Topology::TriangleStrip => n,
-                    Topology::TriangleFan => tri[0],
-                    Topology::TriangleList => tri[0],
+                    _ => tri[0],
                 };
                 self.triangle(g, &fbound, t, [&verts[tri[0]], &verts[tri[1]], &verts[tri[2]]], &verts[provoking], &mut batch)?;
             }
@@ -248,6 +258,42 @@ impl Device<'_> {
             }
         }
         Ok(order.iter().map(|v| shaded[v].clone()).collect())
+    }
+
+    /// A line, clipped to `0 <= z <= w` and drawn as a quad a pixel wide (two triangles, the first vertex
+    /// provoking), adding its fragments to the batch.
+    fn line(&mut self, g: &Graphics, fbound: &[Bound], t: &Target, v: [&Vert; 2], batch: &mut Batch) -> Result<(), Error> {
+        let (mut a, mut b) = (v[0].clone(), v[1].clone());
+        let planes: [fn(&[f64; 4]) -> f64; 3] = [|p| p[2], |p| p[3] - p[2], |p| p[3] - 1e-6];
+        let lerp = |x: &Vert, y: &Vert, s: f64| Vert {
+            clip: [0, 1, 2, 3].map(|k| x.clip[k] + (y.clip[k] - x.clip[k]) * s),
+            vary: x.vary.iter().zip(&y.vary).map(|(p, q)| [0, 1, 2, 3].map(|k| bits(float(p[k]) + (float(q[k]) - float(p[k])) * s as f32))).collect(),
+        };
+        for plane in planes {
+            let (da, db) = (plane(&a.clip), plane(&b.clip));
+            if da < 0.0 && db < 0.0 {
+                return Ok(());
+            }
+            if da < 0.0 {
+                a = lerp(&a, &b, da / (da - db));
+            } else if db < 0.0 {
+                b = lerp(&b, &a, db / (db - da));
+            }
+        }
+        // Half a pixel either side, across the line as the viewport shows it, as a clip-space offset.
+        let vp = t.viewport;
+        let (w, h) = (f64::from(vp.width.abs()), f64::from(vp.height.abs()));
+        let pixel = |c: &[f64; 4]| (c[0] / c[3] * w / 2.0, c[1] / c[3] * h / 2.0);
+        let ((ax, ay), (bx, by)) = (pixel(&a.clip), pixel(&b.clip));
+        let length = (bx - ax).hypot(by - ay);
+        if length == 0.0 {
+            return Ok(());
+        }
+        let (px, py) = (-(by - ay) / length * 0.5, (bx - ax) / length * 0.5);
+        let moved = |v: &Vert, side: f64| Vert { clip: [v.clip[0] + side * px * 2.0 / w * v.clip[3], v.clip[1] + side * py * 2.0 / h * v.clip[3], v.clip[2], v.clip[3]], vary: v.vary.clone() };
+        let (a0, a1, b0, b1) = (moved(&a, -1.0), moved(&a, 1.0), moved(&b, -1.0), moved(&b, 1.0));
+        self.triangle(g, fbound, t, [&a0, &a1, &b1], &a, batch)?;
+        self.triangle(g, fbound, t, [&a0, &b1, &b0], &a, batch)
     }
 
     /// Clips a triangle and rasterizes what's left, adding its fragments to the batch.
@@ -316,7 +362,8 @@ impl Device<'_> {
             FrontFace::CounterClockwise => area < 0,
             FrontFace::Clockwise => area > 0,
         };
-        if (g.cull == Cull::Back && !front_facing) || (g.cull == Cull::Front && front_facing) {
+        let cull = if g.topology.is_line() { Cull::None } else { g.cull };
+        if (cull == Cull::Back && !front_facing) || (cull == Cull::Front && front_facing) {
             return Ok(());
         }
         let area = if area < 0 {

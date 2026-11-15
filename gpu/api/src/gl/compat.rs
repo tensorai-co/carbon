@@ -116,6 +116,11 @@ impl Compat {
     pub(super) fn mode(&self) -> u32 {
         self.mode
     }
+
+    /// The alpha test's function and reference.
+    pub(super) fn alpha(&self) -> (u32, f32) {
+        self.alpha
+    }
 }
 
 impl Gl {

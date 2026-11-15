@@ -287,6 +287,45 @@ fn clip_block(entry: &mut Entry, block: &mut gpu_ir::Block, position: u32) {
     *block = out;
 }
 
+/// The compatibility profile's alpha test on a fragment shader of the program's own: the first colour output's alpha
+/// compared with `reference` by `func` (`GL_NEVER` to `GL_ALWAYS`), and the fragment discarded where it fails, as GL
+/// tests every fragment after its shader runs. Outputs are written as `main` ends, so the test goes before that write.
+pub fn alpha_test(entry: &mut Entry, func: u32, reference: f32) {
+    use gpu_ir::{Cmp, Op, Stmt, Type};
+    let cmp = match func {
+        0x0200 => None,
+        0x0201 => Some(Cmp::Lt),
+        0x0202 => Some(Cmp::Eq),
+        0x0203 => Some(Cmp::Le),
+        0x0204 => Some(Cmp::Gt),
+        0x0205 => Some(Cmp::Ne),
+        0x0206 => Some(Cmp::Ge),
+        _ => return,
+    };
+    let Some(color) = entry.outputs.iter().position(|o| o.slot == Slot::Location(0) && o.ty.lanes() == 4) else { return };
+    let mut out = Vec::with_capacity(entry.body.len() + 4);
+    for s in core::mem::take(&mut entry.body) {
+        if let Stmt::Output(n, v) = s
+            && n == color as u32
+        {
+            match cmp {
+                None => out.push(Stmt::Discard),
+                Some(cmp) => {
+                    let alpha = entry.value(Type::F32);
+                    out.push(Stmt::Let(alpha, Op::Extract(v, 3)));
+                    let r = entry.value(Type::F32);
+                    out.push(Stmt::Let(r, Op::Const(gpu_ir::Scalar::F32, u64::from(reference.to_bits()))));
+                    let pass = entry.value(Type::BOOL);
+                    out.push(Stmt::Let(pass, Op::Compare(cmp, alpha, r)));
+                    out.push(Stmt::If { cond: pass, then: Vec::new(), otherwise: alloc::vec![Stmt::Discard] });
+                }
+            }
+        }
+        out.push(s);
+    }
+    entry.body = out;
+}
+
 /// A fragment shader's colour outputs kept to the first `colors` locations (a framebuffer with fewer attachments than
 /// `gl_FragData` has), the rest and their writes dropped.
 pub fn keep_colors(entry: &mut Entry, colors: u32) {
