@@ -113,6 +113,7 @@ pub(crate) fn warp_cursor(window: Id, view: Id, at: Point) {
         return;
     }
     let height = frame_of(first, "frame").size.height;
+    // SAFETY: CoreGraphics calls taking plain values.
     unsafe {
         CGSetLocalEventsSuppressionInterval(0.0);
         CGWarpMouseCursorPosition(Point { x: on_screen.x, y: height - on_screen.y });

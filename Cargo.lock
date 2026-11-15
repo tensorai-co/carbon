@@ -27,6 +27,17 @@ name = "atlas-abi"
 version = "0.2.0"
 
 [[package]]
+name = "audio"
+version = "0.2.0"
+
+[[package]]
+name = "audio-macos"
+version = "0.2.0"
+dependencies = [
+ "audio",
+]
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -413,6 +424,7 @@ dependencies = [
 name = "lambda"
 version = "0.2.0"
 dependencies = [
+ "audio",
  "display",
  "exec",
  "gpu-api",
@@ -450,6 +462,8 @@ name = "machine"
 version = "0.2.0"
 dependencies = [
  "atlas",
+ "audio",
+ "audio-macos",
  "display",
  "display-macos",
  "exec",

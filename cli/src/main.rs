@@ -40,7 +40,9 @@ usage: carbon <command> ...
                                              screen, or each of its windows in a Mac window of its own
       --gpu auto|host|software|none          its GPU: the host's, else the CPU device (auto, the default; said if
                                              it's the CPU device), the host's or fail, the CPU device, or none
-      --audio none                           where its sound goes (only none, until audio is there)
+      --audio auto|host|none|FILE.wav        where its sound goes: the host's speakers when it's on the host's
+                                             screen (auto, the default), the host's speakers or fail, nowhere, or a
+                                             WAV file of everything played
       -e, --env NAME=VALUE                   an environment variable, over the image's
       --memory SIZE                          how much memory it may use, as 512m or 4g (4g by default)
   ls                                         the machines, and which are running
@@ -150,10 +152,15 @@ fn run(machines: &Machines, mut args: impl Iterator<Item = String>) -> ! {
                     other => fail(format!("--gpu is auto, host, software or none, not {other}")),
                 }
             }
-            "--audio" => match value("--audio").as_str() {
-                "none" => {}
-                other => fail(format!("--audio {other} needs audio, which isn't there yet: use none")),
-            },
+            "--audio" => {
+                spec.audio = match value("--audio").as_str() {
+                    "auto" => machine::Audio::Auto,
+                    "host" => machine::Audio::Host,
+                    "none" => machine::Audio::None,
+                    file if file.ends_with(".wav") => machine::Audio::Wav(file.into()),
+                    other => fail(format!("--audio is auto, host, none or a .wav file, not {other}")),
+                }
+            }
             "-e" | "--env" => {
                 let var = value("--env");
                 if !var.contains('=') {

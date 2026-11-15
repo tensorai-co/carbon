@@ -13,6 +13,8 @@ members = [
     "cli",
     "display",
     "display/macos",
+    "audio",
+    "audio/macos",
     "host",
     "net",
     "gpu",
@@ -48,6 +50,8 @@ images = { path = "images" }
 machine = { path = "machine" }
 display = { path = "display" }
 display-macos = { path = "display/macos" }
+audio = { path = "audio" }
+audio-macos = { path = "audio/macos" }
 host = { path = "host" }
 net = { path = "net" }
 gpu = { path = "gpu" }

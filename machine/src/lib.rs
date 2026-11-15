@@ -49,6 +49,19 @@ pub enum Display {
     None,
 }
 
+/// Where a machine's sound goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Audio {
+    /// The host's speakers when the machine's on the host's screen, else nowhere.
+    Auto,
+    /// The host's speakers (Core Audio's default output on a Mac).
+    Host,
+    /// Everything played, into a WAV file (16-bit stereo, 48 kHz).
+    Wav(std::path::PathBuf),
+    /// Nowhere: sound is taken at the pace it would play, and heard by no one.
+    None,
+}
+
 /// Which kernel a machine runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kernel {
@@ -81,13 +94,14 @@ pub struct Run {
     pub env: Vec<String>,
     pub display: Display,
     pub gpu: Gpu,
+    pub audio: Audio,
     /// How much memory it may use (only what's touched is taken).
     pub memory: u64,
 }
 
 impl Default for Run {
     fn default() -> Run {
-        Run { name: None, source: None, args: Vec::new(), isolation: Isolation::Auto, platform: None, env: Vec::new(), display: Display::Headless(1280, 800, display::output::SCALE_1X), gpu: Gpu::Auto, memory: 4 << 30 }
+        Run { name: None, source: None, args: Vec::new(), isolation: Isolation::Auto, platform: None, env: Vec::new(), display: Display::Headless(1280, 800, display::output::SCALE_1X), gpu: Gpu::Auto, audio: Audio::Auto, memory: 4 << 30 }
     }
 }
 
@@ -597,7 +611,8 @@ impl Machines {
                 let _clock = desktop.clone().filter(|_| headless).map(|d| display::clock::Clock::start(d, 60));
                 let _control = control::serve(self.images.machine_dir(&record.name), desktop.clone());
                 let gpu = open_gpu(run.gpu)?;
-                let mut options = lambda::Options { stop, display: desktop.clone(), gpu, env, ..lambda::Options::default() };
+                let (mixer, _audio) = open_audio(&run.audio, run.display)?;
+                let mut options = lambda::Options { stop, display: desktop.clone(), gpu, audio: Some(mixer), env, ..lambda::Options::default() };
                 options.hostname = record.name.clone();
                 lambda::boot(exec, cpu, disk, host, &argv, options).map(lambda::Status::code)
             }
@@ -637,6 +652,31 @@ impl Machines {
             }
         }
     }
+}
+
+/// The machine's mixer, and what plays it for as long as it's kept: the host's speakers, a WAV file being written, or
+/// a thread taking it at the pace it would play.
+fn open_audio(choice: &Audio, display: Display) -> Result<(audio::Mixer, Box<dyn std::any::Any>), String> {
+    let mixer = audio::Mixer::new();
+    let host = match choice {
+        Audio::Auto => matches!(display, Display::Host(..) | Display::HostWindows),
+        Audio::Host => true,
+        Audio::Wav(path) => return Ok((mixer.clone(), Box::new(audio::output::Timed::wav(mixer, path)?))),
+        Audio::None => false,
+    };
+    if host {
+        #[cfg(target_os = "macos")]
+        match audio_macos::Speakers::start(mixer.clone()) {
+            Ok(speakers) => return Ok((mixer, Box::new(speakers))),
+            Err(e) if *choice == Audio::Host => return Err(e),
+            Err(e) => eprintln!("carbon: no sound: {e}"),
+        }
+        #[cfg(not(target_os = "macos"))]
+        if *choice == Audio::Host {
+            return Err("--audio host isn't there on this host yet: use none or a .wav file".into());
+        }
+    }
+    Ok((mixer.clone(), Box::new(audio::output::Timed::none(mixer))))
 }
 
 /// Opens the machine's GPU on its own thread: the device `--gpu` asks for, or none. `auto` takes the host's GPU where

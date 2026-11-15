@@ -1,0 +1,13 @@
+[package]
+name = "audio-macos"
+description = "A machine's sound on a Mac's speakers: Core Audio's default output pulling the mix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+audio.workspace = true
