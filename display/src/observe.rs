@@ -60,6 +60,9 @@ pub struct Observed {
     pub output: Option<Output>,
     /// The selections offered anew (read them with `Desktop::selection`): the host's clipboard follows.
     pub selections: Vec<Selection>,
+    /// Where a program moved the pointer to, on the screen, if one did (`Desktop::warp_pointer`): a host with its own
+    /// pointer moves it there too, so the next motion it sends starts from there.
+    pub warp: Option<(i32, i32)>,
     /// What changed on the composited screen (`Desktop::screen`), frames and all: the part to show again, for an
     /// observer that shows the whole desktop (the host's desktop mode, a viewer, a screenshot taken now and then).
     pub screen: Rect,
@@ -76,6 +79,7 @@ impl Observed {
             && self.text_input.is_none()
             && self.output.is_none()
             && self.selections.is_empty()
+            && self.warp.is_none()
             && self.screen.is_empty()
     }
 }
@@ -94,13 +98,14 @@ struct Observer {
     text_input: bool,
     output: bool,
     selections: Vec<Selection>,
+    warp: Option<(i32, i32)>,
     screen: Rect,
     waker: Option<Waker>,
 }
 
 impl Observer {
     fn pending(&self) -> bool {
-        !self.changed.is_empty() || !self.gone.is_empty() || self.stacking || self.active || !self.damage.is_empty() || self.cursor || self.text_input || self.output || !self.selections.is_empty() || !self.screen.is_empty()
+        !self.changed.is_empty() || !self.gone.is_empty() || self.stacking || self.active || !self.damage.is_empty() || self.cursor || self.text_input || self.output || !self.selections.is_empty() || self.warp.is_some() || !self.screen.is_empty()
     }
 }
 
@@ -122,6 +127,7 @@ pub(crate) struct Taken {
     pub text_input: bool,
     pub output: bool,
     pub selections: Vec<Selection>,
+    pub warp: Option<(i32, i32)>,
     pub screen: Rect,
 }
 
@@ -136,6 +142,8 @@ pub(crate) enum Note {
     TextInput,
     Output,
     Selection(Selection),
+    /// A program moved the pointer here.
+    Warp(i32, i32),
     /// Part of the composited screen changed.
     Screen(Rect),
 }
@@ -187,6 +195,7 @@ impl Observers {
                     }
                 }
                 Note::Active => o.active = true,
+                Note::Warp(x, y) => o.warp = Some((*x, *y)),
                 Note::Damage(id, r) if !r.is_empty() => add_damage(o.damage.entry(*id).or_default(), *r),
                 Note::Damage(..) => {}
                 Note::Screen(r) if !r.is_empty() => o.screen = if o.screen.is_empty() { *r } else { o.screen.union(r) },
@@ -214,6 +223,7 @@ impl Observers {
             text_input: std::mem::take(&mut o.text_input),
             output: std::mem::take(&mut o.output),
             selections: std::mem::take(&mut o.selections),
+            warp: o.warp.take(),
             screen: std::mem::take(&mut o.screen),
         })
     }

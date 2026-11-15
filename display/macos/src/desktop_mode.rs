@@ -12,7 +12,7 @@ use display::output::{Output, SCALE_1X};
 use crate::clipboard::Pasteboard;
 use crate::ime;
 use crate::input::{Cursors, Keys, button_of, let_go_buttons};
-use crate::objc::{Frame, Id, Images, NIL, Point, Size, class, frame_for, frame_of, is_main_thread, layer_for, msg, ns_string, pooled, pump, refresh_of, start_app, wake_loop};
+use crate::objc::{Frame, Id, Images, NIL, Point, Size, class, frame_for, frame_of, is_main_thread, layer_for, msg, ns_string, pooled, pump, refresh_of, start_app, wake_loop, warp_cursor};
 use crate::{Options, map};
 
 /// Shows the desktop in a window of its own until `done` is set (the machine ended), on the main thread. `close` is
@@ -228,6 +228,23 @@ impl Host {
         }
     }
 
+    /// A program moved the pointer: the Mac's cursor goes there too, while this window has the keyboard and the
+    /// cursor's over its content (it's the user's to take elsewhere).
+    fn warp(&mut self, x: i32, y: i32) {
+        if !msg!(bool; self.window, "isKeyWindow") {
+            return;
+        }
+        let b = frame_of(self.view, "bounds");
+        let mouse = msg!(Point; class("NSEvent"), "mouseLocation");
+        let in_window = msg!(Point; self.window, "convertPointFromScreen:", mouse => Point);
+        let p = msg!(Point; self.view, "convertPoint:fromView:", in_window => Point, NIL => Id);
+        if p.x < 0.0 || p.y < 0.0 || p.x >= b.size.width || p.y >= b.size.height {
+            return;
+        }
+        let to = Point { x: f64::from(x) + 0.5, y: b.size.height - f64::from(y) - 0.5 };
+        warp_cursor(self.window, self.view, to);
+    }
+
     /// Where a mouse event is, in the desktop's logical pixels from the content's top left, and whether that's in it.
     fn location(&self, event: Id) -> (i32, i32, bool) {
         let at = msg!(Point; event, "locationInWindow");
@@ -263,7 +280,7 @@ impl Host {
 
     /// Shows what changed on the screen since last time, and follows the desktop's cursor and output.
     fn present(&mut self) {
-        let (copied, cursor, resize, offered) = {
+        let (copied, cursor, resize, offered, warp) = {
             let mut d = desktop::lock(&self.desktop);
             let observed = d.take_observed(self.observer);
             // Changed from outside (`carbon display resize`): the window follows.
@@ -287,8 +304,11 @@ impl Host {
                 }
                 true
             };
-            (copied, observed.cursor, resize, observed.selections.contains(&display::selection::Selection::Clipboard))
+            (copied, observed.cursor, resize, observed.selections.contains(&display::selection::Selection::Clipboard), observed.warp)
         };
+        if let Some((x, y)) = warp {
+            self.warp(x, y);
+        }
         if offered {
             self.board.offered(&self.desktop);
         }

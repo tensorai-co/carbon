@@ -97,6 +97,26 @@ unsafe extern "C" {
     ) -> *mut c_void;
     fn CGImageRelease(image: *mut c_void);
     fn CGEventGetLocation(event: *mut c_void) -> Point;
+    fn CGWarpMouseCursorPosition(to: Point) -> i32;
+    fn CGSetLocalEventsSuppressionInterval(seconds: f64) -> i32;
+}
+
+/// Moves the Mac's cursor to a point in a view (its bounds' coordinates, y up), without the quarter second in which
+/// the Mac would otherwise drop the mouse's events after a move: games move it every frame.
+pub(crate) fn warp_cursor(window: Id, view: Id, at: Point) {
+    let in_window = msg!(Point; view, "convertPoint:toView:", at => Point, NIL => Id);
+    let on_screen = msg!(Point; window, "convertPointToScreen:", in_window => Point);
+    // The Mac's screens put y up from the first screen's bottom; the cursor's position puts it down from its top.
+    let screens = msg!(Id; class("NSScreen"), "screens");
+    let first = msg!(Id; screens, "objectAtIndex:", 0usize => usize);
+    if first.is_null() {
+        return;
+    }
+    let height = frame_of(first, "frame").size.height;
+    unsafe {
+        CGSetLocalEventsSuppressionInterval(0.0);
+        CGWarpMouseCursorPosition(Point { x: on_screen.x, y: height - on_screen.y });
+    }
 }
 
 unsafe extern "C" {

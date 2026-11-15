@@ -1035,7 +1035,8 @@ impl Server {
             25 => self.send_event(ci, r),
             26 => self.grab_pointer(ci, r),
             27 => self.ungrab_pointer(ci),
-            28 | 29 | 33 | 34 | 35 | 36 | 37 | 41 => {}
+            28 | 29 | 33 | 34 | 35 | 36 | 37 => {}
+            41 => self.warp_pointer(ci, r),
             30 => {
                 if let Some(g) = self.grab.as_mut().filter(|g| g.client == ci) {
                     g.mask = u32::from(r.u16(12));
@@ -2289,6 +2290,45 @@ impl Server {
         let mut rep = Reply::new(1);
         rep.u32(ROOT).u32(child).i16(rx as i16).i16(ry as i16).i16((rx - ox) as i16).i16((ry - oy) as i16).u16(self.state());
         self.reply(ci, rep);
+    }
+
+    /// `WarpPointer`: the pointer moved to a place in `dst` (or by an offset, with none), if it's in `src`'s rectangle
+    /// (or anywhere, with none). It's moved on the desktop, through the top-level window it lands in, so windows hear
+    /// of it as motion and a host's own pointer follows (games turn by moving it back to the middle every frame).
+    fn warp_pointer(&mut self, ci: u32, r: Req) {
+        let (src, dst) = (r.u32(4), r.u32(8));
+        let (sx, sy, sw, sh) = (r.i16(12) as i32, r.i16(14) as i32, r.u16(16) as i32, r.u16(18) as i32);
+        let (dx, dy) = (r.i16(20) as i32, r.i16(22) as i32);
+        for w in [src, dst] {
+            if w != 0 && !self.windows.contains_key(&w) {
+                return self.error(ci, err::WINDOW, w);
+            }
+        }
+        let (px, py) = self.root_pointer;
+        if src != 0 {
+            let (ox, oy) = self.root_origin(src);
+            let win = &self.windows[&src];
+            // A width or height of 0 is the rest of the window.
+            let (w, h) = (if sw == 0 { win.w as i32 - sx } else { sw }, if sh == 0 { win.h as i32 - sy } else { sh });
+            let (x, y) = (px - ox - sx, py - oy - sy);
+            if x < 0 || y < 0 || x >= w || y >= h {
+                return;
+            }
+        }
+        let (rx, ry) = if dst != 0 {
+            let (ox, oy) = self.root_origin(dst);
+            (ox + dx, oy + dy)
+        } else {
+            (px + dx, py + dy)
+        };
+        let Some(top) = self.top_of(if dst != 0 { dst } else { self.under }) else { return };
+        let Some(window) = self.tops.iter().find(|(_, t)| **t == top).map(|(w, _)| *w) else { return };
+        let (ox, oy) = self.root_origin(top);
+        let mut d = desktop::lock(&self.desktop);
+        let Some(c) = d.content_rect(window) else { return };
+        d.warp_pointer(c.left + rx - ox, c.top + ry - oy);
+        drop(d);
+        self.root_pointer = (rx, ry);
     }
 
     /// The child of a window that has a point in its inside (0 for none).

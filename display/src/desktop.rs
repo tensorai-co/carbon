@@ -1137,6 +1137,24 @@ impl Desktop {
         self.windows.get(&id).and_then(|w| w.constraint)
     }
 
+    /// A program moved the pointer (X11's `WarpPointer`, Windows' `SetCursorPos`): it goes there as if the user had
+    /// moved it, windows hearing of it as they would, and observers with a pointer of their own (a host's window) are
+    /// told to move theirs there too. A locked pointer stays where it is.
+    pub fn warp_pointer(&mut self, x: i32, y: i32) {
+        if self.locked().is_some() {
+            return;
+        }
+        let (mut x, mut y) = (x, y);
+        if let Some(r) = self.confinement() {
+            (x, y) = (x.clamp(r.left, r.right - 1), y.clamp(r.top, r.bottom - 1));
+        }
+        self.pointer_to(x, y);
+        self.update_constraint();
+        self.update_cursor();
+        let (x, y) = self.pointer;
+        self.observers.note(Note::Warp(x, y));
+    }
+
     /// The window whose constraint is taken now, and what it is.
     pub fn constrained(&self) -> Option<(WindowId, Constraint)> {
         let id = self.constrained?;
@@ -1599,6 +1617,7 @@ impl Desktop {
             text_input: taken.text_input.then_some(self.text_input),
             output: taken.output.then(|| self.output.clone()),
             selections: taken.selections,
+            warp: taken.warp,
             screen: taken.screen.intersect(&self.screen.bounds()),
         }
     }
