@@ -888,14 +888,8 @@ pub(crate) fn start(k: &Arc<Kernel>, cx: &mut Cx<'_>, argv: &[String]) -> Result
     let path = disk_path(argv.first().ok_or("nothing to run")?);
     let bytes = {
         let disk = lock(&k.disk);
-        match disk.resolve(layers::ROOT, &path, true) {
-            Ok(ino) => disk.contents(ino).map_err(|e| format!("{path}: {e}"))?.to_vec(),
-            // One of atlas's own programs in System32, as this machine's own ISA builds it.
-            Err(e) => match path.to_ascii_lowercase().strip_prefix("/windows/system32/").and_then(|name| crate::images::program(exec::Isa::host(), name)) {
-                Some(image) => image.to_vec(),
-                None => return Err(format!("{path}: {e}")),
-            },
-        }
+        let ino = disk.resolve(layers::ROOT, &path, true).map_err(|e| format!("{path}: {e}"))?;
+        disk.contents(ino).map_err(|e| format!("{path}: {e}"))?.to_vec()
     };
     let isa = Pe::parse(&bytes).map_err(|_| format!("{path} isn't a Windows program"))?.isa;
     let mut handles = Handles::default();

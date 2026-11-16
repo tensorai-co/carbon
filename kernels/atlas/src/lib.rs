@@ -70,18 +70,19 @@ impl layers::Persist for Meta {
 pub type Disk = layers::Fs<Meta>;
 
 /// A new disk for atlas: an empty `C:\`, whose directories fold case.
-/// A program as a Windows machine's first one is found: a path as given; a name alone (`cmd`, `cmd.exe`) as atlas's
-/// own program in System32, or on the disk at the drive's root or in System32. `.exe` is added to a name without an
-/// extension. As the machine names it (`C:\\Windows\\System32\\cmd.exe`), or None if it isn't there.
+/// A program as a Windows machine's first one is found: a path as given; a name alone (`cmd`, `cmd.exe`) at the drive's
+/// root, or where the default `Path` looks (System32, Windows, and PowerShell's folder), where an image (atlas-base)
+/// puts Windows' programs. `.exe` is added to a name without an extension. As the machine names it
+/// (`C:\\Windows\\System32\\cmd.exe`), or None if it isn't there.
 pub fn find_program(disk: &Disk, name: &str) -> Option<String> {
     if name.contains(['\\', '/', ':']) {
         return Some(name.to_string());
     }
     let file = if name.contains('.') { name.to_string() } else { format!("{name}.exe") };
-    if images::program(exec::Isa::host(), &file).is_some() {
-        return Some(format!("C:\\Windows\\System32\\{file}"));
-    }
-    ["", "Windows/System32/"].iter().find(|dir| disk.resolve(layers::ROOT, &format!("/{dir}{file}"), true).is_ok()).map(|dir| format!("C:\\{}{file}", dir.replace('/', "\\")))
+    ["", "Windows/System32/", "Windows/", "Windows/System32/WindowsPowerShell/v1.0/"]
+        .iter()
+        .find(|dir| disk.resolve(layers::ROOT, &format!("/{dir}{file}"), true).is_ok())
+        .map(|dir| format!("C:\\{}{file}", dir.replace('/', "\\")))
 }
 
 pub fn new_disk() -> Disk {

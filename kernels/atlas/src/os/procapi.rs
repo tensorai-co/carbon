@@ -125,12 +125,9 @@ impl Task {
     /// A program at a Windows path: its full path, where it is on the disk, and its bytes.
     fn program_at(&self, raw: &str) -> Option<(String, String, Vec<u8>)> {
         let (windows, disk_path) = self.resolve(raw).ok()?;
-        let on_disk = {
-            let disk = lock(&self.k.disk);
-            disk.resolve(layers::ROOT, &disk_path, true).ok().and_then(|ino| disk.contents(ino).ok().map(|b| b.to_vec()))
-        };
-        // atlas's own programs, in the system layer.
-        let bytes = on_disk.or_else(|| self.system_file(&disk_path).map(|b| b.to_vec()))?;
+        let disk = lock(&self.k.disk);
+        let ino = disk.resolve(layers::ROOT, &disk_path, true).ok()?;
+        let bytes = disk.contents(ino).ok()?.to_vec();
         Some((windows, disk_path, bytes))
     }
 

@@ -623,7 +623,7 @@ impl Registry {
         self.put(m, "SOFTWARE\\Classes", &[]);
         self.put(m, "SOFTWARE\\WOW6432Node", &[]);
         self.put(m, "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment", &v(vec![
-            ("Path", expand_sz("%SystemRoot%\\system32;%SystemRoot%;%SystemRoot%\\System32\\Wbem")),
+            ("Path", expand_sz("%SystemRoot%\\system32;%SystemRoot%;%SystemRoot%\\System32\\Wbem;%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\")),
             ("PATHEXT", sz(".COM;.EXE;.BAT;.CMD")),
             ("TEMP", expand_sz("%SystemRoot%\\TEMP")),
             ("TMP", expand_sz("%SystemRoot%\\TEMP")),

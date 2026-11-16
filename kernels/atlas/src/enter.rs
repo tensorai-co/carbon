@@ -12,13 +12,13 @@ use kernels_core::lock;
 
 use crate::console::Stdio;
 use crate::handles::{Handle, Handles};
-use crate::{Stop, images, process};
+use crate::{Stop, process};
 
 /// What to start.
 #[derive(Debug, Clone, Default)]
 pub struct Spec {
-    /// The program and its arguments; a program named without a path is atlas's own in System32 (`cmd`), or one at
-    /// the drive's root.
+    /// The program and its arguments; a program named without a path is found as a machine's first program is
+    /// (`find_program`).
     pub argv: Vec<String>,
     /// `NAME=value`, over the machine's environment.
     pub env: Vec<String>,
@@ -48,7 +48,7 @@ impl Stop {
     pub fn enter(&self, spec: Spec) -> Result<Entered, String> {
         let k = lock(&self.0).as_ref().and_then(std::sync::Weak::upgrade).ok_or("the machine isn't running")?;
         let name = spec.argv.first().ok_or("exec needs a program")?.clone();
-        // The program: as named, atlas's own in System32, or at the drive's root.
+        // The program: as named, or found where Windows keeps its own.
         let windows = {
             let disk = lock(&k.disk);
             crate::find_program(&disk, &name).ok_or_else(|| format!("exec: {name}: not found on the machine's disk or in System32"))?
@@ -56,15 +56,8 @@ impl Stop {
         let path = process::disk_path(&windows);
         let bytes = {
             let disk = lock(&k.disk);
-            match disk.resolve(layers::ROOT, &path, true) {
-                Ok(ino) => disk.contents(ino).map_err(|e| format!("exec: {windows}: {e}"))?.to_vec(),
-                Err(_) => path
-                    .to_ascii_lowercase()
-                    .strip_prefix("/windows/system32/")
-                    .and_then(|file| images::program(exec::Isa::host(), file))
-                    .ok_or_else(|| format!("exec: {windows} isn't there"))?
-                    .to_vec(),
-            }
+            let ino = disk.resolve(layers::ROOT, &path, true).map_err(|_| format!("exec: {windows} isn't there"))?;
+            disk.contents(ino).map_err(|e| format!("exec: {windows}: {e}"))?.to_vec()
         };
         let isa = crate::images::pe::Pe::parse(&bytes).map_err(|_| format!("exec: {windows} isn't a Windows program"))?.isa;
 

@@ -17,8 +17,8 @@ carbon run -it debian:13 bash               # a shell (pulled if it isn't here);
 carbon run debian:13 -- ls /                # a command: its output here, no stdin (-i for stdin, -t for a terminal)
 carbon run --name dev debian:13             # named; `carbon run --name dev` starts it again, files as they were
 carbon exec -it dev bash                    # a shell in the running machine dev, as docker exec
-carbon run -it windows                      # Carbon's own empty Windows, at cmd.exe's prompt
-carbon run -it windows powershell           # or PowerShell's
+carbon run -it atlas                        # atlas-base, Carbon's Windows userland, at cmd.exe's prompt
+carbon run -it atlas powershell             # or PowerShell's
 carbon exec -it app cmd                     # a cmd in a running Windows machine
 carbon run --platform linux/amd64 debian:13 -- uname -m     # x86_64, translated on Apple silicon
 carbon run --isolation vm debian:13 -- ./untrusted.sh       # hardware VM or fail; sandbox forces the sandbox
@@ -37,6 +37,7 @@ carbon display resize app 1600x900@2        # its screen's size and scale, chang
 carbon display clipboard app                # its clipboard's text (with text after: set, as copied on the host)
 carbon display drop app 300 200 --files 'C:\notes.txt'  # drops files there, as dragged in from the host (or text)
 carbon pull debian:13 [--platform OS/ARCH] | images | rmi IMAGE
+carbon import -c 'CMD ["cmd.exe"]' atlas-base-arm64.tar atlas   # an image from a tar of a root file system
 carbon atlas imports setup.exe              # what a Windows program imports that atlas lacks (--all: everything)
 carbon atlas imports ~/installers/          # a folder of them: which load, and what's wanted most
 ```
@@ -61,10 +62,17 @@ of its own (a pty in lambda, a console in atlas) with this one raw and its size 
 it. Its exit code is `carbon exec`'s; without `-t`, Ctrl-C and other signals go to it. It goes over the machine's
 control socket, so it's there on macOS and Linux hosts (not yet Windows hosts).
 
-The image `windows` is Carbon's own: an empty Windows, atlas's system layer and nothing else, whose command is
-`cmd.exe` (as a Windows container image's is). Its System32 has atlas's own `cmd.exe`, `powershell.exe`, `where`,
-`findstr`, `find`, `more`, `sort`, `whoami`, `hostname` and `timeout` (see [atlas](../kernels/atlas/README.md)); a
-program named without a path is found there.
+`carbon import [--platform OS/ARCH] [-c INSTRUCTION]... FILE|- [NAME]` makes an image from a tar of a root file
+system, as `docker import` does. `-c` sets its config with a Dockerfile instruction: `CMD`, `ENTRYPOINT`, `ENV`,
+`WORKDIR` or `USER`. Without `--platform`, a tar whose first entry is `Windows/` is a Windows image for this host's CPU,
+and anything else is Linux's. Without a name, it's named for the file.
+
+Windows' programs come from an image, as Linux's do. **atlas-base**
+([tensorai-co/atlas-base](https://github.com/tensorai-co/atlas-base)) is Carbon's Windows userland: `cmd.exe`,
+`powershell.exe`, `where`, `findstr`, `find`, `more`, `sort`, `whoami`, `hostname` and `timeout`. Its `build.sh` makes
+a tar for each ISA, which `carbon import` takes in as `atlas`. Soon it'll also be on Docker Hub as `tensoraico/atlas`.
+A program named without a path is found at the drive's root, in System32, in `C:\Windows` or in PowerShell's folder.
+The image `windows` is atlas's system layer and nothing else: its runtime DLLs, and no programs.
 
 ## What's coming
 

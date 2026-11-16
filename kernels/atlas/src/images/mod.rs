@@ -71,46 +71,6 @@ pub fn guest(isa: Isa) -> Option<&'static [u8]> {
     (!image.is_empty()).then_some(image)
 }
 
-/// The programs System32 has of atlas's own, as `build.rs` built them from `atlas-programs`: each file's name, and
-/// its build's name.
-pub const PROGRAMS: &[&str] = &["cmd.exe", "hostname.exe", "whoami.exe", "where.exe", "find.exe", "findstr.exe", "sort.exe", "more.com", "timeout.exe", "powershell.exe"];
-
-macro_rules! programs {
-    ($($file:literal => $build:literal),* $(,)?) => {
-        /// One of atlas's own programs for `isa`, by its file name (case folded), or None if it's not one or wasn't
-        /// built.
-        pub fn program(isa: Isa, name: &str) -> Option<&'static [u8]> {
-            let at = match isa {
-                Isa::Arm64 => 0,
-                Isa::X86_64 => 1,
-                Isa::X86_32 => 2,
-            };
-            let image: &'static [u8] = match name.to_ascii_lowercase().as_str() {
-                $($file => [
-                    include_bytes!(concat!(env!("OUT_DIR"), "/", $build, "-aarch64.exe")).as_slice(),
-                    include_bytes!(concat!(env!("OUT_DIR"), "/", $build, "-x86_64.exe")).as_slice(),
-                    include_bytes!(concat!(env!("OUT_DIR"), "/", $build, "-i686.exe")).as_slice(),
-                ][at],)*
-                _ => return None,
-            };
-            (!image.is_empty()).then_some(image)
-        }
-    };
-}
-
-programs! {
-    "cmd.exe" => "cmd",
-    "hostname.exe" => "hostname",
-    "whoami.exe" => "whoami",
-    "where.exe" => "where",
-    "find.exe" => "find",
-    "findstr.exe" => "findstr",
-    "sort.exe" => "sort",
-    "more.com" => "more",
-    "timeout.exe" => "timeout",
-    "powershell.exe" => "powershell",
-}
-
 /// The stub every x86-64 ntdll service starts with, up to its number: `mov r10, rcx; mov eax, ...`.
 const SERVICE_STUB: [u8; 4] = [0x4c, 0x8b, 0xd1, 0xb8];
 

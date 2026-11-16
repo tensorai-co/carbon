@@ -11,7 +11,7 @@ the CPU, inside a hardware VM or a process sandbox.
 ```sh
 carbon run -it debian:13 bash                                  # a shell in a Linux image, with lambda
 carbon run setup.exe                                           # a Windows program, with atlas
-carbon run -it windows powershell                              # Carbon's own empty Windows, and its own PowerShell
+carbon run -it atlas powershell                                # atlas-base, Carbon's Windows userland, and its PowerShell
 carbon run --name web -p 8080:80 debian:13 -- python3 -m http.server 80   # a port the host reaches
 carbon exec -it web bash                                       # from another terminal: a shell in it, as docker exec
 carbon run --isolation vm debian:13 -- ./untrusted.sh          # a hardware VM, or fail
@@ -24,8 +24,9 @@ carbon run --platform linux/amd64 debian:13 -- apt-get install -y curl    # x86-
 ## Why Carbon
 
 - **The kernel brings the OS, the image brings the software.** **lambda** speaks Linux's system calls and runs
-  unmodified OCI images: Debian's own glibc, bash, apt, Python and git. **atlas** is all of Windows as one Rust
-  module, so a Windows program runs with no Windows files anywhere: its DLLs are made in memory.
+  unmodified OCI images: Debian's own glibc, bash, apt, Python and git. **atlas** is Windows' kernel and its runtime
+  DLLs as one Rust module, so a Windows program runs with no Windows files anywhere: its DLLs are made in memory.
+  Programs, Windows' own included, come in images ([below](#what-comes-with-carbon-and-what-comes-in-an-image)).
 - **A hardware VM, or a sandbox, and you know which.** Each host has two ways to run code: a hardware VM (`vm`) and a
   process sandbox for where there's no hypervisor (`sandbox`). `carbon` takes the VM where it can, and when it can't,
   it says so and why. It never falls back silently.
@@ -38,14 +39,63 @@ carbon run --platform linux/amd64 debian:13 -- apt-get install -y curl    # x86-
 - **A network of its own, over the host's sockets.** Each machine has its own addresses, loopback and DNS, with no
   virtual network card: its connections are the host's, so they go as fast as the host's. Ports are published as
   Docker publishes them (TCP and UDP, the client's own address seen inside), or a machine takes the host's network.
-- **Windows' own tools, of its own.** atlas's System32 has `cmd.exe`, `powershell.exe` and the everyday command-line
-  tools, written for Carbon as real Windows programs, so `carbon run -it windows` is a Windows prompt with no
-  Windows files anywhere.
+- **A Windows userland of its own.** [atlas-base](https://github.com/tensorai-co/atlas-base) is `cmd.exe`,
+  `powershell.exe` and the everyday command-line tools, written for Carbon as real Windows programs and built from
+  source into an image, so `carbon run -it atlas` is a Windows prompt with no Microsoft files anywhere.
 - **Screens for computer use.** One desktop both kernels' windows go on, headless or in the host's own windows (on
   macOS today), with screenshots, clicks and keys from the command line, and later remote viewers over QUIC.
 - **Built for agents.** Because Carbon owns the kernels, the library it's becoming will let a program see, in real
   time, every command a machine runs, every connection it makes and everything it writes, and allow, block, rewrite or
   answer each one (see [the order of work](#the-order-of-work), tier 9).
+
+## What comes with Carbon, and what comes in an image
+
+Carbon splits a machine in two, the same way for every kernel:
+
+- **Built in: the engine and its kernels.** The foundational APIs (display, sound, GPU, networking, clocks, the
+  terminal, certificate trust) are builtins: Carbon's own Rust modules, there in every machine. The kernels are
+  ordinary Rust modules too. **lambda** is Linux's system calls, `/proc`, `/sys` and the vDSO. **atlas** is the NT
+  kernel's calls *and* Windows' runtime DLLs (ntdll, kernel32, user32, gdi32, advapi32, ucrtbase and the rest),
+  because on Windows those DLLs are the kernel's interface: every program links against them, and they have to match
+  the kernel under them. So a `.dll` of Windows' own is part of atlas, made in memory. It is never a file in an image.
+  An image doesn't carry its own copy of Windows, and atlas's DLLs are never stored twice.
+- **From an image: everything that's a program.** Anything that isn't foundational is a program, and comes with an
+  image, as it would in Docker: bash, apt and glibc from `debian:13` or any other Linux image, and `cmd.exe`,
+  `powershell.exe`, `findstr` and the rest of Windows' userland from **atlas-base**. A program an image brings uses
+  the image's own files (glibc, an app's own DLLs) as they are.
+
+```
+ an image (pulled, or imported)                  Carbon (one binary)
+┌──────────────────────────────────┐            ┌──────────────────────────────────────────────────┐
+│ debian:13, ubuntu, any Linux:    │   runs on  │ lambda    Linux's system calls, /proc, the vDSO  │
+│   bash, apt, glibc, python, ...  │ ────────►  │                                                  │
+│ atlas (atlas-base):              │            │ atlas     NT's calls, and the runtime DLLs:      │
+│   cmd.exe, powershell.exe,       │ ────────►  │           ntdll, kernel32, user32, ucrtbase, ... │
+│   where, findstr, ...            │            │           the registry, windows, the console     │
+│ your own: an app, an installer   │            ├──────────────────────────────────────────────────┤
+└──────────────────────────────────┘            │ builtins  display, audio, gpu, net, host         │
+                                                │ engine    exec (hvf, kvm, winkvm, sandboxes),    │
+                                                │           layers, images, machine                │
+                                                └──────────────────────────────────────────────────┘
+```
+
+The two kernels draw the line where their OS draws it. Linux's interface is its system calls, so lambda stops there,
+and glibc is the image's. Windows' interface is its system DLLs, so atlas includes them, and `cmd.exe` (just a
+program that calls kernel32) is the image's.
+
+**atlas-base** is Carbon's Windows userland, in a repository of its own,
+[tensorai-co/atlas-base](https://github.com/tensorai-co/atlas-base). Like Debian, it's built from source, with no
+Microsoft binaries. It's built locally and imported:
+
+```sh
+git clone https://github.com/tensorai-co/atlas-base && cd atlas-base && ./build.sh
+carbon import --platform windows/arm64 -c 'CMD ["cmd.exe"]' out/atlas-base-arm64.tar atlas   # windows/amd64 on x86-64
+carbon run -it atlas                                                                         # cmd.exe's prompt
+```
+
+Or, soon, pulled from Docker Hub as `tensoraico/atlas`, like any image: `carbon run -it tensoraico/atlas`. A Windows
+machine with no image (`windows`, or a program from the host such as `carbon run setup.exe`) has atlas's
+`C:\Windows` and its DLLs, and no programs.
 
 ## Where it runs
 
@@ -71,7 +121,8 @@ carbon run -it debian:13 bash                        # pulled if it isn't here; 
 carbon run debian:13 -- ls /                         # a command: its output here, and no stdin (-i gives it this one's)
 carbon run -it --name dev -p 2222:22 debian:13 bash  # named, with a port; `carbon run --name dev` starts it again
 carbon exec -it dev bash                             # from another terminal, a shell in it (-i -t -d -e -w, as docker)
-carbon run -it windows                               # Carbon's own Windows at cmd.exe's prompt (powershell, findstr...)
+carbon import -c 'CMD ["cmd.exe"]' atlas-base-arm64.tar atlas   # atlas-base, built from its repository (see above)
+carbon run -it atlas                                 # a Windows prompt: atlas-base's cmd.exe (powershell, findstr...)
 carbon run setup.exe                                 # a Windows program from this host, on a disk of its own
 carbon run --display host setup.exe                  # on this Mac's screen and speakers
 carbon ls                                            # NAME  FROM  ISOLATION  STATUS  PORTS
@@ -79,7 +130,7 @@ carbon port dev                                      # 22/tcp -> [::]:2222
 carbon stop dev                                      # SIGTERM to its first process; everything ends 10 s later
 carbon freeze dev mine:1                             # an image of a stopped machine's disk
 carbon display screenshot app -o screen.png          # a running machine's screen
-carbon pull debian:13 | images | rmi IMAGE | rm NAME
+carbon pull debian:13 | import TAR NAME | images | rmi IMAGE | rm NAME
 ```
 
 Everything is kept in `CARBON_HOME`, or `~/.carbon`. [`cli`](cli/README.md) has every option, and what's coming.
@@ -122,9 +173,10 @@ serves them to a viewer. The kernels can't tell the difference.
 
 For the whole project:
 
-1. **The kernel brings the OS; the image brings the user's software.** Nothing that belongs to an OS is a file Carbon
-   builds, installs or reads back. atlas's DLLs and lambda's `/proc` are made in memory. An image's own files (glibc,
-   an app's DLLs) are used as they are.
+1. **The kernel brings the OS; the image brings the programs.** The foundational APIs and each kernel's interface
+   (lambda's system calls and `/proc`, atlas's system calls and runtime DLLs) are Rust, made in memory, never files
+   Carbon builds, installs or reads back. Every program is an image's, Windows' own (`cmd.exe`, `powershell.exe`)
+   included: they're atlas-base's, not atlas's. An image's own files (glibc, an app's DLLs) are used as they are.
 2. **One host, two backends, per host-facing module.** Each host has exactly one `vm` and one `sandbox` backend in
    `exec`. `display`, `gpu`, `audio`, `net` and `host` follow the same pattern: a shared part on top, one folder per host,
    and every host-specific line inside its host's folder.
@@ -162,7 +214,9 @@ For the whole project:
 | **host export** | A Windows DLL export whose body is host Rust in atlas, reached through a trap stub |
 | **guest code** | atlas's `ntdll` (`atlas/guest`): the part of Windows that has to run inside the program |
 | **upcall** | atlas running the program's callback from host Rust, nested, and coming back |
-| **system layer** | The `C:\Windows` atlas makes for every machine, since there's no Windows image to bring |
+| **system layer** | The `C:\Windows` atlas makes for every machine: its runtime DLLs, ntdll, fonts and the registry, under whatever an image brings |
+| **builtin** | A foundational API every machine has from Carbon itself, not an image: display, audio, gpu, net, host |
+| **atlas-base** | Carbon's Windows userland as an image (`cmd.exe`, `powershell.exe`, the tools), from [its own repository](https://github.com/tensorai-co/atlas-base); `atlas` when imported, `tensoraico/atlas` on Docker Hub (coming) |
 | **desktop** | `display::Desktop`: a machine's top-level windows, their frames, stacking, focus and input, whichever kernel made them |
 | **device** | `gpu::Device`: a machine's GPU, the host's or the CPU device, with its memory, programs, queue and fences |
 | **IR** | `gpu-ir`: every GPU program between the frontend that read it (SPIR-V, later DXBC, DXIL, PTX) and a backend |
@@ -212,13 +266,15 @@ programs and how to build them are in [lambda's](kernels/lambda/README.md#runnin
   console, and windows on the desktop with input, dialogs and the basic controls, a progress bar and list view, and
   the shell's core (special folders, file operations, running programs, choosing a folder, shortcuts), on ARM64,
   x86-64 and 32-bit x86. A real 32-bit installer runs from its first page to the end, and a 32-bit program downloads
-  and installs its update over HTTPS. Its System32 has its own `cmd.exe` (batch files, `for`, pipes, redirection),
-  `powershell.exe` (a PowerShell-language shell: pipelines of objects, about seventy cmdlets and Windows PowerShell's
-  aliases), and `where`, `findstr`, `find`, `more`, `sort`, `whoami`, `hostname` and `timeout`.
+  and installs its update over HTTPS. **atlas-base**, its userland, has its own `cmd.exe` (batch files, `for`, pipes,
+  redirection), `powershell.exe` (a PowerShell-language shell: pipelines of objects, about seventy cmdlets and Windows
+  PowerShell's aliases), and `where`, `findstr`, `find`, `more`, `sort`, `whoami`, `hostname` and `timeout`, built
+  locally into an image for `windows/arm64` and `windows/amd64` and imported with `carbon import`.
 - **`carbon`** runs machines as Docker runs containers: `run` with `-i`, `-t`, `-p` and `--network`, and `exec -it` into
   a running machine, for both kernels (a pty in lambda, a console of its own in atlas). `carbon run -it debian:13 bash`
   works on all three hosts, from an image pulled over HTTPS (trusting what the host trusts), with machines kept by
-  name, stopped, frozen and started again; `carbon run -it windows` is a Windows prompt.
+  name, stopped, frozen and started again, or imported from a tar (`carbon import`); `carbon run -it atlas` is a
+  Windows prompt.
 - **net** gives each machine its own network over the host's sockets: `apt-get update` and `curl https://` work in
   `debian:13` on all three hosts, and published ports reach programs in both kernels (`ssh -p 2222` into `sshd`, a
   Windows server's TCP and UDP ports), with the client's own address seen inside.
@@ -259,7 +315,8 @@ blocks real work, it moves up. Each item's detail is in the README it links to.
 **2. A machine you can run** ([layers](layers/README.md#to-do), [images](images/README.md#to-do), [machine](machine/README.md#to-do))
 
 `carbon run -it debian:13 bash` and `carbon exec` work. Left: compacting a running machine's log; zstd layers, registry
-logins, streaming layers, clearing unused chunks; the image's working directory and user; `--rm` and `-d`'s logs;
+logins, streaming layers, clearing unused chunks; atlas-base on Docker Hub as `tensoraico/atlas` (one multi-ISA
+image), and Windows machines from it by default; the image's working directory and user; `--rm` and `-d`'s logs;
 stopping, screenshots and `exec` from another process on Windows hosts; a worker process per machine.
 
 **3. lambda runs real Linux software** ([lambda](kernels/lambda/README.md#to-do))
@@ -286,9 +343,11 @@ stopping, screenshots and `exec` from another process on Windows hosts; a worker
 6. The registry: Windows' own hive format, for hives from a real Windows. (Change notification, the 32-bit view, and
    saving, restoring, loading and unloading hives are done.)
 7. 32-bit x86, which installers are: exec's 32-bit translation, the i686 ntdll, `SysWOW64`.
-8. `msiexec` in host Rust, and `reg.exe`, `regsvr32.exe`, `rundll32.exe`. *Done means:* a real `.msi` installs.
-   (Winsock, `cmd.exe`, `powershell.exe` and the everyday command-line tools are done.)
-9. Ctrl+C to a running Windows program (console control handlers), and `tasklist`, `taskkill`, `sc`, `icacls`.
+8. `msi.dll` in host Rust, and in atlas-base, `msiexec.exe`, `reg.exe`, `regsvr32.exe`, `rundll32.exe`. *Done
+   means:* a real `.msi` installs. (Winsock is done, and atlas-base's `cmd.exe`, `powershell.exe` and everyday
+   command-line tools.)
+9. Ctrl+C to a running Windows program (console control handlers), and in atlas-base, `tasklist`, `taskkill`, `sc`,
+   `icacls`.
 10. The long tail of exports, as the `missing` stubs and `carbon atlas imports` name them. (Code pages, the `*A`
     functions and ANSI windows are done.)
 

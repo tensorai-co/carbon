@@ -93,6 +93,9 @@ usage: carbon <command> ...
                                              each DLL and what of it isn't there; for several or a folder, what's
                                              wanted most (--all lists everything)
   pull IMAGE [--platform OS/ARCH]            pull an image
+  import [options] FILE|- [NAME]             an image from a tar of a root file system, as docker import
+      --platform OS/ARCH                     its platform (a tar of C:\\ for Windows, as atlas-base's, is found)
+      -c, --change INSTRUCTION               its config: CMD, ENTRYPOINT, ENV, WORKDIR or USER, as a Dockerfile
   images                                     the images here
   rmi IMAGE                                  forget an image
 ";
@@ -472,6 +475,38 @@ fn main() {
                 images.pull(&name, &platform, |e: images::Entry| [e.mode, e.uid, e.gid, e.rdev as u32], [0o755, 0, 0, 0], progress)
             }
             .unwrap_or_else(|e| fail(e));
+            println!("{} ({})", image.short_name(), image.platform);
+        }
+        "import" => {
+            let (mut platform, mut changes, mut rest) = (None, Vec::new(), Vec::new());
+            while let Some(arg) = args.next() {
+                let (flag, inline) = match arg.split_once('=') {
+                    Some((f, v)) if f.starts_with("--") => (f.to_string(), Some(v.to_string())),
+                    _ => (arg.clone(), None),
+                };
+                let mut value = |what: &str| inline.clone().or_else(|| args.next()).unwrap_or_else(|| fail(format!("{what} needs a value")));
+                match flag.as_str() {
+                    "--platform" => {
+                        let text = value("--platform");
+                        platform = Some(Platform::parse(&text).unwrap_or_else(|| fail(format!("{text} isn't a platform: windows/arm64, linux/amd64, ..."))));
+                    }
+                    "-c" | "--change" => changes.push(value("--change")),
+                    _ => rest.push(arg),
+                }
+            }
+            let Some(file) = rest.first() else { fail("import needs a tar: carbon import atlas-base-arm64.tar atlas") };
+            let tar = if file == "-" {
+                let mut data = Vec::new();
+                std::io::Read::read_to_end(&mut std::io::stdin(), &mut data).unwrap_or_else(|e| fail(format!("reading stdin: {e}")));
+                data
+            } else {
+                std::fs::read(file).unwrap_or_else(|e| fail(format!("{file}: {e}")))
+            };
+            let name = rest.get(1).cloned().unwrap_or_else(|| {
+                let stem = Path::new(file).file_stem().and_then(|s| s.to_str()).unwrap_or("imported");
+                format!("{stem}:latest")
+            });
+            let image = machines.import(&name, &tar, platform, &changes).unwrap_or_else(|e| fail(e));
             println!("{} ({})", image.short_name(), image.platform);
         }
         "images" => {

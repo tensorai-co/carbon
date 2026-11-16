@@ -396,6 +396,53 @@ impl Machines {
     }
 
     /// Freezes a stopped machine's disk, as it is, into an image called `image`.
+    /// An image from a tar of a root file system, as `docker import` makes one: named `name`, for `platform` (else a
+    /// Windows one for this host's CPU if the tar's first entry is `Windows/`, as atlas-base's are, or Linux's), with
+    /// its config from `changes`, each a Dockerfile instruction: `CMD`, `ENTRYPOINT`, `ENV`, `WORKDIR`, `USER`.
+    pub fn import(&self, name: &str, tar: &[u8], platform: Option<Platform>, changes: &[String]) -> Result<Image, String> {
+        let first = tar.get(..100).map(|n| String::from_utf8_lossy(n).trim_end_matches('\0').to_string()).unwrap_or_default();
+        let platform = platform.unwrap_or_else(|| {
+            if first.trim_start_matches("./").to_ascii_lowercase().starts_with("windows") {
+                Platform { os: "windows".into(), arch: if cfg!(target_arch = "aarch64") { "arm64" } else { "amd64" }.into() }
+            } else {
+                Platform::linux_here()
+            }
+        });
+        let windows = platform.os == "windows";
+        let mut config = Config::default();
+        for change in changes {
+            let (instruction, rest) = change.trim().split_once(char::is_whitespace).ok_or_else(|| format!("--change {change}: an instruction and its value"))?;
+            let rest = rest.trim();
+            // `["a", "b"]`, or a shell's line, as Docker reads them.
+            let argv = || -> Result<Vec<String>, String> {
+                if rest.starts_with('[') {
+                    serde_json::from_str::<Vec<String>>(rest).map_err(|e| format!("--change {change}: {e}"))
+                } else if windows {
+                    Ok(vec!["cmd".into(), "/S".into(), "/C".into(), rest.to_string()])
+                } else {
+                    Ok(vec!["/bin/sh".into(), "-c".into(), rest.to_string()])
+                }
+            };
+            match instruction.to_ascii_uppercase().as_str() {
+                "CMD" => config.cmd = argv()?,
+                "ENTRYPOINT" => config.entrypoint = argv()?,
+                "WORKDIR" => config.workdir = rest.to_string(),
+                "USER" => config.user = rest.to_string(),
+                "ENV" => {
+                    let (k, v) = rest.split_once(['=', ' ']).ok_or_else(|| format!("--change {change}: ENV NAME=VALUE"))?;
+                    config.env.retain(|e| e.split('=').next() != Some(k));
+                    config.env.push(format!("{k}={}", v.trim_matches('"')));
+                }
+                other => return Err(format!("--change {change}: {other} isn't CMD, ENTRYPOINT, ENV, WORKDIR or USER")),
+            }
+        }
+        if windows {
+            self.images.import(name, tar, &platform, &config, |_| atlas::Meta::default(), atlas::Meta { attributes: 0x10 })
+        } else {
+            self.images.import(name, tar, &platform, &config, lambda::Meta::from, lambda::Meta::dir(0o755))
+        }
+    }
+
     pub fn freeze(&self, name: &str, image: &str) -> Result<Image, String> {
         let record = self.record(name).ok_or_else(|| format!("there's no machine called {name}"))?;
         if record.running() {
@@ -805,7 +852,10 @@ impl Machines {
                 let gpu = open_gpu(run.gpu)?;
                 let options = atlas::Options { stop, env, display: desktop, trace: std::env::var_os("CARBON_TRACE").is_some(), gpu, network: Some(network), pipes: !(run.interactive && run.tty) };
                 // A program named without a path is atlas's own in System32 (cmd), or one at the drive's root.
-                let program = atlas::find_program(&disk, &args[0]).ok_or_else(|| format!("{}: not found on the machine's disk or in System32", args[0]))?;
+                // Windows' own programs (cmd, powershell, ...) come from an image: atlas-base's.
+                let program = atlas::find_program(&disk, &args[0]).ok_or_else(|| {
+                    format!("{}: not on the machine's disk. Windows' programs (cmd, powershell, where, ...) come from atlas-base: build it (github.com/tensorai-co/atlas-base), `carbon import` it, and run a machine from that image", args[0])
+                })?;
                 let argv: Vec<&str> = std::iter::once(program.as_str()).chain(args[1..].iter().map(String::as_str)).collect();
                 atlas::boot(exec, cpu, disk, host, &argv, options).map(|ended| ended.code as i32)
             }

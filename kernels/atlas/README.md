@@ -1,8 +1,15 @@
 # atlas
 
-atlas runs Windows programs. It is all of Windows that programs reach, as one Rust module: every system DLL is a
-declaration made into a PE in memory, so a machine has no Windows files to install, and the one part of Windows that
-has to run inside the program, ntdll, is a crate (`guest/`) that cargo builds for each ISA and embeds.
+atlas runs Windows programs. It is Windows' kernel and the runtime DLLs every program links against, as one Rust
+module: every system DLL is a declaration made into a PE in memory, so a machine has no Windows files to install, and
+the one part of Windows that has to run inside the program, ntdll, is a crate (`guest/`) that cargo builds for each ISA
+and embeds.
+
+**What's atlas's, and what's an image's.** A DLL a Windows program links against (ntdll, kernel32, user32, ucrtbase
+and the rest) is atlas's, made in memory, never a file in an image. A program is an image's, even one Windows ships:
+`cmd.exe`, `powershell.exe` and the command-line tools are
+[atlas-base](https://github.com/tensorai-co/atlas-base), Carbon's Windows userland, built from its own repository and
+imported (`carbon import`), as bash is Debian's. A machine with no image has atlas's `C:\Windows` and no programs.
 
 **Where it stands.** Programs run on ARM64 natively and x86-64 translated, and 32-bit x86 programs run too (WoW64,
 translated on Apple silicon; phases 1 to 5 of its six, below, are done): 31 of the test programs pass every check as
@@ -31,10 +38,7 @@ gaps and all, which programs import oleaut32's, ws2_32's and some of shell32's b
 
 ```
 kernels/atlas/
-  build.rs        builds guest/ and programs/ for each ISA (ARM64, x86-64 and i686) and embeds them
-  programs/       atlas-programs: the programs System32 has, as real Windows programs in no_std Rust: cmd.exe,
-                  powershell.exe (a PowerShell-language shell), where, findstr, find, more.com, sort, whoami,
-                  hostname, timeout
+  build.rs        builds guest/ for each ISA (ARM64, x86-64 and i686) and embeds it
   abi/            atlas-abi: what guest/ and atlas share (call numbers, TEB/PEB/CONTEXT layouts at 64 and 32 bits,
                   status codes)
   guest/          atlas-guest: ntdll, the in-process part (loader, heap, sync, exceptions and unwinding, environment);
@@ -975,29 +979,17 @@ interface is the to-do, not each export.
 
 ### 7. The programs Windows ships
 
-Built (`programs/`, in System32 for each ISA, so a 32-bit program gets SysWOW64's): **`cmd.exe`** with its own
-commands (DIR, CD, SET with `/A` and `/P`, COPY, DEL, MD, RD, REN, MOVE, TYPE, ECHO, IF, FOR with `/D`, `/R`, `/L`
-and `/F`, CALL, GOTO, SHIFT, SETLOCAL and ENDLOCAL, PUSHD, POPD, START, MKLINK, TITLE, VER, VOL, PATH, PROMPT,
-PAUSE, DATE, TIME, CLS, EXIT), batch files with labels and `%~dp0`-style modifiers, `%` and delayed `!` expansion,
-`&`, `&&`, `||`, pipes (a side that's cmd's own runs in a `cmd /S /D /C` of its own, as cmd does it), redirection
-(`>`, `>>`, `<`, `2>&1`, `nul`), and `/C`, `/K`, `/S`, `/Q`, `/V:ON`; **`powershell.exe`**, a PowerShell-language
-shell of atlas's own (Windows PowerShell is a .NET program): values and pipelines of objects, `$env:`, `"$x $(...)"`,
-here-strings, arrays, hashtables, script blocks, PowerShell's operators (`-eq`, `-like`, `-match` with `$matches`,
-`-replace`, `-split`, `-join`, `-f`, `..`, casts, `-is`, `-as`), `if`, `foreach`, `while`, `do`, `for`, `switch`,
-`function` with `param()`, `try`/`catch`/`finally`, a regular expression engine of its own, about seventy cmdlets
-(the file system's, `ForEach-Object`, `Where-Object`, `Select-Object`, `Sort-Object`, `Measure-Object`,
-`Group-Object`, `Format-Table`/`List`, `Out-File`, `Select-String`, `Get-Date`, `Start-Process`, `ConvertTo-Json`
-and the rest) with Windows PowerShell 5.1's aliases (`dir`, `ls`, `cd`, `cat`, `%`, `?`), static members
-(`[math]`, `[string]`, `[System.IO.Path]`, `[Environment]`, `[regex]`), its default formatting (Get-ChildItem's
-table, Name/Value, tables and lists), and its command line (`-Command`, `-File`, `-EncodedCommand`, `-NoProfile`,
-`-NoLogo`, `-NonInteractive`, `-NoExit`, `-ExecutionPolicy`); and `where`, `findstr` (with findstr's regular
-expressions), `find`, `more.com`, `sort`, `whoami`, `hostname` and `timeout`.
+These aren't atlas's: they're programs, so they're
+[atlas-base](https://github.com/tensorai-co/atlas-base)'s, in an image. atlas-base has `cmd.exe` (its own commands,
+batch files, `%` and `!` expansion, pipes and redirection), `powershell.exe` (a PowerShell-language shell of its own:
+pipelines of objects, about seventy cmdlets), and `where`, `findstr`, `find`, `more.com`, `sort`, `whoami`, `hostname`
+and `timeout`, each in System32 and SysWOW64. Its README has the detail and what's to come (`reg.exe`, `regsvr32.exe`,
+`rundll32.exe`, `msiexec.exe`, `tasklist`, `taskkill`, ...).
 
-To come: `reg.exe`, `regsvr32.exe`, `rundll32.exe` and `msiexec.exe`; then `sc.exe`, `taskkill`, `tasklist`,
-`schtasks`, `icacls`, `attrib`, `xcopy`, `robocopy`, `choice`, `explorer.exe` and `notepad.exe`; in cmd, filename
-completion and Ctrl+C to a running program (`SetConsoleCtrlHandler`'s handlers); in PowerShell, classes, modules,
-`$PROFILE`, `Get-Process` and `Stop-Process` over the machine's processes, and `powershell.exe` in
-`WindowsPowerShell\v1.0` as well as System32; the system layer's files dated other than 1970.
+What atlas owes them: `find_program` finds a program named without a path where an image puts Windows' programs (the
+drive's root, System32, `C:\Windows`, PowerShell's folder), and the default `Path` has those folders. To come here:
+Ctrl+C to a running console program (`SetConsoleCtrlHandler`'s handlers), the exports each new atlas-base program
+asks for, and the system layer's files dated other than 1970.
 
 ### Across every layer
 
@@ -1077,8 +1069,8 @@ completion and Ctrl+C to a running program (`SetConsoleCtrlHandler`'s handlers);
 Installers, winget and large desktop apps go past the layers' first items, in roughly this order:
 
 1. **What stops them starting:** `__unDName` (checked against `llvm-undname`) and the C++ runtime's internals;
-   `reg.exe`, `regsvr32.exe`, `rundll32.exe` and `cmd.exe`; then `conhost`, `taskkill`, `icacls`, `schtasks`,
-   PowerShell for installer scripts, `explorer.exe`.
+   in atlas-base, `reg.exe`, `regsvr32.exe` and `rundll32.exe`; then `conhost`, and atlas-base's `taskkill`, `icacls`,
+   `schtasks`, PowerShell for installer scripts, `explorer.exe`.
 2. **What ordinary programs use:** menus; real fonts and the rest of GDI, with `DrawTextExW`, `ScrollWindowEx` and
    Uniscribe; real icons and cursors; services; restricted tokens, job objects with limits, and desktops and window
    stations (a browser engine's sandbox); `msi.dll` with compound files written.

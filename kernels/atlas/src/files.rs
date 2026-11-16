@@ -405,16 +405,13 @@ impl Task {
         }
     }
 
-    /// A system-layer file: one of atlas's DLLs or programs, as `System32` or `SysWOW64` has it.
-    pub(crate) fn system_file(&self, disk_path: &str) -> Option<Arc<Vec<u8>>> {
+    /// A system-layer file: one of atlas's DLLs, as `System32` or `SysWOW64` has it.
+    fn system_file(&self, disk_path: &str) -> Option<Arc<Vec<u8>>> {
         let lower = disk_path.to_ascii_lowercase();
         let (dir, name) = lower.rsplit_once('/')?;
         let isa = self.system_isa(dir)?;
         if name == "ntdll.dll" {
             return images::guest(isa).map(|image| Arc::new(image.to_vec()));
-        }
-        if let Some(program) = images::program(isa, name) {
-            return Some(Arc::new(program.to_vec()));
         }
         let dll = os::find(name)?;
         (os::DLLS[dll].name.to_ascii_lowercase() == name).then(|| self.k.images.get(isa, dll))
@@ -430,11 +427,6 @@ impl Task {
             .collect();
         if let Some(image) = images::guest(isa) {
             found.push(Found { name: "ntdll.dll".to_string(), attributes: FILE_ATTRIBUTE_ARCHIVE, size: image.len() as u64, modified: 0, created: 0, accessed: 0 });
-        }
-        for name in images::PROGRAMS {
-            if let Some(image) = images::program(isa, name) {
-                found.push(Found { name: name.to_string(), attributes: FILE_ATTRIBUTE_ARCHIVE, size: image.len() as u64, modified: 0, created: 0, accessed: 0 });
-            }
         }
         found
     }

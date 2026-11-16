@@ -47,7 +47,8 @@ let status = lambda::boot(exec, cpu, disk, host, &argv, options)?;   // or atlas
 ## Seen working
 
 `carbon run -it debian:13 bash` and `carbon exec -it NAME bash` (their own pty, `TERM=xterm`, the exit code back),
-`exec` with `-i` piped, `-e`, `-w` and `-d`; `carbon run -it windows` at cmd.exe's prompt and `powershell`, and
+`exec` with `-i` piped, `-e`, `-w` and `-d`; `carbon run -it atlas` (atlas-base, imported) at cmd.exe's prompt and
+`powershell`, and
 `carbon exec -it` into a running Windows machine, with line editing and history; all on macOS.
 
 On all three hosts (macOS through hvf; Linux through kvm and its sandbox; Windows through winkvm): `debian:13` pulled,
