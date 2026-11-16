@@ -310,6 +310,14 @@ fn boot(store: &Store, record: &Record, launch: &Launch, parts: Parts, notify: &
             // An image's own environment takes the place of lambda's, and few set HOME: it's the image user's home
             // from its passwd file, as a container runtime makes it.
             let mut env = if env.is_empty() { lambda::Options::default().env } else { env };
+            // Where its display and sound are is the machine's to say: an image's own `DISPLAY=:99` or
+            // `XDG_RUNTIME_DIR` names a server that isn't there, so it goes, and lambda puts its own. One set with `-e`
+            // stays, as asked. (It always has sound: the mixer below.)
+            let display = desktop.is_some();
+            env.retain(|e| {
+                let key = e.split('=').next().unwrap_or("");
+                !lambda::owns_env(key, display, true) || launch.env.iter().any(|v| v.split('=').next() == Some(key))
+            });
             // A console is a terminal programs can draw on: `xterm`, as Docker says with `-t`.
             if host::Host::is_terminal(&*host) && !env.iter().any(|e| e.starts_with("TERM=")) {
                 env.push("TERM=xterm".into());

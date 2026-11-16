@@ -201,19 +201,8 @@ impl Status {
 pub fn boot(mut exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&str], options: Options) -> Result<Status, String> {
     let mut disk = disk;
     let mut options = options;
-    let pulse_server = format!("unix:{}", os::pulse::SOCKET);
-    let mut wanted: Vec<(&str, &str)> = Vec::new();
-    if options.display.is_some() {
-        wanted.extend([("XDG_RUNTIME_DIR", os::wayland::RUNTIME_DIR), ("WAYLAND_DISPLAY", os::wayland::DISPLAY), ("DISPLAY", os::x11::DISPLAY)]);
-    }
-    if options.audio.is_some() {
-        wanted.extend([("XDG_RUNTIME_DIR", os::wayland::RUNTIME_DIR), ("PULSE_SERVER", pulse_server.as_str())]);
-    }
-    for (key, value) in wanted {
-        if !options.env.iter().any(|e| e.split('=').next() == Some(key)) {
-            options.env.push(format!("{key}={value}"));
-        }
-    }
+    let (display, audio) = (options.display.is_some(), options.audio.is_some());
+    own_env(display, audio, &mut options.env);
     os::populate(&mut disk, options.gpu.is_some());
     let mount_ns = fs::mount::MountNs::new(fs::mount::Mounts::boot(&disk));
     let boot_ns = ns::Namespaces::boot(mount_ns, admin::Names { host: options.hostname.clone(), domain: "(none)".to_string() });
@@ -284,6 +273,61 @@ pub fn boot(mut exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&
     }
     kernels_core::thread::let_go(&kernel);
     result
+}
+
+/// Whether `key` is one of the variables that say where the machine's own servers are, which the kernel puts in every
+/// program's environment: a machine with a desktop has `DISPLAY`, `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR`; one with
+/// sound has `XDG_RUNTIME_DIR` and `PULSE_SERVER`. Whoever puts a machine together drops an image's own values for
+/// these (they name servers that aren't there), so the machine's are the ones its programs see.
+pub fn owns_env(key: &str, display: bool, audio: bool) -> bool {
+    match key {
+        "DISPLAY" | "WAYLAND_DISPLAY" => display,
+        "PULSE_SERVER" => audio,
+        "XDG_RUNTIME_DIR" => display || audio,
+        _ => false,
+    }
+}
+
+/// Puts where the machine's display and sound servers are in `env`, wherever it doesn't say (unset, or set empty,
+/// which X and Wayland's libraries take as unset): `DISPLAY=:0`, `WAYLAND_DISPLAY=wayland-0` and
+/// `XDG_RUNTIME_DIR=/run/user/0` with a desktop, `PULSE_SERVER` with sound. Done for process 1, for every `carbon
+/// exec`, and at every `execve`, so a program started through `env -i`, `su -`, `sudo` or an ssh session finds the
+/// display as its parent did. A value a program sets itself is kept: a nested X server's `DISPLAY=:1` still works. If
+/// `XDG_RUNTIME_DIR` names somewhere else, `WAYLAND_DISPLAY` is the socket's whole path, which libwayland takes as is.
+fn own_env(display: bool, audio: bool, env: &mut Vec<String>) {
+    fn get<'e>(env: &'e [String], key: &str) -> Option<&'e str> {
+        env.iter().rev().find_map(|e| e.strip_prefix(key)?.strip_prefix('=')).filter(|v| !v.is_empty())
+    }
+    fn set(env: &mut Vec<String>, key: &str, value: &str) {
+        env.retain(|e| e.split('=').next() != Some(key));
+        env.push(format!("{key}={value}"));
+    }
+    let runtime = get(env, "XDG_RUNTIME_DIR").map(|r| r.trim_end_matches('/').to_string());
+    if (display || audio) && runtime.is_none() {
+        set(env, "XDG_RUNTIME_DIR", os::wayland::RUNTIME_DIR);
+    }
+    if display {
+        if get(env, "WAYLAND_DISPLAY").is_none() {
+            let wayland = match runtime.as_deref() {
+                None | Some(os::wayland::RUNTIME_DIR) => os::wayland::DISPLAY.to_string(),
+                Some(_) => format!("{}/{}", os::wayland::RUNTIME_DIR, os::wayland::DISPLAY),
+            };
+            set(env, "WAYLAND_DISPLAY", &wayland);
+        }
+        if get(env, "DISPLAY").is_none() {
+            set(env, "DISPLAY", os::x11::DISPLAY);
+        }
+    }
+    if audio && get(env, "PULSE_SERVER").is_none() {
+        set(env, "PULSE_SERVER", &format!("unix:{}", os::pulse::SOCKET));
+    }
+}
+
+impl Kernel {
+    /// [`own_env`], for this machine's servers.
+    pub(crate) fn own_env(&self, env: &mut Vec<String>) {
+        own_env(self.options.display.is_some(), self.options.audio.is_some(), env);
+    }
 }
 
 fn run_init(kernel: &Arc<Kernel>, cpu: Cpu, argv: &[&str]) -> Result<Status, String> {
@@ -392,5 +436,42 @@ impl Kernel {
         for process in all {
             process.end(Status::Killed(abi::SIGKILL));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::own_env;
+
+    fn env(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_cleared_environment_finds_the_display() {
+        let mut e = env(&[]);
+        own_env(true, true, &mut e);
+        assert_eq!(e, env(&["XDG_RUNTIME_DIR=/run/user/0", "WAYLAND_DISPLAY=wayland-0", "DISPLAY=:0", "PULSE_SERVER=unix:/run/user/0/pulse/native"]));
+    }
+
+    #[test]
+    fn empty_counts_as_unset_and_a_programs_own_value_stays() {
+        let mut e = env(&["DISPLAY=", "WAYLAND_DISPLAY=nested-1"]);
+        own_env(true, false, &mut e);
+        assert_eq!(e, env(&["WAYLAND_DISPLAY=nested-1", "XDG_RUNTIME_DIR=/run/user/0", "DISPLAY=:0"]));
+    }
+
+    #[test]
+    fn another_runtime_dir_gets_the_sockets_whole_path() {
+        let mut e = env(&["XDG_RUNTIME_DIR=/tmp/runtime-root"]);
+        own_env(true, false, &mut e);
+        assert_eq!(e, env(&["XDG_RUNTIME_DIR=/tmp/runtime-root", "WAYLAND_DISPLAY=/run/user/0/wayland-0", "DISPLAY=:0"]));
+    }
+
+    #[test]
+    fn no_desktop_no_display() {
+        let mut e = env(&["PATH=/bin"]);
+        own_env(false, false, &mut e);
+        assert_eq!(e, env(&["PATH=/bin"]));
     }
 }

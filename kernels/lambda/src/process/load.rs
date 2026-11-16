@@ -98,10 +98,12 @@ impl Task {
             };
             Ok((strings(argv_at)?, strings(envp_at)?))
         });
-        let (argv, env) = match read {
+        let (argv, mut env) = match read {
             Ok(r) => r,
             Err(e) => return Err(e).into(),
         };
+        // Where the machine's display and sound are, even if the caller cleared its environment (`env -i`, `su -`).
+        self.k.own_env(&mut env);
         // The machine's hooks see it first, and may stop it, change it, or answer it.
         let (path, argv, env) = match self.hook_exec(path, argv, env) {
             Ok(run) => run,

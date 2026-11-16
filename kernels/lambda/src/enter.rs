@@ -90,7 +90,9 @@ impl Stop {
         let ended = Arc::new((std::sync::Mutex::new(None::<Status>), std::sync::Condvar::new()));
         lock(&k.entered).insert(pid, ended.clone());
         let started = {
-            let (k, env, ctty) = (k.clone(), spec.env.clone(), tty.clone());
+            let mut env = spec.env.clone();
+            k.own_env(&mut env);
+            let (k, ctty) = (k.clone(), tty.clone());
             kernels_core::thread::spawn(k.exec.clone(), format!("lambda {pid}"), move |cx| {
                 process::start_entered(&k, cx, pid, &argv, &env, files, ctty, cwd).map_err(|e| format!("exec: {path}: {e:?}"))
             })
