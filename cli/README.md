@@ -50,7 +50,7 @@ carbon atlas imports ~/installers/          # a folder of them: which load, and 
 | `--platform OS/ARCH` | Which build of an image to pull; Linux for this CPU by default |
 | `--display headless=WxH[@SCALE]\|host[=WxH]\|host-windows\|none` | Where its windows go: a screen in memory (`headless=1280x800` by default), the whole desktop in a window on this Mac's screen (which closing stops the machine), or each window in a Mac window of its own |
 | `--gpu auto\|host\|software\|none` | Its GPU: the host's if there is one, else the CPU device (`auto`, the default, which says so when it takes the CPU device), the host's or fail, the CPU device, or none. Linux machines reach it through lambda's Vulkan driver; Windows machines don't yet |
-| `--audio none` | Where its sound goes: only `none` until `audio` is built |
+| `--audio auto\|host\|none\|FILE.wav` | Where its sound goes: the host's speakers when it's on the host's screen (`auto`, the default), the host's speakers or fail, nowhere, or a WAV file of everything played |
 | `-e`, `--env NAME=VALUE` | An environment variable, over the image's |
 | `--memory SIZE` | How much memory it may use, as `512m` or `4g` (`4g` by default; only what's touched is taken) |
 
@@ -75,8 +75,6 @@ Each module's README has its part; together:
 carbon run --gpu host=NAME …                  # one of several host GPUs
 carbon ls                                     # gains a GPU column beside ISOLATION
 
-# audio
-carbon run --audio host … | --audio out.wav …
 
 # net: policy, and networks between machines (ports in are built: -p, --network nat|host|none, carbon port)
 carbon run --net lab --allow pypi.org:443 --deny 0.0.0.0/0 --dns 1.1.1.1 --hostname web …

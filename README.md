@@ -9,10 +9,13 @@ kernels, written from scratch in Rust, so a machine is ready the moment it start
 the CPU, inside a hardware VM or a process sandbox.
 
 ```sh
-carbon run debian:13 -- bash                            # a Linux image, with lambda
-carbon run setup.exe                                    # a Windows program, with atlas
-carbon run --isolation vm debian:13 -- ./untrusted.sh   # a hardware VM, or fail
-carbon run --platform linux/amd64 debian:13 -- apt-get install -y curl   # x86-64, translated on Apple silicon
+carbon run -it debian:13 bash                                  # a shell in a Linux image, with lambda
+carbon run setup.exe                                           # a Windows program, with atlas
+carbon run -it windows powershell                              # Carbon's own empty Windows, and its own PowerShell
+carbon run --name web -p 8080:80 debian:13 -- python3 -m http.server 80   # a port the host reaches
+carbon exec -it web bash                                       # from another terminal: a shell in it, as docker exec
+carbon run --isolation vm debian:13 -- ./untrusted.sh          # a hardware VM, or fail
+carbon run --platform linux/amd64 debian:13 -- apt-get install -y curl    # x86-64, translated on Apple silicon
 ```
 
 [![Hosts](https://img.shields.io/badge/hosts-macOS%20(Apple%20silicon)%20%7C%20Linux%20x86--64%20%7C%20Windows%20x86--64-333333?style=flat-square)](#where-it-runs)
@@ -30,10 +33,19 @@ carbon run --platform linux/amd64 debian:13 -- apt-get install -y curl   # x86-6
   memory its programs touch, and nothing more.
 - **x86 on Apple silicon.** A built-in translator, with the CPU's own TSO mode for x86 memory ordering: Debian's
   x86-64 image installs packages with apt, translated.
+- **Used as Docker is.** `carbon run` with `-i`, `-t`, `-p` and `--network`, and `carbon exec -it` into a running
+  machine, mean what they mean in Docker, for Linux images and Windows programs alike.
 - **A network of its own, over the host's sockets.** Each machine has its own addresses, loopback and DNS, with no
-  virtual network card: its connections are the host's, so they go as fast as the host's.
+  virtual network card: its connections are the host's, so they go as fast as the host's. Ports are published as
+  Docker publishes them (TCP and UDP, the client's own address seen inside), or a machine takes the host's network.
+- **Windows' own tools, of its own.** atlas's System32 has `cmd.exe`, `powershell.exe` and the everyday command-line
+  tools, written for Carbon as real Windows programs, so `carbon run -it windows` is a Windows prompt with no
+  Windows files anywhere.
 - **Screens for computer use.** One desktop both kernels' windows go on, headless or in the host's own windows (on
   macOS today), with screenshots, clicks and keys from the command line, and later remote viewers over QUIC.
+- **Built for agents.** Because Carbon owns the kernels, the library it's becoming will let a program see, in real
+  time, every command a machine runs, every connection it makes and everything it writes, and allow, block, rewrite or
+  answer each one (see [the order of work](#the-order-of-work), tier 9).
 
 ## Where it runs
 
@@ -44,7 +56,8 @@ carbon run --platform linux/amd64 debian:13 -- apt-get install -y curl   # x86-6
 | Windows x86-64 | `winkvm`, Carbon's own VT-x driver (test-signed) | a stub process under the debug API, a restricted token and a job (one CPU, atlas only) |
 
 All six backends run real programs and pass the same conformance suite. Linux and Windows are tested in GCP VMs with
-nested virtualization. [`exec`](exec/README.md) has what each runs, and what's left.
+nested virtualization: through kvm and winkvm, both kernels' x86-64 test programs pass (but for lambda's vDSO clock
+page), and atlas's 32-bit ones through winkvm. [`exec`](exec/README.md) has what each runs, and what's left.
 
 ## Quickstart
 
@@ -54,13 +67,18 @@ You need Rust. On macOS the binary is signed for the hypervisor.
 cargo build --release -p cli
 codesign --force --sign - --entitlements carbon.entitlements target/release/carbon   # macOS only
 
-carbon run debian:13 -- bash                 # pulled if it isn't here; a machine called debian
-carbon run --name dev debian:13              # named: `carbon run --name dev` starts it again, files as they were
-carbon run setup.exe                         # a Windows program, on a disk of its own
-carbon ls                                    # NAME  FROM  ISOLATION  STATUS
-carbon stop dev                              # SIGTERM to its first process; everything ends 10 s later
-carbon freeze dev mine:1                     # an image of a stopped machine's disk
-carbon display screenshot app -o screen.png  # a running machine's screen
+carbon run -it debian:13 bash                        # pulled if it isn't here; a machine called debian; -it: a shell
+carbon run debian:13 -- ls /                         # a command: its output here, and no stdin (-i gives it this one's)
+carbon run -it --name dev -p 2222:22 debian:13 bash  # named, with a port; `carbon run --name dev` starts it again
+carbon exec -it dev bash                             # from another terminal, a shell in it (-i -t -d -e -w, as docker)
+carbon run -it windows                               # Carbon's own Windows at cmd.exe's prompt (powershell, findstr...)
+carbon run setup.exe                                 # a Windows program from this host, on a disk of its own
+carbon run --display host setup.exe                  # on this Mac's screen and speakers
+carbon ls                                            # NAME  FROM  ISOLATION  STATUS  PORTS
+carbon port dev                                      # 22/tcp -> [::]:2222
+carbon stop dev                                      # SIGTERM to its first process; everything ends 10 s later
+carbon freeze dev mine:1                             # an image of a stopped machine's disk
+carbon display screenshot app -o screen.png          # a running machine's screen
 carbon pull debian:13 | images | rmi IMAGE | rm NAME
 ```
 
@@ -74,9 +92,9 @@ Everything is kept in `CARBON_HOME`, or `~/.carbon`. [`cli`](cli/README.md) has 
 | The OS | [`kernels`](kernels/README.md) | lambda (Linux) and atlas (Windows), on a shared `kernels-core`; [obsidian](kernels/obsidian/README.md) (Android) later | Being built |
 | The disk | [`layers`](layers/README.md) | The file system programs see: an image's index, merged, with the machine's own log on top | Built |
 | The screen | [`display`](display/README.md) | The desktop both kernels' windows go on: frames, stacking, focus and input, on a screen in memory or the host's windows | The desktop is built, and shown on macOS, whole or a Mac window for each window |
-| The GPU | [`gpu`](gpu/README.md) | One device both kernels' graphics and compute APIs lower onto: the host's GPU, or one on the CPU | Built: SPIR-V compute and draws on Metal and the CPU device; Vulkan in Linux machines (vkcube on the M1) |
-| The sound | [`audio`](audio/README.md) | The mixer every program's sound goes into, and the microphone | Playback built: the mixer, the Mac's speakers, lambda's PulseAudio server |
-| The network | [`net`](net/README.md) | Every socket: the machine's addresses, loopback, Unix sockets and DNS, out through the host's sockets | Out works; in, policy and Winsock to do |
+| The GPU | [`gpu`](gpu/README.md) | One device both kernels' graphics and compute APIs lower onto: the host's GPU, or one on the CPU | Built: SPIR-V compute and draws on Metal and the CPU device; Vulkan and OpenGL in Linux machines; atlas's Direct3D 11 begun |
+| The sound | [`audio`](audio/README.md) | The mixer every program's sound goes into, and the microphone | Playback built: the mixer, the Mac's speakers, a WAV file, lambda's PulseAudio server |
+| The network | [`net`](net/README.md) | Every socket: the machine's addresses, loopback, Unix sockets and DNS, over the host's sockets | Out and in (published ports, `--network host` and `none`) for both kernels; policy and networks between machines to do |
 | The host | [`host`](host/README.md) | Standard streams, clocks, randomness, memory, the terminal, certificate trust | Built |
 
 Around them:
@@ -84,10 +102,10 @@ Around them:
 | Module | What it is | State |
 | --- | --- | --- |
 | [`images`](images/README.md) | What machines start from, on the host's disk: pulled OCI images, imports, frozen machines | Built |
-| [`machine`](machine/README.md) | Puts one machine together and owns its life | Built, for what exists |
+| [`machine`](machine/README.md) | Puts one machine together and owns its life: run, `exec`, stop, freeze, its ports, console and control socket | Built; to become the core of the `carbon` library |
 | [`remote`](remote/README.md) | A machine's desktop and sound, shown and driven from another computer over QUIC | Not started |
-| [`cli`](cli/README.md) | The `carbon` command | Built |
-| [`sdk`](sdk/README.md) | Carbon as a Rust library | Not started |
+| [`cli`](cli/README.md) | The `carbon` command | Built; to become a thin layer over the `carbon` library |
+| [`sdk`](sdk/README.md) | Carbon as a Rust library | Being redesigned as the crate `carbon`, with real-time hooks for agents |
 
 ```
 cli, sdk ──► machine ──► kernels ──► exec, layers, display, gpu, audio, net, host
@@ -150,8 +168,10 @@ For the whole project:
 | **IR** | `gpu-ir`: every GPU program between the frontend that read it (SPIR-V, later DXBC, DXIL, PTX) and a backend |
 | **mixer** | `audio`'s: every program's sound streams, converted and mixed for each output |
 | **viewer** | `carbon connect`, showing a machine's desktop from another computer |
-| **network** | `net::Network`: a machine's addresses, loopback, ports and policy; a named one (`--net lab`) is shared by machines |
+| **network** | `net::Network`: a machine's addresses, loopback, ports and policy; its mode is `--network nat`, `host` or `none` (and later a name, shared by machines) |
 | **publish** | Make a machine's port reachable from a host port (`--publish 8080:80`) |
+| **console** | A machine's terminal with `-it`: the host's, in raw mode, with the kernel editing lines (lambda's line discipline, atlas's conhost-like console) |
+| **exec** | Starting a process in a running machine from outside it (`carbon exec`), over its control socket |
 
 ## Building and testing
 
@@ -186,20 +206,26 @@ programs and how to build them are in [lambda's](kernels/lambda/README.md#runnin
 - **exec** runs on all three hosts, both isolations, and all six backends pass its conformance suite. A dropped CPU's
   slot is used again, so a machine can make threads and processes for as long as it runs.
 - **lambda** runs Debian 13, ARM64 natively and x86-64 translated or native: bash with job control on a console,
-  ptys, signals, threads, `epoll` and friends, sockets, and `apt-get install` of curl, Python and git, which then
-  work over HTTPS. **atlas** runs Windows programs with its loader and SEH, threads, processes and objects, pipes,
-  sections, asynchronous I/O, files, the registry, security, resources and system information, and windows on the
-  desktop with input, dialogs and the basic controls, a progress bar and list view, and the shell's core (special
-  folders, file operations, running programs, choosing a folder, shortcuts), on ARM64, x86-64 and 32-bit x86. A real
-  32-bit installer runs from its first page to the end, its shortcuts made.
-- **`carbon run debian:13 -- bash`** works on all three hosts, from an image pulled over HTTPS (trusting what the host
-  trusts), with machines kept by name, stopped, frozen and started again.
-- **net** gives each machine its own network out through the host's sockets: `apt-get update` and `curl https://`
-  work in `debian:13` on all three hosts.
+  ptys, signals, threads, `epoll` and friends, sockets, `sshd`, and `apt-get install` of curl, Python and git, which
+  then work over HTTPS. **atlas** runs Windows programs with its loader and SEH, threads, processes and objects,
+  pipes, sections, asynchronous I/O, files, the registry, security, Winsock, resources and system information, a
+  console, and windows on the desktop with input, dialogs and the basic controls, a progress bar and list view, and
+  the shell's core (special folders, file operations, running programs, choosing a folder, shortcuts), on ARM64,
+  x86-64 and 32-bit x86. A real 32-bit installer runs from its first page to the end, and a 32-bit program downloads
+  and installs its update over HTTPS. Its System32 has its own `cmd.exe` (batch files, `for`, pipes, redirection),
+  `powershell.exe` (a PowerShell-language shell: pipelines of objects, about seventy cmdlets and Windows PowerShell's
+  aliases), and `where`, `findstr`, `find`, `more`, `sort`, `whoami`, `hostname` and `timeout`.
+- **`carbon`** runs machines as Docker runs containers: `run` with `-i`, `-t`, `-p` and `--network`, and `exec -it` into
+  a running machine, for both kernels (a pty in lambda, a console of its own in atlas). `carbon run -it debian:13 bash`
+  works on all three hosts, from an image pulled over HTTPS (trusting what the host trusts), with machines kept by
+  name, stopped, frozen and started again; `carbon run -it windows` is a Windows prompt.
+- **net** gives each machine its own network over the host's sockets: `apt-get update` and `curl https://` work in
+  `debian:13` on all three hosts, and published ports reach programs in both kernels (`ssh -p 2222` into `sshd`, a
+  Windows server's TCP and UDP ports), with the client's own address seen inside.
 - **display** has the desktop on a screen in memory, and on a Mac's screen: whole in one window (`--display host`), or
   each window in a Mac window of its own (`--display host-windows`). **audio** plays: every stream mixed to 48 kHz
   stereo on the Mac's speakers (or a WAV file), and lambda answers PulseAudio's protocol itself, so Linux programs
-  play through their own libpulse and OpenAL. **remote** and **sdk** are designed, not started.
+  play through their own libpulse and OpenAL. **remote** is designed, not started; the library (**sdk**) is being redesigned.
 - **gpu** reads SPIR-V compute shaders into an IR of its own and runs them on the Mac's GPU through Metal (written as
   AIR libraries, so no shader source is compiled) and on a CPU device, with the same results on its conformance suite.
   Vertex and fragment shaders draw on both too, by Vulkan's rasterization rules, vkcube's among them. `--gpu` gives a
@@ -232,9 +258,9 @@ blocks real work, it moves up. Each item's detail is in the README it links to.
 
 **2. A machine you can run** ([layers](layers/README.md#to-do), [images](images/README.md#to-do), [machine](machine/README.md#to-do))
 
-`carbon run debian:13 -- bash` works. Left: compacting a running machine's log; zstd layers, registry logins,
-streaming layers, clearing unused chunks; the image's working directory and user; stopping and screenshots from
-another process on Windows hosts; a worker process per machine.
+`carbon run -it debian:13 bash` and `carbon exec` work. Left: compacting a running machine's log; zstd layers, registry
+logins, streaming layers, clearing unused chunks; the image's working directory and user; `--rm` and `-d`'s logs;
+stopping, screenshots and `exec` from another process on Windows hosts; a worker process per machine.
 
 **3. lambda runs real Linux software** ([lambda](kernels/lambda/README.md#to-do))
 
@@ -244,7 +270,7 @@ another process on Windows hosts; a worker process per machine.
 3. The vDSO's counter on every host (Apple silicon's reads it already), and `time`, `getcpu` and `getrandom` in it.
 4. Signals' remainder: queued real-time signals, `rt_sigtimedwait`, `setitimer`, `alarm`, SIGTTOU, the FP state in the
    frame, core dumps.
-5. `apt install` on the Linux and Windows hosts, and locks that hold between processes.
+5. `apt install` on Windows hosts (it works on Linux hosts), and locks that hold between processes.
 6. A console on Windows hosts, checked with a full-screen editor.
 
 **4. atlas runs real Windows programs and installers** ([atlas](kernels/atlas/README.md#to-do))
@@ -260,10 +286,9 @@ another process on Windows hosts; a worker process per machine.
 6. The registry: Windows' own hive format, for hives from a real Windows. (Change notification, the 32-bit view, and
    saving, restoring, loading and unloading hives are done.)
 7. 32-bit x86, which installers are: exec's 32-bit translation, the i686 ntdll, `SysWOW64`.
-8. Winsock over `net` (with `net`'s phase 4). *Done means:* a Windows program downloads over HTTPS. (Done: a 32-bit
-   program downloads, checks and installs its 240 MB update.)
-9. `msiexec` in host Rust, and `cmd.exe`, `reg.exe`, `regsvr32.exe`, `rundll32.exe`. *Done means:* a real `.msi`
-   installs.
+8. `msiexec` in host Rust, and `reg.exe`, `regsvr32.exe`, `rundll32.exe`. *Done means:* a real `.msi` installs.
+   (Winsock, `cmd.exe`, `powershell.exe` and the everyday command-line tools are done.)
+9. Ctrl+C to a running Windows program (console control handlers), and `tasklist`, `taskkill`, `sc`, `icacls`.
 10. The long tail of exports, as the `missing` stubs and `carbon atlas imports` name them. (Code pages, the `*A`
     functions and ANSI windows are done.)
 
@@ -297,12 +322,15 @@ another process on Windows hosts; a worker process per machine.
 
 **8. Sound** ([audio](audio/README.md#to-do))
 
-1. The mixer, record streams, a WAV output, and `audio/macos`; then Linux and Windows.
-2. lambda's PulseAudio server. 3. atlas's winmm, WASAPI and DirectSound.
+1. Record streams and the microphone; Linux and Windows hosts' speakers. (The mixer, a WAV output, `audio/macos` and
+   lambda's PulseAudio server are done.)
+2. atlas's winmm, WASAPI and DirectSound.
 
 **9. Reach and polish**
 
-1. [The SDK](sdk/README.md#to-do).
+1. The library: the crate `carbon`, from `machine`, with the CLI on top of it, and real-time hooks for agents
+   (commands, output, network, files: allow, block, rewrite, answer), rules, workers and an MCP server. The
+   proposal replaces [the old SDK sketch](sdk/README.md).
 2. Linux ARM64 hosts; ARM64 → x86-64 translation ([exec](exec/README.md#5-more-hosts-and-isas)).
 3. The macOS sandbox: shared memory, x86 programs, the rest of ARM64; the Windows sandbox hardened; winkvm's rest
    (NMIs, VPID, kernel CET, AMD SVM, signing) ([exec](exec/README.md#4-safety-and-robustness)).
