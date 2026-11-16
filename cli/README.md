@@ -41,7 +41,8 @@ carbon display key app ctrl+s
 carbon display resize app 1600x900@2        # its screen's size and scale, changed while it runs
 carbon display clipboard app                # its clipboard's text (with text after: set, as copied on the host)
 carbon display drop app 300 200 --files 'C:\notes.txt'  # drops files there, as dragged in from the host (or text)
-carbon pull debian:13 [--platform OS/ARCH] | images | rmi IMAGE
+carbon pull debian:13 [--platform OS/ARCH] | rmi IMAGE
+carbon images                               # KERNEL  IMAGE  PLATFORM  FROM: atlas for a Windows image, lambda for a Linux one
 carbon import -c 'CMD ["cmd.exe"]' atlas-base-arm64.tar atlas   # an image from a tar of a root file system
 carbon atlas imports setup.exe              # what a Windows program imports that atlas lacks (--all: everything)
 carbon atlas imports ~/installers/          # a folder of them: which load, and what's wanted most

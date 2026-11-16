@@ -8,6 +8,21 @@ machine. Traditional VMs get there by booting a guest operating system. Carbon b
 kernels, written from scratch in Rust, so a machine is ready the moment it starts, and program code runs straight on
 the CPU, inside a hardware VM or a process sandbox.
 
+Every image runs on one of Carbon's two kernels:
+
+```console
+$ carbon images
+KERNEL  IMAGE         PLATFORM       FROM
+atlas   atlas:latest  windows/arm64  imported
+lambda  debian:13     linux/arm64    imported
+```
+
+- **lambda** is Linux's kernel, in Rust: it speaks Linux's system calls, so `debian:13` and any other Linux image run
+  as they are, with their own bash, apt and glibc.
+- **atlas** is Windows' kernel and its system DLLs (ntdll, kernel32, user32 and the rest), in Rust and made in memory,
+  so a Windows program runs with no Windows files anywhere. Its programs (`cmd.exe`, `powershell.exe`) come from the
+  image `atlas`, [atlas-base](https://github.com/tensorai-co/atlas-base).
+
 ```sh
 carbon run -it debian:13 bash                                  # a shell in a Linux image, with lambda
 carbon run setup.exe                                           # a Windows program, with atlas

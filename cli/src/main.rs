@@ -575,8 +575,10 @@ fn main() {
             println!("{} ({})", image.short_name(), image.platform);
         }
         "images" => {
-            let rows: Vec<[String; 3]> = carbon.images().into_iter().map(|i| [i.short_name().to_string(), i.platform.to_string(), i.source]).collect();
-            table(&["IMAGE", "PLATFORM", "FROM"], &rows);
+            // The kernel a machine from it runs: atlas for a Windows image, lambda for a Linux one.
+            let kernel = |i: &carbon::Image| if i.platform.os == "windows" { carbon::Kernel::Atlas } else { carbon::Kernel::Lambda }.name().to_string();
+            let rows: Vec<[String; 4]> = carbon.images().into_iter().map(|i| [kernel(&i), i.short_name().to_string(), i.platform.to_string(), i.source]).collect();
+            table(&["KERNEL", "IMAGE", "PLATFORM", "FROM"], &rows);
         }
         "rmi" => carbon.remove_image(&one("an image")).unwrap_or_else(|e| fail(e)),
         other => fail(format!("{other} isn't a command: carbon help")),
