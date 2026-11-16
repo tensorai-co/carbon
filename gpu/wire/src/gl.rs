@@ -44,6 +44,8 @@ pub const SWAP: u32 = 9;
 pub const ERROR: u32 = 10;
 /// `glFinish` (and `glFlush`): everything recorded runs on the device before the ring returns.
 pub const FINISH: u32 = 11;
+/// `glDepthRange`: near and far, as `f64`s' bits.
+pub const DEPTH_RANGE: u32 = 12;
 
 /// Four `f32`s' bits.
 pub const CLEAR_COLOR: u32 = 16;
@@ -198,6 +200,37 @@ pub const BLIT_FRAMEBUFFER: u32 = 152;
 /// How many buffers, then each (`GL_NONE`, `GL_COLOR_ATTACHMENT0`, `GL_BACK`…): where the draw framebuffer's
 /// fragment outputs go.
 pub const DRAW_BUFFERS: u32 = 153;
+
+// OpenGL ES 3.0's and GL 3.1's: uniform blocks and the buffers bound to them, sampler objects, and buffers read back.
+
+/// `program`, then a block's name (length, bytes): answers its index (all ones for none).
+pub const UNIFORM_BLOCK_INDEX: u32 = 160;
+/// `program`, `index`, `binding point`.
+pub const UNIFORM_BLOCK_BINDING: u32 = 161;
+/// `program`, `index`, `pname`: answers an `i32`.
+pub const ACTIVE_UNIFORM_BLOCK: u32 = 162;
+/// `program`, `index`: answers its name (length, bytes).
+pub const ACTIVE_UNIFORM_BLOCK_NAME: u32 = 163;
+/// `target`, `index`, `buffer` (0 to unbind), `offset` and `size` (64 bits each; a size of 0 is all of it): what
+/// `glBindBufferBase` and `glBindBufferRange` bind, at an indexed binding point and the target's own.
+pub const BIND_BUFFER_RANGE: u32 = 164;
+/// `sampler`, `pname`, the value's bits, and whether it's a float.
+pub const SAMPLER_PARAMETER: u32 = 165;
+/// `unit`, `sampler` (0 for the texture's own parameters).
+pub const BIND_SAMPLER: u32 = 166;
+pub const DELETE_SAMPLER: u32 = 167;
+/// `target`, `offset`, `length` (64 bits each), then where in the program to write it (64 bits): a buffer's bytes
+/// read back, as `glMapBufferRange` with `GL_MAP_READ_BIT` reads them.
+pub const READ_BUFFER: u32 = 168;
+/// `target`, `pname`: answers an `i64`.
+pub const GET_BUFFER_PARAMETER: u32 = 169;
+/// `program`: answers how many shaders are attached, then each name.
+pub const ATTACHED_SHADERS: u32 = 170;
+/// `glClearBuffer*`: `buffer` (`GL_COLOR`, `GL_DEPTH`, `GL_STENCIL`, `GL_DEPTH_STENCIL`), `drawbuffer`, then four words:
+/// a colour's components as floats, or the depth's bits and the stencil value.
+pub const CLEAR_BUFFER: u32 = 171;
+/// `glReadBuffer`: `mode` (`GL_BACK`, `GL_COLOR_ATTACHMENT<i>`, `GL_NONE`).
+pub const READ_COLOR: u32 = 172;
 
 /// [`MATRIX`]'s operations, and the floats each takes.
 pub const MATRIX_IDENTITY: u32 = 0;

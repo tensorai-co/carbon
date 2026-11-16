@@ -95,6 +95,8 @@ pub struct Config {
     pub double: bool,
     pub depth_bits: u32,
     pub stencil_bits: u32,
+    /// It can be drawn to in sRGB (`GL_FRAMEBUFFER_SRGB`).
+    pub srgb: bool,
 }
 
 impl Config {
@@ -103,7 +105,7 @@ impl Config {
     }
 
     /// Its attributes, as GetFBConfigs sends them: the same names, in the same order, for every config.
-    fn attributes(&self) -> [(u32, u32); 29] {
+    fn attributes(&self) -> [(u32, u32); 30] {
         [
             (VISUAL_ID, self.visual),
             (FBCONFIG_ID, self.id),
@@ -134,6 +136,7 @@ impl Config {
             (MAX_PBUFFER_WIDTH, MAX_PBUFFER),
             (MAX_PBUFFER_HEIGHT, MAX_PBUFFER),
             (MAX_PBUFFER_PIXELS, MAX_PBUFFER * MAX_PBUFFER),
+            (FRAMEBUFFER_SRGB_CAPABLE, u32::from(self.srgb)),
         ]
     }
 
@@ -141,7 +144,7 @@ impl Config {
     fn visual_config(&self) -> Vec<u32> {
         let a = self.alpha();
         let mut v = vec![self.visual, 4, 1, 8, 8, 8, a, 0, 0, 0, 0, u32::from(self.double), 0, 24 + a, self.depth_bits, self.stencil_bits, 0, 0];
-        for (name, value) in [(CONFIG_CAVEAT, NONE), (TRANSPARENT_TYPE, NONE), (SAMPLE_BUFFERS, 0), (SAMPLES, 0), (FBCONFIG_ID, self.id), (DRAWABLE_TYPE, WINDOW_BIT | PIXMAP_BIT | PBUFFER_BIT), (FRAMEBUFFER_SRGB_CAPABLE, 0)] {
+        for (name, value) in [(CONFIG_CAVEAT, NONE), (TRANSPARENT_TYPE, NONE), (SAMPLE_BUFFERS, 0), (SAMPLES, 0), (FBCONFIG_ID, self.id), (DRAWABLE_TYPE, WINDOW_BIT | PIXMAP_BIT | PBUFFER_BIT), (FRAMEBUFFER_SRGB_CAPABLE, u32::from(self.srgb))] {
             v.extend([name, value]);
         }
         v
@@ -150,13 +153,19 @@ impl Config {
 
 /// The screen's configs. Each visual's own comes first, numbered as the visuals are (24-bit depth and 8-bit stencil,
 /// double-buffered or not as the visual is): what `glXChooseVisual` and a context made for a visual get. Then the
-/// framebuffer configs that share those visuals with other depth and stencil buffers, for `glXChooseFBConfig`. The
-/// client's driver keeps those it can draw.
+/// framebuffer configs that share those visuals with other depth and stencil buffers, for `glXChooseFBConfig`, and
+/// those that can be drawn to in sRGB. The client's driver keeps those it can draw.
 pub fn configs() -> Vec<Config> {
-    let mut out: Vec<Config> = VISUALS.iter().map(|&(visual, depth, double)| Config { id: 0, visual, depth, double, depth_bits: 24, stencil_bits: 8 }).collect();
-    for &(visual, depth, double) in &VISUALS {
+    let config = |(visual, depth, double): (u32, u8, bool), depth_bits, stencil_bits, srgb| Config { id: 0, visual, depth, double, depth_bits, stencil_bits, srgb };
+    let mut out: Vec<Config> = VISUALS.iter().map(|&v| config(v, 24, 8, false)).collect();
+    for &v in &VISUALS {
         for (depth_bits, stencil_bits) in [(0, 0), (16, 0), (24, 0), (32, 0)] {
-            out.push(Config { id: 0, visual, depth, double, depth_bits, stencil_bits });
+            out.push(config(v, depth_bits, stencil_bits, false));
+        }
+    }
+    for &v in &VISUALS {
+        for (depth_bits, stencil_bits) in [(24, 8), (0, 0), (24, 0)] {
+            out.push(config(v, depth_bits, stencil_bits, true));
         }
     }
     for (i, c) in out.iter_mut().enumerate() {

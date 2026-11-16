@@ -142,6 +142,8 @@ struct Objects {
     programs: HashMap<u32, Program>,
     buffers: HashMap<u32, Buffer>,
     textures: HashMap<u32, Texture>,
+    /// Sampler objects, by name: the parameters a unit's texture is read with instead of its own.
+    sampler_objects: HashMap<u32, draw::SamplerObject>,
     /// Samplers made, by what they are: the device keeps them.
     samplers: HashMap<draw::SamplerKey, gpu::Sampler>,
     /// What a texture unit with no complete texture reads: one black texel.
@@ -170,9 +172,11 @@ struct Framebuffer {
     key: u64,
     width: u32,
     height: u32,
-    /// The colour image and the level drawn into, and its format.
+    /// The colour image and the level drawn into (fragment output 0's), and its format.
     color: Option<(Image, Sub)>,
     format: Format,
+    /// Fragment outputs 1 to 3's: a framebuffer object's other draw buffers.
+    extra: [Option<(Image, Sub, Format)>; 3],
     depth: Option<(Image, Sub)>,
     alpha: bool,
     stencil_bits: u32,
@@ -187,6 +191,8 @@ struct Context {
     clear_color: [f32; 4],
     clear_depth: f64,
     clear_stencil: i32,
+    /// `glDepthRange`'s near and far.
+    depth_range: [f64; 2],
     viewport: [i32; 4],
     scissor: [i32; 4],
     enabled: Vec<u32>,
@@ -195,12 +201,18 @@ struct Context {
     program: u32,
     /// Buffers bound, by target (`GL_ARRAY_BUFFER` and the rest; the element buffer is the vertex array's).
     bindings: HashMap<u32, u32>,
+    /// Buffers bound at indexed binding points (`GL_UNIFORM_BUFFER`'s), by target and index: the buffer, offset and
+    /// size (0 for all of it).
+    indexed: HashMap<(u32, u32), (u32, u64, u64)>,
+    /// Each unit's sampler object (0 for none: its texture's own parameters).
+    sampler_units: [u32; UNITS],
     /// Vertex arrays, this context's own as GL has them (0 is the default one).
     vaos: HashMap<u32, Vao>,
     vao: u32,
     unit: u32,
-    /// Each unit's 2D texture.
+    /// Each unit's 2D texture, and its cube map.
     units: [u32; UNITS],
+    cube_units: [u32; UNITS],
     blend: [u32; 4],
     equation: [u32; 2],
     depth_func: u32,
@@ -227,6 +239,7 @@ impl Context {
             clear_color: [0.0; 4],
             clear_depth: 1.0,
             clear_stencil: 0,
+            depth_range: [0.0, 1.0],
             viewport: [0; 4],
             scissor: [0; 4],
             enabled: CAPS.iter().filter(|c| c.1).map(|c| c.0).collect(),
@@ -234,10 +247,13 @@ impl Context {
             depth_mask: true,
             program: 0,
             bindings: HashMap::new(),
+            indexed: HashMap::new(),
+            sampler_units: [0; UNITS],
             vaos,
             vao: 0,
             unit: 0,
             units: [0; UNITS],
+            cube_units: [0; UNITS],
             // ONE, ZERO; FUNC_ADD; LESS; BACK; CCW.
             blend: [1, 0, 1, 0],
             equation: [0x8006, 0x8006],
@@ -286,7 +302,7 @@ enum Value {
 /// A step of work on the device, as a context's call makes it, sent at once.
 enum Step {
     /// A render pass that only clears: each attachment cleared, or loaded as it is.
-    Clear { color: Option<(Image, Sub, Load<[f32; 4]>)>, depth: Option<(Image, Sub, Load<f32>)> },
+    Clear { colors: Vec<(Image, Sub, Load<[f32; 4]>)>, depth: Option<(Image, Sub, Load<f32>)> },
     /// Texels into a region of one level of an image.
     Upload { bytes: Vec<u8>, to: Image, level: u32, region: Rect },
     /// A region of one level of an image read back, `bytes` a texel: one of the answers `run` gives.
@@ -397,6 +413,46 @@ impl Gl {
                     context(o, current)?.fail(code);
                 }
                 wire::FINISH => self.flush(o)?,
+                wire::CLEAR_BUFFER => {
+                    let (buffer, drawbuffer) = (p.u32()?, p.u32()?);
+                    let v = p.words::<4>()?;
+                    // As `glClear` of the one buffer, with its value for the clear value meanwhile.
+                    let c = context(o, current)?;
+                    let (color, depth) = (c.clear_color, c.clear_depth);
+                    let mask = match buffer {
+                        0x1800 if drawbuffer == 0 => {
+                            c.clear_color = v.map(f32::from_bits);
+                            COLOR_BUFFER_BIT
+                        }
+                        0x1801 => {
+                            c.clear_depth = f64::from(f32::from_bits(v[0])).clamp(0.0, 1.0);
+                            DEPTH_BUFFER_BIT
+                        }
+                        0x84f9 => {
+                            c.clear_depth = f64::from(f32::from_bits(v[0])).clamp(0.0, 1.0);
+                            DEPTH_BUFFER_BIT | STENCIL_BUFFER_BIT
+                        }
+                        0x1802 => STENCIL_BUFFER_BIT,
+                        // Another draw buffer's.
+                        0x1800 => {
+                            c.clear_color = v.map(f32::from_bits);
+                            COLOR_BUFFER_BIT
+                        }
+                        _ => {
+                            c.fail(INVALID_ENUM);
+                            0
+                        }
+                    };
+                    if mask != 0 {
+                        self.clear(o, current, mask, (buffer == 0x1800).then_some(drawbuffer as usize))?;
+                    }
+                    let c = context(o, current)?;
+                    (c.clear_color, c.clear_depth) = (color, depth);
+                }
+                wire::DEPTH_RANGE => {
+                    let (near, far) = (f64::from_bits(p.u64()?), f64::from_bits(p.u64()?));
+                    context(o, current)?.depth_range = [near.clamp(0.0, 1.0), far.clamp(0.0, 1.0)];
+                }
                 wire::GET => {
                     let pname = p.u32()?;
                     let fb = framebuffer_of(o, current, false);
@@ -476,7 +532,7 @@ impl Gl {
                 }
                 wire::CLEAR => {
                     let mask = p.u32()?;
-                    self.clear(o, current, mask)?;
+                    self.clear(o, current, mask, None)?;
                 }
                 wire::READ_PIXELS => {
                     let v = p.words::<6>()?;
@@ -542,7 +598,7 @@ impl Gl {
                 }
                 _ => {
                     if !self.program_record(o, current, kind, &mut p, reply)?
-                        && !self.draw_record(o, current, kind, &mut p, guest)?
+                        && !self.draw_record(o, current, kind, &mut p, guest, reply)?
                         && !self.compat_record(o, current, kind, &mut p)?
                         && !self.framebuffer_record(o, current, kind, &mut p, reply)?
                     {
@@ -577,8 +633,8 @@ impl Gl {
         let sub = Sub::default();
         // What a new buffer holds is undefined; it's made black, and far, so it's the same every time.
         let depth_load = depth_image.map(|i| (i, sub, Load::Clear(1.0)));
-        self.steps(o, vec![Step::Clear { color: Some((color, sub, Load::Clear([0.0, 0.0, 0.0, if alpha { 0.0 } else { 1.0 }]))), depth: depth_load }])?;
-        let f = Framebuffer { key: id, width, height, color: Some((color, sub)), format: Format::Bgra8Unorm, depth: depth_image.map(|i| (i, sub)), alpha, stencil_bits };
+        self.steps(o, vec![Step::Clear { colors: vec![(color, sub, Load::Clear([0.0, 0.0, 0.0, if alpha { 0.0 } else { 1.0 }]))], depth: depth_load }])?;
+        let f = Framebuffer { key: id, width, height, color: Some((color, sub)), format: Format::Bgra8Unorm, extra: [None; 3], depth: depth_image.map(|i| (i, sub)), alpha, stencil_bits };
         o.drawables.insert(id, f);
         Ok(())
     }
@@ -593,8 +649,9 @@ impl Gl {
             .map_err(device_error)
     }
 
-    /// `glClear`: the buffers in `mask`, inside the scissor when its test is on, as the write masks allow.
-    fn clear(&self, o: &mut Objects, current: u64, mask: u32) -> Result<(), String> {
+    /// `glClear`: the buffers in `mask` (every draw buffer's colour, or `only` one's), inside the scissor when its
+    /// test is on, as the write masks allow.
+    fn clear(&self, o: &mut Objects, current: u64, mask: u32, only: Option<usize>) -> Result<(), String> {
         let fb = framebuffer_of(o, current, false);
         let c = context(o, current)?;
         if mask & !(COLOR_BUFFER_BIT | DEPTH_BUFFER_BIT | STENCIL_BUFFER_BIT) != 0 {
@@ -612,48 +669,54 @@ impl Gl {
         let Some(area) = area else { return Ok(()) };
         let all = area == whole;
         let region = Rect { x: area[0] as u32, y: area[1] as u32, width: area[2] as u32, height: area[3] as u32 };
-        let color = if mask & COLOR_BUFFER_BIT != 0 && c.color_mask.contains(&true) { f.color } else { None };
-        let depth = if mask & DEPTH_BUFFER_BIT != 0 && c.depth_mask { f.depth } else { None };
+        // Every output's attachment, and whether it's cleared.
+        let outputs: Vec<(usize, Image, Sub, Format)> = std::iter::once(f.color.map(|(i, s)| (i, s, f.format))).chain(f.extra).enumerate().filter_map(|(n, o)| o.map(|(i, s, fmt)| (n, i, s, fmt))).collect();
+        let clear_color = mask & COLOR_BUFFER_BIT != 0 && c.color_mask.contains(&true);
+        let cleared = |n: usize| clear_color && only.is_none_or(|k| k == n);
+        let depth = if mask & DEPTH_BUFFER_BIT != 0 && c.depth_mask && only.is_none() { f.depth } else { None };
+        let (color_mask, z, clear) = (c.color_mask, c.clear_depth as f32, c.clear_color);
         // Colour is kept in [0, 1] in a fixed-point buffer; an alpha the buffer hasn't reads as 1.
-        let mut rgba = c.clear_color;
-        if !f.format_is_float() {
-            rgba = rgba.map(|v| v.clamp(0.0, 1.0));
-        }
-        if !f.alpha {
-            rgba[3] = 1.0;
-        }
-        let (color_mask, z) = (c.color_mask, c.clear_depth as f32);
+        let rgba_for = |format: Format| {
+            let mut rgba = clear;
+            if !is_float(format) {
+                rgba = rgba.map(|v| v.clamp(0.0, 1.0));
+            }
+            if !f.alpha {
+                rgba[3] = 1.0;
+            }
+            rgba
+        };
+        let any_color = outputs.iter().any(|o| cleared(o.0));
         let mut steps = Vec::new();
-        if all && (color.is_none() || color_mask == [true; 4]) {
+        if all && (!any_color || color_mask == [true; 4]) {
             // A pass that clears what it's asked to and loads the rest.
-            if color.is_some() || depth.is_some() {
-                let color_load = f.color.map(|(i, sub)| (i, sub, if color.is_some() { Load::Clear(rgba) } else { Load::Load }));
+            if any_color || depth.is_some() {
+                let colors = outputs.iter().map(|&(n, image, sub, format)| (image, sub, if cleared(n) { Load::Clear(rgba_for(format)) } else { Load::Load })).collect();
                 let depth_load = f.depth.map(|(i, sub)| (i, sub, if depth.is_some() { Load::Clear(z) } else { Load::Load }));
-                steps.push(Step::Clear { color: color_load, depth: depth_load });
+                steps.push(Step::Clear { colors, depth: depth_load });
             }
         } else {
             let n = region.width as usize * region.height as usize;
-            if let Some((image, sub)) = color {
-                match texel(f.format, rgba) {
-                    Some(t) => {
-                        let mut bytes: Vec<u8> = t.iter().copied().cycle().take(n * t.len()).collect();
-                        if color_mask != [true; 4] {
-                            // The channels it mustn't write, as they are.
-                            let now = self.steps(o, vec![Step::Download { from: image, sub, region, bytes: t.len() as u32 }])?.pop().unwrap_or_default();
-                            let size = t.len() / 4;
-                            let order = channels(f.format);
-                            for (texel, old) in bytes.chunks_exact_mut(t.len()).zip(now.chunks_exact(t.len())) {
-                                for (k, &channel) in order.iter().enumerate() {
-                                    if !color_mask[channel] {
-                                        texel[k * size..(k + 1) * size].copy_from_slice(&old[k * size..(k + 1) * size]);
-                                    }
-                                }
+            for &(_, image, sub, format) in outputs.iter().filter(|o| cleared(o.0)) {
+                let Some(t) = texel(format, rgba_for(format)) else {
+                    draw::not_yet("a part of a buffer of this format cleared", 16);
+                    continue;
+                };
+                let mut bytes: Vec<u8> = t.iter().copied().cycle().take(n * t.len()).collect();
+                if color_mask != [true; 4] {
+                    // The channels it mustn't write, as they are.
+                    let now = self.steps(o, vec![Step::Download { from: image, sub, region, bytes: t.len() as u32 }])?.pop().unwrap_or_default();
+                    let size = t.len() / 4;
+                    let order = channels(format);
+                    for (texel, old) in bytes.chunks_exact_mut(t.len()).zip(now.chunks_exact(t.len())) {
+                        for (k, &channel) in order.iter().enumerate() {
+                            if !color_mask[channel] {
+                                texel[k * size..(k + 1) * size].copy_from_slice(&old[k * size..(k + 1) * size]);
                             }
                         }
-                        steps.push(Step::Upload { bytes, to: image, level: sub.level, region });
                     }
-                    None => draw::not_yet("a part of a buffer of this format cleared", 16),
                 }
+                steps.push(Step::Upload { bytes, to: image, level: sub.level, region });
             }
             if let Some((image, sub)) = depth {
                 let bytes = z.to_le_bytes().iter().copied().cycle().take(n * 4).collect();
@@ -730,8 +793,8 @@ fn run(d: &mut gpu::Device, fence: Option<gpu::Fence>, value: u64, steps: Vec<St
         let mut commands = Vec::new();
         for step in &steps {
             match step {
-                Step::Clear { color, depth } => {
-                    let colors = color.iter().map(|&(image, sub, load)| ColorAttachment { image, sub, load }).collect();
+                Step::Clear { colors, depth } => {
+                    let colors = colors.iter().map(|&(image, sub, load)| ColorAttachment { image, sub, load }).collect();
                     let depth = depth.map(|(image, sub, load)| DepthAttachment { image, sub, load });
                     commands.push(Command::BeginRender { colors, depth });
                     commands.push(Command::EndRender);
@@ -782,6 +845,15 @@ fn get(c: &Context, fb: Option<&Framebuffer>, pname: u32) -> Option<Vec<Value>> 
         0x0c10 => ints(&c.scissor),
         0x0c22 => c.clear_color.iter().map(|&f| Value::Float(f64::from(f))).collect(),
         0x0b73 => vec![Value::Float(c.clear_depth)],
+        // DEPTH_RANGE; SHADER_COMPILER, NUM_SHADER_BINARY_FORMATS, SHADER_BINARY_FORMATS (none), and the ES limits a
+        // program reads as vectors.
+        0x0b70 => c.depth_range.iter().map(|&d| Value::Float(d)).collect(),
+        0x8dfa => vec![Value::Bool(true)],
+        0x8df9 => int(0),
+        0x8df8 => Vec::new(),
+        0x8dfb => int(1024),
+        0x8dfc => int(16),
+        0x8dfd => int(1024),
         0x0b91 => vec![Value::Int(i64::from(c.clear_stencil))],
         0x0c23 => c.color_mask.iter().map(|&b| Value::Bool(b)).collect(),
         0x0b72 => vec![Value::Bool(c.depth_mask)],
@@ -801,6 +873,17 @@ fn get(c: &Context, fb: Option<&Framebuffer>, pname: u32) -> Option<Vec<Value>> 
         0x8894 => int(c.bindings.get(&0x8892).copied().unwrap_or(0)),
         0x8895 => int(c.vaos.get(&c.vao).map_or(0, |v| v.elements)),
         0x85b5 => int(c.vao),
+        // Uniform buffers: UNIFORM_BUFFER_BINDING, UNIFORM_BUFFER_OFFSET_ALIGNMENT, MAX_UNIFORM_BUFFER_BINDINGS,
+        // MAX_UNIFORM_BLOCK_SIZE, MAX_VERTEX/FRAGMENT/COMBINED_UNIFORM_BLOCKS, and the components they add.
+        0x8a28 => int(c.bindings.get(&0x8a11).copied().unwrap_or(0)),
+        0x8a34 => int(256),
+        0x8a2f => int(24),
+        0x8a30 => int(65536),
+        0x8a2b | 0x8a2d => int(12),
+        0x8a2e => int(24),
+        0x8a31 | 0x8a33 => int(4096 + 12 * 16384),
+        // SAMPLER_BINDING.
+        0x8919 => int(c.sampler_units[c.unit as usize]),
         // DRAW_FRAMEBUFFER_BINDING (FRAMEBUFFER_BINDING), READ_FRAMEBUFFER_BINDING, RENDERBUFFER_BINDING, and which
         // buffer draws and reads go to: the back buffer, or the colour attachment.
         0x8ca6 => int(c.draw_fbo),
@@ -810,13 +893,15 @@ fn get(c: &Context, fb: Option<&Framebuffer>, pname: u32) -> Option<Vec<Value>> 
         0x0c02 => int(if c.read_fbo != 0 { 0x8ce0 } else { 0x0405 }),
         0x84e0 => int(0x84c0 + c.unit),
         0x8069 => int(c.units[c.unit as usize]),
+        // TEXTURE_BINDING_CUBE_MAP.
+        0x8514 => int(c.cube_units[c.unit as usize]),
         // MAX_VERTEX_ATTRIBS, MAX_TEXTURE_IMAGE_UNITS, MAX_COMBINED_TEXTURE_IMAGE_UNITS, MAX_VERTEX_TEXTURE_IMAGE_UNITS,
         // MAX_DRAW_BUFFERS, MAX_COLOR_ATTACHMENTS, MAX_VARYING_COMPONENTS, MAX_VERTEX_UNIFORM_COMPONENTS,
         // MAX_FRAGMENT_UNIFORM_COMPONENTS, MAX_TEXTURE_COORDS.
         0x8869 => int(ATTRIBS as u32),
         0x8872 | 0x8b4c => int(16),
         0x8b4d => int(UNITS as u32),
-        0x8824 | 0x8cdf => int(1),
+        0x8824 | 0x8cdf => int(framebuffer::COLORS as u32),
         0x8b4b => int(64),
         0x8b4a | 0x8b49 => int(4096),
         0x8871 => int(8),
@@ -882,8 +967,12 @@ fn framebuffer_of(o: &Objects, current: u64, read: bool) -> Option<Framebuffer> 
 
 impl Framebuffer {
     fn format_is_float(&self) -> bool {
-        matches!(self.format, Format::Rgba16Float | Format::Rgba32Float | Format::R32Float | Format::Rg11b10Float)
+        is_float(self.format)
     }
+}
+
+fn is_float(format: Format) -> bool {
+    matches!(format, Format::Rgba16Float | Format::Rgba32Float | Format::R32Float | Format::Rg11b10Float)
 }
 
 /// Which of red, green, blue and alpha each of a format's four channels is, in memory order.

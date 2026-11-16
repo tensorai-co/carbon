@@ -449,7 +449,9 @@ fn inverse(m: &M) -> M {
 
 /// Writes the compatibility profile's built-ins (and fixed function's own uniforms) into a program's default blocks,
 /// from the context's state as it is at a draw.
-pub(super) fn fill(l: &mut Linked, c: &Context) {
+/// `size_of` is the size of the 2D texture or cube map (`true`) on a unit, for the samplers' sizes `texelFetch`,
+/// `textureSize` and cube maps read.
+pub(super) fn fill(l: &mut Linked, c: &Context, size_of: &dyn Fn(u32, bool) -> (u32, u32)) {
     let k = &c.compat;
     let mv = k.matrix(MODELVIEW, 0);
     let p = k.matrix(PROJECTION, 0);
@@ -462,6 +464,12 @@ pub(super) fn fill(l: &mut Linked, c: &Context) {
     };
     let names: Vec<(usize, String)> = l.slots.iter().enumerate().filter(|(_, s)| s.name.starts_with("gl_") || s.name.starts_with("carbon_")).map(|(i, s)| (i, s.name.clone())).collect();
     for (slot, name) in names {
+        let size = name.strip_prefix("carbon_size_").map(|sampler| {
+            let binding = l.slots.iter().find(|s| s.name == sampler).and_then(|s| s.sampler);
+            let unit = binding.and_then(|b| l.units.get(b as usize).copied());
+            let cube = binding.is_some_and(|b| l.cube.get(b as usize).copied().unwrap_or(false));
+            unit.map_or((1, 1), |u| size_of(u, cube))
+        });
         let words = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
         let mut put = |elem: u32, cols: u32, rows: u32, v: &[f32]| write(l, slot, elem, cols, rows, &words(v));
         if let Some(s) = name.strip_prefix("gl_ModelViewProjectionMatrix") {
@@ -487,6 +495,8 @@ pub(super) fn fill(l: &mut Linked, c: &Context) {
             put(0, 4, 1, &[start, end, density, if end != start { 1.0 / (end - start) } else { 0.0 }]);
         } else if name == "carbon_fog_color" {
             put(0, 4, 1, &k.fog_color);
+        } else if let Some((w, h)) = size {
+            put(0, 2, 1, &[w as f32, h as f32]);
         } else if let Some(u) = name.strip_prefix("carbon_env").and_then(|u| u.parse::<usize>().ok()) {
             put(0, 4, 1, &k.env_color[u.min(UNITS - 1)]);
         }

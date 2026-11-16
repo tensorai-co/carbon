@@ -47,11 +47,23 @@ pub(super) struct Linked {
     pub attribs: Vec<(String, u32, Ty)>,
     /// The vertex and fragment shaders' default blocks.
     pub blocks: [Vec<u8>; 2],
-    /// Each sampler binding's texture unit.
+    /// Each sampler binding's texture unit, and whether it's a cube map's.
     pub units: Vec<u32>,
+    pub cube: Vec<bool>,
     pub pipelines: HashMap<super::draw::PipelineKey, gpu::Pipeline>,
-    /// Uniform or buffer blocks, which draws don't bind yet.
+    /// Its uniform blocks, by GL's index: what each draw binds from the buffers at their binding points.
+    pub ubos: Vec<Ubo>,
+    /// Buffer (storage) blocks, which draws don't bind yet.
     pub has_blocks: bool,
+}
+
+/// A uniform block: its name, its binding in the entries (in `SET_UNIFORM_BLOCK`), its size laid out, and the binding
+/// point `glUniformBlockBinding` gave it (or its `layout(binding)`, or 0).
+pub(super) struct Ubo {
+    pub name: String,
+    pub binding: u32,
+    pub size: u32,
+    pub point: u32,
 }
 
 /// One uniform as GL names it: its element type, its array size, where each stage keeps it (offset, array stride,
@@ -251,8 +263,9 @@ impl Gl {
                             0x8b87 => Some(l.map_or(0, |l| l.slots[..l.visible].iter().map(|s| active_name(s).len() as i32 + 1).max().unwrap_or(0))),
                             0x8b89 => Some(l.map_or(0, |l| l.attribs.len() as i32)),
                             0x8b8a => Some(l.map_or(0, |l| l.attribs.iter().map(|a| a.0.len() as i32 + 1).max().unwrap_or(0))),
-                            // ACTIVE_UNIFORM_BLOCKS.
-                            0x8a36 => Some(0),
+                            // ACTIVE_UNIFORM_BLOCKS, ACTIVE_UNIFORM_BLOCK_MAX_NAME_LENGTH.
+                            0x8a36 => Some(l.map_or(0, |l| l.ubos.len() as i32)),
+                            0x8a35 => Some(l.map_or(0, |l| l.ubos.iter().map(|u| u.name.len() as i32 + 1).max().unwrap_or(0))),
                             _ => None,
                         }
                     }
@@ -305,6 +318,50 @@ impl Gl {
                         records::put_u32(reply, 0);
                         records::put_bytes(reply, &[]);
                     }
+                }
+            }
+            wire::UNIFORM_BLOCK_INDEX => {
+                let program = p.u32()?;
+                let name = String::from_utf8_lossy(p.bytes()?).into_owned();
+                let index = o.programs.get(&program).and_then(|p| p.linked.as_ref()).and_then(|l| l.ubos.iter().position(|u| u.name == name));
+                records::put_u32(reply, index.map_or(u32::MAX, |i| i as u32));
+            }
+            wire::UNIFORM_BLOCK_BINDING => {
+                let [program, index, point] = p.words::<3>()?;
+                match o.programs.get_mut(&program).and_then(|p| p.linked.as_mut()).and_then(|l| l.ubos.get_mut(index as usize)) {
+                    Some(u) => u.point = point,
+                    None => context(o, current)?.fail(INVALID_VALUE),
+                }
+            }
+            wire::ACTIVE_UNIFORM_BLOCK | wire::ACTIVE_UNIFORM_BLOCK_NAME => {
+                let (program, index) = (p.u32()?, p.u32()?);
+                let pname = if kind == wire::ACTIVE_UNIFORM_BLOCK { p.u32()? } else { 0 };
+                let found = o.programs.get(&program).and_then(|p| p.linked.as_ref()).and_then(|l| l.ubos.get(index as usize).map(|u| (u, l)));
+                if kind == wire::ACTIVE_UNIFORM_BLOCK_NAME {
+                    records::put_bytes(reply, found.map_or(&b""[..], |(u, _)| u.name.as_bytes()));
+                } else {
+                    // BINDING, DATA_SIZE, NAME_LENGTH, ACTIVE_UNIFORMS, and whether each stage reads it.
+                    let v = found.map(|(u, l)| match pname {
+                        0x8a3f => u.point as i32,
+                        0x8a40 => u.size as i32,
+                        0x8a41 => u.name.len() as i32 + 1,
+                        0x8a42 => 0,
+                        0x8a44 => i32::from(l.vertex.bindings.iter().any(|b| b.set == glsl::SET_UNIFORM_BLOCK && b.binding == u.binding)),
+                        0x8a46 => i32::from(l.fragment.bindings.iter().any(|b| b.set == glsl::SET_UNIFORM_BLOCK && b.binding == u.binding)),
+                        _ => 0,
+                    });
+                    if v.is_none() {
+                        context(o, current)?.fail(INVALID_VALUE);
+                    }
+                    records::put_u32(reply, v.unwrap_or(0) as u32);
+                }
+            }
+            wire::ATTACHED_SHADERS => {
+                let program = p.u32()?;
+                let shaders = o.programs.get(&program).map(|p| p.shaders.clone()).unwrap_or_default();
+                records::put_u32(reply, shaders.len() as u32);
+                for s in shaders {
+                    records::put_u32(reply, s);
                 }
             }
             wire::UNIFORM => {
@@ -395,7 +452,8 @@ fn link(shaders: &[&Shader], binds: &[(String, u32)]) -> Result<Linked, String> 
         attribs.push((v.name.clone(), first, v.ty.clone()));
     }
     glsl::gl_clip(&mut vertex);
-    glsl::keep_colors(&mut fragment, 1);
+    // As many outputs as draw buffers there can be; each draw's pipeline keeps those its framebuffer has.
+    glsl::keep_colors(&mut fragment, super::framebuffer::COLORS as u32);
     // Uniforms, both stages' merged by name.
     let mut slots: Vec<Uniform> = Vec::new();
     for (stage, shader) in [vs, fs].into_iter().enumerate() {
@@ -422,8 +480,10 @@ fn link(shaders: &[&Shader], binds: &[(String, u32)]) -> Result<Linked, String> 
         }
     }
     // The program's own uniforms first; the compatibility profile's built-ins after, listed and found by name never.
-    slots.sort_by_key(|s| s.name.starts_with("gl_"));
-    let visible = slots.iter().filter(|s| !s.name.starts_with("gl_")).count();
+    // Samplers' sizes (`carbon_size_*`, for `texelFetch`) are hidden built-ins too.
+    let hidden = |s: &Uniform| s.name.starts_with("gl_") || s.name.starts_with("carbon_size_");
+    slots.sort_by_key(hidden);
+    let visible = slots.iter().filter(|s| !hidden(s)).count();
     let locations = slots.iter().enumerate().flat_map(|(i, s)| (0..s.count.unwrap_or(1)).map(move |e| (i, e))).collect();
     let block = |s: &glsl::Shader| vec![0u8; s.interface.default_block.map_or(0, |b| b.1) as usize];
     // Samplers with `layout(binding = n)` start on unit n.
@@ -435,8 +495,26 @@ fn link(shaders: &[&Shader], binds: &[(String, u32)]) -> Result<Linked, String> 
             }
         }
     }
-    let has_blocks = !vs.interface.blocks.is_empty() || !fs.interface.blocks.is_empty();
-    Ok(Linked { vertex, fragment, slots, visible, locations, attribs, blocks: [block(vs), block(fs)], units, pipelines: HashMap::new(), has_blocks })
+    let mut cube = vec![false; program.samplers.len()];
+    for shader in [vs, fs] {
+        for u in &shader.interface.uniforms {
+            if let (Ty::Sampler(s), Some(found)) = (&u.ty, program.samplers.iter().find(|s| s.0 == u.name)) {
+                cube[found.1 as usize] = s.dim == glsl::types::Dim::Cube;
+            }
+        }
+    }
+    // Uniform blocks, numbered as the link numbered them; buffer blocks aren't bound yet.
+    let mut ubos: Vec<Ubo> = Vec::new();
+    for (name, set, binding) in &program.blocks {
+        if *set != glsl::SET_UNIFORM_BLOCK {
+            continue;
+        }
+        let info = [vs, fs].iter().flat_map(|s| s.interface.blocks.iter()).find(|b| &b.name == name);
+        ubos.push(Ubo { name: name.clone(), binding: *binding, size: info.map_or(0, |b| b.size), point: info.and_then(|b| b.explicit).unwrap_or(0) });
+    }
+    ubos.sort_by_key(|u| u.binding);
+    let has_blocks = program.blocks.iter().any(|b| b.1 == glsl::SET_BUFFER);
+    Ok(Linked { vertex, fragment, slots, visible, locations, attribs, blocks: [block(vs), block(fs)], units, cube, pipelines: HashMap::new(), ubos, has_blocks })
 }
 
 /// A uniform's name as GL lists it: an array's with `[0]`.

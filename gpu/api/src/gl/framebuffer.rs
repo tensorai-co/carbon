@@ -3,8 +3,9 @@
 //!
 //! A framebuffer object keeps what's attached to it, a texture's level or a renderbuffer, by name; what it draws into
 //! is worked out from them each time it's used ([`resolve`]), so a texture given a new image of another size is
-//! simply what's drawn into next. One colour attachment and a depth attachment are drawn into (`GL_MAX_DRAW_BUFFERS`
-//! is 1); a stencil attachment is kept, and has no stencil to draw into, as the default framebuffer hasn't.
+//! simply what's drawn into next. Up to [`COLORS`] colour attachments and a depth attachment are drawn into, each
+//! fragment output going to the attachment its draw buffer names; a stencil attachment is kept, and has no stencil
+//! to draw into, as the default framebuffer hasn't.
 //!
 //! Depth renderbuffers and textures are `D32Float`, whatever depth format they're asked for in, as the default
 //! framebuffer's depth is.
@@ -43,13 +44,28 @@ pub(super) enum Attachment {
     Renderbuffer(u32),
 }
 
-#[derive(Clone, Copy, Default)]
+/// Colour attachments a framebuffer object has, and draw buffers (`GL_MAX_COLOR_ATTACHMENTS`, `GL_MAX_DRAW_BUFFERS`).
+pub(super) const COLORS: usize = 4;
+
+#[derive(Clone, Copy)]
 pub(super) struct Fbo {
-    color: Option<Attachment>,
+    colors: [Option<Attachment>; COLORS],
     depth: Option<Attachment>,
     stencil: Option<Attachment>,
-    /// `glDrawBuffers` named no buffer: draws write only depth.
-    draw_none: bool,
+    /// Each fragment output's colour attachment (`glDrawBuffers`; [`NO_BUFFER`] for none), and the one reads read
+    /// (`glReadBuffer`).
+    draw: [usize; COLORS],
+    read: usize,
+}
+
+/// A draw buffer that's none.
+const NO_BUFFER: usize = usize::MAX;
+
+impl Default for Fbo {
+    fn default() -> Fbo {
+        // Output 0 to attachment 0 and the rest to none; reads from attachment 0.
+        Fbo { colors: [None; COLORS], depth: None, stencil: None, draw: [0, NO_BUFFER, NO_BUFFER, NO_BUFFER], read: 0 }
+    }
 }
 
 pub(super) struct Renderbuffer {
@@ -76,16 +92,26 @@ pub(super) fn resolve(o: &Objects, name: u32, read: bool) -> Result<Framebuffer,
             }
         }
     };
-    let color = match fbo.color.filter(|_| read || !fbo.draw_none) {
-        Some(a) => {
-            let c = image(a)?;
+    // Every attachment there must be one that can be drawn into, whichever are drawn into now.
+    let mut attached = [None; COLORS];
+    for (i, a) in fbo.colors.iter().enumerate() {
+        if let Some(a) = a {
+            let c = image(*a)?;
             if c.2.is_depth() || !c.2.is_renderable() {
                 return Err(INCOMPLETE_ATTACHMENT);
             }
-            Some(c)
+            attached[i] = Some(c);
         }
-        None => None,
+    }
+    // What each output goes to (reading: the read buffer's attachment, as output 0).
+    let outputs: [Option<_>; COLORS] = if read {
+        let mut o = [None; COLORS];
+        o[0] = attached.get(fbo.read).copied().flatten();
+        o
+    } else {
+        fbo.draw.map(|a| attached.get(a).copied().flatten())
     };
+    let color = outputs[0];
     let depth = match fbo.depth {
         Some(a) => {
             let d = image(a)?;
@@ -96,14 +122,13 @@ pub(super) fn resolve(o: &Objects, name: u32, read: bool) -> Result<Framebuffer,
         }
         None => None,
     };
-    if fbo.color.is_none() && fbo.depth.is_none() && fbo.stencil.is_none() {
+    if fbo.colors.iter().all(Option::is_none) && fbo.depth.is_none() && fbo.stencil.is_none() {
         return Err(INCOMPLETE_MISSING_ATTACHMENT);
     }
-    let size = color.map(|c| (c.3, c.4)).or(depth.map(|d| (d.3, d.4)));
+    let size = outputs.iter().flatten().map(|c| (c.3, c.4)).next().or(depth.map(|d| (d.3, d.4)));
     // The device draws into attachments of one size only.
-    if let (Some(c), Some(d)) = (color, depth)
-        && (c.3, c.4) != (d.3, d.4)
-    {
+    let sizes = outputs.iter().flatten().map(|c| (c.3, c.4)).chain(depth.map(|d| (d.3, d.4)));
+    if sizes.clone().any(|s| Some(s) != size) {
         return Err(UNSUPPORTED);
     }
     // Only a stencil attachment, or a colour one its draw buffers leave out: nothing to draw into.
@@ -115,6 +140,7 @@ pub(super) fn resolve(o: &Objects, name: u32, read: bool) -> Result<Framebuffer,
         height,
         color: color.map(|c| (c.0, sub(c.1))),
         format: color.map_or(Format::Rgba8Unorm, |c| c.2),
+        extra: [1, 2, 3].map(|i| outputs[i].map(|c| (c.0, sub(c.1), c.2))),
         depth: depth.map(|d| (d.0, sub(d.1))),
         alpha: true,
         stencil_bits: if fbo.stencil.is_some() { 8 } else { 0 },
@@ -204,14 +230,14 @@ impl Gl {
                 self.flush(o)?;
                 let fbo = o.fbos.entry(name).or_default();
                 match attachment {
-                    COLOR_ATTACHMENT0 => fbo.color = what,
+                    COLOR_ATTACHMENT0..=0x8ce3 => fbo.colors[(attachment - COLOR_ATTACHMENT0) as usize] = what,
                     DEPTH_ATTACHMENT => fbo.depth = what,
                     STENCIL_ATTACHMENT => fbo.stencil = what,
                     DEPTH_STENCIL_ATTACHMENT => {
                         fbo.depth = what;
                         fbo.stencil = what;
                     }
-                    0x8ce1..=0x8cff => not_yet("a second colour attachment", 64),
+                    0x8ce4..=0x8cff => context(o, current)?.fail(INVALID_OPERATION),
                     _ => context(o, current)?.fail(INVALID_ENUM),
                 }
             }
@@ -299,15 +325,46 @@ impl Gl {
                 self.blit(o, current, s, d, mask)?;
             }
             wire::DRAW_BUFFERS => {
-                let n = p.u32()?;
-                let first = if n > 0 { p.u32()? } else { NONE };
+                let n = p.u32()? as usize;
+                let mut list = [NO_BUFFER; COLORS];
+                let mut ok = n <= COLORS;
+                for i in 0..n {
+                    let b = p.u32()?;
+                    if let Some(slot) = list.get_mut(i) {
+                        *slot = match b {
+                            NONE => NO_BUFFER,
+                            COLOR_ATTACHMENT0..=0x8ce3 => (b - COLOR_ATTACHMENT0) as usize,
+                            // BACK, for the default framebuffer.
+                            0x0405 | 0x0404 => 0,
+                            _ => {
+                                ok = false;
+                                NO_BUFFER
+                            }
+                        };
+                    }
+                }
                 let c = context(o, current)?;
                 let name = c.draw_fbo;
-                if name != 0 {
+                if !ok {
+                    c.fail(INVALID_ENUM);
+                } else if name != 0 {
                     self.flush(o)?;
                     if let Some(f) = o.fbos.get_mut(&name) {
-                        f.draw_none = first == NONE;
+                        f.draw = list;
                     }
+                }
+            }
+            wire::READ_COLOR => {
+                let mode = p.u32()?;
+                let c = context(o, current)?;
+                let name = c.read_fbo;
+                if name != 0
+                    && let Some(f) = o.fbos.get_mut(&name)
+                {
+                    f.read = match mode {
+                        COLOR_ATTACHMENT0..=0x8ce3 => (mode - COLOR_ATTACHMENT0) as usize,
+                        _ => NO_BUFFER,
+                    };
                 }
             }
             _ => return Ok(false),

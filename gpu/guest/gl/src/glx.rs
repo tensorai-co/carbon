@@ -85,7 +85,7 @@ const CREATE_CONTEXT_ATTRIBS: u8 = 34;
 const CLIENT_VENDOR: &[u8] = b"Carbon\0";
 const CLIENT_VERSION: &[u8] = b"1.4\0";
 /// The GLX extensions this library has.
-const CLIENT_EXTENSIONS: &[u8] = b"GLX_ARB_create_context GLX_ARB_create_context_profile GLX_ARB_get_proc_address GLX_EXT_visual_info GLX_EXT_visual_rating\0";
+const CLIENT_EXTENSIONS: &[u8] = b"GLX_ARB_create_context GLX_ARB_create_context_profile GLX_EXT_create_context_es2_profile GLX_EXT_create_context_es_profile GLX_ARB_framebuffer_sRGB GLX_EXT_framebuffer_sRGB GLX_ARB_get_proc_address GLX_EXT_visual_info GLX_EXT_visual_rating\0";
 
 /// A config, as the server describes it: its attributes, by name. A `GLXFBConfig` is the address of one.
 pub(crate) struct Config {
@@ -249,8 +249,9 @@ fn choose(configs: &[Config], list: *const c_int, fbconfig: bool) -> Vec<&Config
             let have = c.value(name);
             match name {
                 RENDER_TYPE | DRAWABLE_TYPE => have & w == w,
-                BUFFER_SIZE | AUX_BUFFERS | RED_SIZE..=ACCUM_ALPHA_SIZE | SAMPLE_BUFFERS | SAMPLES => have >= w,
-                LEVEL | DOUBLEBUFFER | STEREO | X_VISUAL_TYPE | CONFIG_CAVEAT | TRANSPARENT_TYPE | X_RENDERABLE | FRAMEBUFFER_SRGB_CAPABLE => have == w,
+                // Asking for sRGB requires it; not asking takes either.
+                BUFFER_SIZE | AUX_BUFFERS | RED_SIZE..=ACCUM_ALPHA_SIZE | SAMPLE_BUFFERS | SAMPLES | FRAMEBUFFER_SRGB_CAPABLE => have >= w,
+                LEVEL | DOUBLEBUFFER | STEREO | X_VISUAL_TYPE | CONFIG_CAVEAT | TRANSPARENT_TYPE | X_RENDERABLE => have == w,
                 _ => true,
             }
         })
@@ -310,11 +311,15 @@ pub(crate) struct Context {
     screen: c_int,
     config: *const Config,
     render_type: u32,
+    /// An OpenGL ES context (`GLX_CONTEXT_ES2_PROFILE_BIT_EXT`): ES 3.0, what a request for 2.0 or 3.0 gets.
+    pub(crate) es: bool,
     records: Vec<u8>,
     /// `glPixelStore`'s state.
     pub(crate) store: gl::Store,
     /// `glClientActiveTexture`'s unit, which `glTexCoordPointer` sets the array of.
     pub(crate) client_unit: u32,
+    /// Buffers mapped (`glMapBufferRange`), each by the target it was mapped at.
+    pub(crate) maps: Vec<crate::objects::Map>,
     drawable: u32,
     /// The X window it draws into, and its size as last bound.
     window: u32,
@@ -355,12 +360,12 @@ impl Context {
     }
 }
 
-fn new_context(dpy: *mut c_void, screen: c_int, config: *const Config, render_type: u32, share: *mut Context, request: impl FnOnce(&X, *mut c_void, u32)) -> *mut Context {
+fn new_context(dpy: *mut c_void, screen: c_int, config: *const Config, render_type: u32, es: bool, share: *mut Context, request: impl FnOnce(&X, *mut c_void, u32)) -> *mut Context {
     let Some(x) = X::get() else { return ptr::null_mut() };
     let connection = x.connection(dpy);
     let xid = unsafe { (x.generate_id)(connection) };
     request(&x, connection, xid);
-    let c = Box::into_raw(Box::new(Context { xid, dpy, connection, screen, config, render_type, records: Vec::new(), store: gl::Store::default(), client_unit: 0, drawable: 0, window: 0, width: 0, height: 0, current: false, destroyed: false }));
+    let c = Box::into_raw(Box::new(Context { xid, dpy, connection, screen, config, render_type, es, records: Vec::new(), store: gl::Store::default(), client_unit: 0, maps: Vec::new(), drawable: 0, window: 0, width: 0, height: 0, current: false, destroyed: false }));
     let mut made = Vec::new();
     records::put_u64(&mut made, unsafe { (*c).id() });
     records::put_u64(&mut made, if share.is_null() { 0 } else { unsafe { (*share).id() } });
@@ -474,7 +479,7 @@ unsafe extern "C" fn glXCreateContext(dpy: *mut c_void, vis: *const VisualInfo, 
     let Some(config) = s.config_of_visual(vis.visualid) else { return ptr::null_mut() };
     let share_xid = unsafe { share.as_ref() }.map_or(0, |c| c.xid);
     let (visual, number) = (vis.visualid as u32, vis.screen as u32);
-    new_context(dpy, vis.screen, config, RGBA_TYPE, share, |x, c, xid| {
+    new_context(dpy, vis.screen, config, RGBA_TYPE, false, share, |x, c, xid| {
         x.glx(c, CREATE_CONTEXT, &[xid, visual, number, share_xid, 1], false);
     })
 }
@@ -484,7 +489,7 @@ unsafe extern "C" fn glXCreateNewContext(dpy: *mut c_void, config: *const Config
     let screen = screen_of(dpy, c);
     let share_xid = unsafe { share.as_ref() }.map_or(0, |c| c.xid);
     let id = c.value(FBCONFIG_ID);
-    new_context(dpy, screen, config, render_type as u32, share, |x, conn, xid| {
+    new_context(dpy, screen, config, render_type as u32, false, share, |x, conn, xid| {
         x.glx(conn, CREATE_NEW_CONTEXT, &[xid, id, screen as u32, render_type as u32, share_xid, 1], false);
     })
 }
@@ -507,15 +512,16 @@ unsafe extern "C" fn glXCreateContextAttribsARB(dpy: *mut c_void, config: *const
             i += 2;
         }
     }
-    // Only the GL this library has made so far: none of GLES, and no later version.
-    if profile & ES2_PROFILE_BIT != 0 || (major, minor) > gl::VERSION {
+    // Only the GL this library has made so far: desktop GL up to its version, OpenGL ES up to 3.0.
+    let es = profile & ES2_PROFILE_BIT != 0;
+    if (es && (major, minor) > gl::ES_VERSION) || (!es && (major, minor) > gl::VERSION) {
         return ptr::null_mut();
     }
     let config_ref = unsafe { config.as_ref() };
     let screen = config_ref.map_or(0, |c| screen_of(dpy, c));
     let id = config_ref.map_or(0, |c| c.value(FBCONFIG_ID));
     let share_xid = unsafe { share.as_ref() }.map_or(0, |c| c.xid);
-    new_context(dpy, screen, config, render_type, share, |x, conn, xid| {
+    new_context(dpy, screen, config, render_type, es, share, |x, conn, xid| {
         let mut fields = alloc::vec![xid, id, screen as u32, share_xid, 1, (attrs.len() / 2) as u32];
         fields.extend(&attrs);
         x.glx(conn, CREATE_CONTEXT_ATTRIBS, &fields, false);

@@ -562,3 +562,155 @@ void main() { gl_FragColor = vec4(1.0, 1.0, 0.0, a); }";
         assert!(close(px[3 * 8 + x], want), "({x}, 3) is {:?}, wanted {want:?}", px[3 * 8 + x]);
     }
 }
+
+/// A full-target quad, as a triangle strip, in the program's memory at 1024: attribute 0, two floats.
+fn quad_at_1024(gl: &Gl, memory: &mut Memory) {
+    memory.0[1024..1056].copy_from_slice(&f32s(&[-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0]));
+    let mut c = Calls::new();
+    c.w64(wire::ATTRIB_POINTER, &[0, 2, 0x1406, 0, 0, 0], 1024).w(wire::ENABLE_ATTRIB, &[0, 1]);
+    calls(gl, memory, &c);
+}
+
+const QUAD_VS: &str = "#version 330 core
+layout(location = 0) in vec2 pos;
+void main() { gl_Position = vec4(pos, 0.0, 1.0); }";
+
+#[test]
+fn two_draw_buffers_take_two_outputs_and_clear_apart() {
+    let fs = "#version 330 core
+layout(location = 0) out vec4 a;
+layout(location = 1) out vec4 b;
+void main() { a = vec4(1.0, 0.0, 0.0, 1.0); b = vec4(0.0, 1.0, 0.0, 1.0); }";
+    let (gl, mut memory) = with_program(QUAD_VS, fs);
+    quad_at_1024(&gl, &mut memory);
+    // Two 8×8 textures as colour attachments 0 and 1 of framebuffer 30, both drawn into.
+    let mut c = Calls::new();
+    for (t, unit) in [(20, 0), (21, 1)] {
+        c.w(wire::ACTIVE_TEXTURE, &[unit]).w(wire::BIND_TEXTURE, &[0x0de1, t]).wb(wire::TEX_IMAGE, &[0x0de1, 0, RGBA, 8, 8, RGBA, UNSIGNED_BYTE, 0], &[]);
+    }
+    c.w(wire::BIND_FRAMEBUFFER, &[0x8d40, 30]).w(wire::FRAMEBUFFER_TEXTURE, &[0x8d40, 0x8ce0, 0x0de1, 20, 0]).w(wire::FRAMEBUFFER_TEXTURE, &[0x8d40, 0x8ce1, 0x0de1, 21, 0]);
+    c.w(wire::DRAW_BUFFERS, &[2, 0x8ce0, 0x8ce1]).w(wire::CHECK_FRAMEBUFFER, &[0x8d40]).w(wire::GET, &[0x8824]);
+    c.w(wire::DRAW_ARRAYS, &[5, 0, 4, 1]).w(wire::GET_ERROR, &[]);
+    let a = calls(&gl, &mut memory, &c);
+    let mut r = Reader::new(&a);
+    assert_eq!(r.u32().unwrap(), 0x8cd5);
+    assert_eq!((r.u32().unwrap(), r.u32().unwrap(), r.u64().unwrap()), (1, INT, 4), "four draw buffers");
+    assert_eq!(r.u32().unwrap(), NO_ERROR);
+    let read = |gl: &Gl, memory: &mut Memory, attachment: u32| {
+        let mut c = Calls::new();
+        c.w(wire::READ_COLOR, &[attachment]);
+        calls(gl, memory, &c);
+        pixels(gl, memory)
+    };
+    assert!(read(&gl, &mut memory, 0x8ce0).iter().all(|&p| close(p, [255, 0, 0, 255])), "attachment 0 is output 0's");
+    assert!(read(&gl, &mut memory, 0x8ce1).iter().all(|&p| close(p, [0, 255, 0, 255])), "attachment 1 is output 1's");
+    // Draw buffer 1 cleared blue alone: attachment 0 keeps its red.
+    let mut c = Calls::new();
+    c.w(wire::CLEAR_BUFFER, &[0x1800, 1, 0, 0, 1.0f32.to_bits(), 1.0f32.to_bits()]);
+    calls(&gl, &mut memory, &c);
+    assert!(read(&gl, &mut memory, 0x8ce1).iter().all(|&p| close(p, [0, 0, 255, 255])));
+    assert!(read(&gl, &mut memory, 0x8ce0).iter().all(|&p| close(p, [255, 0, 0, 255])));
+}
+
+#[test]
+fn a_cube_map_is_sampled_by_direction() {
+    let fs = "#version 330 core
+uniform samplerCube sky;
+uniform vec3 dir;
+out vec4 o;
+void main() { o = texture(sky, dir); }";
+    let (gl, mut memory) = with_program(QUAD_VS, fs);
+    quad_at_1024(&gl, &mut memory);
+    let mut c = Calls::new();
+    c.wb(wire::UNIFORM_LOCATION, &[3], b"sky").wb(wire::UNIFORM_LOCATION, &[3], b"dir");
+    let a = calls(&gl, &mut memory, &c);
+    let mut r = Reader::new(&a);
+    let (sky, dir) = (r.u32().unwrap(), r.u32().unwrap());
+    // Each face 2×2 of one colour: +X red, -X green, +Y blue, -Y white, +Z yellow, -Z cyan.
+    let colours: [[u8; 4]; 6] = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [255, 255, 255, 255], [255, 255, 0, 255], [0, 255, 255, 255]];
+    let mut c = Calls::new();
+    c.w(wire::ACTIVE_TEXTURE, &[3]).w(wire::BIND_TEXTURE, &[0x8513, 40]);
+    for (face, colour) in colours.iter().enumerate() {
+        c.wb(wire::TEX_IMAGE, &[0x8515 + face as u32, 0, RGBA, 2, 2, RGBA, UNSIGNED_BYTE, 1], &colour.repeat(4));
+    }
+    c.w(wire::TEX_PARAMETER, &[0x8513, 0x2801, 0x2601, 0]).w(wire::TEX_PARAMETER, &[0x8513, 0x2800, 0x2601, 0]);
+    c.wb(wire::UNIFORM, &[sky, wire::INT, 1, 1, 1, 0], &3u32.to_le_bytes()).w(wire::GET, &[0x8514]);
+    let a = calls(&gl, &mut memory, &c);
+    let mut r = Reader::new(&a);
+    assert_eq!((r.u32().unwrap(), r.u32().unwrap(), r.u64().unwrap()), (1, INT, 40));
+    for (d, want) in [([1.0f32, 0.1, -0.2], colours[0]), ([-1.0, 0.3, 0.2], colours[1]), ([0.1, 1.0, 0.1], colours[2]), ([0.2, -1.0, -0.3], colours[3]), ([0.1, 0.2, 1.0], colours[4]), ([-0.1, 0.1, -1.0], colours[5])] {
+        let mut c = Calls::new();
+        c.floats(wire::UNIFORM, &[dir, wire::FLOAT, 3, 1, 1, 0], &d).w(wire::DRAW_ARRAYS, &[5, 0, 4, 1]);
+        calls(&gl, &mut memory, &c);
+        let px = pixels(&gl, &mut memory);
+        assert!(px.iter().all(|&p| close(p, want)), "{d:?} reads {:?}, wanted {want:?}", px[0]);
+    }
+}
+
+#[test]
+fn texel_fetch_and_texture_size_read_exact_texels() {
+    let fs = "#version 330 core
+uniform sampler2D tex;
+out vec4 o;
+void main() {
+    ivec2 size = textureSize(tex, 0);
+    vec4 t = texelFetch(tex, ivec2(2, 1), 0);
+    o = (size == ivec2(4, 2)) ? t : vec4(1.0, 0.0, 1.0, 1.0);
+}";
+    let (gl, mut memory) = with_program(QUAD_VS, fs);
+    quad_at_1024(&gl, &mut memory);
+    // 4×2 texels, each its own colour, linear filtering (a fetch is exact whatever the filter).
+    let texels: Vec<u8> = (0..8u8).flat_map(|i| [i * 30, 255 - i * 30, i * 10, 255]).collect();
+    let mut c = Calls::new();
+    c.wb(wire::UNIFORM_LOCATION, &[3], b"tex");
+    let a = calls(&gl, &mut memory, &c);
+    let tex = Reader::new(&a).u32().unwrap();
+    let mut c = Calls::new();
+    c.w(wire::BIND_TEXTURE, &[0x0de1, 20]).wb(wire::TEX_IMAGE, &[0x0de1, 0, RGBA, 4, 2, RGBA, UNSIGNED_BYTE, 1], &texels);
+    c.w(wire::TEX_PARAMETER, &[0x0de1, 0x2801, 0x2601, 0]).w(wire::TEX_PARAMETER, &[0x0de1, 0x2800, 0x2601, 0]);
+    c.wb(wire::UNIFORM, &[tex, wire::INT, 1, 1, 1, 0], &0u32.to_le_bytes()).w(wire::DRAW_ARRAYS, &[5, 0, 4, 1]);
+    calls(&gl, &mut memory, &c);
+    // Texel (2, 1) is the seventh: row 1's third.
+    let want = [6 * 30, 255 - 6 * 30, 60, 255];
+    let px = pixels(&gl, &mut memory);
+    assert!(px.iter().all(|&p| close(p, want)), "{:?}, wanted {want:?}", px[0]);
+}
+
+#[test]
+fn a_uniform_block_reads_the_buffer_at_its_binding_point() {
+    let fs = "#version 330 core
+layout(std140) uniform Look { vec4 unused; vec4 tint; };
+out vec4 o;
+void main() { o = tint; }";
+    let (gl, mut memory) = with_program(QUAD_VS, fs);
+    quad_at_1024(&gl, &mut memory);
+    let mut c = Calls::new();
+    c.wb(wire::UNIFORM_BLOCK_INDEX, &[3], b"Look").wb(wire::UNIFORM_BLOCK_INDEX, &[3], b"Nope").w(wire::ACTIVE_UNIFORM_BLOCK, &[3, 0, 0x8a40]).w(wire::GET_PROGRAM, &[3, 0x8a36]);
+    let a = calls(&gl, &mut memory, &c);
+    let mut r = Reader::new(&a);
+    assert_eq!((r.u32().unwrap(), r.u32().unwrap(), r.u32().unwrap(), r.u32().unwrap()), (0, u32::MAX, 32, 1), "index, none, size, count");
+    // The block's data at offset 256 of buffer 50, bound at point 2 by a range.
+    let mut data = vec![0u8; 512];
+    data[256 + 16..256 + 32].copy_from_slice(&f32s(&[0.0, 0.5, 1.0, 1.0]));
+    let mut c = Calls::new();
+    c.w(wire::BIND_BUFFER, &[0x8a11, 50]);
+    let mut p = Vec::new();
+    records::put_u32(&mut p, 0x8a11);
+    records::put_u64(&mut p, data.len() as u64);
+    records::put_u32(&mut p, 0x88e4);
+    records::put_u32(&mut p, 1);
+    records::put_bytes(&mut p, &data);
+    c.raw(wire::BUFFER_DATA, &p);
+    let mut p = Vec::new();
+    for w in [0x8a11u32, 2, 50] {
+        records::put_u32(&mut p, w);
+    }
+    records::put_u64(&mut p, 256);
+    records::put_u64(&mut p, 256);
+    c.raw(wire::BIND_BUFFER_RANGE, &p);
+    c.w(wire::UNIFORM_BLOCK_BINDING, &[3, 0, 2]).w(wire::DRAW_ARRAYS, &[5, 0, 4, 1]).w(wire::GET_ERROR, &[]);
+    let a = calls(&gl, &mut memory, &c);
+    assert_eq!(Reader::new(&a).u32().unwrap(), NO_ERROR);
+    let px = pixels(&gl, &mut memory);
+    assert!(px.iter().all(|&p| close(p, [0, 128, 255, 255])), "{:?}", px[0]);
+}

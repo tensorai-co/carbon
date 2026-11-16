@@ -505,14 +505,17 @@ impl Lower {
                 self.binary(out, super::ast::Binary::Mul, m, v)?
             }
             // ---- Textures ----
-            "texture" | "texture2D" | "textureLod" | "texture2DLod" | "textureProj" | "texture2DProj" | "texture2DProjLod" | "textureProjLod" => {
-                let Some((_, Val::Sampler(image))) = args.first().cloned() else { return self.err(&format!("{name} without a sampler")) };
+            "texture" | "texture2D" | "textureLod" | "texture2DLod" | "textureProj" | "texture2DProj" | "texture2DProjLod" | "textureProjLod" | "textureCube" | "textureCubeLod" => {
+                let Some((sampler_ty, Val::Sampler(image))) = args.first().cloned() else { return self.err(&format!("{name} without a sampler")) };
                 if args.len() < 2 {
                     return self.err(&format!("{name} without a coordinate"));
                 }
+                let cube = matches!(sampler_ty, Ty::Sampler(s) if s.dim == super::types::Dim::Cube);
                 let (ct, coord) = self.floats(out, &args[1])?;
                 let proj = name.contains("Proj");
                 let coord = match (proj, ct.lanes()) {
+                    (false, 3) if cube => self.cube_coord(out, image, coord)?,
+                    _ if cube => return self.err(&format!("{name} on a samplerCube takes a vec3")),
                     (false, 2) => coord,
                     (true, 3 | 4) => {
                         let xy = vec![self.let_(out, Type::F32, Op::Extract(coord, 0)), self.let_(out, Type::F32, Op::Extract(coord, 1))];
@@ -537,6 +540,52 @@ impl Lower {
                 };
                 let v = self.let_(out, Type::Vector(Scalar::F32, 4), Op::Sample { image, sampler: None, coord, lod });
                 (Ty::Vector(Base::Float, 4), Val::V(v))
+            }
+            // A texel by its integer coordinates and level, and a level's size. The device samples only, so a texel is
+            // sampled at its very centre at its level (exactly it, whatever the filter), the size coming from a
+            // hidden uniform GL fills with the bound texture's.
+            "texelFetch" | "textureSize" => {
+                let Some((_, Val::Sampler(image))) = args.first().cloned() else { return self.err(&format!("{name} without a sampler")) };
+                let cube = matches!(args[0].0, Ty::Sampler(s) if s.dim == super::types::Dim::Cube);
+                if cube && name == "texelFetch" {
+                    return self.err("texelFetch on a samplerCube");
+                }
+                let mut size = self.sampler_size(out, image)?;
+                if cube {
+                    // A cube's faces lie side by side: one face's size is a sixth of the width.
+                    let sixth = self.float_const(out, 1.0 / 6.0);
+                    let one = self.float_const(out, 1.0);
+                    let scale = self.let_(out, Type::Vector(Scalar::F32, 2), Op::Construct(vec![sixth, one]));
+                    size = self.fbin(out, BinOp::Mul, size, scale);
+                }
+                let lod_index = if name == "texelFetch" { 2 } else { 1 };
+                let lod = match args.get(lod_index) {
+                    Some(a) => self.as_floats(out, a)?,
+                    None => self.float_const(out, 0.0),
+                };
+                // The level's size: halved for each level, at least 1.
+                let scale = self.fun(out, UnOp::Exp2, lod);
+                let scale = self.splat(out, scale, Type::Vector(Scalar::F32, 2));
+                let level = self.fbin(out, BinOp::Div, size, scale);
+                let level = self.fun(out, UnOp::Floor, level);
+                let one = self.float_const(out, 1.0);
+                let one = self.splat(out, one, Type::Vector(Scalar::F32, 2));
+                let level = self.fbin(out, BinOp::Max, level, one);
+                if name == "textureSize" {
+                    let v = self.convert(out, level, &Ty::Vector(Base::Float, 2), Base::Int);
+                    (Ty::Vector(Base::Int, 2), Val::V(v))
+                } else {
+                    if args.len() < 3 {
+                        return self.err("texelFetch takes a sampler, a coordinate and a level");
+                    }
+                    let p = self.as_floats(out, &args[1])?;
+                    let half = self.float_const(out, 0.5);
+                    let half = self.splat(out, half, Type::Vector(Scalar::F32, 2));
+                    let centre = self.fbin(out, BinOp::Add, p, half);
+                    let coord = self.fbin(out, BinOp::Div, centre, level);
+                    let v = self.let_(out, Type::Vector(Scalar::F32, 4), Op::Sample { image, sampler: None, coord, lod: Lod::Level(lod) });
+                    (Ty::Vector(Base::Float, 4), Val::V(v))
+                }
             }
             // ---- Derivatives ----
             "dFdx" | "dFdy" | "fwidth" | "dFdxFine" | "dFdyFine" | "dFdxCoarse" | "dFdyCoarse" | "fwidthFine" | "fwidthCoarse" => {
@@ -759,6 +808,89 @@ impl Lower {
         let below = self.let_(out, bools, Op::Compare(Cmp::Lt, y, zero));
         let negated = self.fun(out, UnOp::Neg, r);
         self.let_(out, ty, Op::Select(below, negated, r))
+    }
+
+    /// A cube map's direction as the coordinate of its texel in the image its six faces lie side by side in (+X, -X,
+    /// +Y, -Y, +Z, -Z): the face of the direction's major axis, and s and t on it as GL's table has them, kept half a
+    /// texel inside the face so its neighbour's edge isn't filtered in.
+    fn cube_coord(&mut self, out: &mut Block, image: u32, dir: Value) -> Result<Value, Error> {
+        let f = Type::F32;
+        let lane = |me: &mut Self, out: &mut Block, i: u8| me.let_(out, f, Op::Extract(dir, i));
+        let (x, y, z) = (lane(self, out, 0), lane(self, out, 1), lane(self, out, 2));
+        let (ax, ay, az) = (self.fun(out, UnOp::Abs, x), self.fun(out, UnOp::Abs, y), self.fun(out, UnOp::Abs, z));
+        let (nx, ny, nz) = (self.fun(out, UnOp::Neg, x), self.fun(out, UnOp::Neg, y), self.fun(out, UnOp::Neg, z));
+        let zero = self.float_const(out, 0.0);
+        let cmp = |me: &mut Self, out: &mut Block, c: Cmp, a: Value, b: Value| me.let_(out, Type::BOOL, Op::Compare(c, a, b));
+        let (x_ge_y, x_ge_z, y_ge_z) = (cmp(self, out, Cmp::Ge, ax, ay), cmp(self, out, Cmp::Ge, ax, az), cmp(self, out, Cmp::Ge, ay, az));
+        let x_major = self.let_(out, Type::BOOL, Op::Binary(BinOp::And, x_ge_y, x_ge_z));
+        let (xpos, ypos, zpos) = (cmp(self, out, Cmp::Gt, x, zero), cmp(self, out, Cmp::Gt, y, zero), cmp(self, out, Cmp::Gt, z, zero));
+        let sel = |me: &mut Self, out: &mut Block, c: Value, a: Value, b: Value| me.let_(out, f, Op::Select(c, a, b));
+        let consts: Vec<Value> = (0..6).map(|i| self.float_const(out, i as f32)).collect();
+        // The face, its major axis's length, and s and t before they're divided by it.
+        let face_x = sel(self, out, xpos, consts[0], consts[1]);
+        let face_y = sel(self, out, ypos, consts[2], consts[3]);
+        let face_z = sel(self, out, zpos, consts[4], consts[5]);
+        let face_yz = sel(self, out, y_ge_z, face_y, face_z);
+        let face = sel(self, out, x_major, face_x, face_yz);
+        let ma_yz = sel(self, out, y_ge_z, ay, az);
+        let ma = sel(self, out, x_major, ax, ma_yz);
+        let sc_x = sel(self, out, xpos, nz, z);
+        let sc_z = sel(self, out, zpos, x, nx);
+        let sc_yz = sel(self, out, y_ge_z, x, sc_z);
+        let sc = sel(self, out, x_major, sc_x, sc_yz);
+        let tc_y = sel(self, out, ypos, z, nz);
+        let tc_yz = sel(self, out, y_ge_z, tc_y, ny);
+        let tc = sel(self, out, x_major, ny, tc_yz);
+        let half = self.float_const(out, 0.5);
+        let one = self.float_const(out, 1.0);
+        let st = |me: &mut Self, out: &mut Block, c: Value| {
+            let d = me.fbin(out, BinOp::Div, c, ma);
+            let d = me.fbin(out, BinOp::Add, d, one);
+            me.fbin(out, BinOp::Mul, d, half)
+        };
+        let (s, t) = (st(self, out, sc), st(self, out, tc));
+        // Half a texel inside the face: one face is a sixth of the image's width.
+        let size = self.sampler_size(out, image)?;
+        let w = self.let_(out, f, Op::Extract(size, 0));
+        let h = self.let_(out, f, Op::Extract(size, 1));
+        let six = self.float_const(out, 6.0);
+        let face_w = self.fbin(out, BinOp::Div, w, six);
+        let inside = |me: &mut Self, out: &mut Block, v: Value, n: Value| {
+            let lo = me.fbin(out, BinOp::Div, half, n);
+            let hi = me.fbin(out, BinOp::Sub, one, lo);
+            let v = me.fbin(out, BinOp::Max, v, lo);
+            me.fbin(out, BinOp::Min, v, hi)
+        };
+        let (s, t) = (inside(self, out, s, face_w), inside(self, out, t, h));
+        let across = self.fbin(out, BinOp::Add, face, s);
+        let u = self.fbin(out, BinOp::Div, across, six);
+        Ok(self.let_(out, Type::Vector(Scalar::F32, 2), Op::Construct(vec![u, t])))
+    }
+
+    /// An integer or float argument as floats, converted as a constructor converts (texel coordinates and levels are
+    /// integers, which GLSL ES doesn't convert by itself).
+    fn as_floats(&mut self, out: &mut Block, (t, v): &(Ty, Val)) -> Result<Value, Error> {
+        match t.base() {
+            Some(Base::Float) => Ok(v.v()),
+            Some(Base::Int | Base::Uint) if t.is_scalar_or_vector() => Ok(self.convert(out, v.v(), t, Base::Float)),
+            _ => self.err(&format!("{t} where a number is wanted")),
+        }
+    }
+
+    /// A sampler's level-0 size, as a `vec2`: the hidden uniform GL fills with its texture's, declared the first time.
+    fn sampler_size(&mut self, out: &mut Block, image: u32) -> Result<Value, Error> {
+        let place = match self.sizes.get(&image) {
+            Some(p) => p.clone(),
+            None => {
+                let Some(name) = self.iface.uniforms.iter().find(|u| u.binding.map(|b| b.0) == Some(image)).map(|u| u.name.clone()) else {
+                    return self.err("a sampler with no name");
+                };
+                let p = self.uniform_place(&format!("carbon_size_{name}"), Ty::Vector(Base::Float, 2), None, None)?;
+                self.sizes.insert(image, p.clone());
+                p
+            }
+        };
+        Ok(self.load(out, &place)?.v())
     }
 
     /// A scalar or vector argument as floats: integers converted where GLSL converts them.

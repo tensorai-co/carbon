@@ -23,8 +23,24 @@ use super::{
 use crate::vulkan::Guest;
 
 const ARRAY_BUFFER: u32 = 0x8892;
+const UNIFORM_BUFFER: u32 = 0x8a11;
 const ELEMENT_ARRAY_BUFFER: u32 = 0x8893;
 const TEXTURE_2D: u32 = 0x0de1;
+const TEXTURE_CUBE_MAP: u32 = 0x8513;
+/// The cube map's faces' targets, +X to -Z: the order its faces lie side by side in its image.
+const CUBE_FACES: std::ops::RangeInclusive<u32> = 0x8515..=0x851a;
+
+/// The texture bound at a target on the context's active unit (a cube map's for its faces' targets), or None for a
+/// target this GL hasn't.
+fn bound_texture(c: &super::Context, target: u32) -> Option<u32> {
+    let unit = c.unit as usize;
+    match target {
+        TEXTURE_2D => Some(c.units[unit]),
+        TEXTURE_CUBE_MAP => Some(c.cube_units[unit]),
+        t if CUBE_FACES.contains(&t) => Some(c.cube_units[unit]),
+        _ => None,
+    }
+}
 const BYTE: u32 = 0x1400;
 const UNSIGNED_BYTE: u32 = 0x1401;
 const SHORT: u32 = 0x1402;
@@ -34,6 +50,9 @@ const UNSIGNED_INT: u32 = 0x1405;
 const FLOAT: u32 = 0x1406;
 const HALF_FLOAT: u32 = 0x140b;
 const BGRA: u32 = 0x80e1;
+/// Four components packed in 32 bits, 10, 10, 10 and 2, x lowest: signed, and unsigned.
+const INT_2_10_10_10_REV: u32 = 0x8d9f;
+const UNSIGNED_INT_2_10_10_10_REV: u32 = 0x8368;
 
 pub(super) struct Buffer {
     memory: Option<gpu::Memory>,
@@ -75,12 +94,16 @@ impl Attrib {
 
     /// The bytes of one element.
     fn bytes(&self) -> u32 {
-        self.components() * kind_size(self.kind)
+        if packed(self.kind) { 4 } else { self.components() * kind_size(self.kind) }
     }
 
     fn stride(&self) -> u32 {
         if self.stride == 0 { self.bytes() } else { self.stride }
     }
+}
+
+fn packed(kind: u32) -> bool {
+    matches!(kind, INT_2_10_10_10_REV | UNSIGNED_INT_2_10_10_10_REV)
 }
 
 fn kind_size(kind: u32) -> u32 {
@@ -93,6 +116,8 @@ fn kind_size(kind: u32) -> u32 {
 
 pub(super) struct Texture {
     image: Option<Image>,
+    /// A cube map: its six faces side by side in its image, +X to -Z (`width` is all six).
+    cube: bool,
     width: u32,
     height: u32,
     format: Format,
@@ -115,8 +140,43 @@ impl Texture {
 impl Default for Texture {
     fn default() -> Texture {
         // NEAREST_MIPMAP_LINEAR, LINEAR, REPEAT.
-        Texture { image: None, width: 0, height: 0, format: Format::Rgba8Unorm, defined: 0, min: 0x2702, mag: 0x2601, wrap: [0x2901; 2], max_level: 1000 }
+        Texture { image: None, cube: false, width: 0, height: 0, format: Format::Rgba8Unorm, defined: 0, min: 0x2702, mag: 0x2601, wrap: [0x2901; 2], max_level: 1000 }
     }
+}
+
+/// A sampler object's parameters: what a unit it's bound to reads its texture with.
+#[derive(Clone, Copy)]
+pub(super) struct SamplerObject {
+    min: u32,
+    mag: u32,
+    wrap: [u32; 2],
+}
+
+impl Default for SamplerObject {
+    fn default() -> SamplerObject {
+        // NEAREST_MIPMAP_LINEAR, LINEAR, REPEAT, as a texture's start.
+        SamplerObject { min: 0x2702, mag: 0x2601, wrap: [0x2901; 2] }
+    }
+}
+
+/// A sampling parameter set on a texture or a sampler object: whether `pname` and `value` were ones GL has.
+fn set_parameter(min: &mut u32, mag: &mut u32, wrap: &mut [u32; 2], max_level: Option<&mut u32>, pname: u32, value: u32) -> bool {
+    let wrap_ok = matches!(value, 0x2901 | 0x812f | 0x8370 | 0x812d | 0x2900);
+    match pname {
+        0x2801 if matches!(value, 0x2600 | 0x2601 | 0x2700..=0x2703) => *min = value,
+        0x2800 if matches!(value, 0x2600 | 0x2601) => *mag = value,
+        0x2802 if wrap_ok => wrap[0] = value,
+        0x2803 if wrap_ok => wrap[1] = value,
+        0x813d => {
+            if let Some(m) = max_level {
+                *m = value;
+            }
+        }
+        // WRAP_R, BASE_LEVEL, MIN_LOD, MAX_LOD, anisotropy, comparison, swizzles, border colour, LOD bias.
+        0x8072 | 0x813c | 0x813a | 0x813b | 0x84fe | 0x884c | 0x884d | 0x8e42..=0x8e46 | 0x1004 | 0x8501 => {}
+        _ => return false,
+    }
+    true
 }
 
 /// A sampler, by what it is.
@@ -139,8 +199,10 @@ pub(super) struct PipelineKey {
     front: FrontFace,
     depth: Option<DepthState>,
     depth_attachment: bool,
-    /// The colour attachment's format.
+    /// The colour attachment's format (output 0's), and the other outputs' formats and write masks, a scratch
+    /// image's (written nowhere) where a draw buffer's none.
     color: Format,
+    extra: Vec<(Format, [bool; 4])>,
     /// The compatibility profile's alpha test, on a program of the program's own: its function and reference's bits.
     alpha: Option<(u32, u32)>,
     blend: Option<Blend>,
@@ -178,8 +240,82 @@ pub(super) fn not_yet(what: &str, bit: u64) {
 
 impl Gl {
     /// A buffer's, vertex array's, texture's or draw's record, if it's one: whether it was.
-    pub(super) fn draw_record(&self, o: &mut Objects, current: u64, kind: u32, p: &mut R<'_>, guest: &mut dyn Guest) -> Result<bool, String> {
+    pub(super) fn draw_record(&self, o: &mut Objects, current: u64, kind: u32, p: &mut R<'_>, guest: &mut dyn Guest, reply: &mut Vec<u8>) -> Result<bool, String> {
         match kind {
+            wire::BIND_BUFFER_RANGE => {
+                let (target, index, name) = (p.u32()?, p.u32()?, p.u32()?);
+                let (offset, size) = (p.u64()?, p.u64()?);
+                if name != 0 {
+                    o.buffers.entry(name).or_insert(Buffer { memory: None, size: 0 });
+                }
+                let c = context(o, current)?;
+                if index >= 24 {
+                    c.fail(INVALID_VALUE);
+                    return Ok(true);
+                }
+                c.indexed.insert((target, index), (name, offset, size));
+                c.bindings.insert(target, name);
+            }
+            wire::SAMPLER_PARAMETER => {
+                let [sampler, pname, bits, float] = p.words::<4>()?;
+                let value = if float != 0 { f32::from_bits(bits) as i64 as u32 } else { bits };
+                let s = o.sampler_objects.entry(sampler).or_default();
+                let (mut min, mut mag, mut wrap) = (s.min, s.mag, s.wrap);
+                let ok = set_parameter(&mut min, &mut mag, &mut wrap, None, pname, value);
+                *s = SamplerObject { min, mag, wrap };
+                if !ok {
+                    context(o, current)?.fail(INVALID_ENUM);
+                }
+            }
+            wire::BIND_SAMPLER => {
+                let (unit, sampler) = (p.u32()?, p.u32()?);
+                if sampler != 0 {
+                    o.sampler_objects.entry(sampler).or_default();
+                }
+                let c = context(o, current)?;
+                match c.sampler_units.get_mut(unit as usize) {
+                    Some(u) => *u = sampler,
+                    None => c.fail(INVALID_VALUE),
+                }
+            }
+            wire::DELETE_SAMPLER => {
+                let name = p.u32()?;
+                o.sampler_objects.remove(&name);
+                for c in o.contexts.values_mut() {
+                    for u in &mut c.sampler_units {
+                        if *u == name {
+                            *u = 0;
+                        }
+                    }
+                }
+            }
+            wire::READ_BUFFER => {
+                let target = p.u32()?;
+                let (offset, length, at) = (p.u64()?, p.u64()?, p.u64()?);
+                let Some(name) = self.bound_buffer(o, current, target)? else { return Ok(true) };
+                let (memory, size) = o.buffers.get(&name).map_or((None, 0), |b| (b.memory, b.size));
+                let Some(memory) = memory.filter(|_| offset + length <= size) else {
+                    context(o, current)?.fail(INVALID_VALUE);
+                    return Ok(true);
+                };
+                // What's drawn reads buffers, never writes them; but what's waiting goes first, in order.
+                self.flush(o)?;
+                let bytes = self.read_source(Some(memory), offset, length, guest)?;
+                guest.write(at, &bytes)?;
+            }
+            wire::GET_BUFFER_PARAMETER => {
+                let (target, pname) = (p.u32()?, p.u32()?);
+                let name = self.bound_buffer(o, current, target)?;
+                let size = name.and_then(|n| o.buffers.get(&n)).map_or(0, |b| b.size);
+                // BUFFER_SIZE, BUFFER_USAGE (always STATIC_DRAW's here), BUFFER_ACCESS_FLAGS and BUFFER_MAPPED (the
+                // guest's to know).
+                let v: i64 = match pname {
+                    0x8764 => size as i64,
+                    0x8765 => 0x88e4,
+                    _ => 0,
+                };
+                gpu_wire::records::put_u64(reply, v as u64);
+            }
             wire::BIND_BUFFER => {
                 let (target, name) = (p.u32()?, p.u32()?);
                 if name != 0 {
@@ -265,12 +401,12 @@ impl Gl {
                 let [index, size, kind, normalized, integer, stride] = p.words::<6>()?;
                 let pointer = p.u64()?;
                 let c = context(o, current)?;
-                let ok_size = (1..=4).contains(&size) || (size == BGRA && kind == UNSIGNED_BYTE);
+                let ok_size = if packed(kind) { size == 4 || size == BGRA } else { (1..=4).contains(&size) || (size == BGRA && kind == UNSIGNED_BYTE) };
                 if index as usize >= ATTRIBS || !ok_size || stride > 2048 {
                     c.fail(INVALID_VALUE);
                     return Ok(true);
                 }
-                if !matches!(kind, BYTE | UNSIGNED_BYTE | SHORT | UNSIGNED_SHORT | INT | UNSIGNED_INT | FLOAT | HALF_FLOAT) {
+                if !matches!(kind, BYTE | UNSIGNED_BYTE | SHORT | UNSIGNED_SHORT | INT | UNSIGNED_INT | FLOAT | HALF_FLOAT | INT_2_10_10_10_REV | UNSIGNED_INT_2_10_10_10_REV) {
                     c.fail(INVALID_ENUM);
                     return Ok(true);
                 }
@@ -314,65 +450,45 @@ impl Gl {
             }
             wire::BIND_TEXTURE => {
                 let (target, name) = (p.u32()?, p.u32()?);
-                if target != TEXTURE_2D {
-                    // Cube maps, 3D and array textures: kept nowhere yet, and said so once.
-                    not_yet("a texture other than GL_TEXTURE_2D", 1);
+                if !matches!(target, TEXTURE_2D | TEXTURE_CUBE_MAP) {
+                    // 3D and array textures: kept nowhere yet, and said so once.
+                    not_yet("a 3D or array texture", 1);
                     return Ok(true);
                 }
                 if name != 0 {
-                    o.textures.entry(name).or_default();
+                    let t = o.textures.entry(name).or_default();
+                    // A texture is what it's first bound as.
+                    if t.image.is_none() {
+                        t.cube = target == TEXTURE_CUBE_MAP;
+                    }
                 }
                 let c = context(o, current)?;
                 let unit = c.unit as usize;
-                c.units[unit] = name;
+                if target == TEXTURE_CUBE_MAP {
+                    c.cube_units[unit] = name;
+                } else {
+                    c.units[unit] = name;
+                }
             }
             wire::TEX_IMAGE | wire::TEX_SUB_IMAGE => self.tex_image(o, current, kind, p)?,
             wire::TEX_PARAMETER => {
                 let [target, pname, bits, float] = p.words::<4>()?;
-                if target != TEXTURE_2D {
-                    return Ok(true);
-                }
                 let value = if float != 0 { f32::from_bits(bits) as i64 as u32 } else { bits };
                 let c = context(o, current)?;
-                let name = c.units[c.unit as usize];
+                let Some(name) = bound_texture(c, target) else { return Ok(true) };
                 let Some(t) = o.textures.get_mut(&name) else {
                     context(o, current)?.fail(INVALID_OPERATION);
                     return Ok(true);
                 };
-                let wrap_ok = matches!(value, 0x2901 | 0x812f | 0x8370 | 0x812d | 0x2900);
-                let ok = match pname {
-                    0x2801 if matches!(value, 0x2600 | 0x2601 | 0x2700..=0x2703) => {
-                        t.min = value;
-                        true
-                    }
-                    0x2800 if matches!(value, 0x2600 | 0x2601) => {
-                        t.mag = value;
-                        true
-                    }
-                    0x2802 if wrap_ok => {
-                        t.wrap[0] = value;
-                        true
-                    }
-                    0x2803 if wrap_ok => {
-                        t.wrap[1] = value;
-                        true
-                    }
-                    0x813d => {
-                        t.max_level = value;
-                        true
-                    }
-                    // WRAP_R, BASE_LEVEL, MIN_LOD, MAX_LOD, anisotropy, comparison, swizzles, border colour, LOD bias.
-                    0x8072 | 0x813c | 0x813a | 0x813b | 0x84fe | 0x884c | 0x884d | 0x8e42..=0x8e46 | 0x1004 | 0x8501 => true,
-                    _ => false,
-                };
+                let ok = set_parameter(&mut t.min, &mut t.mag, &mut t.wrap, Some(&mut t.max_level), pname, value);
                 if !ok {
                     context(o, current)?.fail(INVALID_ENUM);
                 }
             }
             wire::GENERATE_MIPMAP => {
-                let _target = p.u32()?;
+                let target = p.u32()?;
                 let c = context(o, current)?;
-                let name = c.units[c.unit as usize];
+                let name = bound_texture(c, target).unwrap_or(0);
                 match o.textures.get_mut(&name).and_then(|t| t.image.map(|i| (t, i))) {
                     // A depth texture's levels aren't made: the device makes only colour images'.
                     Some((t, _)) if t.format.is_depth() || !t.format.is_renderable() => t.defined |= 1,
@@ -391,7 +507,7 @@ impl Gl {
                         self.gpu.run(move |d| d.free_image(i)).map_err(device_error)?;
                     }
                     for c in o.contexts.values_mut() {
-                        for u in &mut c.units {
+                        for u in c.units.iter_mut().chain(c.cube_units.iter_mut()) {
                             if *u == name {
                                 *u = 0;
                             }
@@ -440,12 +556,14 @@ impl Gl {
         let (width, height, format, ty) = (p.u32()?, p.u32()?, p.u32()?, p.u32()?);
         let given = if sub { true } else { p.u32()? != 0 };
         let data = p.bytes()?;
-        if target != TEXTURE_2D {
-            not_yet("a texture other than GL_TEXTURE_2D", 1);
+        if target != TEXTURE_2D && !CUBE_FACES.contains(&target) {
+            not_yet("a 3D or array texture", 1);
             return Ok(());
         }
+        // A cube map's face goes in its place beside the others.
+        let face = if CUBE_FACES.contains(&target) { Some(target - CUBE_FACES.start()) } else { None };
         let c = context(o, current)?;
-        let name = c.units[c.unit as usize];
+        let name = bound_texture(c, target).unwrap_or(0);
         if name == 0 || !o.textures.contains_key(&name) {
             context(o, current)?.fail(INVALID_OPERATION);
             return Ok(());
@@ -463,14 +581,21 @@ impl Gl {
             }
         };
         let t = o.textures.get_mut(&name).expect("there");
+        let faces = if face.is_some() { 6 } else { 1 };
+        if face.is_some() != t.cube {
+            context(o, current)?.fail(INVALID_OPERATION);
+            return Ok(());
+        }
         if !sub {
-            // Level 0 says the texture's size and format: an image of every level is made for it.
-            if level == 0 && (t.image.is_none() || (t.width, t.height, t.format) != (width, height, fmt)) {
+            // Level 0 says the texture's size and format: an image of every level is made for it (a cube map's six
+            // faces wide).
+            if level == 0 && (t.image.is_none() || (t.width, t.height, t.format) != (width * faces, height, fmt)) {
                 if width == 0 || height == 0 {
                     return Ok(());
                 }
                 let old = t.image.take();
                 let levels = ImageDesc::most_levels(width, height);
+                let width = width * faces;
                 self.flush(o)?;
                 let image = self
                     .gpu
@@ -491,9 +616,10 @@ impl Gl {
             context(o, current)?.fail(INVALID_OPERATION);
             return Ok(());
         };
-        let (lw, lh) = ((t.width >> level).max(1), (t.height >> level).max(1));
+        let face_width = t.width / faces;
+        let (lw, lh) = ((face_width >> level).max(1), (t.height >> level).max(1));
         let fits = if sub { x + width <= lw && y + height <= lh } else { (width, height) == (lw, lh) && fmt == t.format };
-        if !fits || level >= ImageDesc::most_levels(t.width, t.height) {
+        if !fits || level >= ImageDesc::most_levels(face_width, t.height) {
             context(o, current)?.fail(if sub { INVALID_VALUE } else { INVALID_OPERATION });
             return Ok(());
         }
@@ -504,12 +630,17 @@ impl Gl {
             return Ok(());
         }
         let bytes = if given { bytes } else { vec![0; (width * height * fmt.bytes()) as usize] };
+        let x = x + face.unwrap_or(0) * lw;
         self.steps(o, vec![Step::Upload { bytes, to: image, level, region: Rect { x, y, width, height } }])?;
         Ok(())
     }
 
-    /// The sampler a texture's parameters make, made once.
-    fn sampler(&self, o: &mut Objects, t: &Texture) -> Result<gpu::Sampler, String> {
+    /// The sampler a texture's parameters make (or a sampler object's, over them), made once.
+    fn sampler(&self, o: &mut Objects, t: &Texture, over: Option<SamplerObject>) -> Result<gpu::Sampler, String> {
+        let t = &match over {
+            Some(s) => Texture { image: t.image, min: s.min, mag: s.mag, wrap: s.wrap, ..*t },
+            None => Texture { image: t.image, ..*t },
+        };
         let filter = |f: u32| if matches!(f, 0x2601 | 0x2701 | 0x2703) { Filter::Linear } else { Filter::Nearest };
         let address = |w: u32| match w {
             0x2901 => Address::Repeat,
@@ -595,7 +726,11 @@ impl Gl {
         }
         let values = c.attrib_values;
         let units = c.units;
+        let cube_units = c.cube_units;
+        let sampler_units = c.sampler_units;
+        let indexed = c.indexed.clone();
         let viewport = c.viewport;
+        let depth_range = c.depth_range;
         let scissor = if c.is_enabled(SCISSOR_TEST) { c.scissor } else { [0, 0, fb.width as i32, fb.height as i32] };
         let looped = mode == 2;
         let cull = if topology.is_line() || !c.is_enabled(CULL_FACE) {
@@ -622,13 +757,20 @@ impl Gl {
             // An alpha the buffer hasn't stays 1.
             write[3] = false;
         }
+        // The other outputs' write mask, before output 0's is made none for a scratch image.
+        let c_write = c.color_mask;
         if fb.color.is_none() {
             // Only depth to draw into: the colour outputs go to a scratch image, written to nowhere.
             write = [false; 4];
         }
         // The compatibility profile's built-ins (and fixed function's own uniforms), as the state is now.
         if let (Some(ctx), Some(l)) = (o.contexts.get(&current), o.programs.get_mut(&program).and_then(|p| p.linked.as_mut())) {
-            super::compat::fill(l, ctx);
+            let textures = &o.textures;
+            let size_of = |unit: u32, cube: bool| {
+                let table = if cube { &ctx.cube_units } else { &ctx.units };
+                table.get(unit as usize).and_then(|t| textures.get(t)).and_then(|t| t.level(0)).map_or((1, 1), |l| (l.2, l.3))
+            };
+            super::compat::fill(l, ctx, &size_of);
         }
         let Some(linked) = o.programs.get(&program).and_then(|p| p.linked.as_ref()) else {
             context(o, current)?.fail(INVALID_OPERATION);
@@ -651,14 +793,16 @@ impl Gl {
                 _ => (0, Scalar::F32, 4),
             })
             .collect();
-        let sampler_units = linked.units.clone();
+        let unit_of = linked.units.clone();
+        let cube_of = linked.cube.clone();
         let blocks = linked.blocks.clone();
+        let ubos: Vec<(u32, u32, u32)> = linked.ubos.iter().map(|u| (u.binding, u.size, u.point)).collect();
         // Anything that sends the batch is done before its arena is taken for this draw: draws waiting on another
         // framebuffer, and the texture an incomplete one reads (made once).
         if o.batch.target != fb.key && !o.batch.items.is_empty() {
             self.flush(o)?;
         }
-        if !sampler_units.is_empty() {
+        if !unit_of.is_empty() {
             self.black(o)?;
         }
         let mut arena = std::mem::take(&mut o.batch.arena);
@@ -774,8 +918,9 @@ impl Gl {
                 }
             }
             let color = if fb.color.is_some() { fb.format } else { Format::Rgba8Unorm };
-            let blend = if fb.color.is_some() { blend } else { None };
-            let key = PipelineKey { attributes: key_attrs, topology, cull, front, depth, depth_attachment: fb.depth.is_some(), color, alpha, blend, write };
+            let last = fb.extra.iter().rposition(Option::is_some).map_or(0, |i| i + 1);
+            let extra = fb.extra[..last].iter().map(|e| e.map_or((Format::Rgba8Unorm, [false; 4]), |(_, _, f)| (f, c_write))).collect();
+            let key = PipelineKey { attributes: key_attrs, topology, cull, front, depth, depth_attachment: fb.depth.is_some(), color, extra, alpha, blend, write };
             let pipeline = self.pipeline(o, program, &key)?;
             let Some(pipeline) = pipeline else { return Ok(None) };
             // Uniforms as they are now, and the textures each sampler's unit has.
@@ -785,20 +930,42 @@ impl Gl {
                     buffers.push((glsl::SET_DEFAULT, stage as u32, put(&mut arena, bytes, 256)));
                 }
             }
+            // Each uniform block from the buffer at its binding point: read where it is when it's aligned and big
+            // enough, else copied into the arena, short of it padded with zeroes.
+            for &(binding, size, point) in &ubos {
+                let bound = indexed.get(&(UNIFORM_BUFFER, point)).and_then(|&(name, offset, length)| o.buffers.get(&name).and_then(|b| b.memory.map(|m| (m, b.size, offset, length))));
+                let src = match bound {
+                    Some((m, total, offset, length)) if offset < total => {
+                        let available = total - offset;
+                        let length = if length == 0 { available } else { length.min(available) };
+                        if offset % 256 == 0 && length >= u64::from(size) {
+                            Src::Device(Range { memory: m, offset, size: length })
+                        } else {
+                            let mut bytes = self.read_source(Some(m), offset, length.min(u64::from(size)), guest)?;
+                            bytes.resize((size as usize).max(16), 0);
+                            put(&mut arena, &bytes, 256)
+                        }
+                    }
+                    _ => put(&mut arena, &vec![0; (size as usize).max(16)], 256),
+                };
+                buffers.push((glsl::SET_UNIFORM_BLOCK, binding, src));
+            }
             let mut images = Vec::new();
-            for (binding, &unit) in sampler_units.iter().enumerate() {
-                let name = units.get(unit as usize).copied().unwrap_or(0);
+            for (binding, &unit) in unit_of.iter().enumerate() {
+                let table = if cube_of.get(binding).copied().unwrap_or(false) { &cube_units } else { &units };
+                let name = table.get(unit as usize).copied().unwrap_or(0);
+                let over = sampler_units.get(unit as usize).and_then(|s| o.sampler_objects.get(s)).copied();
                 let found = o.textures.get(&name).and_then(|t| t.image.map(|i| (i, t.defined & 1 != 0)));
                 let (image, sampler) = match found {
                     Some((image, true)) => {
                         let t = o.textures.remove(&name).expect("there");
-                        let s = self.sampler(o, &t);
+                        let s = self.sampler(o, &t, over);
                         o.textures.insert(name, t);
                         (image, s?)
                     }
                     _ => {
                         let black = self.black(o)?;
-                        let s = self.sampler(o, &Texture::default())?;
+                        let s = self.sampler(o, &Texture::default(), None)?;
                         (black, s)
                     }
                 };
@@ -817,15 +984,20 @@ impl Gl {
         let Some(planned) = result? else { return Ok(()) };
         // In the framebuffer's render pass, open since the last draw on it (sent above if it was another's) or begun now.
         if o.batch.items.is_empty() {
-            let color = match fb.color {
-                Some(c) => c,
-                None => (self.scratch(o, fb.width, fb.height)?, Sub::default()),
-            };
+            let mut colors = Vec::new();
+            let last = fb.extra.iter().rposition(Option::is_some).map_or(0, |i| i + 1);
+            for output in std::iter::once(fb.color).chain(fb.extra[..last].iter().map(|e| e.map(|(i, s, _)| (i, s)))) {
+                let (image, sub) = match output {
+                    Some(c) => c,
+                    None => (self.scratch(o, fb.width, fb.height)?, Sub::default()),
+                };
+                colors.push(ColorAttachment { image, sub, load: Load::Load });
+            }
             o.batch.target = fb.key;
             let depth = fb.depth.map(|(image, sub)| DepthAttachment { image, sub, load: Load::Load });
-            o.batch.items.push(Item::Command(Command::BeginRender { colors: vec![ColorAttachment { image: color.0, sub: color.1, load: Load::Load }], depth }));
+            o.batch.items.push(Item::Command(Command::BeginRender { colors, depth }));
         }
-        o.batch.items.push(Item::Command(Command::SetViewport(Viewport { x: viewport[0] as f32, y: viewport[1] as f32, width: viewport[2] as f32, height: viewport[3] as f32, min_depth: 0.0, max_depth: 1.0 })));
+        o.batch.items.push(Item::Command(Command::SetViewport(Viewport { x: viewport[0] as f32, y: viewport[1] as f32, width: viewport[2] as f32, height: viewport[3] as f32, min_depth: depth_range[0] as f32, max_depth: depth_range[1] as f32 })));
         o.batch.items.push(Item::Command(Command::SetScissor(Rect { x: area[0] as u32, y: area[1] as u32, width: area[2] as u32, height: area[3] as u32 })));
         o.batch.items.push(Item::Draw(planned));
         Ok(())
@@ -857,6 +1029,8 @@ impl Gl {
             return Ok(Some(p));
         }
         let (vertex, mut fragment, k) = (linked.vertex.clone(), linked.fragment.clone(), key.clone());
+        // Outputs past the framebuffer's draw buffers are dropped, and their writes.
+        glsl::keep_colors(&mut fragment, 1 + key.extra.len() as u32);
         if let Some((func, reference)) = key.alpha {
             glsl::alpha_test(&mut fragment, func, f32::from_bits(reference));
         }
@@ -865,7 +1039,8 @@ impl Gl {
             .run(move |d| {
                 let buffers: Vec<VertexBuffer> = k.attributes.iter().map(|a| VertexBuffer { stride: a.2, per_instance: a.3 }).collect();
                 let attributes: Vec<Attribute> = k.attributes.iter().enumerate().map(|(i, a)| Attribute { location: a.0, buffer: i as u32, offset: 0, format: a.1 }).collect();
-                let colors = [ColorTarget { format: k.color, blend: k.blend, write: k.write }];
+                let mut colors = vec![ColorTarget { format: k.color, blend: k.blend, write: k.write }];
+                colors.extend(k.extra.iter().map(|&(format, write)| ColorTarget { format, blend: if write.contains(&true) { k.blend } else { None }, write }));
                 d.graphics(&GraphicsDesc {
                     vertex: &vertex,
                     fragment: &fragment,
@@ -980,6 +1155,34 @@ fn convert_attrib(raw: &[u8], a: &Attrib, n: u64, scalar: Scalar, lanes: u8) -> 
         let at = i * a.stride() as usize;
         let mut comps = [0.0f64, 0.0, 0.0, 1.0];
         let mut ints = [0i64, 0, 0, 1];
+        if packed(a.kind) {
+            // 10, 10, 10 and 2 bits, x lowest; signed ones normalized so the most negative is -1 too, as GL 4.2 and
+            // ES 3.0 say.
+            let w = u32::from_le_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]]);
+            let fields = [(w & 0x3ff, 10), ((w >> 10) & 0x3ff, 10), ((w >> 20) & 0x3ff, 10), (w >> 30, 2)];
+            for (k, (v, bits)) in fields.into_iter().enumerate() {
+                let (value, max) = if a.kind == INT_2_10_10_10_REV {
+                    let shift = 32 - bits;
+                    (i64::from(((v << shift) as i32) >> shift), f64::from((1u32 << (bits - 1)) - 1))
+                } else {
+                    (i64::from(v), f64::from((1u32 << bits) - 1))
+                };
+                ints[k] = value;
+                comps[k] = if a.normalized { (value as f64 / max).max(-1.0) } else { value as f64 };
+            }
+            if a.size == BGRA {
+                comps.swap(0, 2);
+                ints.swap(0, 2);
+            }
+            for k in 0..lanes as usize {
+                let word = match scalar {
+                    Scalar::F32 => (comps[k] as f32).to_bits(),
+                    _ => ints[k] as u32,
+                };
+                out.extend(word.to_le_bytes());
+            }
+            continue;
+        }
         for k in 0..a.components() as usize {
             let b = &raw[at + k * size..at + k * size + size];
             let (v, int): (f64, i64) = match a.kind {

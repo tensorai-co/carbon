@@ -649,10 +649,22 @@ Luanti, Debian's `minetest`, plays on the M1 with no Mesa in the image's path. D
   world as it does on Mesa: the 3D view drawn into a framebuffer object and post-processed, the wielded hand, the
   selection box and the crosshair. The host's tests draw into a framebuffer object and sample it, draw lines, and
   test alpha.
-- Left, in order: points (Metal needs the vertex shader's point size); lighting and materials; uniform blocks;
-  stencil; flat shading; more than one colour attachment; drawing faster (draws batched across rings, not sent one by
-  one); then the X server names `carbon` for machines with a GPU. Until then a program asks for it
-  with `__GLX_VENDOR_LIBRARY_NAME=carbon`; GL says 3.3, of which this is what's there.
+- OpenGL ES 3.0 contexts (`GLX_EXT_create_context_es2_profile`; a request for 2.0 gets 3.0), with ES's version,
+  GLSL ES and extension strings, and sRGB-capable configs on the X server, so SDL programs built for GLES start on it.
+  ES 3.0's and GL 3.1's pieces built for them: uniform blocks (std140, bound at draws from the buffers at their binding
+  points, read in place when aligned), `glBindBufferBase`/`Range`, mapped buffers (`glMapBufferRange` and its flushes,
+  kept in the program and written back), sampler objects, up to four colour attachments with `glDrawBuffers` and
+  `glClearBuffer*`, cube maps (six faces side by side in one image, `samplerCube` sampled by GL's face table half a
+  texel inside each face), `texelFetch` and `textureSize` (a texel's centre sampled at its level, the size a hidden
+  uniform GL fills), packed 10-10-10-2 vertex attributes, `glTexStorage2D`, `glDepthRange`, sync objects (a client wait
+  finishes what's recorded), and the stencil calls taken (no stencil yet). The ES functions not built yet each say so
+  once (`guest/gl/src/missing.rs`). SuperTuxKart (Debian's GLES build) races on it on the M1: menus, tracks, karts,
+  its deferred lighting and the sky. The host's tests cover two draw buffers, a cube map, `texelFetch` and a uniform
+  block.
+- Left, in order: points (Metal needs the vertex shader's point size); 3D and array textures (the device samples one
+  layer); stencil; constant blend colours; transform feedback and queries; drawing faster (draws batched across rings,
+  not sent one by one); then the X server names `carbon` for machines with a GPU. Until then a program asks for it
+  with `__GLX_VENDOR_LIBRARY_NAME=carbon`; GL says 3.3 and ES 3.0, of which this is what's there.
 
 **5. atlas: DXGI, Direct3D 11 and Vulkan.** DXGI's factory, adapters and flip-model swap chains, the `dxbc` frontend
 and the Direct3D 11 lowering, and `vulkan-1`. *Done means:* the browser-engine program on its default path (ANGLE on

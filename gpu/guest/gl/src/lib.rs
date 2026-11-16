@@ -18,6 +18,7 @@ mod compat;
 mod gl;
 mod glx;
 mod objects;
+mod missing;
 mod sync;
 mod x;
 
@@ -226,9 +227,10 @@ unsafe extern "C" fn get_proc_address(name: *const u8) -> *const c_void {
         return ptr::null();
     }
     let name = unsafe { CStr::from_ptr(name as *const c_char) }.to_bytes();
-    let find = |n: &[u8]| glx::lookup(n).or_else(|| gl::lookup(n)).or_else(|| objects::lookup(n)).or_else(|| compat::lookup(n));
+    let find = |n: &[u8]| glx::lookup(n).or_else(|| gl::lookup(n)).or_else(|| objects::lookup(n)).or_else(|| compat::lookup(n)).or_else(|| missing::lookup(n));
     // An extension's name for what's core now (`glBindBufferARB`, `glBlendEquationEXT`) is the core function.
-    find(name).or_else(|| name.strip_suffix(b"ARB").or_else(|| name.strip_suffix(b"EXT")).and_then(find)).unwrap_or_default()
+    let got = find(name).or_else(|| name.strip_suffix(b"ARB").or_else(|| name.strip_suffix(b"EXT")).and_then(find));
+    got.unwrap_or_default()
 }
 
 /// GLX extension functions that pick their vendor by display: none here. Those this library has take a current

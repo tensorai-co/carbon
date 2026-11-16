@@ -158,6 +158,9 @@ pub(super) struct Lower {
     frag_outputs: bool,
     /// The compatibility profile's built-ins are there (GLSL before 1.40, or `compatibility`).
     pub compat: bool,
+    /// Each sampler's size, as hidden uniforms GL fills at each draw (`carbon_size_<sampler>`): what `texelFetch` and
+    /// `textureSize` read, by the sampler's binding.
+    pub(super) sizes: BTreeMap<u32, Place>,
 }
 
 /// Locations GLSL's `gl_FragData` has here (`GL_MAX_DRAW_BUFFERS`).
@@ -191,6 +194,7 @@ impl Lower {
             row_major: false,
             frag_outputs: false,
             compat: false,
+            sizes: BTreeMap::new(),
         }
     }
 
@@ -1097,7 +1101,7 @@ impl Lower {
     }
 
     /// A plain uniform's place: in the default block (or a sampler's binding), reflected for GL.
-    fn uniform_place(&mut self, name: &str, ty: Ty, location: Option<u32>, binding: Option<u32>) -> Result<Place, Error> {
+    pub(super) fn uniform_place(&mut self, name: &str, ty: Ty, location: Option<u32>, binding: Option<u32>) -> Result<Place, Error> {
         if ty.has_sampler() {
             return self.sampler_place(name, &ty, location, binding);
         }
@@ -1164,8 +1168,8 @@ impl Lower {
     fn sampler_place(&mut self, name: &str, ty: &Ty, location: Option<u32>, binding: Option<u32>) -> Result<Place, Error> {
         match ty {
             Ty::Sampler(s) => {
-                if s.dim != types::Dim::D2 || s.shadow || s.array || s.base != Base::Float {
-                    return self.err(&format!("{ty} isn't sampled here yet: only sampler2D is"));
+                if !matches!(s.dim, types::Dim::D2 | types::Dim::Cube) || s.shadow || s.array || s.base != Base::Float {
+                    return self.err(&format!("{ty} isn't sampled here yet: only sampler2D and samplerCube are"));
                 }
                 let index = self.iface.uniforms.iter().filter(|u| u.binding.is_some()).count() as u32;
                 self.e.bindings.push(Binding { set: super::SET_SAMPLER, binding: index, kind: BindingKind::Combined });

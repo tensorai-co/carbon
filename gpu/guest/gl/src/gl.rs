@@ -18,14 +18,36 @@ use crate::current;
 use crate::glx::Context;
 use crate::sync::Spin;
 
-/// The GL this library makes: what a context asked for by version may be at most.
+/// The GL this library makes: what a context asked for by version may be at most, desktop GL and OpenGL ES.
 pub(crate) const VERSION: (u32, u32) = (3, 3);
+pub(crate) const ES_VERSION: (u32, u32) = (3, 0);
 const VERSION_STRING: &[u8] = b"3.3 Carbon 0.2.0\0";
 const GLSL_STRING: &[u8] = b"3.30\0";
+const ES_VERSION_STRING: &[u8] = b"OpenGL ES 3.0 Carbon 0.2.0\0";
+const ES_GLSL_STRING: &[u8] = b"OpenGL ES GLSL ES 3.00\0";
+/// An OpenGL ES context's extensions: ES's names for what's built.
+const ES_EXTENSIONS_LIST: &[&[u8]] = &[
+    b"GL_EXT_texture_format_BGRA8888\0",
+    b"GL_OES_depth_texture\0",
+    b"GL_OES_depth24\0",
+    b"GL_OES_depth32\0",
+    b"GL_OES_packed_depth_stencil\0",
+    b"GL_OES_rgb8_rgba8\0",
+    b"GL_OES_element_index_uint\0",
+    b"GL_OES_texture_npot\0",
+    b"GL_OES_vertex_array_object\0",
+    b"GL_EXT_blend_minmax\0",
+    b"GL_OES_texture_float\0",
+    b"GL_OES_texture_half_float\0",
+    b"GL_EXT_color_buffer_float\0",
+    b"GL_EXT_color_buffer_half_float\0",
+];
 const VENDOR_STRING: &[u8] = b"Carbon\0";
 /// The extensions this GL has: each one's whole, as built. `GL_EXTENSIONS` is these, joined by spaces.
 const EXTENSIONS_LIST: &[&[u8]] = &[
     b"GL_ARB_framebuffer_object\0",
+    b"GL_ARB_ES2_compatibility\0",
+    b"GL_ARB_ES3_compatibility\0",
     b"GL_EXT_framebuffer_object\0",
     b"GL_EXT_framebuffer_blit\0",
     b"GL_ARB_draw_buffers\0",
@@ -153,6 +175,130 @@ unsafe extern "C" fn glClearDepthf(d: f32) {
     unsafe { glClearDepth(f64::from(d)) }
 }
 
+unsafe extern "C" fn glDepthRange(near: f64, far: f64) {
+    if let Some(c) = context() {
+        let mut p = Vec::new();
+        records::put_u64(&mut p, near.to_bits());
+        records::put_u64(&mut p, far.to_bits());
+        c.record(wire::DEPTH_RANGE, &p);
+    }
+}
+
+unsafe extern "C" fn glDepthRangef(near: f32, far: f32) {
+    unsafe { glDepthRange(f64::from(near), f64::from(far)) }
+}
+
+/// The precision of a shader's floats and integers: IEEE single precision and 32-bit integers, at every
+/// precision, as the device computes them.
+unsafe extern "C" fn glGetShaderPrecisionFormat(_shader: u32, precision: u32, range: *mut i32, bits: *mut i32) {
+    // LOW_FLOAT..HIGH_FLOAT, then LOW_INT..HIGH_INT.
+    let (lo, hi, p) = if (0x8df0..=0x8df2).contains(&precision) { (127, 127, 23) } else { (31, 30, 0) };
+    unsafe {
+        if !range.is_null() {
+            *range = lo;
+            *range.add(1) = hi;
+        }
+        if !bits.is_null() {
+            *bits = p;
+        }
+    }
+}
+
+unsafe extern "C" fn glReleaseShaderCompiler() {}
+
+/// No binary formats: every one is an invalid enum.
+unsafe extern "C" fn glShaderBinary(_count: i32, _shaders: *const u32, _format: u32, _binary: *const c_void, _length: i32) {
+    if let Some(c) = context() {
+        fail(c, INVALID_ENUM);
+    }
+}
+
+fn clear_buffer(buffer: u32, drawbuffer: i32, words: [u32; 4]) {
+    if let Some(c) = context() {
+        let w = [buffer, drawbuffer.max(0) as u32, words[0], words[1], words[2], words[3]];
+        self::words(c, wire::CLEAR_BUFFER, &w);
+    }
+}
+
+unsafe extern "C" fn glClearBufferfv(buffer: u32, drawbuffer: i32, v: *const f32) {
+    if v.is_null() {
+        return;
+    }
+    let n = if buffer == 0x1800 { 4 } else { 1 };
+    let mut w = [0u32; 4];
+    for (i, x) in w.iter_mut().enumerate().take(n) {
+        *x = unsafe { *v.add(i) }.to_bits();
+    }
+    clear_buffer(buffer, drawbuffer, w);
+}
+
+unsafe extern "C" fn glClearBufferiv(buffer: u32, drawbuffer: i32, v: *const i32) {
+    if v.is_null() {
+        return;
+    }
+    // A stencil value, or an integer colour (as floats: the buffers here are normalized).
+    let w = if buffer == 0x1800 { core::array::from_fn(|i| (unsafe { *v.add(i) } as f32).to_bits()) } else { [0, unsafe { *v } as u32, 0, 0] };
+    clear_buffer(buffer, drawbuffer, w);
+}
+
+unsafe extern "C" fn glClearBufferuiv(buffer: u32, drawbuffer: i32, v: *const u32) {
+    if !v.is_null() {
+        clear_buffer(buffer, drawbuffer, core::array::from_fn(|i| (unsafe { *v.add(i) } as f32).to_bits()));
+    }
+}
+
+unsafe extern "C" fn glClearBufferfi(buffer: u32, drawbuffer: i32, depth: f32, stencil: i32) {
+    clear_buffer(buffer, drawbuffer, [depth.to_bits(), stencil as u32, 0, 0]);
+}
+
+// Sync objects. Work is done in order and a ring waits for it, so a fence is signalled once what came before it has
+// been sent and finished: a client wait sends it all (as `glFinish`) and finds it signalled.
+
+/// What a `GLsync` is here: any address that isn't null.
+const SYNC: *const c_void = 1 as *const c_void;
+
+unsafe extern "C" fn glFenceSync(_condition: u32, _flags: u32) -> *const c_void {
+    SYNC
+}
+
+unsafe extern "C" fn glClientWaitSync(_sync: *const c_void, _flags: u32, _timeout: u64) -> u32 {
+    unsafe { glFinish() };
+    // ALREADY_SIGNALED.
+    0x911a
+}
+
+unsafe extern "C" fn glWaitSync(_sync: *const c_void, _flags: u32, _timeout: u64) {}
+
+unsafe extern "C" fn glDeleteSync(_sync: *const c_void) {}
+
+unsafe extern "C" fn glIsSync(sync: *const c_void) -> u8 {
+    u8::from(!sync.is_null())
+}
+
+unsafe extern "C" fn glGetSynciv(_sync: *const c_void, pname: u32, size: i32, length: *mut i32, out: *mut i32) {
+    // OBJECT_TYPE (SYNC_FENCE), SYNC_STATUS (SIGNALED), SYNC_CONDITION (SYNC_GPU_COMMANDS_COMPLETE), SYNC_FLAGS.
+    let v = match pname {
+        0x9112 => 0x9116,
+        0x9114 => 0x9119,
+        0x9113 => 0x9117,
+        _ => 0,
+    };
+    if size > 0 && !out.is_null() {
+        unsafe { *out = v };
+    }
+    if !length.is_null() {
+        unsafe { *length = 1 };
+    }
+}
+
+// The stencil test's state: taken, and nothing done with it, as the framebuffers here have no stencil yet.
+unsafe extern "C" fn glStencilFunc(_func: u32, _reference: i32, _mask: u32) {}
+unsafe extern "C" fn glStencilFuncSeparate(_face: u32, _func: u32, _reference: i32, _mask: u32) {}
+unsafe extern "C" fn glStencilOp(_fail: u32, _zfail: u32, _zpass: u32) {}
+unsafe extern "C" fn glStencilOpSeparate(_face: u32, _fail: u32, _zfail: u32, _zpass: u32) {}
+unsafe extern "C" fn glStencilMask(_mask: u32) {}
+unsafe extern "C" fn glStencilMaskSeparate(_face: u32, _mask: u32) {}
+
 unsafe extern "C" fn glClearStencil(s: i32) {
     if let Some(c) = context() {
         words(c, wire::CLEAR_STENCIL, &[s as u32]);
@@ -241,9 +387,13 @@ fn get(c: &mut Context, pname: u32) -> Vec<Value> {
     if let Some(v) = c.store.get(pname) {
         return alloc::vec![Value::Int(i64::from(v))];
     }
-    // NUM_EXTENSIONS: as many as `glGetStringi` lists.
-    if pname == 0x821d {
-        return alloc::vec![Value::Int(EXTENSIONS_LIST.len() as i64)];
+    // NUM_EXTENSIONS: as many as `glGetStringi` lists. An ES context's version is ES's, with no profile.
+    match pname {
+        0x821d => return alloc::vec![Value::Int(extensions(c).len() as i64)],
+        0x821b if c.es => return alloc::vec![Value::Int(i64::from(ES_VERSION.0))],
+        0x821c if c.es => return alloc::vec![Value::Int(i64::from(ES_VERSION.1))],
+        0x9126 if c.es => return alloc::vec![Value::Int(0)],
+        _ => {}
     }
     let mut then = Vec::new();
     records::record(&mut then, wire::GET, &pname.to_le_bytes());
@@ -338,18 +488,26 @@ fn as_f64(v: Value) -> f64 {
 
 /// `GL_RENDERER`: the device's name, as Carbon's.
 static RENDERER_STRING: Spin<Vec<u8>> = Spin::new(Vec::new());
-/// `GL_EXTENSIONS`: [`EXTENSIONS_LIST`] as one string.
+/// `GL_EXTENSIONS`: [`EXTENSIONS_LIST`] (or an ES context's) as one string.
 static EXTENSIONS_STRING: Spin<Vec<u8>> = Spin::new(Vec::new());
+static ES_EXTENSIONS_STRING: Spin<Vec<u8>> = Spin::new(Vec::new());
+
+/// The current context's extensions, one at a time.
+fn extensions(c: &Context) -> &'static [&'static [u8]] {
+    if c.es { ES_EXTENSIONS_LIST } else { EXTENSIONS_LIST }
+}
 
 unsafe extern "C" fn glGetString(name: u32) -> *const u8 {
     let Some(c) = context() else { return ptr::null() };
     match name {
         VENDOR => VENDOR_STRING.as_ptr(),
+        VERSION_NAME if c.es => ES_VERSION_STRING.as_ptr(),
         VERSION_NAME => VERSION_STRING.as_ptr(),
         EXTENSIONS => {
-            let mut s = EXTENSIONS_STRING.lock();
+            let (lock, list) = if c.es { (&ES_EXTENSIONS_STRING, ES_EXTENSIONS_LIST) } else { (&EXTENSIONS_STRING, EXTENSIONS_LIST) };
+            let mut s = lock.lock();
             if s.is_empty() {
-                for (i, e) in EXTENSIONS_LIST.iter().enumerate() {
+                for (i, e) in list.iter().enumerate() {
                     if i > 0 {
                         s.push(b' ');
                     }
@@ -361,6 +519,7 @@ unsafe extern "C" fn glGetString(name: u32) -> *const u8 {
             s.as_ptr()
         }
         // SHADING_LANGUAGE_VERSION.
+        0x8b8c if c.es => ES_GLSL_STRING.as_ptr(),
         0x8b8c => GLSL_STRING.as_ptr(),
         RENDERER => {
             let mut s = RENDERER_STRING.lock();
@@ -418,12 +577,11 @@ unsafe extern "C" fn glReadPixels(x: i32, y: i32, width: i32, height: i32, forma
 
 /// `glGetStringi`: the extensions, one at a time.
 unsafe extern "C" fn glGetStringi(name: u32, index: u32) -> *const u8 {
-    match EXTENSIONS_LIST.get(index as usize) {
+    let Some(c) = context() else { return ptr::null() };
+    match extensions(c).get(index as usize) {
         Some(e) if name == EXTENSIONS => e.as_ptr(),
         _ => {
-            if let Some(c) = context() {
-                fail(c, if name == EXTENSIONS { INVALID_VALUE } else { INVALID_ENUM });
-            }
+            fail(c, if name == EXTENSIONS { INVALID_VALUE } else { INVALID_ENUM });
             ptr::null()
         }
     }
@@ -437,7 +595,11 @@ unsafe extern "C" fn glDrawBuffer(mode: u32) {
     unsafe { crate::objects::glDrawBuffers(1, &mode) }
 }
 
-unsafe extern "C" fn glReadBuffer(_mode: u32) {}
+unsafe extern "C" fn glReadBuffer(mode: u32) {
+    if let Some(c) = context() {
+        words(c, wire::READ_COLOR, &[mode]);
+    }
+}
 
 macro_rules! entry {
     ($f:ident) => {
@@ -451,6 +613,27 @@ pub(crate) fn lookup(name: &[u8]) -> Option<*const c_void> {
         entry!(glClearColor),
         entry!(glClearDepth),
         entry!(glClearDepthf),
+        entry!(glStencilFunc),
+        entry!(glStencilFuncSeparate),
+        entry!(glStencilOp),
+        entry!(glStencilOpSeparate),
+        entry!(glStencilMask),
+        entry!(glStencilMaskSeparate),
+        entry!(glClearBufferfv),
+        entry!(glClearBufferiv),
+        entry!(glClearBufferuiv),
+        entry!(glClearBufferfi),
+        entry!(glFenceSync),
+        entry!(glClientWaitSync),
+        entry!(glWaitSync),
+        entry!(glDeleteSync),
+        entry!(glIsSync),
+        entry!(glGetSynciv),
+        entry!(glDepthRange),
+        entry!(glDepthRangef),
+        entry!(glGetShaderPrecisionFormat),
+        entry!(glReleaseShaderCompiler),
+        entry!(glShaderBinary),
         entry!(glClearStencil),
         entry!(glClear),
         entry!(glViewport),
