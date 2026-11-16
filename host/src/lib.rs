@@ -267,16 +267,27 @@ pub struct Std {
     start: Instant,
     /// Captured output, for tests, instead of the real stdout and stderr.
     capture: Option<Mutex<Vec<u8>>>,
+    /// Whether the machine has the host's stdin (`-i`); without it, its stdin is at its end from the start.
+    stdin: bool,
+    /// Whether the machine may have the host's terminal as its console (`-t`), if it is one.
+    tty: bool,
 }
 
 impl Std {
+    /// The host's stdin, and its terminal as a console if it's one.
     pub fn new() -> Std {
-        Std { start: Instant::now(), capture: None }
+        Std::stdio(true, true)
+    }
+
+    /// As `docker run` has it: `stdin` (`-i`) keeps the host's stdin, else the machine's reads its end at once; `tty`
+    /// (`-t`) makes the host's terminal the machine's console, where it is one.
+    pub fn stdio(stdin: bool, tty: bool) -> Std {
+        Std { start: Instant::now(), capture: None, stdin, tty }
     }
 
     /// One that keeps what's written instead of printing it: see `captured`.
     pub fn capturing() -> Std {
-        Std { start: Instant::now(), capture: Some(Mutex::new(Vec::new())) }
+        Std { start: Instant::now(), capture: Some(Mutex::new(Vec::new())), stdin: true, tty: false }
     }
 
     /// Everything written so far, to stdout and stderr alike, if capturing.
@@ -306,19 +317,27 @@ impl Host for Std {
     }
 
     fn read(&self, buffer: &mut [u8]) -> usize {
+        if !self.stdin {
+            return 0;
+        }
         Input::get().read(buffer)
     }
 
     fn wait_input(&self, timeout: Option<Duration>) -> bool {
-        Input::get().wait(timeout.map(|t| Instant::now() + t))
+        // No stdin is one at its end: ready at once.
+        !self.stdin || Input::get().wait(timeout.map(|t| Instant::now() + t))
     }
 
     fn wake(&self) {
-        Input::get().wake();
+        if self.stdin {
+            Input::get().wake();
+        }
     }
 
     fn watch_input(&self, notify: Arc<dyn Fn() + Send + Sync>) {
-        Input::get().watchers.lock().unwrap_or_else(|p| p.into_inner()).push(notify);
+        if self.stdin {
+            Input::get().watchers.lock().unwrap_or_else(|p| p.into_inner()).push(notify);
+        }
     }
 
     fn wall(&self) -> u64 {
@@ -343,7 +362,7 @@ impl Host for Std {
 
     fn is_terminal(&self) -> bool {
         use std::io::IsTerminal;
-        self.capture.is_none() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+        self.tty && self.capture.is_none() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
     }
 
     fn set_raw(&self, raw: bool) {

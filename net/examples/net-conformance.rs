@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use net::{Addr, Config, Domain, Error, Kind, Network, Shutdown, Socket, System};
+use net::{Addr, Config, Domain, Error, Kind, Mode, Network, Publish, Shutdown, Socket, System};
 
 static FAILURES: AtomicUsize = AtomicUsize::new(0);
 
@@ -115,7 +115,7 @@ fn main() {
         std::process::exit(1);
     };
     println!("[net conformance, peers on {host_ip}]");
-    let net = Network::new(Config { hostname: "conformance".into(), dns: None }, Arc::new(System));
+    let net = Network::new(Config { hostname: "conformance".into(), dns: None, ..Default::default() }, Arc::new(System));
     check(!net.address().octets()[..2].eq(&host_ip.octets()[..2]) || host_ip.octets()[0] != 10, "the machine's network is on none of the host's addresses");
 
     // TCP: connect, accept, echo; the machine's own address as the local one.
@@ -209,11 +209,62 @@ fn main() {
     check(a.is_some_and(|a| a[7] >= 1 && a[a.len() - 4..] == [127, 0, 0, 1]), "dns: localhost's address");
     let own = ask(&net, query(2, "conformance", 1));
     check(own.is_some_and(|a| a[a.len() - 4..] == net.address().octets()), "dns: the machine's own name");
-    let with_server = Network::new(Config { hostname: "conformance".into(), dns: Some(txt_server()) }, Arc::new(System));
+    let with_server = Network::new(Config { hostname: "conformance".into(), dns: Some(txt_server()), ..Default::default() }, Arc::new(System));
     let txt = ask(&with_server, query(3, "example.test", 16));
     check(txt.is_some_and(|t| t.ends_with(b"\x06carbon") && t[..2] == [0, 3]), "dns: a TXT record from the machine's own DNS server");
+
+    published(host_ip);
 
     let failures = FAILURES.load(Ordering::SeqCst);
     println!("{}", if failures == 0 { "all passed" } else { "some checks failed" });
     std::process::exit(i32::from(failures != 0));
+}
+
+/// In: ports published on the host's, reached by host clients on one of the host's own addresses, which the machine
+/// sees as they are; and with the host's network, a port the machine listens on is the host's.
+fn published(host_ip: Ipv4Addr) {
+    let net = Network::new(Config { hostname: "conformance".into(), ..Default::default() }, Arc::new(System));
+    let listener = net.socket(Domain::Inet, Kind::Stream).unwrap_or_else(|e| panic!("{e}"));
+    let _ = listener.bind(&Addr::Inet("0.0.0.0:80".parse().unwrap_or_else(|e| panic!("{e}"))));
+    let _ = listener.listen(8);
+    let udp = net.socket(Domain::Inet, Kind::Datagram).unwrap_or_else(|e| panic!("{e}"));
+    let _ = udp.bind(&Addr::Inet("0.0.0.0:53".parse().unwrap_or_else(|e| panic!("{e}"))));
+    let spec = |text: String| Publish::parse(&text).unwrap_or_else(|e| panic!("{e}"));
+    let published = net.publish(&[spec(format!("{host_ip}::80")), spec(format!("{host_ip}::53/udp"))].concat());
+    check(published.as_ref().is_ok_and(|p| p.bound().len() == 2), "publish: a TCP and a UDP port on the host's address");
+    let Ok(published) = published else { return };
+    let at = |protocol: net::Protocol| published.bound().iter().find(|b| b.protocol == protocol).map(|b| b.host).unwrap_or_else(|| panic!("bound"));
+
+    let client = std::net::TcpStream::connect(at(net::Protocol::Tcp));
+    let accepted = until(|| listener.ready().read).then(|| listener.accept().ok()).flatten();
+    let mine = client.as_ref().ok().and_then(|c| c.local_addr().ok());
+    check(matches!((&accepted, mine), (Some((_, Addr::Inet(from))), Some(mine)) if *from == mine), "publish: a host client accepted, with its own address");
+    if let (Ok(mut client), Some((server, _))) = (client, accepted) {
+        let _ = client.write_all(b"in");
+        let got = until(|| server.ready().read).then(|| server.recv(16, false).ok()).flatten();
+        let _ = server.send(b"out", None, &mut None);
+        let mut back = [0u8; 3];
+        let echoed = client.set_read_timeout(Some(Duration::from_secs(5))).is_ok() && client.read_exact(&mut back).is_ok();
+        check(got.is_some_and(|g| g.data == b"in") && echoed && &back == b"out", "publish: both ways over it");
+    }
+
+    let client = UdpSocket::bind((host_ip, 0)).unwrap_or_else(|e| panic!("{e}"));
+    let _ = client.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = client.send_to(b"q", at(net::Protocol::Udp));
+    let got = until(|| udp.ready().read).then(|| udp.recv(16, false).ok()).flatten();
+    let from = got.as_ref().and_then(|g| g.from.clone());
+    check(from == client.local_addr().ok().map(Addr::Inet), "publish: a UDP datagram, with its sender's address");
+    if let Some(from) = from {
+        let _ = udp.send(b"a", Some(&from), &mut None);
+    }
+    let mut buffer = [0u8; 8];
+    check(client.recv_from(&mut buffer).is_ok_and(|(n, src)| &buffer[..n] == b"a" && src == at(net::Protocol::Udp)), "publish: the answer comes from the published port");
+
+    // The host's network: no publishing.
+    let host = Network::new(Config { hostname: "conformance".into(), mode: Mode::Host, ..Default::default() }, Arc::new(System));
+    let port = TcpListener::bind((host_ip, 0)).and_then(|l| l.local_addr()).map(|a| a.port()).unwrap_or_else(|e| panic!("{e}"));
+    let own = host.socket(Domain::Inet, Kind::Stream).unwrap_or_else(|e| panic!("{e}"));
+    let listening = own.bind(&Addr::Inet(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port))).and_then(|()| own.listen(8));
+    let reached = listening.is_ok() && std::net::TcpStream::connect((host_ip, port)).is_ok() && until(|| own.ready().read);
+    check(reached, "--network host: a port the machine listens on is the host's");
 }

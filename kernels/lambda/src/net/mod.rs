@@ -57,6 +57,10 @@ const SOL_SOCKET: i32 = 1;
 const SCM_RIGHTS: i32 = 1;
 const SCM_CREDENTIALS: i32 = 2;
 const IPPROTO_TCP: i32 = 6;
+const IPPROTO_IP: i32 = 0;
+const IP_OPTIONS: i32 = 4;
+const IPPROTO_IPV6: i32 = 41;
+const IPV6_V6ONLY: i32 = 26;
 const IPPROTO_UDP: i32 = 17;
 
 const SO_REUSEADDR: i32 = 2;
@@ -834,6 +838,10 @@ impl Task {
                 let on = flag()?;
                 s.socket.set_options(|o| o.nodelay = on);
             }
+            (IPPROTO_IPV6, IPV6_V6ONLY) => {
+                let on = flag()?;
+                s.socket.set_options(|o| o.v6only = on);
+            }
             (SOL_SOCKET, SO_RCVTIMEO | SO_SNDTIMEO) => {
                 if value.len() < 16 {
                     return Err(EINVAL);
@@ -890,6 +898,7 @@ impl Task {
                     (SOL_SOCKET, SO_BROADCAST) => int(options.broadcast),
                     (SOL_SOCKET, SO_PASSCRED) => int(options.pass_cred),
                     (IPPROTO_TCP, TCP_NODELAY) => int(options.nodelay),
+                    (IPPROTO_IPV6, IPV6_V6ONLY) => int(options.v6only),
                     (IPPROTO_TCP, TCP_MAXSEG) => int(1448),
                     (SOL_SOCKET, SO_RCVTIMEO | SO_SNDTIMEO) => timeval(lock(&s.timeouts)[usize::from(name == SO_SNDTIMEO)]),
                     (SOL_SOCKET, SO_PEERCRED) => {
@@ -900,6 +909,8 @@ impl Task {
                         b
                     }
                     (SOL_SOCKET, SO_PEERSEC) => return Err(ENOPROTOOPT),
+                    // No IP options: none come through a host's socket (sshd refuses a connection that has any).
+                    (IPPROTO_IP, IP_OPTIONS) => Vec::new(),
                     _ => match lock(&s.kept).get(&(level, name)) {
                         Some(kept) => kept.clone(),
                         None if level == SOL_SOCKET && matches!(name, SO_SNDBUF | SO_RCVBUF) => int(BUFFER_SIZE),

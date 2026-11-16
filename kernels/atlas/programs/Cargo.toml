@@ -1,0 +1,62 @@
+[package]
+name = "atlas-programs"
+description = "The programs Windows ships that atlas has its own of, as real Windows programs in System32: cmd.exe first"
+version = "0.2.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+# Built by atlas's build.rs for Windows targets, not with the workspace.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "cmd"
+path = "src/bin/cmd/main.rs"
+
+[[bin]]
+name = "hostname"
+path = "src/bin/tools/hostname.rs"
+
+[[bin]]
+name = "whoami"
+path = "src/bin/tools/whoami.rs"
+
+[[bin]]
+name = "where"
+path = "src/bin/tools/where.rs"
+
+[[bin]]
+name = "find"
+path = "src/bin/tools/find.rs"
+
+[[bin]]
+name = "findstr"
+path = "src/bin/tools/findstr.rs"
+
+[[bin]]
+name = "sort"
+path = "src/bin/tools/sort.rs"
+
+[[bin]]
+name = "more"
+path = "src/bin/tools/more.rs"
+
+[[bin]]
+name = "timeout"
+path = "src/bin/tools/timeout.rs"
+
+[[bin]]
+name = "powershell"
+path = "src/bin/powershell/main.rs"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+
+[profile.dev]
+panic = "abort"

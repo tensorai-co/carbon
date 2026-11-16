@@ -68,6 +68,7 @@ for arch in aarch64 x86_64; do
         "$out/advapi32-$arch.lib" "$out/shell32-$arch.lib" "$out/ole32-$arch.lib" "$out/psapi-$arch.lib" "$out/oleaut32-$arch.lib" \
         "$out/bcrypt-$arch.lib" "$out/ws2_32-$arch.lib" -o "$out/loader-$arch/startup.exe"
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console sockets.c "$out/kernel32-$arch.lib" "$out/ws2_32-$arch.lib" -o "$out/loader-$arch/sockets.exe"
+    $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console serve.c "$out/kernel32-$arch.lib" "$out/ws2_32-$arch.lib" -o "$out/loader-$arch/serve.exe"
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:console sandbox.c "$out/kernel32-$arch.lib" "$out/user32-$arch.lib" "$out/advapi32-$arch.lib" \
         "$out/ntdll-$arch.lib" "$out/combase-$arch.lib" "$out/bcryptprimitives-$arch.lib" -o "$out/loader-$arch/sandbox.exe"
     $cc -Wl,/entry:mainCRTStartup -Wl,/subsystem:windows desktop.c "$out/kernel32-$arch.lib" "$out/user32-$arch.lib" "$out/shell32-$arch.lib" -o "$out/loader-$arch/desktop.exe"
@@ -137,7 +138,7 @@ i686dll() {
     rm -rf "$tmp"
 }
 mkdir -p "$out/loader-i686"
-for prog in sandbox sockets startup shell comctl installer wow64 files io pipes process sections registry links environment security pool windows desktop ansiwin exceptions fibers crt ansi hello; do
+for prog in sandbox sockets serve startup shell comctl installer wow64 files io pipes process sections registry links environment security pool windows desktop ansiwin exceptions fibers crt ansi hello; do
     i686 $prog.c "$out/loader-i686/$prog.exe" || echo "i686: $prog.c doesn't build"
 done
 # The loader's DLLs, as the 64-bit ones are made.

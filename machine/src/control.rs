@@ -2,8 +2,161 @@
 //! `windows`, and the input an agent drives a machine with (`move`, `click`, `drag`, `scroll`, `type`, `key`). It's a
 //! Unix socket in the host's temporary folder (a socket's path has to be short), named in the machine's folder as
 //! `control`. One request per connection: a line, then the answer: `ok <length>` and that many bytes, or `error <why>`.
+//!
+//! `exec <json>` (`carbon exec`) is the one that goes on: after its `ok 0`, the connection carries frames both ways, a
+//! kind byte, a 4-byte little-endian length and that many bytes. In: stdin (0), stdin's end (1), a terminal size
+//! (2: rows and columns, 2 bytes each), a signal (3: 4 bytes). Out: stdout (1), stderr (2), and its exit code (3: 4
+//! bytes), last.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+/// What `carbon exec` asks a running machine to start.
+#[derive(Debug, Clone, Default)]
+pub struct ExecRequest {
+    pub args: Vec<String>,
+    /// `NAME=value`, over the machine's own environment.
+    pub env: Vec<String>,
+    pub workdir: Option<String>,
+    /// A terminal of its own, this many rows and columns.
+    pub tty: Option<(u16, u16)>,
+    /// Started and left running: nothing comes back but whether it started.
+    pub detach: bool,
+}
+
+/// What comes out of a process `exec` started.
+pub(crate) enum Output {
+    Out(Vec<u8>),
+    Err(Vec<u8>),
+    Exit(i32),
+}
+
+/// A process `exec` started, whichever kernel's.
+pub(crate) trait Session: Send + Sync {
+    fn input(&self, data: &[u8]);
+    fn close_input(&self);
+    fn resize(&self, rows: u16, cols: u16);
+    fn signal(&self, signal: i32);
+    fn next(&self, timeout: Duration) -> Option<Output>;
+}
+
+/// How a machine starts what `exec` asks for.
+pub(crate) type Enter = Arc<dyn Fn(ExecRequest) -> Result<Box<dyn Session>, String> + Send + Sync>;
+
+impl Session for lambda::Entered {
+    fn input(&self, data: &[u8]) {
+        lambda::Entered::input(self, data);
+    }
+    fn close_input(&self) {
+        lambda::Entered::close_input(self);
+    }
+    fn resize(&self, rows: u16, cols: u16) {
+        lambda::Entered::resize(self, rows, cols);
+    }
+    fn signal(&self, signal: i32) {
+        lambda::Entered::signal(self, signal);
+    }
+    fn next(&self, timeout: Duration) -> Option<Output> {
+        lambda::Entered::next(self, timeout).map(|e| match e {
+            lambda::Event::Out(d) => Output::Out(d),
+            lambda::Event::Err(d) => Output::Err(d),
+            lambda::Event::Exit(c) => Output::Exit(c),
+        })
+    }
+}
+
+impl Session for atlas::Entered {
+    fn input(&self, data: &[u8]) {
+        atlas::Entered::input(self, data);
+    }
+    fn close_input(&self) {
+        atlas::Entered::close_input(self);
+    }
+    fn resize(&self, rows: u16, cols: u16) {
+        atlas::Entered::resize(self, rows, cols);
+    }
+    fn signal(&self, signal: i32) {
+        atlas::Entered::signal(self, signal);
+    }
+    fn next(&self, timeout: Duration) -> Option<Output> {
+        atlas::Entered::next(self, timeout).map(|e| match e {
+            atlas::Event::Out(d) => Output::Out(d),
+            atlas::Event::Err(d) => Output::Err(d),
+            atlas::Event::Exit(c) => Output::Exit(c),
+        })
+    }
+}
+
+fn request_json(r: &ExecRequest) -> String {
+    serde_json::json!({ "args": r.args, "env": r.env, "workdir": r.workdir, "tty": r.tty.map(|(rows, cols)| [rows, cols]), "detach": r.detach }).to_string()
+}
+
+fn request_from_json(text: &str) -> Option<ExecRequest> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let list = |key: &str| v.get(key).and_then(|l| l.as_array()).map(|l| l.iter().filter_map(|s| s.as_str().map(String::from)).collect()).unwrap_or_default();
+    let tty = v.get("tty").and_then(|t| t.as_array()).and_then(|t| Some((t.first()?.as_u64()? as u16, t.get(1)?.as_u64()? as u16)));
+    Some(ExecRequest { args: list("args"), env: list("env"), workdir: v.get("workdir").and_then(|w| w.as_str()).map(String::from), tty, detach: v.get("detach").and_then(|d| d.as_bool()).unwrap_or(false) })
+}
+
+#[cfg(unix)]
+fn frame(kind: u8, data: &[u8]) -> Vec<u8> {
+    let mut f = Vec::with_capacity(5 + data.len());
+    f.push(kind);
+    f.extend((data.len() as u32).to_le_bytes());
+    f.extend(data);
+    f
+}
+
+/// Reads one frame: its kind and bytes, or None at the end.
+#[cfg(unix)]
+fn read_frame(r: &mut impl std::io::Read) -> Option<(u8, Vec<u8>)> {
+    let mut head = [0u8; 5];
+    r.read_exact(&mut head).ok()?;
+    let len = u32::from_le_bytes([head[1], head[2], head[3], head[4]]) as usize;
+    let mut data = vec![0; len.min(16 << 20)];
+    r.read_exact(&mut data).ok()?;
+    Some((head[0], data))
+}
+
+/// An `exec` connection, after its request: the session's output out, the client's input in, until it ends.
+#[cfg(unix)]
+fn run_exec(stream: &mut std::os::unix::net::UnixStream, request: ExecRequest, enter: &Enter) -> std::io::Result<()> {
+    use std::io::Write;
+    let detach = request.detach;
+    let session: Arc<dyn Session> = match enter(request) {
+        Ok(session) => Arc::from(session),
+        Err(why) => return stream.write_all(format!("error {why}\n").as_bytes()),
+    };
+    stream.write_all(b"ok 0\n")?;
+    if detach {
+        // Left running: its output is drained, so it never waits on a full pipe, until it ends.
+        session.close_input();
+        std::thread::spawn(move || while !matches!(session.next(Duration::from_secs(3600)), Some(Output::Exit(_))) {});
+        return Ok(());
+    }
+    let mut reader = stream.try_clone()?;
+    let input = session.clone();
+    std::thread::spawn(move || {
+        while let Some((kind, data)) = read_frame(&mut reader) {
+            match kind {
+                0 => input.input(&data),
+                1 => input.close_input(),
+                2 if data.len() >= 4 => input.resize(u16::from_le_bytes([data[0], data[1]]), u16::from_le_bytes([data[2], data[3]])),
+                3 if data.len() >= 4 => input.signal(i32::from_le_bytes([data[0], data[1], data[2], data[3]])),
+                _ => {}
+            }
+        }
+    });
+    loop {
+        match session.next(Duration::from_millis(250)) {
+            Some(Output::Out(data)) => stream.write_all(&frame(1, &data))?,
+            Some(Output::Err(data)) => stream.write_all(&frame(2, &data))?,
+            Some(Output::Exit(code)) => return stream.write_all(&frame(3, &code.to_le_bytes())),
+            None => {}
+        }
+    }
+}
 
 /// The socket, removed when the machine ends.
 pub struct Control {
@@ -19,14 +172,30 @@ impl Drop for Control {
     }
 }
 
+/// The request's line, read a byte at a time so nothing after it (an `exec`'s frames) is taken with it.
 #[cfg(unix)]
-fn answer(stream: &mut std::os::unix::net::UnixStream, desktop: &Option<display::desktop::Shared>) -> std::io::Result<()> {
-    use std::io::{BufRead, BufReader, Write};
-    let mut line = String::new();
-    BufReader::new(&mut *stream).read_line(&mut line)?;
+fn read_line(stream: &mut impl std::io::Read) -> std::io::Result<String> {
+    let mut bytes = Vec::new();
+    let mut byte = [0u8; 1];
+    while stream.read(&mut byte)? == 1 && byte[0] != b'\n' {
+        bytes.push(byte[0]);
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[cfg(unix)]
+fn answer(stream: &mut std::os::unix::net::UnixStream, desktop: &Option<display::desktop::Shared>, enter: &Option<Enter>) -> std::io::Result<()> {
+    use std::io::Write;
     // Only the line's end goes: text typed, copied or dropped keeps its own spaces at either end.
-    let line = line.strip_suffix('\n').unwrap_or(&line);
-    match (line.strip_suffix('\r').unwrap_or(line), desktop) {
+    let line = read_line(stream)?;
+    if let Some(json) = line.strip_prefix("exec ") {
+        return match (request_from_json(json), enter) {
+            (Some(request), Some(enter)) => run_exec(stream, request, enter),
+            (None, _) => stream.write_all(b"error exec's request made no sense\n"),
+            (_, None) => stream.write_all(b"error this machine can't start a process from outside yet\n"),
+        };
+    }
+    match (line.strip_suffix('\r').unwrap_or(&line), desktop) {
         ("screenshot", Some(desktop)) => {
             let png = display::desktop::lock(desktop).screen().png();
             stream.write_all(format!("ok {}\n", png.len()).as_bytes())?;
@@ -272,7 +441,7 @@ fn windows(d: &display::Desktop) -> String {
 
 /// Starts answering on a socket for the machine whose folder is `dir`.
 #[cfg(unix)]
-pub fn serve(dir: PathBuf, desktop: Option<display::desktop::Shared>) -> Option<Control> {
+pub(crate) fn serve(dir: PathBuf, desktop: Option<display::desktop::Shared>, enter: Option<Enter>) -> Option<Control> {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     dir.hash(&mut hasher);
@@ -282,15 +451,17 @@ pub fn serve(dir: PathBuf, desktop: Option<display::desktop::Shared>) -> Option<
     let named = dir.join("control");
     std::fs::write(&named, socket.to_string_lossy().as_bytes()).ok()?;
     let _ = std::thread::Builder::new().name("carbon control".into()).spawn(move || {
+        // Each on a thread of its own: an `exec` lasts as long as its process.
         for mut stream in listener.incoming().flatten() {
-            let _ = answer(&mut stream, &desktop);
+            let (desktop, enter) = (desktop.clone(), enter.clone());
+            let _ = std::thread::Builder::new().name("carbon control".into()).spawn(move || answer(&mut stream, &desktop, &enter));
         }
     });
     Some(Control { paths: vec![socket, named] })
 }
 
 #[cfg(not(unix))]
-pub fn serve(_dir: PathBuf, _desktop: Option<display::desktop::Shared>) -> Option<Control> {
+pub(crate) fn serve(_dir: PathBuf, _desktop: Option<display::desktop::Shared>, _enter: Option<Enter>) -> Option<Control> {
     None
 }
 
@@ -317,4 +488,137 @@ pub fn ask(dir: &Path, request: &str) -> Result<Vec<u8>, String> {
 #[cfg(not(unix))]
 pub fn ask(_dir: &Path, _request: &str) -> Result<Vec<u8>, String> {
     Err("asking a running machine isn't there yet on Windows hosts".into())
+}
+
+/// `carbon exec`'s side: asks the running machine whose folder is `dir` to start `request`, then relays this
+/// process's stdin (if `interactive`), terminal size and signals to it and its output back, until it ends; its exit
+/// code. With a terminal (`request.tty`), this one's is put in raw mode for as long.
+#[cfg(unix)]
+pub fn exec(dir: &Path, request: ExecRequest, interactive: bool) -> Result<i32, String> {
+    use std::io::{Read, Write};
+    use std::sync::Mutex;
+    let mut request = request;
+    // A terminal's starting size: this one's.
+    if request.tty.is_some() {
+        request.tty = Some(host::Host::terminal_size(&host::Std::new()).unwrap_or((24, 80)));
+    }
+    let socket = std::fs::read_to_string(dir.join("control")).map_err(|_| "the machine isn't running".to_string())?;
+    let mut stream = std::os::unix::net::UnixStream::connect(socket.trim()).map_err(|e| format!("reaching the machine: {e}"))?;
+    stream.write_all(format!("exec {}\n", request_json(&request)).as_bytes()).map_err(|e| e.to_string())?;
+    let answer = read_line(&mut stream).map_err(|e| e.to_string())?;
+    if let Some(why) = answer.strip_prefix("error ") {
+        return Err(why.to_string());
+    }
+    if !answer.starts_with("ok") {
+        return Err("the machine's answer made no sense".into());
+    }
+    if request.detach {
+        return Ok(0);
+    }
+    let writer = Arc::new(Mutex::new(stream.try_clone().map_err(|e| e.to_string())?));
+    let send = {
+        let writer = writer.clone();
+        move |kind: u8, data: &[u8]| writer.lock().map(|mut w| w.write_all(&frame(kind, data)).is_ok()).unwrap_or(false)
+    };
+
+    // This terminal, raw, for as long as it's the process's.
+    struct Raw(Option<host::Std>);
+    impl Drop for Raw {
+        fn drop(&mut self) {
+            if let Some(host) = &self.0 {
+                host::Host::set_raw(host, false);
+            }
+        }
+    }
+    let raw = Raw(request.tty.map(|_| {
+        let host = host::Std::new();
+        host::Host::set_raw(&host, true);
+        host
+    }));
+
+    if interactive {
+        let send = send.clone();
+        std::thread::spawn(move || {
+            let mut stdin = std::io::stdin();
+            let mut buffer = [0u8; 4096];
+            loop {
+                match stdin.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if !send(0, &buffer[..n]) {
+                            return;
+                        }
+                    }
+                }
+            }
+            send(1, &[]);
+        });
+    } else {
+        send(1, &[]);
+    }
+    if request.tty.is_some() {
+        // Its size, as this terminal's changes.
+        let send = send.clone();
+        std::thread::spawn(move || {
+            let host = host::Std::new();
+            let mut last = None;
+            loop {
+                let size = host::Host::terminal_size(&host);
+                if size != last {
+                    if let Some((rows, cols)) = size {
+                        let mut d = rows.to_le_bytes().to_vec();
+                        d.extend(cols.to_le_bytes());
+                        if !send(2, &d) {
+                            return;
+                        }
+                    }
+                    last = size;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        });
+    } else {
+        // Signals to this process go to it, as Docker's --sig-proxy does; with a terminal, ^C is a key it reads.
+        let send = send.clone();
+        // SAFETY: a set made empty and given three signals, blocked in this thread (and those made after it) and
+        // waited for on one of its own.
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+                libc::sigaddset(&mut set, signal);
+            }
+            libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+            let set = set;
+            std::thread::spawn(move || loop {
+                let mut signal = 0;
+                if libc::sigwait(&set, &mut signal) != 0 || !send(3, &signal.to_le_bytes()) {
+                    return;
+                }
+            });
+        }
+    }
+
+    let mut out = std::io::stdout();
+    let mut err = std::io::stderr();
+    let code = loop {
+        match read_frame(&mut stream) {
+            Some((1, data)) => {
+                let _ = out.write_all(&data).and_then(|()| out.flush());
+            }
+            Some((2, data)) => {
+                let _ = err.write_all(&data);
+            }
+            Some((3, data)) if data.len() >= 4 => break i32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+            Some(_) => {}
+            None => break 255,
+        }
+    };
+    drop(raw);
+    Ok(code)
+}
+
+#[cfg(not(unix))]
+pub fn exec(_dir: &Path, _request: ExecRequest, _interactive: bool) -> Result<i32, String> {
+    Err("exec into a running machine isn't there yet on Windows hosts".into())
 }

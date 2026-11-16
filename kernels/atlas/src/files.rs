@@ -97,9 +97,9 @@ pub enum Node {
     System(Arc<Vec<u8>>),
     /// `NUL`: reads nothing, takes anything.
     Null,
-    /// `CONOUT$` and `CONIN$`.
-    Console(host::Stream),
-    Input,
+    /// `CONOUT$` and `CONIN$`: a console's.
+    Console(Arc<crate::console::Stdio>, host::Stream),
+    Input(Arc<crate::console::Stdio>),
     /// One end of an anonymous pipe.
     Pipe(crate::pipes::End),
     /// One end of a named pipe: a server's instance, or a client's connection to one.
@@ -277,13 +277,13 @@ pub fn resolve(cwd: &str, raw: &str) -> Result<(String, String), u32> {
     Ok((format!("C:\\{}", parts.join("\\")), format!("/{}", parts.join("/"))))
 }
 
-/// A device name the program can open by itself, as `NUL` or `CONOUT$`.
-pub fn device(raw: &str) -> Option<Node> {
+/// A device name the program can open by itself, as `NUL` or `CONOUT$` (its console's).
+pub fn device(raw: &str, console: &Arc<crate::console::Stdio>) -> Option<Node> {
     let name = raw.rsplit(['\\', '/']).next().unwrap_or(raw).to_ascii_uppercase();
     match name.as_str() {
         "NUL" => Some(Node::Null),
-        "CONOUT$" | "CON" => Some(Node::Console(host::Stream::Out)),
-        "CONIN$" => Some(Node::Input),
+        "CONOUT$" | "CON" => Some(Node::Console(console.clone(), host::Stream::Out)),
+        "CONIN$" => Some(Node::Input(console.clone())),
         _ => None,
     }
 }
@@ -405,13 +405,16 @@ impl Task {
         }
     }
 
-    /// A system-layer file: one of atlas's DLLs, as `System32` or `SysWOW64` has it.
-    fn system_file(&self, disk_path: &str) -> Option<Arc<Vec<u8>>> {
+    /// A system-layer file: one of atlas's DLLs or programs, as `System32` or `SysWOW64` has it.
+    pub(crate) fn system_file(&self, disk_path: &str) -> Option<Arc<Vec<u8>>> {
         let lower = disk_path.to_ascii_lowercase();
         let (dir, name) = lower.rsplit_once('/')?;
         let isa = self.system_isa(dir)?;
         if name == "ntdll.dll" {
             return images::guest(isa).map(|image| Arc::new(image.to_vec()));
+        }
+        if let Some(program) = images::program(isa, name) {
+            return Some(Arc::new(program.to_vec()));
         }
         let dll = os::find(name)?;
         (os::DLLS[dll].name.to_ascii_lowercase() == name).then(|| self.k.images.get(isa, dll))
@@ -427,6 +430,11 @@ impl Task {
             .collect();
         if let Some(image) = images::guest(isa) {
             found.push(Found { name: "ntdll.dll".to_string(), attributes: FILE_ATTRIBUTE_ARCHIVE, size: image.len() as u64, modified: 0, created: 0, accessed: 0 });
+        }
+        for name in images::PROGRAMS {
+            if let Some(image) = images::program(isa, name) {
+                found.push(Found { name: name.to_string(), attributes: FILE_ATTRIBUTE_ARCHIVE, size: image.len() as u64, modified: 0, created: 0, accessed: 0 });
+            }
         }
         found
     }
@@ -488,7 +496,8 @@ impl Task {
             file.sharing = sharing;
             Arc::new(file)
         };
-        if let Some(node) = device(raw) {
+        let console = lock(&self.process.state).console.clone();
+        if let Some(node) = device(raw, &console) {
             return Ok((make(node, raw.to_string(), String::new()), true));
         }
         let (path, disk_path) = self.resolve(raw)?;
@@ -595,14 +604,9 @@ impl Task {
             }
             Node::System(image) => image.get(start as usize..).map_or(Vec::new(), |rest| rest[..len.min(rest.len())].to_vec()),
             Node::Null => Vec::new(),
-            Node::Input => {
-                let mut buffer = vec![0; len.min(1 << 16)];
-                let n = self.k.host.read(&mut buffer);
-                buffer.truncate(n);
-                return Ok(buffer);
-            }
+            Node::Input(console) => return Ok(console.read(len.min(1 << 16))),
             // A socket's read goes through Winsock.
-            Node::Dir(_) | Node::Console(_) | Node::Pipe(_) | Node::NamedPipe(_) | Node::Socket(_) => return Err(ERROR_ACCESS_DENIED),
+            Node::Dir(_) | Node::Console(..) | Node::Pipe(_) | Node::NamedPipe(_) | Node::Socket(_) => return Err(ERROR_ACCESS_DENIED),
         };
         *position = start + data.len() as u64;
         Ok(data)
@@ -625,8 +629,8 @@ impl Task {
                 Ok(n)
             }
             Node::Null => Ok(data.len()),
-            Node::Console(stream) => {
-                self.k.host.write(*stream, data);
+            Node::Console(console, stream) => {
+                console.write(*stream, data);
                 Ok(data.len())
             }
             _ => Err(ERROR_ACCESS_DENIED),

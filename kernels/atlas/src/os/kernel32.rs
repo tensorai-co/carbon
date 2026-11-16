@@ -489,6 +489,9 @@ dll! {
     host ReadConsoleA(5) => read_console_a;
     host ReadConsoleW(5) => read_console_w;
     host SetConsoleCtrlHandler(2) => set_console_ctrl_handler;
+    host SetConsoleTitleW(1) => set_console_title_w;
+    host SetConsoleTitleA(1) => set_console_title_a;
+    host GetConsoleTitleW(2) => get_console_title_w;
     host SetStdHandle(2) => set_std_handle;
     host OpenThread(3) => open_thread;
     host SetThreadPriority(2) => set_thread_priority;
@@ -695,8 +698,8 @@ fn get_std_handle(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
 fn write_to(task: &mut Task, handle: u64, data: &[u8]) -> Option<usize> {
     let h = lock(&task.process.state).handles.get(handle)?;
     match h {
-        Handle::Console(stream) => {
-            task.k.host.write(stream, data);
+        Handle::Console(console, stream) => {
+            console.write(stream, data);
             Some(data.len())
         }
         Handle::File(file) => task.write_to_file(&file, data, None).ok(),
@@ -867,10 +870,21 @@ fn enum_system_locales(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) 
 // --- The console's modes, reading it, and the standard handles ---
 
 /// Whether a handle is the console's: its input, or output to it.
+/// Whether a handle is a console's input (true) or output (false); None if it isn't a console's (or the console is
+/// pipes, without `-t`).
 fn is_console(task: &Task, handle: u64) -> Option<bool> {
+    console_of(task, handle).map(|(_, input)| input)
+}
+
+fn console_of(task: &Task, handle: u64) -> Option<(std::sync::Arc<crate::console::Stdio>, bool)> {
     match lock(&task.process.state).handles.get(handle)? {
-        Handle::Input => Some(true),
-        Handle::Console(_) => Some(false),
+        Handle::Input(c) if c.console => Some((c, true)),
+        Handle::Console(c, _) if c.console => Some((c, false)),
+        Handle::File(f) => match &f.node {
+            crate::files::Node::Input(c) if c.console => Some((c.clone(), true)),
+            crate::files::Node::Console(c, _) if c.console => Some((c.clone(), false)),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -879,19 +893,19 @@ fn is_console(task: &Task, handle: u64) -> Option<bool> {
 /// processed output with wrapping at the line's end. A handle that isn't the console's is ERROR_INVALID_HANDLE, which
 /// is how programs tell a console from a file or pipe.
 fn get_console_mode(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(input) = is_console(task, a[0]) else { return task.fail(cx, 6) };
-    let mode: u32 = if input { 0x1f7 } else { 0x3 };
+    let Some((console, input)) = console_of(task, a[0]) else { return task.fail(cx, 6) };
+    let mode: u32 = if input { console.input_mode() } else { console.output_mode() };
     if task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[1], mode)).is_err() {
         return task.fail(cx, 998);
     }
     Reply::Value(TRUE)
 }
 
-/// `SetConsoleMode(handle, mode)`: taken for the console's handles; the host's terminal keeps its own modes.
+/// `SetConsoleMode(handle, mode)`: kept, and for input, what reading it does (line mode and echo, which the console's
+/// own line editing follows).
 fn set_console_mode(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    if is_console(task, a[0]).is_none() {
-        return task.fail(cx, 6);
-    }
+    let Some((console, input)) = console_of(task, a[0]) else { return task.fail(cx, 6) };
+    console.set_mode(input, a[1] as u32);
     Reply::Value(TRUE)
 }
 
@@ -915,14 +929,54 @@ fn read_console_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     }
     let Ok(n) = task.mem(cx, false, |t| user::read_u32(&t.space(), a[3])) else { return task.fail(cx, 998) };
     let Ok(bytes) = task.mem(cx, false, |t| user::read_vec(&t.space(), a[1], n as usize)) else { return task.fail(cx, 998) };
-    let cp = task.k.console_cp.load(std::sync::atomic::Ordering::Relaxed);
-    let units = crate::ansi::decode(cp, &bytes, false).unwrap_or_default();
+    // What's typed comes as UTF-8, from a terminal.
+    let units: Vec<u16> = String::from_utf8_lossy(&bytes).encode_utf16().collect();
     let out: Vec<u8> = units.iter().take(a[2] as u32 as usize).flat_map(|u| u.to_le_bytes()).collect();
     let wrote = task.mem(cx, true, |t| {
         user::write(&mut t.space(), a[1], &out)?;
         user::write_u32(&mut t.space(), a[3], (out.len() / 2) as u32)
     });
     if wrote.is_err() { task.fail(cx, 998) } else { Reply::Value(TRUE) }
+}
+
+/// The console's title, as `SetConsoleTitle` last set it.
+static CONSOLE_TITLE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// `SetConsoleTitleW(title)`: kept, and when the console is the host's terminal, its title too (`ESC ] 0 ; ... BEL`).
+fn set_console_title_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    set_console_title(task, cx, a[0], true)
+}
+
+fn set_console_title_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    set_console_title(task, cx, a[0], false)
+}
+
+fn set_console_title(task: &mut Task, cx: &mut Cx<'_>, at: u64, wide: bool) -> Reply {
+    let title = if wide { task.mem(cx, false, |t| user::read_wstr(&t.space(), at, 4096)) } else { task.mem(cx, false, |t| user::read_cstr(&t.space(), at, 4096)).map(|b| crate::ansi::text(&b)) };
+    let Ok(title) = title else { return task.fail(cx, 998) };
+    if task.k.host.is_terminal() {
+        let clean: String = title.chars().filter(|c| !c.is_control()).collect();
+        task.k.host.write(host::Stream::Out, format!("\x1b]0;{clean}\x07").as_bytes());
+    }
+    *lock(&CONSOLE_TITLE) = title;
+    Reply::Value(TRUE)
+}
+
+/// `GetConsoleTitleW(buffer, size)`: the title, cut to fit; its length.
+fn get_console_title_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let title = lock(&CONSOLE_TITLE).clone();
+    let size = a[1] as u32 as usize;
+    if size == 0 {
+        return Reply::Value(title.encode_utf16().count() as u64);
+    }
+    let mut units: Vec<u16> = title.encode_utf16().take(size - 1).collect();
+    let n = units.len();
+    units.push(0);
+    let bytes: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+    if task.mem(cx, true, |t| user::write(&mut t.space(), a[0], &bytes)).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(n as u64)
 }
 
 /// `SetConsoleCtrlHandler(handler, add)`: kept nowhere, as the host's terminal sends atlas no Ctrl+C to pass on.

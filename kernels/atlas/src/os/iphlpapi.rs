@@ -381,7 +381,7 @@ mod tests {
     /// The records' sizes, as Windows' headers give them.
     #[test]
     fn records_are_windows_sizes() {
-        let net = net::Network::on_this_host(net::Config { hostname: "m".into(), dns: None });
+        let net = net::Network::on_this_host(net::Config { hostname: "m".into(), dns: None, ..Default::default() });
         for (width, adapter, unicast, first_unicast) in [(8u64, 448u32, 64u32, 24usize), (4, 376, 48, 16)] {
             let l = adapters(&net, width, 0, 0);
             assert_eq!(u32::from_le_bytes(l.bytes[0..4].try_into().unwrap()), adapter);
@@ -406,7 +406,7 @@ mod tests {
 
     #[test]
     fn best_interfaces() {
-        let net = net::Network::on_this_host(net::Config { hostname: "m".into(), dns: None });
+        let net = net::Network::on_this_host(net::Config { hostname: "m".into(), dns: None, ..Default::default() });
         let loopback = std::net::Ipv4Addr::from(u32::from_le_bytes([127, 0, 0, 1]).to_le_bytes());
         assert!(loopback.is_loopback());
         assert!(net.interfaces().iter().any(|i| i.loopback) && net.interfaces().iter().any(|i| !i.loopback));

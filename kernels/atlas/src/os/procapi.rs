@@ -125,9 +125,12 @@ impl Task {
     /// A program at a Windows path: its full path, where it is on the disk, and its bytes.
     fn program_at(&self, raw: &str) -> Option<(String, String, Vec<u8>)> {
         let (windows, disk_path) = self.resolve(raw).ok()?;
-        let disk = lock(&self.k.disk);
-        let ino = disk.resolve(layers::ROOT, &disk_path, true).ok()?;
-        let bytes = disk.contents(ino).ok()?.to_vec();
+        let on_disk = {
+            let disk = lock(&self.k.disk);
+            disk.resolve(layers::ROOT, &disk_path, true).ok().and_then(|ino| disk.contents(ino).ok().map(|b| b.to_vec()))
+        };
+        // atlas's own programs, in the system layer.
+        let bytes = on_disk.or_else(|| self.system_file(&disk_path).map(|b| b.to_vec()))?;
         Some((windows, disk_path, bytes))
     }
 
@@ -209,6 +212,14 @@ fn create_process(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool, token
         let state = lock(&task.process.state);
         let mut handles = if inherit { state.handles.inherited() } else { Default::default() };
         let std_handles = if startup_flags & STARTF_USESTDHANDLES != 0 {
+            // A console's handles go along whether or not they're inheritable, as Windows' console layer gives them.
+            for &h in &given {
+                if !handles.contains(h)
+                    && let Some(handle @ (Handle::Input(_) | Handle::Console(..))) = state.handles.get(h)
+                {
+                    handles.put(h, handle, false);
+                }
+            }
             given
         } else {
             for &h in &state.std_handles {
@@ -226,7 +237,8 @@ fn create_process(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool, token
     if task.k.options.trace {
         task.k.host.write(host::Stream::Err, format!("[{}] starts {path}: {command_line}\n", task.tid).as_bytes());
     }
-    let launch = Launch { path, bytes, command_line, environment, cwd: Some(cwd), handles, std_handles, suspended: flags & CREATE_SUSPENDED != 0, parent: task.process.pid, token };
+    let console = lock(&task.process.state).console.clone();
+    let launch = Launch { path, bytes, command_line, environment, cwd: Some(cwd), handles, std_handles, suspended: flags & CREATE_SUSPENDED != 0, parent: task.process.pid, token, console };
     let k = task.k.clone();
     let (made, child) = std::sync::mpsc::channel();
     let started = kernels_core::thread::spawn(task.k.exec.clone(), "atlas process".to_string(), move |cx| {

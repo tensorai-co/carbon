@@ -226,6 +226,15 @@ impl Files {
         files
     }
 
+    /// Descriptors 0, 1 and 2 as given: a process started from outside the machine (`carbon exec`).
+    pub fn with_standard(opens: [Arc<Open>; 3]) -> Files {
+        let mut files = Files::default();
+        for (fd, open) in opens.into_iter().enumerate() {
+            files.fds.insert(fd as i32, Fd { open, cloexec: false });
+        }
+        files
+    }
+
     pub fn get(&self, fd: i32) -> Option<Arc<Open>> {
         self.fds.get(&fd).map(|f| f.open.clone())
     }

@@ -17,6 +17,7 @@
 mod abi;
 mod admin;
 mod fs;
+mod enter;
 mod ipc;
 mod mm;
 mod net;
@@ -41,6 +42,7 @@ use kernels_core::lock;
 use kernels_core::thread::{Cx, SharedExec};
 use kernels_core::wait::Futexes;
 
+pub use enter::{Entered, Event, Spec};
 use process::Process;
 use tty::Tty;
 
@@ -212,7 +214,7 @@ pub fn boot(mut exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&
     disk.observe(Some(fs::fanotify::observer(watches.clone(), fanotify.clone())));
     let console = (options.console && host.is_terminal()).then(|| Tty::console(host.clone()));
     let klog = admin::Klog::boot(host.cpus(), exec.memory().size().limit);
-    let net = options.network.clone().unwrap_or_else(|| ::net::Network::on_this_host(::net::Config { hostname: options.hostname.clone(), dns: None }));
+    let net = options.network.clone().unwrap_or_else(|| ::net::Network::on_this_host(::net::Config { hostname: options.hostname.clone(), dns: None, ..Default::default() }));
     let exec = Arc::new(Mutex::new(exec));
     let kernel = Arc::new(Kernel {
         console,
@@ -238,6 +240,7 @@ pub fn boot(mut exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&
         boot_ns,
         klog: Mutex::new(klog),
         system: Mutex::new(BTreeMap::new()),
+        entered: Mutex::new(BTreeMap::new()),
     });
     os::vdso::start(&kernel);
     if let Some(desktop) = kernel.options.display.clone() {
@@ -335,6 +338,8 @@ pub(crate) struct Kernel {
     klog: Mutex<admin::Klog>,
     /// The system layer's files, made as they're first opened (`os::system`).
     system: Mutex<BTreeMap<String, Arc<mm::shared::SharedMem>>>,
+    /// Processes started from outside (`carbon exec`), by pid, and how each ended once it has.
+    entered: Mutex<BTreeMap<i32, Arc<(Mutex<Option<Status>>, Condvar)>>>,
 }
 
 /// Feeds the host's keyboard to the console, sending the signals it asks for, and keeps its size the terminal's.

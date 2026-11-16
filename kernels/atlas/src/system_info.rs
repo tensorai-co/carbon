@@ -458,7 +458,7 @@ impl Task {
                 let rest = f.path.strip_prefix("C:").or_else(|| f.path.strip_prefix("c:")).unwrap_or(&f.path);
                 format!("\\Device\\HarddiskVolume3{rest}")
             }
-            Handle::Console(_) | Handle::Input => "\\Device\\ConDrv".to_string(),
+            Handle::Console(..) | Handle::Input(_) => "\\Device\\ConDrv".to_string(),
             Handle::Object(o) => self.k.objects.name_of(o).map(|n| format!("\\Sessions\\1\\BaseNamedObjects\\{n}")).unwrap_or_default(),
             Handle::Section(s, _) => lock(&self.k.sections)
                 .iter()
@@ -539,7 +539,7 @@ fn type_of(handle: &Handle) -> (u8, u32) {
         },
         Handle::Port(_) => (36, 0x1f_0003),
         Handle::Token(_) => (5, 0xf_01ff),
-        Handle::Console(_) | Handle::Input | Handle::File(_) | Handle::Find(_) | Handle::Snapshot(_) => (37, 0x12_019f),
+        Handle::Console(..) | Handle::Input(_) | Handle::File(_) | Handle::Find(_) | Handle::Snapshot(_) => (37, 0x12_019f),
         Handle::Section(_, access) => (42, *access),
         Handle::Key(_) => (44, 0xf_003f),
     }
@@ -556,9 +556,9 @@ fn object_address(handle: &Handle) -> u64 {
         Handle::Token(t) => Arc::as_ptr(t) as u64,
         Handle::Snapshot(s) => Arc::as_ptr(s) as u64,
         Handle::Key(id) => 0x10_0000 + id * 0x40,
-        Handle::Console(host::Stream::Out) => 0x1000,
-        Handle::Console(_) => 0x1040,
-        Handle::Input => 0x1080,
+        Handle::Console(_, host::Stream::Out) => 0x1000,
+        Handle::Console(..) => 0x1040,
+        Handle::Input(_) => 0x1080,
     };
     SYSTEM_RANGE_START | 0x7000_0000_0000 | host & 0x0fff_ffff_fff0
 }

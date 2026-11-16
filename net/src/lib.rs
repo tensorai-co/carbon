@@ -16,6 +16,7 @@
 mod dns;
 mod host;
 mod loop_host;
+mod publish;
 mod socket;
 mod stream;
 mod sys;
@@ -27,7 +28,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
-pub use host::{Host, HostDatagram, HostStream};
+pub use host::{Host, HostDatagram, HostListener, HostStream};
+pub use publish::{Bound, Protocol, Publish, Published};
 pub use loop_host::{Loop, Peer};
 pub use socket::{Received, Socket, SocketInfo, TcpState};
 pub use sys::System;
@@ -195,6 +197,19 @@ pub enum Shutdown {
     Both,
 }
 
+/// What a machine's network reaches, as `--network` says.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Mode {
+    /// Its own addresses and loopback; out through the host; in only through published ports.
+    #[default]
+    Nat,
+    /// The host's ports: a program that listens (or binds a UDP port) has the host's port, with no publishing, and
+    /// the host's loopback is reachable as its own. It keeps its own addresses and loopback otherwise.
+    Host,
+    /// Loopback only: nothing out, and DNS answers only the machine's own names.
+    None,
+}
+
 /// How a machine's network is set up.
 #[derive(Debug, Clone, Default)]
 pub struct Config {
@@ -202,6 +217,7 @@ pub struct Config {
     pub hostname: String,
     /// Where the resolver asks what it doesn't answer itself, instead of the host's resolver (`--dns`).
     pub dns: Option<SocketAddr>,
+    pub mode: Mode,
 }
 
 /// A network interface, as programs see it.
@@ -232,7 +248,7 @@ pub struct Network(pub(crate) Arc<Shared>);
 
 impl fmt::Debug for Network {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Network({}, {:?})", self.0.address, self.0.config.hostname)
+        write!(f, "Network({}, {:?})", self.0.address, self.0.hostname())
     }
 }
 
@@ -242,10 +258,27 @@ pub(crate) struct Binding {
     pub ip: IpAddr,
     pub reuse_addr: bool,
     pub reuse_port: bool,
+    /// An IPv6 address only: `::` that doesn't take IPv4's too.
+    pub v6only: bool,
+}
+
+/// Whether two bound addresses take any address in common: the same one, a family's wildcard and an address of it,
+/// or `::` that isn't IPv6 only and anything IPv4.
+fn overlap(a: IpAddr, a_v6only: bool, b: IpAddr, b_v6only: bool) -> bool {
+    if a == b {
+        return true;
+    }
+    if a.is_ipv4() == b.is_ipv4() {
+        return a.is_unspecified() || b.is_unspecified();
+    }
+    let (v6, v6only) = if a.is_ipv4() { (b, b_v6only) } else { (a, a_v6only) };
+    v6.is_unspecified() && !v6only
 }
 
 pub(crate) struct Shared {
     pub config: Config,
+    /// What the machine calls itself: `config`'s, until the kernel names it ([`Network::set_hostname`]).
+    hostname: Mutex<String>,
     pub host: Arc<dyn Host>,
     pub address: Ipv4Addr,
     pub gateway: Ipv4Addr,
@@ -254,6 +287,8 @@ pub(crate) struct Shared {
     pub unix: Mutex<HashMap<UnixKey, Weak<Inner>>>,
     /// Every socket, for `/proc/net`.
     pub all: Mutex<Vec<Weak<Inner>>>,
+    /// Published UDP ports, for sending their clients' answers back the way they came.
+    pub published_udp: Mutex<Vec<Weak<publish::Entry>>>,
     pub next_id: AtomicU64,
     next_port: AtomicU16,
 }
@@ -301,6 +336,7 @@ impl Network {
         let taken: Vec<Ipv4Addr> = host.addresses().into_iter().filter_map(v4_of).collect();
         let second = (89..=254u8).find(|n| !taken.iter().any(|a| a.octets()[0] == 10 && a.octets()[1] == *n)).unwrap_or(89);
         Network(Arc::new(Shared {
+            hostname: Mutex::new(config.hostname.clone()),
             config,
             host,
             address: Ipv4Addr::new(10, second, 0, 2),
@@ -308,6 +344,7 @@ impl Network {
             ports: Mutex::new(HashMap::new()),
             unix: Mutex::new(HashMap::new()),
             all: Mutex::new(Vec::new()),
+            published_udp: Mutex::new(Vec::new()),
             next_id: AtomicU64::new(1),
             next_port: AtomicU16::new(FIRST_EPHEMERAL),
         }))
@@ -322,6 +359,12 @@ impl Network {
         &self.0.config
     }
 
+    /// Names the machine, for its DNS and [`Network::lookup`]: the kernel's own name for it, once it knows it (atlas's
+    /// computer name, from its registry).
+    pub fn set_hostname(&self, name: &str) {
+        *lock(&self.0.hostname) = name.to_string();
+    }
+
     /// The machine's own address.
     pub fn address(&self) -> Ipv4Addr {
         self.0.address
@@ -333,17 +376,32 @@ impl Network {
     /// server isn't asked here yet: the host's lookup is.
     pub fn lookup(&self, name: &str) -> Result<Vec<IpAddr>> {
         let name = name.trim_end_matches('.').to_ascii_lowercase();
-        let hostname = self.0.config.hostname.to_ascii_lowercase();
+        let hostname = self.0.hostname().to_ascii_lowercase();
         if !hostname.is_empty() && name == hostname {
             return Ok(vec![IpAddr::V4(self.0.address)]);
         }
         if name == "localhost" {
             return Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)]);
         }
-        if name.is_empty() {
+        if name.is_empty() || self.0.config.mode == Mode::None {
             return Err(Error::NotFound);
         }
         self.0.host.lookup(&name)
+    }
+
+    /// Publishes machine ports on the host's (`--publish`): whatever listens on (or, for UDP, is bound to) each
+    /// machine port on the machine's address gets what comes in, for as long as the [`Published`] is kept. All or
+    /// nothing: if one can't be had (its host port is taken), none is. With the host's network ([`Mode::Host`]) there's
+    /// nothing to publish, and this publishes nothing.
+    pub fn publish(&self, ports: &[Publish]) -> Result<Published> {
+        let mut published = Published::none();
+        if self.0.config.mode != Mode::Nat {
+            return Ok(published);
+        }
+        for &port in ports {
+            published.join(self.0.publish(port)?);
+        }
+        Ok(published)
     }
 
     /// Its gateway and DNS server.
@@ -400,6 +458,10 @@ impl Network {
 }
 
 impl Shared {
+    pub(crate) fn hostname(&self) -> String {
+        lock(&self.hostname).clone()
+    }
+
     pub(crate) fn place(&self, ip: IpAddr) -> Place {
         if ip.is_loopback() || ip.is_unspecified() {
             return Place::Local;
@@ -422,16 +484,17 @@ impl Shared {
     }
 
     /// Takes `ip`'s `port` (or a free one, if it's 0) for `socket`, for TCP or UDP. The port taken.
-    pub(crate) fn take_port(&self, tcp: bool, ip: IpAddr, port: u16, socket: &Arc<Inner>, reuse_addr: bool, reuse_port: bool) -> Result<u16> {
+    pub(crate) fn take_port(&self, tcp: bool, ip: IpAddr, port: u16, socket: &Arc<Inner>, options: socket::Options) -> Result<u16> {
+        let (reuse_addr, reuse_port) = (options.reuse_addr, options.reuse_port);
         let mut ports = lock(&self.ports);
         let ip = v4_of(ip).map_or(ip, IpAddr::V4);
+        let v6only = options.v6only && socket.domain == Domain::Inet6 && ip.is_ipv6();
         let clashes = |ports: &HashMap<(bool, u16), Vec<Binding>>, port: u16| {
             ports.get(&(tcp, port)).is_some_and(|bound| {
                 bound.iter().any(|b| {
                     let Some(other) = b.socket.upgrade() else { return false };
-                    let overlap = b.ip == ip || b.ip.is_unspecified() || ip.is_unspecified();
                     let shared = (reuse_port && b.reuse_port) || (reuse_addr && b.reuse_addr && !(tcp && other.is_listening()));
-                    overlap && !shared
+                    overlap(b.ip, b.v6only, ip, v6only) && !shared
                 })
             })
         };
@@ -455,7 +518,7 @@ impl Shared {
         };
         let entry = ports.entry((tcp, port)).or_default();
         entry.retain(|b| b.socket.strong_count() > 0);
-        entry.push(Binding { socket: Arc::downgrade(socket), ip, reuse_addr, reuse_port });
+        entry.push(Binding { socket: Arc::downgrade(socket), ip, reuse_addr, reuse_port, v6only });
         Ok(port)
     }
 
@@ -464,9 +527,10 @@ impl Shared {
         let ip = v4_of(ip).map_or(ip, IpAddr::V4);
         let ports = lock(&self.ports);
         let Some(bound) = ports.get(&(tcp, port)) else { return Vec::new() };
-        // An exact address first, then any.
+        // An exact address first, then a wildcard that takes it: its family's, or `::` taking IPv4 too.
         let mut exact: Vec<Arc<Inner>> = bound.iter().filter(|b| b.ip == ip).filter_map(|b| b.socket.upgrade()).collect();
-        exact.extend(bound.iter().filter(|b| b.ip != ip && b.ip.is_unspecified()).filter_map(|b| b.socket.upgrade()));
+        let wildcard = |b: &&Binding| b.ip != ip && b.ip.is_unspecified() && (b.ip.is_ipv4() == ip.is_ipv4() || (ip.is_ipv4() && !b.v6only));
+        exact.extend(bound.iter().filter(wildcard).filter_map(|b| b.socket.upgrade()));
         exact
     }
 }

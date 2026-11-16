@@ -53,6 +53,8 @@ pub(crate) struct Process {
 }
 
 pub(crate) struct ProcState {
+    /// The console it's attached to: its parent's, or the machine's.
+    pub console: Arc<crate::console::Stdio>,
     pub space: SpaceId,
     /// Where ntdll's exception dispatcher is, for exceptions atlas delivers, and where new threads start.
     pub dispatcher: u64,
@@ -811,8 +813,38 @@ pub(crate) fn disk_path(path: &str) -> String {
 }
 
 /// A command line, as Windows programs parse it back: each argument quoted if it has spaces.
-fn command_line(argv: &[String]) -> String {
-    argv.iter().map(|a| if a.contains(' ') || a.is_empty() { format!("\"{a}\"") } else { a.clone() }).collect::<Vec<_>>().join(" ")
+pub(crate) fn command_line(argv: &[String]) -> String {
+    argv.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ")
+}
+
+/// An argument as `CommandLineToArgvW` reads it back: quoted if it has spaces, tabs or quotes, with a quote inside as
+/// `\"` and the backslashes before a quote (or the closing one) doubled.
+fn quote(a: &str) -> String {
+    if !a.is_empty() && !a.contains([' ', '\t', '"']) {
+        return a.to_string();
+    }
+    let mut out = String::from("\"");
+    let mut slashes = 0;
+    for c in a.chars() {
+        match c {
+            '\\' => slashes += 1,
+            '"' => {
+                out.push_str(&"\\".repeat(slashes * 2 + 1));
+                out.push('"');
+                slashes = 0;
+                continue;
+            }
+            _ => {}
+        }
+        if c != '\\' {
+            out.push_str(&"\\".repeat(slashes));
+            slashes = 0;
+            out.push(c);
+        }
+    }
+    out.push_str(&"\\".repeat(slashes * 2));
+    out.push('"');
+    out
 }
 
 fn utf16z(s: &str) -> Vec<u8> {
@@ -846,6 +878,8 @@ pub(crate) struct Launch {
     pub parent: u64,
     /// The token it's to run as (`CreateProcessAsUser`'s); else a copy of its parent's.
     pub token: Option<Arc<crate::security::Token>>,
+    /// The console it's attached to.
+    pub console: Arc<crate::console::Stdio>,
 }
 
 /// Starts process 1: `argv[0]` from the disk, loaded with its system DLLs, with the host's console as its standard
@@ -854,19 +888,27 @@ pub(crate) fn start(k: &Arc<Kernel>, cx: &mut Cx<'_>, argv: &[String]) -> Result
     let path = disk_path(argv.first().ok_or("nothing to run")?);
     let bytes = {
         let disk = lock(&k.disk);
-        let ino = disk.resolve(layers::ROOT, &path, true).map_err(|e| format!("{path}: {e}"))?;
-        disk.contents(ino).map_err(|e| format!("{path}: {e}"))?.to_vec()
+        match disk.resolve(layers::ROOT, &path, true) {
+            Ok(ino) => disk.contents(ino).map_err(|e| format!("{path}: {e}"))?.to_vec(),
+            // One of atlas's own programs in System32, as this machine's own ISA builds it.
+            Err(e) => match path.to_ascii_lowercase().strip_prefix("/windows/system32/").and_then(|name| crate::images::program(exec::Isa::host(), name)) {
+                Some(image) => image.to_vec(),
+                None => return Err(format!("{path}: {e}")),
+            },
+        }
     };
     let isa = Pe::parse(&bytes).map_err(|_| format!("{path} isn't a Windows program"))?.isa;
     let mut handles = Handles::default();
-    let std_handles = [handles.add(Handle::Input), handles.add(Handle::Console(host::Stream::Out)), handles.add(Handle::Console(host::Stream::Err))];
+    let console = k.stdio.clone();
+    // A console's handles are inheritable, as Windows makes them: a child started with `bInheritHandles` has them.
+    let std_handles = [handles.add_with(Handle::Input(console.clone()), true), handles.add_with(Handle::Console(console.clone(), host::Stream::Out), true), handles.add_with(Handle::Console(console.clone(), host::Stream::Err), true)];
     let environment = crate::environment::block(&crate::environment::first(k, isa));
-    launch(k, cx, Launch { path, bytes, command_line: command_line(argv), environment, cwd: None, handles, std_handles, suspended: false, parent: 0, token: None })
+    launch(k, cx, Launch { path, bytes, command_line: command_line(argv), environment, cwd: Some(String::from("C:\\")), handles, std_handles, suspended: false, parent: 0, token: None, console })
 }
 
 /// Starts a process on this host thread (whose CPU becomes its first thread's), giving that thread's task to run.
 pub(crate) fn launch(k: &Arc<Kernel>, cx: &mut Cx<'_>, launch: Launch) -> Result<Task, String> {
-    let Launch { path, bytes, command_line: line, environment, cwd, handles, std_handles, suspended, parent, token: given } = launch;
+    let Launch { path, bytes, command_line: line, environment, cwd, handles, std_handles, suspended, parent, token: given, console } = launch;
     let pe = Pe::parse(&bytes).map_err(|_| format!("{path} isn't a Windows program"))?;
     if pe.is_dll {
         return Err(format!("{path} is a DLL"));
@@ -1019,7 +1061,7 @@ pub(crate) fn launch(k: &Arc<Kernel>, cx: &mut Cx<'_>, launch: Launch) -> Result
     let mut threads = BTreeMap::new();
     threads.insert(tid, control.clone());
     let cwd = cwd.unwrap_or_else(|| format!("C:\\{}", exe_dir.trim_start_matches('/').replace('/', "\\")));
-    let state = ProcState { space, dispatcher, thread_start, peb, threads, mapped, exe_dir, dll_directory: None, dll_search: 0, cwd, regions, handles, std_handles, command_line: command, exiting: None, windows10, parent, created: crate::files::filetime(k.host.wall()), image: windows_path.clone(), token, error_mode: 0, com: BTreeMap::new() };
+    let state = ProcState { console, space, dispatcher, thread_start, peb, threads, mapped, exe_dir, dll_directory: None, dll_search: 0, cwd, regions, handles, std_handles, command_line: command, exiting: None, windows10, parent, created: crate::files::filetime(k.host.wall()), image: windows_path.clone(), token, error_mode: 0, com: BTreeMap::new() };
     let object = Object::new(objects_mod::Kind::Process(pid), State::default());
     let process = Arc::new(Process { pid, isa, state: Mutex::new(state), remote: Mutex::new(false), object, ended: (Mutex::new(None), Condvar::new()), net: Mutex::default() });
     k.started(&process);

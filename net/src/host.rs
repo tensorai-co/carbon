@@ -23,6 +23,27 @@ pub trait Host: Send + Sync + 'static {
 
     /// The host's own addresses, so a machine's network can be on none of them.
     fn addresses(&self) -> Vec<IpAddr>;
+
+    /// Listens for TCP connections on `at`, a host address and port (port 0 for any free one), for a published port.
+    /// `wake` is called whenever a connection may be waiting.
+    fn listen(&self, _at: SocketAddr, _wake: Waker) -> Result<Box<dyn HostListener>> {
+        Err(crate::Error::NotSupported)
+    }
+
+    /// A UDP socket bound to `at` (port 0 for any free one), for a published port, with `wake` as for
+    /// [`Host::connect`].
+    fn udp_at(&self, _at: SocketAddr, _wake: Waker) -> Result<Box<dyn HostDatagram>> {
+        Err(crate::Error::NotSupported)
+    }
+}
+
+/// A host's listening TCP socket, for a published port. Every call returns at once.
+pub trait HostListener: Send + Sync {
+    /// The address it listens on, its port chosen if 0 was asked for.
+    fn local(&self) -> SocketAddr;
+    /// The next connection and who made it, [`crate::Error::WouldBlock`] if none is waiting. `wake` is the
+    /// connection's, as for [`Host::connect`].
+    fn accept(&self, wake: Waker) -> Result<(Box<dyn HostStream>, SocketAddr)>;
 }
 
 /// A TCP connection out through the host. Every call returns at once.
@@ -44,4 +65,8 @@ pub trait HostDatagram: Send + Sync {
     fn send_to(&self, data: &[u8], to: SocketAddr) -> Result<usize>;
     /// [`crate::Error::WouldBlock`] when there's nothing yet.
     fn recv_from(&self, buffer: &mut [u8]) -> Result<(usize, SocketAddr)>;
+    /// The address it's bound to.
+    fn local(&self) -> Result<SocketAddr> {
+        Err(crate::Error::NotSupported)
+    }
 }

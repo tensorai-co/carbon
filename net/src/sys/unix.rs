@@ -1,12 +1,16 @@
 //! macOS and Linux: `poll`, `getifaddrs`, and `/etc/resolv.conf`'s servers.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::AsRawFd;
 
 use super::{READ, Raw, WRITE};
 
 pub(super) fn raw_tcp(stream: &TcpStream) -> Raw {
     stream.as_raw_fd() as Raw
+}
+
+pub(super) fn raw_listener(listener: &TcpListener) -> Raw {
+    listener.as_raw_fd() as Raw
 }
 
 pub(super) fn raw_udp(socket: &UdpSocket) -> Raw {

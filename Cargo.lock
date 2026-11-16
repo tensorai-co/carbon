@@ -473,6 +473,7 @@ dependencies = [
  "lambda",
  "layers",
  "libc",
+ "net",
  "serde_json",
 ]
 

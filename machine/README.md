@@ -21,10 +21,15 @@ a kernel's locks and its run loop have to be designed together.
 4. **Finds the program**: one named without a `/` is found on the image's `PATH`; with none, the image's entrypoint
    and command run, with its environment and `--env` over it.
 5. **Attaches a display, sound, a network and host services**: a headless desktop (atlas), the machine's own `net`
-   network, `host::Std`, and with `--display host` or `host-windows`, the Mac's screen. Later: the host's speakers,
-   `--net` and `--publish`, and `remote` when `--remote` asks for it.
-6. **Runs it** in the calling process (hvf allows one VM per process, and a machine is one), relaying stdin, stdout
-   and the exit code. SIGINT, SIGTERM and SIGHUP go to the first process; a second signal, or ten seconds, ends
+   network (in the mode `--network` asks for, with `--publish`'s ports listening on the host's before the kernel boots,
+   for lambda and atlas alike), `host::Std`, and with `--display host` or `host-windows`, the Mac's screen. Later:
+   `remote` when `--remote` asks for it.
+6. **Runs it** in the calling process (hvf allows one VM per process, and a machine is one), relaying stdout and the
+   exit code, and stdin with `-i` (else the machine's stdin is empty, as Docker's is); with `-it`, the host's terminal
+   is the machine's console (`host::Std::stdio` says which). A process can be started in it from outside while it
+   runs (`carbon exec`, `Machines::exec`): over the control socket, an `exec` request turns the connection into frames
+   of stdin, terminal sizes and signals in, and stdout, stderr and the exit code out; lambda starts it with a pty or
+   pipes (`lambda::Stop::enter`), atlas with a console of its own (`atlas::Stop::enter`). SIGINT, SIGTERM and SIGHUP go to the first process; a second signal, or ten seconds, ends
    everything (`signals.rs`).
 7. **Keeps its state** in `<home>/machines/<name>/`: its record says whether it's running (its process), so another
    `carbon` can stop it, screenshot it (over a Unix socket the machine answers on, `control.rs`), freeze it or remove
@@ -41,6 +46,10 @@ let status = lambda::boot(exec, cpu, disk, host, &argv, options)?;   // or atlas
 
 ## Seen working
 
+`carbon run -it debian:13 bash` and `carbon exec -it NAME bash` (their own pty, `TERM=xterm`, the exit code back),
+`exec` with `-i` piped, `-e`, `-w` and `-d`; `carbon run -it windows` at cmd.exe's prompt and `powershell`, and
+`carbon exec -it` into a running Windows machine, with line editing and history; all on macOS.
+
 On all three hosts (macOS through hvf; Linux through kvm and its sandbox; Windows through winkvm): `debian:13` pulled,
 run, started again with a file it wrote, frozen into an image a new machine runs; exit codes; a Windows program from
 the host's disk. On macOS and Linux also: an interactive `bash` through a terminal, `carbon stop` on a running
@@ -49,13 +58,14 @@ reach, `auto` falls back to the sandbox and says why, and `--isolation vm` refus
 
 ## Testing
 
-`cargo test -p machine`: records round-trip, and programs are found on the image's `PATH`. The rest is checked end to
+`cargo test -p machine`: records round-trip (with their network mode, `--publish` and the ports bound), and programs
+are found on the image's `PATH`. The rest is checked end to
 end through `carbon`.
 
 ## To do
 
 - [ ] **Sound and networks**, as [`audio`](../audio/README.md) and [`net`](../net/README.md)'s phases 3 and 5 come:
-      `--audio`, `--net`, `--publish`; and `--remote`, attaching a [`remote`](../remote/README.md) listener to the
+      `--audio`, `--network` and `--publish` are done; a named network (`--network lab`) and `--remote`, attaching a [`remote`](../remote/README.md) listener to the
       desktop and mixer. The host's display on Linux and Windows comes with [`display`](../display/README.md)'s.
 - [ ] **The image's working directory and user** for its first process (lambda starts it in `/`, as root). Its `HOME`
       is done: the image's, or its user's home from the image's `/etc/passwd`, as runc decides it.

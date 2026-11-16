@@ -1,6 +1,6 @@
 //! Windows: `WSAPoll`, the host's IPv4 addresses from `GetIpAddrTable`, and its DNS servers from `GetNetworkParams`.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::windows::io::AsRawSocket;
 
 use super::{READ, Raw, WRITE};
@@ -37,6 +37,10 @@ const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 
 pub(super) fn raw_tcp(stream: &TcpStream) -> Raw {
     stream.as_raw_socket()
+}
+
+pub(super) fn raw_listener(listener: &TcpListener) -> Raw {
+    listener.as_raw_socket()
 }
 
 pub(super) fn raw_udp(socket: &UdpSocket) -> Raw {

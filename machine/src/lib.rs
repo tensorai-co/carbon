@@ -19,7 +19,10 @@ use images::{Config, Image, Images, Platform};
 use layers::{Fs, Persist, ROOT};
 use serde_json::{Value, json};
 
+pub use control::ExecRequest;
 pub use exec::Isolation;
+/// A machine's network mode (`--network`) and a port it publishes (`--publish`).
+pub use net::{Bound, Mode as Network, Publish};
 
 /// What a machine starts from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,11 +100,54 @@ pub struct Run {
     pub audio: Audio,
     /// How much memory it may use (only what's touched is taken).
     pub memory: u64,
+    /// What its network reaches (`--network`); None for what it had last, or NAT for a new machine.
+    pub network: Option<Network>,
+    /// Host ports that reach its ports (`--publish`), each as it was written; None for what it had last.
+    pub publish: Option<Vec<String>>,
+    /// `-i`: the host's stdin is the machine's; without it, the machine's stdin is at its end from the start.
+    pub interactive: bool,
+    /// `-t`: with `-i`, the host's terminal (if stdin and stdout are one) is the machine's console, in raw mode, with
+    /// the kernel's own line editing, so a shell's prompt, Ctrl-C and full-screen programs work as on its own system.
+    pub tty: bool,
 }
 
 impl Default for Run {
     fn default() -> Run {
-        Run { name: None, source: None, args: Vec::new(), isolation: Isolation::Auto, platform: None, env: Vec::new(), display: Display::Headless(1280, 800, display::output::SCALE_1X), gpu: Gpu::Auto, audio: Audio::Auto, memory: 4 << 30 }
+        Run {
+            name: None,
+            source: None,
+            args: Vec::new(),
+            isolation: Isolation::Auto,
+            platform: None,
+            env: Vec::new(),
+            display: Display::Headless(1280, 800, display::output::SCALE_1X),
+            gpu: Gpu::Auto,
+            audio: Audio::Auto,
+            memory: 4 << 30,
+            network: None,
+            publish: None,
+            interactive: false,
+            tty: false,
+        }
+    }
+}
+
+/// A network mode's name, as `--network` takes it.
+pub fn network_name(mode: Network) -> &'static str {
+    match mode {
+        Network::Nat => "nat",
+        Network::Host => "host",
+        Network::None => "none",
+    }
+}
+
+/// `--network`'s modes by name: `nat` (or Docker's `bridge`), `host`, `none`.
+pub fn parse_network(name: &str) -> Option<Network> {
+    match name {
+        "nat" | "bridge" | "default" => Some(Network::Nat),
+        "host" => Some(Network::Host),
+        "none" => Some(Network::None),
+        _ => None,
     }
 }
 
@@ -124,6 +170,11 @@ pub struct Record {
     pub pid: Option<u32>,
     /// Where it was last run: `vm/hvf`, `sandbox/linux`, …
     pub backend: String,
+    /// Its network mode, and the ports it publishes as they were written (`2222:22`), kept for when it runs again.
+    pub network: Network,
+    pub publish: Vec<String>,
+    /// The host addresses its ports are published on while it runs (`0.0.0.0:2222->22/tcp`).
+    pub ports: Vec<String>,
 }
 
 impl Record {
@@ -139,6 +190,9 @@ impl Record {
             "created": self.created,
             "pid": self.pid,
             "backend": self.backend,
+            "network": network_name(self.network),
+            "publish": self.publish,
+            "ports": self.ports,
         })
     }
 
@@ -169,6 +223,9 @@ impl Record {
             created: v.get("created").and_then(Value::as_u64).unwrap_or(0),
             pid: v.get("pid").and_then(Value::as_u64).map(|p| p as u32),
             backend: s("backend").unwrap_or_default(),
+            network: s("network").as_deref().and_then(parse_network).unwrap_or_default(),
+            publish: list(Some(v), "publish"),
+            ports: list(Some(v), "ports"),
         })
     }
 
@@ -266,6 +323,16 @@ impl Machines {
     }
 
     /// The running machine's screen, as a PNG.
+    /// Runs a program in a running machine, as `docker exec` does: `interactive` relays this process's stdin, and
+    /// `request.tty` gives it a terminal of its own, this one in raw mode. Its exit code.
+    pub fn exec(&self, name: &str, request: ExecRequest, interactive: bool) -> Result<i32, String> {
+        let record = self.record(name).ok_or_else(|| format!("there's no machine called {name}"))?;
+        if !record.running() {
+            return Err(format!("{name} isn't running"));
+        }
+        control::exec(&self.images.machine_dir(name), request, interactive)
+    }
+
     pub fn screenshot(&self, name: &str) -> Result<Vec<u8>, String> {
         let record = self.record(name).ok_or_else(|| format!("there's no machine called {name}"))?;
         if !record.running() {
@@ -413,6 +480,27 @@ impl Machines {
     /// A new machine's record, from its source.
     fn create(&self, run: &Run, source: &Source, progress: &mut dyn FnMut(&str)) -> Result<(Record, Option<Vec<u8>>), String> {
         match source {
+            // `windows`: Carbon's own empty Windows, atlas's system layer and nothing else, running cmd.exe unless told
+            // otherwise, as a Windows container image runs it.
+            Source::Image(name) if self.images.image(name).is_none() && matches!(name.to_ascii_lowercase().as_str(), "windows" | "windows:latest") => {
+                let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "amd64" };
+                let record = Record {
+                    name: run.name.clone().unwrap_or_else(|| self.new_name("windows")),
+                    kernel: Kernel::Atlas,
+                    image: Some("windows".into()),
+                    index: None,
+                    program: None,
+                    platform: Platform { os: "windows".into(), arch: arch.into() },
+                    config: Config { cmd: vec!["cmd.exe".into()], ..Config::default() },
+                    created: now(),
+                    pid: None,
+                    backend: String::new(),
+                    network: Network::Nat,
+                    publish: Vec::new(),
+                    ports: Vec::new(),
+                };
+                Ok((record, None))
+            }
             Source::Image(name) => {
                 // One here for another platform than the one asked for is pulled again, for that one.
                 let here = self.images.image(name).filter(|image| run.platform.as_ref().is_none_or(|p| *p == image.platform));
@@ -441,6 +529,9 @@ impl Machines {
                     created: now(),
                     pid: None,
                     backend: String::new(),
+                    network: Network::Nat,
+                    publish: Vec::new(),
+                    ports: Vec::new(),
                 };
                 Ok((record, None))
             }
@@ -479,6 +570,9 @@ impl Machines {
                     created: now(),
                     pid: None,
                     backend: String::new(),
+                    network: Network::Nat,
+                    publish: Vec::new(),
+                    ports: Vec::new(),
                 };
                 Ok((record, Some(bytes)))
             }
@@ -497,6 +591,20 @@ impl Machines {
         if record.running() {
             return Err(format!("{} is running already", record.name));
         }
+        // What it's asked for this time, else what it had.
+        if let Some(network) = run.network {
+            record.network = network;
+        }
+        if let Some(publish) = &run.publish {
+            record.publish = publish.clone();
+        }
+        let mut ports = Vec::new();
+        for text in &record.publish {
+            ports.push((text.clone(), Publish::parse(text).map_err(|e| format!("--publish {e}"))?));
+        }
+        if !ports.is_empty() && record.network != Network::Nat {
+            eprintln!("carbon: published ports are discarded with --network {}", network_name(record.network));
+        }
 
         // Signals are taken by a thread of their own, from here on: block them before any thread is made.
         #[cfg(unix)]
@@ -507,11 +615,25 @@ impl Machines {
         // Opens exec and boots the kernel on this thread, which its CPUs belong to.
         let start = |record: &mut Record, desktop: Option<display::desktop::Shared>| {
             let (exec, cpu) = open_exec(run.isolation, tso, run.memory)?;
+            // Its network, with its ports published on the host's before anything runs: a host port that's taken
+            // stops it here, saying which.
+            let network = net::Network::on_this_host(net::Config { hostname: record.name.clone(), mode: record.network, ..net::Config::default() });
+            let mut published = Vec::new();
+            for (text, ports) in &ports {
+                published.push(network.publish(ports).map_err(|e| match e {
+                    net::Error::AddrInUse => format!("--publish {text}: the host's port is in use"),
+                    net::Error::AddrNotAvailable => format!("--publish {text}: that address isn't this host's"),
+                    e => format!("--publish {text}: {e}"),
+                })?);
+            }
+            record.ports = published.iter().flat_map(net::Published::bound).map(|b| b.to_string()).collect();
             record.backend = exec.backend().to_string();
             record.pid = Some(std::process::id());
             self.save_record(record)?;
-            let ended = self.boot(record, &run, (exec, cpu), program.clone(), desktop, #[cfg(unix)] &relay);
+            let ended = self.boot(record, &run, (exec, cpu), program.clone(), desktop, network, #[cfg(unix)] &relay);
+            drop(published);
             record.pid = None;
+            record.ports.clear();
             let _ = self.save_record(record);
             ended
         };
@@ -558,18 +680,21 @@ impl Machines {
         }
     }
 
-    fn boot(&self, record: &Record, run: &Run, (exec, cpu): (Exec, Cpu), program: Option<Vec<u8>>, host_desktop: Option<display::desktop::Shared>, #[cfg(unix)] relay: &signals::Relay) -> Result<i32, String> {
-        let host: Arc<dyn host::Host> = Arc::new(host::Std::new());
+    #[allow(clippy::too_many_arguments)]
+    fn boot(&self, record: &Record, run: &Run, (exec, cpu): (Exec, Cpu), program: Option<Vec<u8>>, host_desktop: Option<display::desktop::Shared>, network: net::Network, #[cfg(unix)] relay: &signals::Relay) -> Result<i32, String> {
+        let host: Arc<dyn host::Host> = Arc::new(host::Std::stdio(run.interactive, run.interactive && run.tty));
         let mut env = record.config.env.clone();
         for var in &run.env {
             let key = var.split('=').next().unwrap_or("");
             env.retain(|e| e.split('=').next() != Some(key));
             env.push(var.clone());
         }
-        let args: Vec<String> = if !run.args.is_empty() {
+        // A machine made from a program runs it, with the arguments given; an image's runs what's given, or else what
+        // the image says.
+        let args: Vec<String> = if let Some(program) = &record.program {
+            std::iter::once(program.clone()).chain(run.args.iter().cloned()).collect()
+        } else if !run.args.is_empty() {
             run.args.clone()
-        } else if let Some(program) = &record.program {
-            vec![program.clone()]
         } else {
             record.config.entrypoint.iter().chain(&record.config.cmd).cloned().collect()
         };
@@ -585,6 +710,10 @@ impl Machines {
                 // An image's own environment takes the place of lambda's, and few set HOME: it's the image user's home
                 // from its passwd file, as a container runtime makes it.
                 let mut env = if env.is_empty() { lambda::Options::default().env } else { env };
+                // A console is a terminal programs can draw on: `xterm`, as Docker says with `-t`.
+                if run.interactive && run.tty && !env.iter().any(|e| e.starts_with("TERM=")) {
+                    env.push("TERM=xterm".into());
+                }
                 if !env.iter().any(|e| e.starts_with("HOME=")) {
                     let passwd = disk.resolve(ROOT, "/etc/passwd", true).and_then(|ino| disk.contents(ino)).unwrap_or_default();
                     env.push(format!("HOME={}", home_of(&String::from_utf8_lossy(&passwd), &record.config.user)));
@@ -609,10 +738,29 @@ impl Machines {
                 };
                 let headless = matches!(run.display, Display::Headless(..));
                 let _clock = desktop.clone().filter(|_| headless).map(|d| display::clock::Clock::start(d, 60));
-                let _control = control::serve(self.images.machine_dir(&record.name), desktop.clone());
+                // `carbon exec`: a process started in it from outside, with its environment and working directory unless
+                // the request says otherwise, as Docker's are.
+                let enter: control::Enter = {
+                    let (stop, base) = (stop.clone(), env.iter().filter(|e| !e.starts_with("TERM=")).cloned().collect::<Vec<_>>());
+                    let workdir = Some(record.config.workdir.clone()).filter(|w| !w.is_empty());
+                    Arc::new(move |request: control::ExecRequest| {
+                        let mut env = base.clone();
+                        for var in &request.env {
+                            let key = var.split('=').next().unwrap_or("");
+                            env.retain(|e| e.split('=').next() != Some(key));
+                            env.push(var.clone());
+                        }
+                        if request.tty.is_some() && !env.iter().any(|e| e.starts_with("TERM=")) {
+                            env.push("TERM=xterm".into());
+                        }
+                        let spec = lambda::Spec { argv: request.args, env, cwd: request.workdir.or_else(|| workdir.clone()), tty: request.tty };
+                        stop.enter(spec).map(|entered| Box::new(entered) as Box<dyn control::Session>)
+                    })
+                };
+                let _control = control::serve(self.images.machine_dir(&record.name), desktop.clone(), Some(enter));
                 let gpu = open_gpu(run.gpu)?;
                 let (mixer, _audio) = open_audio(&run.audio, run.display)?;
-                let mut options = lambda::Options { stop, display: desktop.clone(), gpu, audio: Some(mixer), env, ..lambda::Options::default() };
+                let mut options = lambda::Options { stop, display: desktop.clone(), gpu, audio: Some(mixer), env, network: Some(network), ..lambda::Options::default() };
                 options.hostname = record.name.clone();
                 lambda::boot(exec, cpu, disk, host, &argv, options).map(lambda::Status::code)
             }
@@ -639,15 +787,26 @@ impl Machines {
                     Display::Host(..) | Display::HostWindows => host_desktop.clone(),
                     Display::None => None,
                 };
-                let _control = control::serve(self.images.machine_dir(&record.name), desktop.clone());
+                // `carbon exec`: a process started in it from outside, with a console of its own.
+                let enter: control::Enter = {
+                    let stop = stop.clone();
+                    let workdir = Some(record.config.workdir.clone()).filter(|w| !w.is_empty());
+                    Arc::new(move |request: control::ExecRequest| {
+                        let spec = atlas::Spec { argv: request.args, env: request.env, cwd: request.workdir.or_else(|| workdir.clone()), tty: request.tty };
+                        stop.enter(spec).map(|entered| Box::new(entered) as Box<dyn control::Session>)
+                    })
+                };
+                let _control = control::serve(self.images.machine_dir(&record.name), desktop.clone(), Some(enter));
                 // A headless desktop's frames come from a clock of its own, ticking only while a window waits for one;
                 // on the host's screen, its refresh is the clock.
                 let headless = matches!(run.display, Display::Headless(..));
                 let _clock = desktop.clone().filter(|_| headless).map(|d| display::clock::Clock::start(d, 60));
                 let env = env.iter().filter_map(|e| e.split_once('=')).map(|(k, v)| (k.to_string(), v.to_string())).collect();
                 let gpu = open_gpu(run.gpu)?;
-                let options = atlas::Options { stop, env, display: desktop, trace: std::env::var_os("CARBON_TRACE").is_some(), gpu };
-                let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+                let options = atlas::Options { stop, env, display: desktop, trace: std::env::var_os("CARBON_TRACE").is_some(), gpu, network: Some(network), pipes: !(run.interactive && run.tty) };
+                // A program named without a path is atlas's own in System32 (cmd), or one at the drive's root.
+                let program = atlas::find_program(&disk, &args[0]).ok_or_else(|| format!("{}: not found on the machine's disk or in System32", args[0]))?;
+                let argv: Vec<&str> = std::iter::once(program.as_str()).chain(args[1..].iter().map(String::as_str)).collect();
                 atlas::boot(exec, cpu, disk, host, &argv, options).map(|ended| ended.code as i32)
             }
         }
@@ -832,6 +991,9 @@ mod tests {
             created: 5,
             pid: Some(42),
             backend: "vm/hvf".into(),
+            network: Network::Host,
+            publish: vec!["2222:22".into(), "127.0.0.1:5353:53/udp".into()],
+            ports: vec!["0.0.0.0:2222->22/tcp".into()],
         };
         assert_eq!(Record::from_json(&record.to_json()), Some(record));
     }

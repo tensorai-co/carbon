@@ -37,8 +37,8 @@ impl Task {
     pub(crate) fn file_handle(&self, handle: u64) -> Option<Arc<File>> {
         match lock(&self.process.state).handles.get(handle)? {
             Handle::File(file) => Some(file),
-            Handle::Console(stream) => Some(Arc::new(File::device(Node::Console(stream), false, true))),
-            Handle::Input => Some(Arc::new(File::device(Node::Input, true, false))),
+            Handle::Console(console, stream) => Some(Arc::new(File::device(Node::Console(console, stream), false, true))),
+            Handle::Input(console) => Some(Arc::new(File::device(Node::Input(console), true, false))),
             _ => None,
         }
     }
@@ -455,12 +455,14 @@ pub fn get_file_size_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 pub fn get_file_type(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let handle = lock(&task.process.state).handles.get(a[0]);
     match handle {
-        Some(Handle::File(file)) => Reply::Value(match file.node {
-            Node::Null | Node::Console(_) | Node::Input => 2,
+        Some(Handle::File(file)) => Reply::Value(match &file.node {
+            Node::Console(c, _) | Node::Input(c) => if c.console { 2 } else { 3 },
+            Node::Null => 2,
             Node::Pipe(_) | Node::NamedPipe(_) => 3,
             _ => 1,
         }),
-        Some(Handle::Console(_) | Handle::Input) => Reply::Value(2),
+        // FILE_TYPE_CHAR for a console, FILE_TYPE_PIPE for pipes.
+        Some(Handle::Console(c, _) | Handle::Input(c)) => Reply::Value(if c.console { 2 } else { 3 }),
         Some(_) => Reply::Value(0),
         None => {
             task.set_last_error(cx, ERROR_INVALID_HANDLE);

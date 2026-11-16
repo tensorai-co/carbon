@@ -10,10 +10,10 @@ use crate::objects::Object;
 
 #[derive(Clone)]
 pub enum Handle {
-    /// The host's stdout or stderr.
-    Console(host::Stream),
-    /// The host's stdin.
-    Input,
+    /// A console's stdout or stderr (`console::Stdio`).
+    Console(Arc<crate::console::Stdio>, host::Stream),
+    /// A console's stdin.
+    Input(Arc<crate::console::Stdio>),
     Object(Arc<Object>),
     /// A file, a folder, a device, or one end of a pipe.
     File(Arc<File>),

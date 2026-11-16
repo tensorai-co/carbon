@@ -9,7 +9,7 @@ use super::*;
 
 fn network() -> (Network, Arc<Loop>) {
     let host = Loop::new();
-    (Network::new(Config { hostname: "box".into(), dns: None }, Arc::new(host.clone())), host)
+    (Network::new(Config { hostname: "box".into(), dns: None, ..Default::default() }, Arc::new(host.clone())), host)
 }
 
 fn inet(s: &str) -> Addr {
@@ -341,4 +341,182 @@ fn sockets_are_listed() {
     assert!(infos.iter().any(|i| i.id == l.id() && i.state == TcpState::Listen && i.local == Some(inet("0.0.0.0:22"))));
     drop(l);
     assert!(net.sockets().is_empty());
+}
+
+/// A network on the host's own sockets, with `mode`.
+fn on_host(mode: Mode) -> Network {
+    Network::on_this_host(Config { hostname: "box".into(), mode, ..Default::default() })
+}
+
+/// The one host address a publish bound, of the family `v4` asks for.
+fn published_at(published: &Published, v4: bool) -> SocketAddr {
+    published.bound().iter().map(|b| b.host).find(|h| h.is_ipv4() == v4).unwrap()
+}
+
+#[test]
+fn a_published_tcp_port_takes_the_hosts_connections() {
+    use std::io::{Read, Write};
+    let net = on_host(Mode::Nat);
+    let listener = net.socket(Domain::Inet, Kind::Stream).unwrap();
+    listener.bind(&inet("0.0.0.0:80")).unwrap();
+    listener.listen(8).unwrap();
+    let published = net.publish(&Publish::parse("127.0.0.1::80").unwrap()).unwrap();
+    let at = published_at(&published, true);
+    assert_eq!(published.bound()[0].to_string(), format!("127.0.0.1:{}->80/tcp", at.port()));
+
+    let mut client = std::net::TcpStream::connect(at).unwrap();
+    assert!(until(|| listener.ready().read));
+    let (server, from) = listener.accept().unwrap();
+    // The host's loopback shows as the gateway, with the client's own port.
+    let Addr::Inet(from) = from else { panic!() };
+    assert_eq!((from.ip(), from.port()), (IpAddr::V4(net.gateway()), client.local_addr().unwrap().port()));
+    assert_eq!(server.local(), Addr::Inet(SocketAddr::new(IpAddr::V4(net.address()), 80)));
+    assert_eq!(server.peer().unwrap(), Addr::Inet(from));
+
+    client.write_all(b"hello machine").unwrap();
+    assert!(until(|| server.ready().read));
+    assert_eq!(recv_all(&server), b"hello machine");
+    server.send(b"hello host", None, &mut None).unwrap();
+    let mut got = [0u8; 10];
+    client.read_exact(&mut got).unwrap();
+    assert_eq!(&got, b"hello host");
+    drop(server);
+    assert_eq!(client.read(&mut got).unwrap(), 0);
+
+    // A listener on the machine's loopback only isn't published; nor is anything when nobody listens.
+    drop(listener);
+    let local_only = net.socket(Domain::Inet, Kind::Stream).unwrap();
+    local_only.bind(&inet("127.0.0.1:80")).unwrap();
+    local_only.listen(8).unwrap();
+    let mut refused = std::net::TcpStream::connect(at).unwrap();
+    refused.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert!(matches!(refused.read(&mut got), Ok(0) | Err(_)));
+    assert!(!local_only.ready().read);
+
+    // Dropped, the port is the host's again.
+    drop(published);
+    assert!(std::net::TcpListener::bind(at).is_ok());
+}
+
+#[test]
+fn a_published_udp_port_answers_from_itself() {
+    let net = on_host(Mode::Nat);
+    let server = net.socket(Domain::Inet, Kind::Datagram).unwrap();
+    server.bind(&inet("0.0.0.0:53")).unwrap();
+    let published = net.publish(&Publish::parse("127.0.0.1::53/udp").unwrap()).unwrap();
+    let at = published_at(&published, true);
+
+    let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    client.send_to(b"question", at).unwrap();
+    assert!(until(|| server.ready().read));
+    let got = server.recv(64, false).unwrap();
+    let Some(Addr::Inet(from)) = got.from else { panic!() };
+    assert_eq!((got.data.as_slice(), from.ip(), from.port()), (&b"question"[..], IpAddr::V4(net.gateway()), client.local_addr().unwrap().port()));
+
+    server.send(b"answer", Some(&Addr::Inet(from)), &mut None).unwrap();
+    let mut buffer = [0u8; 64];
+    let (n, answered_from) = client.recv_from(&mut buffer).unwrap();
+    assert_eq!((&buffer[..n], answered_from), (&b"answer"[..], at));
+}
+
+#[test]
+fn every_address_means_ipv4_and_ipv6() {
+    use std::io::Write;
+    let net = on_host(Mode::Nat);
+    let listener = net.socket(Domain::Inet6, Kind::Stream).unwrap();
+    listener.bind(&inet("[::]:22")).unwrap();
+    listener.listen(8).unwrap();
+    let published = net.publish(&Publish::parse("22").unwrap()).unwrap();
+    let port = published.bound()[0].host.port();
+    assert!(published.bound().iter().all(|b| b.host.port() == port && b.host.ip().is_unspecified()));
+    for at in ["127.0.0.1", "::1"] {
+        let Ok(mut client) = std::net::TcpStream::connect((at.parse::<IpAddr>().unwrap(), port)) else {
+            // A host without IPv6 loopback.
+            assert_eq!(at, "::1");
+            continue;
+        };
+        client.write_all(b"x").unwrap();
+        assert!(until(|| listener.ready().read), "{at}");
+        let (server, _) = listener.accept().unwrap();
+        assert!(until(|| server.ready().read));
+        assert_eq!(recv_all(&server), b"x");
+    }
+}
+
+#[test]
+fn the_hosts_network_needs_no_publishing() {
+    use std::io::{Read, Write};
+    let net = on_host(Mode::Host);
+    // A free host port, for the machine to listen on as its own.
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let listener = net.socket(Domain::Inet, Kind::Stream).unwrap();
+    listener.bind(&Addr::Inet(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port))).unwrap();
+    listener.listen(8).unwrap();
+    let mut client = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+    assert!(until(|| listener.ready().read));
+    let (server, from) = listener.accept().unwrap();
+    let Addr::Inet(from) = from else { panic!() };
+    assert_eq!(from, client.local_addr().unwrap());
+    server.send(b"same port", None, &mut None).unwrap();
+    let mut got = [0u8; 9];
+    client.read_exact(&mut got).unwrap();
+    assert_eq!(&got, b"same port");
+    // Taken while it listens, as a host program's would be.
+    assert!(std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_err());
+
+    // The host's loopback is the machine's: a host server nothing in the machine shadows.
+    let host_server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let out = net.socket(Domain::Inet, Kind::Stream).unwrap();
+    let r = out.connect(&Addr::Inet(host_server.local_addr().unwrap()));
+    assert!(r.is_ok() || r == Err(Error::InProgress));
+    let (mut accepted, _) = host_server.accept().unwrap();
+    assert!(until(|| out.ready().write));
+    out.send(b"to the host", None, &mut None).unwrap();
+    let mut got = [0u8; 11];
+    accepted.read_exact(&mut got).unwrap();
+    accepted.write_all(b"!").unwrap();
+    assert_eq!(&got, b"to the host");
+
+    // --publish is nothing to do there.
+    assert!(net.publish(&Publish::parse("9:9").unwrap()).unwrap().bound().is_empty());
+    drop(listener);
+    assert!(until(|| std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok()));
+}
+
+#[test]
+fn no_network_reaches_only_itself() {
+    let net = on_host(Mode::None);
+    let s = net.socket(Domain::Inet, Kind::Stream).unwrap();
+    assert_eq!(s.connect(&inet("93.184.216.34:80")), Err(Error::NetworkUnreachable));
+    let u = net.socket(Domain::Inet, Kind::Datagram).unwrap();
+    assert_eq!(u.send(b"x", Some(&inet("9.9.9.9:53")), &mut None), Err(Error::NetworkUnreachable));
+    assert_eq!(net.lookup("example.com"), Err(Error::NotFound));
+    assert_eq!(net.lookup("box").unwrap(), vec![IpAddr::V4(net.address())]);
+    // Loopback still works.
+    let l = net.socket(Domain::Inet, Kind::Stream).unwrap();
+    l.bind(&inet("127.0.0.1:7")).unwrap();
+    l.listen(1).unwrap();
+    net.socket(Domain::Inet, Kind::Stream).unwrap().connect(&inet("127.0.0.1:7")).unwrap();
+}
+
+#[test]
+fn ipv6_only_leaves_ipv4_its_port() {
+    let (net, _) = network();
+    let v6 = net.socket(Domain::Inet6, Kind::Stream).unwrap();
+    v6.set_options(|o| o.v6only = true);
+    v6.bind(&inet("[::]:22")).unwrap();
+    v6.listen(1).unwrap();
+    let v4 = net.socket(Domain::Inet, Kind::Stream).unwrap();
+    v4.bind(&inet("0.0.0.0:22")).unwrap();
+    v4.listen(1).unwrap();
+    // Each family reaches its own.
+    net.socket(Domain::Inet, Kind::Stream).unwrap().connect(&inet("127.0.0.1:22")).unwrap();
+    assert!(v4.ready().read && !v6.ready().read);
+    net.socket(Domain::Inet6, Kind::Stream).unwrap().connect(&inet("[::1]:22")).unwrap();
+    assert!(v6.ready().read);
+    // Without it, `::` takes IPv4's port too.
+    let dual = net.socket(Domain::Inet6, Kind::Stream).unwrap();
+    dual.bind(&inet("[::]:23")).unwrap();
+    assert_eq!(net.socket(Domain::Inet, Kind::Stream).unwrap().bind(&inet("0.0.0.0:23")), Err(Error::AddrInUse));
 }

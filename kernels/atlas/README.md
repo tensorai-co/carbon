@@ -31,7 +31,10 @@ gaps and all, which programs import oleaut32's, ws2_32's and some of shell32's b
 
 ```
 kernels/atlas/
-  build.rs        builds guest/ for each ISA (ARM64, x86-64 and i686) and embeds it
+  build.rs        builds guest/ and programs/ for each ISA (ARM64, x86-64 and i686) and embeds them
+  programs/       atlas-programs: the programs System32 has, as real Windows programs in no_std Rust: cmd.exe,
+                  powershell.exe (a PowerShell-language shell), where, findstr, find, more.com, sort, whoami,
+                  hostname, timeout
   abi/            atlas-abi: what guest/ and atlas share (call numbers, TEB/PEB/CONTEXT layouts at 64 and 32 bits,
                   status codes)
   guest/          atlas-guest: ntdll, the in-process part (loader, heap, sync, exceptions and unwinding, environment);
@@ -43,7 +46,9 @@ kernels/atlas/
     mapping.rs    VirtualAlloc and friends, at 64 KiB granularity
     sections.rs   sections and file mappings
     objects.rs handles.rs     the object manager: handles, names, events, mutants, semaphores, waits, APCs
-    files.rs      files and devices over layers, the console
+    files.rs      files and devices over layers
+    console.rs    a console: pipes or a console, line-at-a-time reads, conhost's line editing on a raw terminal
+    enter.rs      processes started from outside (`carbon exec`), each with a console of its own
     pipes.rs named_pipes.rs ports.rs    anonymous and named pipes; completion ports and asynchronous I/O
     registry.rs environment.rs
     security.rs   tokens, SIDs, ACLs, security descriptors, SDDL and access checks
@@ -104,6 +109,7 @@ opening comment says what it checks. `crt.exe` (and `crt-mingw.exe`) want the ar
 | atlas's `registry.c`, both ISAs | A fresh machine's hives, keys and every value type, enumeration, deletion, and saving; change notification, asynchronous and not; the 32-bit view; hives saved, restored, loaded and unloaded |
 | atlas's `sandbox.c`, both ISAs and i686 | What a browser engine's processes call setting up their sandbox: window stations and desktops made, named, opened, made current and closed, their DACLs read, extended with `SetEntriesInAcl` and set; DACLs built from trustees by name and by SID, a deny put first, a grant revoked; message-only windows, getting messages and passed by `FindWindow`; the registry by NT path (`NtCreateKey` and its disposition, relative to a key, `NtOpenKeyEx`, `NtQueryValueKey`'s three forms and short buffers, `NtDeleteKey`) and `RtlFormatCurrentUserKeyPath`; `GetThreadContext` of the caller, of a running thread suspended (its pc in its loop) and of one suspended while it waits; WinRT's start, activation finding no class, and HSTRINGs (copies, references, duplicates, comparisons, the null one, embedded NULs); event tracing's 64-bit handles; `ProcessPrng` |
 | atlas's `sockets.c`, both ISAs and i686 | Winsock over the machine's loopback: TCP's listen, connect, accept and names; send, recv, MSG_PEEK, FIONREAD; `select` and `WSAPoll`; non-blocking sockets and a connect seen through `select`; SO_RCVTIMEO; options; overlapped `WSARecv` through an event and a completion port, done at once and later, with and without FILE_SKIP_COMPLETION_PORT_ON_SUCCESS; `closesocket` aborting what's under way; shutdown; UDP; `ConnectEx`, `AcceptEx` and `GetAcceptExSockaddrs` from `WSAIoctl`; `getaddrinfo` (numeric, passive, localhost, the machine's own name, AI_NUMERICHOST); `gethostname`, `inet_addr`; ws2_32's old functions by ordinal |
+| atlas's `serve.c`, both ISAs and i686 | Not a check of its own: a Winsock server for reaching a Windows program from outside (`serve.exe [PORT [CONNECTIONS]]`), through `--publish` or `--network host`. Over TCP it tells each client the address atlas sees it from and echoes what it sends; over UDP it echoes each datagram to its sender |
 | atlas's `startup.c`, both ISAs and i686 | What larger programs call as they start: the heap's sizes, reallocation and queries; encoded pointers; `InitOnceBeginInitialize`/`Complete` and `ExecuteOnce`; interlocked lists; `IsDebuggerPresent`, `DebugBreak` to a vectored handler, `UnhandledExceptionFilter`; `IsBadWritePtr`/`ReadPtr`; `CompareString`, `LCMapString` (case and sort keys), `GetStringType`; `GetDateFormat`/`GetTimeFormat`; disk space, drive types, `FindFirstFileEx`; console modes and `SetStdHandle`; `OpenThread`, priorities, affinity, the session; psapi; the monitor, the window station, `MapWindowPoints`, `MsgWaitForMultipleObjects` (a timeout, a message, an object); memory fonts; the event log and `RtlGenRandom`; `CommandLineToArgvW`, `SHGetKnownFolderPath`, `IsUserAnAdmin`; oleaut32's BSTRs and VARIANTs, bcrypt's random bytes and Winsock's start, imported by ordinal |
 | atlas's `installer.c`, both ISAs and i686 | What installers call first: the `lstr*` functions, `CharNext`/`CharPrev`, `MulDiv`, `CompareFileTime`; `wsprintf` with its arguments past the registers, cut at 1024 characters, and `wvsprintf`; temporary and short names, disk space, `SearchPath`; .ini files; the error mode; COM's start, its task allocator and `CoCreateInstance` with no class registered; `SHGetFileInfo` with no flags |
 | atlas's `environment.c`, both ISAs | The environment a logon gives, from the registry: read, expanded, set and deleted |
@@ -138,6 +144,15 @@ version and features) and `sandbox` (`NtCreateKey`, then an internal stop at an 
 On Windows, atlas's own x86-64 calls into atlas go through its trampoline (`call::TRAP_AT` in the atlas page), which is
 `syscall` everywhere but the Windows sandbox, where it's that sandbox's gate; the stubs it makes for host exports do
 the same there.
+
+**The console** (`console.rs`). A machine run with `-it` has a console: its standard handles answer
+`GetConsoleMode`, reads are a line at a time, and on the host's terminal (raw) atlas does conhost's line editing:
+echo, Backspace, the arrows, history, Home, End, Delete, Esc to clear the line, Ctrl+C to drop it, and Ctrl+Z then
+Enter for the end; `SetConsoleMode` turns line mode and echo off and on, and `SetConsoleTitle` sets the terminal's
+title. Without `-t`, the standard handles are pipes (`GetFileType` says so) to the host's stdin and stdout, as a
+Windows program in `docker run` without `-t` finds them. A console's handles are inheritable, and go to a child
+`CreateProcess` gives them to in `STARTUPINFO`. Each process started from outside (`carbon exec`, `enter.rs`) has a
+console of its own, its input from and output to the caller.
 
 ## Windows, in short
 
@@ -960,9 +975,29 @@ interface is the to-do, not each export.
 
 ### 7. The programs Windows ships
 
-First `cmd.exe` (variables, `if`, `for`, `goto`, `call`, pipes, redirection, `.bat` files), `conhost`, `reg.exe`,
-`regsvr32.exe`, `rundll32.exe` and `msiexec.exe`; then `sc.exe`, `taskkill`, `tasklist`, `schtasks`, `icacls`,
-`where`, `timeout`, `start`, `explorer.exe` and `notepad.exe`; later, enough PowerShell for installers' scripts.
+Built (`programs/`, in System32 for each ISA, so a 32-bit program gets SysWOW64's): **`cmd.exe`** with its own
+commands (DIR, CD, SET with `/A` and `/P`, COPY, DEL, MD, RD, REN, MOVE, TYPE, ECHO, IF, FOR with `/D`, `/R`, `/L`
+and `/F`, CALL, GOTO, SHIFT, SETLOCAL and ENDLOCAL, PUSHD, POPD, START, MKLINK, TITLE, VER, VOL, PATH, PROMPT,
+PAUSE, DATE, TIME, CLS, EXIT), batch files with labels and `%~dp0`-style modifiers, `%` and delayed `!` expansion,
+`&`, `&&`, `||`, pipes (a side that's cmd's own runs in a `cmd /S /D /C` of its own, as cmd does it), redirection
+(`>`, `>>`, `<`, `2>&1`, `nul`), and `/C`, `/K`, `/S`, `/Q`, `/V:ON`; **`powershell.exe`**, a PowerShell-language
+shell of atlas's own (Windows PowerShell is a .NET program): values and pipelines of objects, `$env:`, `"$x $(...)"`,
+here-strings, arrays, hashtables, script blocks, PowerShell's operators (`-eq`, `-like`, `-match` with `$matches`,
+`-replace`, `-split`, `-join`, `-f`, `..`, casts, `-is`, `-as`), `if`, `foreach`, `while`, `do`, `for`, `switch`,
+`function` with `param()`, `try`/`catch`/`finally`, a regular expression engine of its own, about seventy cmdlets
+(the file system's, `ForEach-Object`, `Where-Object`, `Select-Object`, `Sort-Object`, `Measure-Object`,
+`Group-Object`, `Format-Table`/`List`, `Out-File`, `Select-String`, `Get-Date`, `Start-Process`, `ConvertTo-Json`
+and the rest) with Windows PowerShell 5.1's aliases (`dir`, `ls`, `cd`, `cat`, `%`, `?`), static members
+(`[math]`, `[string]`, `[System.IO.Path]`, `[Environment]`, `[regex]`), its default formatting (Get-ChildItem's
+table, Name/Value, tables and lists), and its command line (`-Command`, `-File`, `-EncodedCommand`, `-NoProfile`,
+`-NoLogo`, `-NonInteractive`, `-NoExit`, `-ExecutionPolicy`); and `where`, `findstr` (with findstr's regular
+expressions), `find`, `more.com`, `sort`, `whoami`, `hostname` and `timeout`.
+
+To come: `reg.exe`, `regsvr32.exe`, `rundll32.exe` and `msiexec.exe`; then `sc.exe`, `taskkill`, `tasklist`,
+`schtasks`, `icacls`, `attrib`, `xcopy`, `robocopy`, `choice`, `explorer.exe` and `notepad.exe`; in cmd, filename
+completion and Ctrl+C to a running program (`SetConsoleCtrlHandler`'s handlers); in PowerShell, classes, modules,
+`$PROFILE`, `Get-Process` and `Stop-Process` over the machine's processes, and `powershell.exe` in
+`WindowsPowerShell\v1.0` as well as System32; the system layer's files dated other than 1970.
 
 ### Across every layer
 

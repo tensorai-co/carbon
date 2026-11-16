@@ -140,11 +140,19 @@ working: `bash -c`, scripts on stdin, and `bash -i`; `ls`, `find`, `grep`, `sed`
 `id`, `uname`, `sleep`, `dpkg -l` and `apt --version`; pipelines, command substitution, here-strings, files written
 and read back in `/tmp`, exit statuses, and `yes | head` (SIGPIPE).
 
-When stdin and stdout are a terminal, it becomes the machine's **console**: the host terminal goes into raw mode, and
+When stdin and stdout are a terminal (and `carbon run` has `-it`), it becomes the machine's **console**: the host
+terminal goes into raw mode, and
 lambda's own line discipline edits lines, echoes, and turns ^C, ^\ and ^Z into signals for the foreground process
 group. So bash gets job control and readline: ^C (status 130), ^Z and `fg`, `jobs`, `kill %1`, background jobs with
 `&`, arrow keys and history. Resizing the host's terminal sends SIGWINCH. Inside the machine, `/dev/ptmx` makes pty
 pairs: util-linux's `script` runs a command in one.
+
+**Processes from outside** (`enter.rs`, `Stop::enter`, for `carbon exec`): a process started in the running machine
+with no parent in it (0, as Docker's are), a session of its own, the environment and working directory it's given,
+and the program found on its `PATH`. With a terminal it gets a new pty's slave as fds 0, 1 and 2 and as its
+controlling terminal, and the caller has the master (input with its signal keys, resizes as SIGWINCH); without one,
+three pipes. Its output comes out as events, and its end (`Kernel::entered` hears it) last, once what it wrote is
+out.
 
 Use a release build for interactive use: a debug build's fork and exec take about 250 ms, long enough for a quick ^Z to
 catch a job before it has run.

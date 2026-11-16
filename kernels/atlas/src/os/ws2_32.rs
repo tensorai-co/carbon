@@ -336,6 +336,8 @@ impl Task {
             _ => return Err(WSAEPROTONOSUPPORT),
         };
         let socket = self.k.net.socket(domain, net_kind).map_err(|e| wsa(&e))?;
+        // Windows' IPv6 sockets are IPv6 only until IPV6_V6ONLY says otherwise, unlike Linux's.
+        socket.set_options(|o| o.v6only = domain == net::Domain::Inet6);
         Ok(self.socket_handle(Sock::new(&self.process, socket, af, kind, protocol), overlapped))
     }
 
@@ -1005,6 +1007,8 @@ fn setsockopt(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     const SO_SNDTIMEO: u32 = 0x1005;
     const SO_RCVTIMEO: u32 = 0x1006;
     const TCP_NODELAY: u32 = 1;
+    const IPPROTO_IPV6: u32 = 41;
+    const IPV6_V6ONLY: u32 = 27;
     let r = (|| -> Result<u64, Failed> {
         let (_, sock) = task.sock(a[0])?;
         let (level, name) = (a[1] as u32, a[2] as u32);
@@ -1020,6 +1024,7 @@ fn setsockopt(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
             (SOL_SOCKET, SO_RCVTIMEO) => lock(&sock.timeouts)[0] = ms(),
             (SOL_SOCKET, SO_SNDTIMEO) => lock(&sock.timeouts)[1] = ms(),
             (IPPROTO_TCP, TCP_NODELAY) => socket.set_options(|o| o.nodelay = flag),
+            (IPPROTO_IPV6, IPV6_V6ONLY) => socket.set_options(|o| o.v6only = flag),
             _ => {}
         }
         lock(&sock.kept).insert((level, name), value);
@@ -1051,6 +1056,7 @@ fn getsockopt(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
             // SO_CONNECT_TIME: seconds connected, or -1 for not.
             (SOL_SOCKET, 0x700c) => int(if socket.peer().is_ok() { 0 } else { u32::MAX }),
             (IPPROTO_TCP, 1) => int(u32::from(options.nodelay)),
+            (41, 27) => int(u32::from(options.v6only)),
             _ => kept.unwrap_or_else(|| vec![0; 4]),
         };
         let room = task.u32_at(cx, a[4])? as usize;

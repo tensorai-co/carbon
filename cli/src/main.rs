@@ -1,11 +1,16 @@
 //! `carbon`: run Linux and Windows programs in machines of their own.
 //!
 //! ```sh
-//! carbon run debian:13 -- bash              # a Linux image, with lambda (pulled if it isn't here)
+//! carbon run -it debian:13 bash             # a shell in a Linux image, with lambda (pulled if it isn't here)
+//! carbon run debian:13 -- ls /              # a command, its output here and no stdin, as `docker run` has it
 //! carbon run --name dev debian:13           # named, to start again later with `carbon run --name dev`
 //! carbon run --isolation vm debian:13 -- ./untrusted.sh
 //! carbon run setup.exe                      # a Windows program, with atlas
 //! carbon run --gpu host debian:13 -- vulkaninfo --summary   # the Mac's GPU, as a Carbon GPU
+//! carbon run -p 8080:80 debian:13 -- python3 -m http.server 80   # the host's port 8080 reaches the machine's 80
+//! carbon run --network host debian:13 -- python3 -m http.server 80   # the host's port 80 itself
+//! carbon port NAME                          # what a machine publishes: 80/tcp -> 0.0.0.0:8080
+//! carbon exec -it NAME bash                 # a shell in a running machine
 //! carbon gpu                                # the devices a machine's GPU can be
 //! carbon ls | stop NAME | rm NAME | freeze NAME IMAGE
 //! carbon display screenshot NAME -o screen.png
@@ -31,6 +36,9 @@ usage: carbon <command> ...
 
   run [options] IMAGE|PROGRAM [-- ARGS...]   run a new machine from an image or a program
   run --name NAME [-- ARGS...]               start a stopped machine again, with its files as it left them
+      -i, --interactive                      keep stdin: the machine's stdin is this one's (without it, it's empty)
+      -t, --tty                              with -i, this terminal is the machine's console: a shell's prompt and
+                                             line editing, Ctrl-C, full-screen programs (-it for a shell, as Docker)
       --isolation vm|sandbox|auto            a hardware VM, the process sandbox, or the best there is (the default)
       --name NAME                            the machine's name (else one from its image or program)
       --platform OS/ARCH                     which build of an image to pull (linux for this CPU by default)
@@ -45,7 +53,23 @@ usage: carbon <command> ...
                                              WAV file of everything played
       -e, --env NAME=VALUE                   an environment variable, over the image's
       --memory SIZE                          how much memory it may use, as 512m or 4g (4g by default)
+      -p, --publish [IP:][HOST_PORT:]PORT[/tcp|udp]
+                                             a host port that reaches a port in the machine, as Docker's: 2222:22,
+                                             127.0.0.1:8080:80, [::1]:8080:80, 5353:53/udp, 8000-8009:8000-8009;
+                                             no HOST_PORT takes a free one; no IP is every address, IPv4 and IPv6
+      --network nat|host|none, --net         what its network reaches: its own addresses, out through the host and
+                                             in only through --publish (nat, the default); the host's ports, with
+                                             no publishing (host: a program listening on 80 has the host's 80); or
+                                             loopback only (none). A machine run again keeps its last --network and
+                                             --publish unless they're given again
+  exec [options] NAME COMMAND [ARGS...]      run a command in a running machine, as docker exec
+      -i, --interactive                      keep stdin
+      -t, --tty                              a terminal of its own, this one (-it for a shell)
+      -d, --detach                           start it and leave it running
+      -e, --env NAME=VALUE                   an environment variable, over the machine's
+      -w, --workdir DIR                      where it starts (the image's working directory by default)
   ls                                         the machines, and which are running
+  port NAME [PORT[/tcp|udp]]                 what a running machine publishes: 22/tcp -> 0.0.0.0:2222
   gpu                                        the devices a machine's GPU can be: this host's, and the CPU device
   stop NAME                                  stop a running machine (SIGTERM, then everything after 10s)
   rm NAME                                    remove a stopped machine and its files
@@ -120,11 +144,26 @@ fn run(machines: &Machines, mut args: impl Iterator<Item = String>) -> ! {
     let mut spec = Run::default();
     let mut source = None;
     while let Some(arg) = args.next() {
-        let mut value = |what: &str| args.next().unwrap_or_else(|| fail(format!("{what} needs a value")));
+        // `--flag=value` as well as `--flag value`, and a short flag's `-p=value` and `-pvalue`, as Docker takes them.
+        let (arg, inline) = match arg.split_once('=') {
+            Some((flag, value)) if flag.starts_with("--") && source.is_none() => (flag.to_string(), Some(value.to_string())),
+            _ if source.is_none() && (arg.starts_with("-p") || arg.starts_with("-e")) && arg.len() > 2 && !arg.starts_with("--") => {
+                (arg[..2].to_string(), Some(arg[2..].trim_start_matches('=').to_string()))
+            }
+            _ => (arg, None),
+        };
+        let mut value = |what: &str| inline.clone().or_else(|| args.next()).unwrap_or_else(|| fail(format!("{what} needs a value")));
         match arg.as_str() {
             "--" => {
                 spec.args = args.by_ref().collect();
                 break;
+            }
+            "-i" | "--interactive" => spec.interactive = true,
+            "-t" | "--tty" => spec.tty = true,
+            // Short flags together, as `-it`.
+            flag if source.is_none() && flag.len() > 2 && !flag.starts_with("--") && flag.starts_with('-') && flag[1..].chars().all(|c| c == 'i' || c == 't') => {
+                spec.interactive |= flag.contains('i');
+                spec.tty |= flag.contains('t');
             }
             "--isolation" => {
                 spec.isolation = match value("--isolation").as_str() {
@@ -172,6 +211,17 @@ fn run(machines: &Machines, mut args: impl Iterator<Item = String>) -> ! {
                 let text = value("--memory");
                 spec.memory = size(&text).unwrap_or_else(|| fail(format!("{text} isn't a size: 512m, 4g")));
             }
+            "-p" | "--publish" => {
+                let text = value("--publish");
+                if let Err(why) = machine::Publish::parse(&text) {
+                    fail(format!("--publish {why}"));
+                }
+                spec.publish.get_or_insert_with(Vec::new).push(text);
+            }
+            "--network" | "--net" => {
+                let text = value("--network");
+                spec.network = Some(machine::parse_network(&text).unwrap_or_else(|| fail(format!("--network is nat, host or none, not {text}"))));
+            }
             flag if flag.starts_with('-') => fail(format!("run doesn't know {flag}")),
             _ if source.is_none() => source = Some(arg),
             _ => {
@@ -182,6 +232,10 @@ fn run(machines: &Machines, mut args: impl Iterator<Item = String>) -> ! {
         }
     }
     spec.source = source.map(|what| if Path::new(&what).is_file() { Source::Program(PathBuf::from(what)) } else { Source::Image(what) });
+    // As Docker says it: a console needs a terminal to read from.
+    if spec.interactive && spec.tty && !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        fail("the input device is not a TTY: -t needs this terminal as stdin (leave out -t to pipe stdin in with -i)");
+    }
     if spec.source.is_none() && spec.name.is_none() {
         usage();
     }
@@ -191,17 +245,101 @@ fn run(machines: &Machines, mut args: impl Iterator<Item = String>) -> ! {
     }
 }
 
+/// `carbon exec [options] NAME COMMAND [ARGS...]`, as `docker exec`.
+fn exec(machines: &Machines, mut args: impl Iterator<Item = String>) -> ! {
+    let mut request = machine::ExecRequest::default();
+    let (mut interactive, mut tty) = (false, false);
+    let mut name = None;
+    while let Some(arg) = args.next() {
+        let (arg, inline) = match arg.split_once('=') {
+            Some((flag, value)) if flag.starts_with("--") => (flag.to_string(), Some(value.to_string())),
+            _ if (arg.starts_with("-e") || arg.starts_with("-w")) && arg.len() > 2 => (arg[..2].to_string(), Some(arg[2..].trim_start_matches('=').to_string())),
+            _ => (arg, None),
+        };
+        let mut value = |what: &str| inline.clone().or_else(|| args.next()).unwrap_or_else(|| fail(format!("{what} needs a value")));
+        match arg.as_str() {
+            "-i" | "--interactive" => interactive = true,
+            "-t" | "--tty" => tty = true,
+            "-d" | "--detach" => request.detach = true,
+            "-e" | "--env" => {
+                let var = value("--env");
+                if !var.contains('=') {
+                    fail(format!("{var}: an environment variable is NAME=VALUE"));
+                }
+                request.env.push(var);
+            }
+            "-w" | "--workdir" => request.workdir = Some(value("--workdir")),
+            flag if flag.len() > 1 && flag.starts_with('-') && !flag.starts_with("--") && flag[1..].chars().all(|c| "itd".contains(c)) => {
+                interactive |= flag.contains('i');
+                tty |= flag.contains('t');
+                request.detach |= flag.contains('d');
+            }
+            flag if flag.starts_with('-') => fail(format!("exec doesn't know {flag}")),
+            _ => {
+                name = Some(arg);
+                request.args = args.by_ref().collect();
+                break;
+            }
+        }
+    }
+    let Some(name) = name else { fail("exec needs a machine's name and a command: carbon exec -it NAME bash") };
+    if request.args.is_empty() {
+        fail("exec needs a command: carbon exec -it NAME bash");
+    }
+    if tty && interactive && !request.detach && !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        fail("the input device is not a TTY: -t needs this terminal as stdin (leave out -t to pipe stdin in with -i)");
+    }
+    request.tty = tty.then_some((24, 80));
+    match machines.exec(&name, request, interactive) {
+        Ok(code) => exit(code),
+        Err(why) => fail(why),
+    }
+}
+
 fn ls(machines: &Machines) {
-    let rows: Vec<[String; 4]> = machines
+    let rows: Vec<[String; 5]> = machines
         .list()
         .into_iter()
         .map(|m| {
             let from = m.image.as_deref().map(|i| i.strip_prefix("docker.io/library/").unwrap_or(i).to_string()).or(m.program.clone()).unwrap_or_default();
-            let status = if m.running() { format!("running ({})", m.pid.unwrap_or(0)) } else { "stopped".to_string() };
-            [m.name, from, m.backend, status]
+            let running = m.running();
+            let status = if running { format!("running ({})", m.pid.unwrap_or(0)) } else { "stopped".to_string() };
+            let ports = if !running {
+                String::new()
+            } else if m.network == machine::Network::Nat {
+                m.ports.join(", ")
+            } else {
+                format!("--network {}", machine::network_name(m.network))
+            };
+            [m.name, from, m.backend, status, ports]
         })
         .collect();
-    table(&["NAME", "FROM", "ISOLATION", "STATUS"], &rows);
+    table(&["NAME", "FROM", "ISOLATION", "STATUS", "PORTS"], &rows);
+}
+
+/// `carbon port NAME [PORT[/PROTO]]`, as `docker port`: each published port and where on the host it is, or for one
+/// port, just where.
+fn port(machines: &Machines, name: &str, which: Option<&str>) {
+    let record = machines.record(name).unwrap_or_else(|| fail(format!("there's no machine called {name}")));
+    // `0.0.0.0:2222->22/tcp` as `22/tcp -> 0.0.0.0:2222`.
+    let ports: Vec<(String, String)> = if record.running() { record.ports.iter().filter_map(|p| p.split_once("->")).map(|(host, machine)| (machine.to_string(), host.to_string())).collect() } else { Vec::new() };
+    match which {
+        None => {
+            for (machine, host) in &ports {
+                println!("{machine} -> {host}");
+            }
+        }
+        Some(which) => {
+            let which = if which.contains('/') { which.to_string() } else { format!("{which}/tcp") };
+            let found: Vec<&String> = ports.iter().filter(|(machine, _)| *machine == which).map(|(_, host)| host).collect();
+            if found.is_empty() {
+                fail(format!("no public port {which} published for {name}"));
+            }
+            for host in found {
+                println!("{host}");
+            }
+        }
+    }
 }
 
 fn table<const N: usize>(head: &[&str; N], rows: &[[String; N]]) {
@@ -230,7 +368,12 @@ fn main() {
     let mut one = |what: &str| args.next().unwrap_or_else(|| fail(format!("{command} needs {what}")));
     match command.as_str() {
         "run" => run(&machines, args),
+        "exec" => exec(&machines, args),
         "ls" | "ps" => ls(&machines),
+        "port" => {
+            let name = one("a machine's name");
+            port(&machines, &name, args.next().as_deref());
+        }
         "gpu" => {
             println!("{:<10} {:<24} {:<10} SUBGROUP", "KIND", "NAME", "BACKEND");
             for (kind, device) in ["host", "software"].into_iter().zip(machine::gpus()) {

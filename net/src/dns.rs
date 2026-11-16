@@ -75,11 +75,11 @@ pub(crate) fn respond(net: &Shared, query: &[u8], question: &Question) -> Vec<u8
     if question.opcode != 0 {
         return build(query, question, NOTIMP, &[]);
     }
-    if let Some(server) = net.config.dns {
+    if let Some(server) = net.config.dns.filter(|_| net.config.mode != crate::Mode::None) {
         return net.host.query(query, Some(server)).ok().filter(|r| r.get(..2) == query.get(..2)).unwrap_or_else(|| build(query, question, SERVFAIL, &[]));
     }
     let addresses = question.qclass == IN && matches!(question.qtype, A | AAAA);
-    let hostname = net.config.hostname.to_ascii_lowercase();
+    let hostname = net.hostname().to_ascii_lowercase();
     let own: Option<Vec<IpAddr>> = if !hostname.is_empty() && question.name == hostname {
         Some(vec![IpAddr::V4(net.address)])
     } else if question.name == "localhost" {
@@ -89,6 +89,10 @@ pub(crate) fn respond(net: &Shared, query: &[u8], question: &Question) -> Vec<u8
     };
     if let Some(own) = own {
         return build(query, question, NOERROR, if addresses { &own } else { &[] });
+    }
+    // With no network, nothing else is known.
+    if net.config.mode == crate::Mode::None {
+        return build(query, question, NXDOMAIN, &[]);
     }
     if addresses {
         return match net.host.lookup(&question.name) {

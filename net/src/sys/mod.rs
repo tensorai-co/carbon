@@ -16,12 +16,12 @@ mod windows;
 use windows as os;
 
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown as StdShutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown as StdShutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
-use crate::{Error, Host, HostDatagram, HostStream, Ready, Result, Shutdown, Waker, lock};
+use crate::{Error, Host, HostDatagram, HostListener, HostStream, Ready, Result, Shutdown, Waker, lock};
 
 /// How long a connection out may take to be made.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -164,6 +164,14 @@ impl TcpOut {
         out
     }
 
+    /// A connection a published port's listener accepted: connected already.
+    fn accepted(stream: TcpStream, wake: Waker) -> Result<TcpOut> {
+        stream.set_nonblocking(true)?;
+        let raw = os::raw_tcp(&stream);
+        let state = Arc::new(Mutex::new(Connection::Ready(stream, Registration::new(raw, READ, WRITE, wake))));
+        Ok(TcpOut { state, options: Mutex::new((false, false)) })
+    }
+
     fn with<T>(&self, f: impl FnOnce(&TcpStream, &Registration) -> Result<T>) -> Result<T> {
         match &*lock(&self.state) {
             Connection::Ready(stream, registration) => f(stream, registration),
@@ -235,6 +243,30 @@ struct UdpOut {
     registration: Arc<Registration>,
 }
 
+/// A published port's host listener.
+struct TcpIn {
+    listener: TcpListener,
+    local: SocketAddr,
+    registration: Arc<Registration>,
+}
+
+impl HostListener for TcpIn {
+    fn local(&self) -> SocketAddr {
+        self.local
+    }
+
+    fn accept(&self, wake: Waker) -> Result<(Box<dyn HostStream>, SocketAddr)> {
+        loop {
+            match self.registration.after(READ, self.listener.accept()) {
+                Ok((stream, from)) => return Ok((Box::new(TcpOut::accepted(stream, wake)?), from)),
+                // A connection that went before it was taken: take the next.
+                Err(Error::ConnectionAborted | Error::ConnectionReset) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
 impl HostDatagram for UdpOut {
     fn ready(&self) -> Ready {
         Ready { read: self.registration.is(READ), write: true, ..Ready::default() }
@@ -252,6 +284,10 @@ impl HostDatagram for UdpOut {
                 other => return self.registration.after(READ, other),
             }
         }
+    }
+
+    fn local(&self) -> Result<SocketAddr> {
+        Ok(self.socket.local_addr()?)
     }
 }
 
@@ -304,6 +340,21 @@ impl Host for System {
 
     fn addresses(&self) -> Vec<IpAddr> {
         os::addresses()
+    }
+
+    fn listen(&self, at: SocketAddr, wake: Waker) -> Result<Box<dyn HostListener>> {
+        let listener = TcpListener::bind(at)?;
+        listener.set_nonblocking(true)?;
+        let local = listener.local_addr()?;
+        let registration = Registration::new(os::raw_listener(&listener), READ, 0, wake);
+        Ok(Box::new(TcpIn { listener, local, registration }))
+    }
+
+    fn udp_at(&self, at: SocketAddr, wake: Waker) -> Result<Box<dyn HostDatagram>> {
+        let socket = UdpSocket::bind(at)?;
+        socket.set_nonblocking(true)?;
+        let registration = Registration::new(os::raw_udp(&socket), READ, WRITE, wake);
+        Ok(Box::new(UdpOut { socket, registration }))
     }
 }
 

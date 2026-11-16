@@ -284,7 +284,8 @@ another process on Windows hosts; a worker process per machine.
 
 **6. Networks** ([net](net/README.md#to-do))
 
-1. In, and policy: `--publish`, `--net none` and `host`, `--allow` and `--deny` with a log, `--dns`, `carbon port`.
+1. In, and policy: `--allow` and `--deny` with a log, `--dns`. (`--publish`, `--network none` and `host`, and
+   `carbon port` are done, for lambda and atlas.)
 2. Between machines: named networks, names in DNS, `carbon net`.
 3. ICMP echo, IPv6 end to end, broadcast and multicast, as programs ask.
 

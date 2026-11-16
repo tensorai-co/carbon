@@ -8,13 +8,17 @@ over it.
 
 **Phases 1 and 2 are built** (the shared part in memory, and out through each host): lambda's sockets and atlas's
 Winsock work on it; `apt-get update` and `curl https://` work in `debian:13` on macOS, Linux and Windows, and a
-32-bit Windows program downloads and installs its update over HTTPS. Ports in, policy and networks between machines
-are to do.
+32-bit Windows program downloads and installs its update over HTTPS. **Ports in are built** (`--publish`, and
+`--network host` and `none`): `ssh -p 2222` from the host reaches `sshd` in `debian:13`, and a Windows server's TCP and
+UDP ports answer the host. Policy and networks between machines are to do.
 
 ```sh
 carbon run debian:13 -- curl https://example.com                      # out through the host, by default
-carbon run --publish 8080:80 debian:13 -- python3 -m http.server 80   # in, from the host's port 8080 (to do)
-carbon run --net none setup.exe                                       # loopback only (to do)
+carbon run -p 8080:80 debian:13 -- python3 -m http.server 80         # in, from the host's port 8080
+carbon run -p 2222:22 -p 5353:53/udp dev                              # several, TCP and UDP
+carbon run --network host debian:13 -- python3 -m http.server 80      # the host's port 80 itself, no publishing
+carbon run --network none setup.exe                                   # loopback only
+carbon port dev                                                       # 22/tcp -> [::]:2222
 carbon run --net lab --name db postgres:17                            # machines on network "lab" reach it as "db" (to do)
 ```
 
@@ -110,23 +114,39 @@ and `getaddrinfo` (through `Network::lookup`, the resolver's answer without a DN
 [atlas's](../kernels/atlas/README.md). A peek at a host connection takes what the host has (64 KiB at least), and a
 read after it gets the rest too, so a kernel that peeks to see what's readable doesn't make each read a byte.
 
-## The design still to build
+### In: published ports (`publish.rs`)
 
-### In: published ports
+Nothing outside reaches a machine unless it publishes a port, or has the host's network. `--publish` is Docker's:
+`[HOST_IP:][HOST_PORT:]PORT[/tcp|udp]`, repeated for more, with an IPv6 address in brackets (`[::1]:8080:80`), ranges
+(`8000-8009:8000-8009`), and no host port (`-p 80`, `127.0.0.1::80`) for a free one. With no address it's every
+address, IPv6's and IPv4's: `net` listens on `[::]`, and on `0.0.0.0` too where `[::]` doesn't take IPv4 (Windows).
+`Network::publish` gives a `Published`, listening for as long as it's kept; `machine` keeps it while the machine runs,
+and stops before the kernel boots, naming the port, if a host port is taken.
 
-Nothing outside reaches a machine unless it publishes a port. `--publish 8080:80` has `net` listen on the host's port
-8080 and hand each connection to whichever socket in the machine listens on port 80. Because the connection was never
-re-made, the program's `accept` sees the real client's address and port, not the host's. With nothing listening in
-the machine, the host side closes the connection at once, as a refused one would. UDP ports publish the same way
-(`8080:80/udp`), with each datagram's real source.
+- **TCP**: `net` listens on the host's port (a host listener on the reactor, `Host::listen`) and hands each
+  connection to the socket in the machine listening on the published port, on the machine's address or any address
+  (one bound to `127.0.0.1` alone isn't reached, as in Docker). The connection isn't made again inside: the host's
+  accepted connection becomes the machine's accepted socket, read and written directly, so there's no proxy and no
+  copy, and `accept` gives the client's own address. With nothing listening, the connection is closed at once.
+- **Who's connecting**: a client elsewhere shows as itself (`ssh` from another computer sees `SSH_CLIENT` with its
+  address); a client on the host's loopback shows as the gateway (`10.89.0.1`) with its own port, as Docker's proxy
+  shows it, so a program that trusts `127.0.0.1` doesn't trust every process on the host.
+- **UDP**: each datagram goes to the socket bound to the port, from its real source (or the gateway, as above), and
+  what the machine sends back to that client from that port goes out through the host socket it came in on, so the
+  client sees the answer from the port it asked (`net` remembers the last 4,096 clients a port has had).
+- **Readiness** of a host connection is what a read would get now: when the host says readable and nothing's been
+  read ahead, `net` reads ahead, so `poll` never says POLLIN for a read that would block (OpenSSH treats that as
+  fatal).
+- **`IPV6_V6ONLY`** is honoured, so a server that binds `[::]` and `0.0.0.0` on one port (sshd does) gets both; lambda's
+  IPv6 sockets take IPv4 too by default, as Linux's do, and atlas's don't, as Windows' don't.
 
 ### Modes and policy
 
-| `--net` | What a machine has |
+| `--network`, `--net` | What a machine has |
 | --- | --- |
-| `nat` (default) | Its own addresses and loopback; out through the host; in only through `--publish` |
-| `none` | Loopback only. Every `connect` beyond it is refused, and DNS answers only the machine's own name |
-| `host` | No network of its own: `bind` takes the host's ports and `connect` uses the host's addresses, as `docker run --network host`. The fastest and the least isolated, for a dev box |
+| `nat` (default; `bridge` as Docker calls it) | Its own addresses and loopback; out through the host; in only through `--publish` (built) |
+| `none` | Loopback only: a `connect` or `sendto` beyond it is `ENETUNREACH`, and DNS answers only the machine's own names (built) |
+| `host` | The host's ports: a program listening on a port (or binding a UDP port by number) has the host's port, on the address it bound (`127.0.0.1` stays the host's loopback), and the host's loopback is reachable as its own where nothing in the machine listens. `--publish` is discarded, with a warning, as Docker's is. It keeps its own addresses and interfaces otherwise (built) |
 | `NAME` | `nat`, plus the other machines on network `NAME`, which is made on first use |
 
 Rules narrow what `nat` allows out, first match wins, after which the default allows:
@@ -184,8 +204,8 @@ steal a port, so `net` uses `SO_EXCLUSIVEADDRUSE` there), each host's errors, Wi
 
 | Option | Meaning |
 | --- | --- |
-| `--net nat\|none\|host\|NAME` | The machine's network; default `nat` |
-| `--publish [IP:]HOST:MACHINE[/udp]`, `-p` | A host port that reaches a machine port; `IP` defaults to `0.0.0.0` |
+| `--network nat\|none\|host\|NAME`, `--net` | The machine's network; default `nat` (`NAME` to do) |
+| `--publish [IP:][HOST_PORT:]PORT[/tcp\|udp]`, `-p` | A host port that reaches a machine port, as Docker's; no `IP` is every address, IPv4 and IPv6 |
 | `--allow RULE`, `--deny RULE` | Outbound rules, first match wins: an address, a CIDR, a name or `host`, each with an optional `:PORT` |
 | `--dns ADDR` | Where the machine's resolver sends what it doesn't know, instead of the host's resolver |
 | `--hostname NAME` | What the machine calls itself; default its `--name` |
@@ -194,8 +214,11 @@ steal a port, so `net` uses `SO_EXCLUSIVEADDRUSE` there), each host's errors, Wi
 carbon net ls                       # NETWORK   SUBNET          MACHINES
 carbon net inspect lab              # each machine's addresses and published ports
 carbon net log web                  # connections and refusals, as they happen
-carbon port web                     # 80/tcp -> 0.0.0.0:8080
+carbon port web                     # 80/tcp -> [::]:8080 (built, as are ls's PORTS)
 ```
+
+A machine run again (`carbon run --name web`) keeps the `--network` and `--publish` it had, unless they're given
+again; its record keeps them, and the host addresses they're on while it runs.
 
 ## Layout
 
@@ -207,6 +230,7 @@ net/
     watch.rs      watchers and wakers
     stream.rs     stream and seqpacket sockets joined in memory: Unix, and TCP over loopback
     dns.rs        the machine's DNS server: the wire format, its own names, looking up and forwarding
+    publish.rs    ports in: --publish parsed, the host's listeners, connections and datagrams into the machine
     host.rs       the Host contract: what a host gives net
     sys/          the real host: std's sockets, the poll reactor; unix.rs and windows.rs for what differs
     loop_host.rs  Loop: an internet in memory, for tests
@@ -214,8 +238,7 @@ net/
   examples/net-conformance.rs       the same checks on every host
 ```
 
-To come: `publish.rs` (the host's listeners), `policy.rs` (modes, rules, the log), `switch.rs` (named networks and
-their registry). `net` depends on nothing of Carbon's; the kernels depend on it, and `machine` makes each machine's
+To come: `policy.rs` (rules and the log), `switch.rs` (named networks and their registry). `net` depends on nothing of Carbon's; the kernels depend on it, and `machine` makes each machine's
 `Network` and gives it to the kernel.
 
 ## Testing
@@ -228,11 +251,16 @@ cargo run -p net --example net-conformance        # the same checks on every hos
 The conformance suite connects out to peers it starts on one of the host's own addresses (which a machine reaches the
 way it reaches anywhere out): TCP connect, echo and half-close, a reset, a refused connection seen through
 `SO_ERROR`, UDP both ways, an address the host's way, the machine's own name, and a TXT record from a DNS server of
-the machine's own. All 17 checks pass on macOS, Linux and Windows (GCP VMs). lambda's `net.c` checks the same from
-inside a machine.
+the machine's own; and ports in: a TCP and a UDP port published on one of the host's addresses, a host client
+accepted with its own address, both ways over it, a datagram with its sender's address and the answer from the
+published port, and with `--network host` a port the machine listens on being the host's. All 23 pass on macOS; the
+first 17 have passed on Linux and Windows (GCP VMs), the publishing ones not yet run there. lambda's `net.c` checks
+the same from inside a machine, and `cargo test -p net` has publishing, both modes and `IPV6_V6ONLY` too.
 
-As the phases below land, it adds: a published port reached from a host client with the client's address seen
-inside, a policy refusal, and two networks in two processes. atlas gets a `winsock.c`, and real software is the test:
+End to end, through `carbon`: `ssh -p 2222` and `scp` into `debian:13` running `sshd` (`-p 2222:22`), from the host's
+loopback and from its LAN address; `python3 -m http.server` over IPv4 and IPv6 (`-p 8080:80`); a UDP echo answering
+from its published port; and atlas's `serve.c` (TCP and UDP, ARM64, x86-64 and i686) published and with `--network
+host`. As the phases below land, it adds a policy refusal, and two networks in two processes. atlas gets a `winsock.c`, and real software is the test:
 Debian's `curl`, `apt`, `ssh` and `python3 -m http.server`, and a Windows download over WinHTTP.
 
 ## To do
@@ -241,9 +269,13 @@ Debian's `curl`, `apt`, `ssh` and `python3 -m http.server`, and a Windows downlo
 2. [x] **Out, on every host**: TCP and UDP out, the reactor, interfaces, the machine's DNS; lambda's netlink,
        `/proc/net` and `/etc` files. The conformance suite passes on all three hosts, and `curl https://` and
        `apt update` work in `debian:13`.
-3. [ ] **In, and policy**: `--publish` (TCP and UDP, the client's real address seen inside), `--net none` and
-       `host`, `--allow` and `--deny` with the log of refusals, `--dns`, `carbon port`. *Done means:* a web server in
-       a machine answers the host's browser with the client's real address.
+3. [ ] **In, and policy**: [x] `--publish` (TCP and UDP, the client's real address seen inside), [x] `--network none`
+       and `host`, [x] `carbon port` and `ls`'s PORTS, for lambda and atlas; [ ] `--allow` and `--deny` with the log
+       of refusals, `--dns` on the command line, `-P`/`--publish-all` (with images' `EXPOSE`). *Done means:* a web
+       server in a machine answers the host's browser with the client's real address (it does).
+       - [ ] The publishing checks of the conformance suite run on Linux and Windows hosts.
+       - [ ] `--network host` with the host's interfaces and addresses shown inside (it keeps the machine's own).
+       - [ ] SCTP, which Docker also publishes.
 4. [ ] **atlas**: Winsock with overlapped I/O, `iphlpapi`, `dnsapi`; then WinHTTP and WinINet with TLS. *Done means:*
        `winsock.c` passes, and a Windows program downloads over HTTPS.
 5. [ ] **Between machines**: named networks, the registry, names in DNS, `carbon net ls`, `inspect` and `log`.

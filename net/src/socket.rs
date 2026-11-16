@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex, Weak};
 
 use crate::stream::{self, End};
 use crate::watch::{Watch, Watchers, waker_for};
-use crate::{Addr, Ancillary, Cred, Domain, Error, HostDatagram, HostStream, Kind, Place, Ready, Result, Shared, Shutdown, UnixAddr, UnixName, Waker, as_domain, dns, lock, v4_of};
+use crate::publish::{Protocol, Published};
+use crate::{Addr, Ancillary, Cred, Domain, Error, HostDatagram, HostStream, Kind, Mode, Place, Ready, Result, Shared, Shutdown, UnixAddr, UnixName, Waker, as_domain, dns, lock, v4_of};
 
 /// The most datagrams a socket holds unread, and the most bytes.
 const MOST_DATAGRAMS: usize = 512;
@@ -26,6 +27,8 @@ pub struct Options {
     pub keepalive: bool,
     pub broadcast: bool,
     pub pass_cred: bool,
+    /// An IPv6 socket that's IPv6 only (`IPV6_V6ONLY`): bound to `::`, it leaves IPv4's ports to IPv4 sockets.
+    pub v6only: bool,
 }
 
 pub(crate) struct Datagram {
@@ -67,6 +70,8 @@ struct State {
     error: Option<Error>,
     /// A datagram socket's shutdown: no more reading, no more writing.
     shut: (bool, bool),
+    /// `--network host`'s: the host's port this socket listens on, or is bound to for UDP.
+    published: Option<Published>,
 }
 
 pub(crate) struct Inner {
@@ -168,6 +173,14 @@ impl Inner {
         Ok(())
     }
 
+    /// Its IP address, if it's bound to one.
+    pub(crate) fn local_inet(&self) -> Option<SocketAddr> {
+        match lock(&self.state).local {
+            Some(Addr::Inet(addr)) => Some(addr),
+            _ => None,
+        }
+    }
+
     pub fn info(&self) -> SocketInfo {
         let state = lock(&self.state);
         let (tcp, queued) = match &state.conn {
@@ -192,7 +205,7 @@ impl Socket {
             id: net.next_id.fetch_add(1, Ordering::Relaxed),
             watchers: Arc::default(),
             listening: AtomicBool::new(false),
-            state: Mutex::new(State { local: None, peer: None, conn, options: Options::default(), cred: Cred::default(), peer_cred: None, error: None, shut: (false, false) }),
+            state: Mutex::new(State { local: None, peer: None, conn, options: Options::default(), cred: Cred::default(), peer_cred: None, error: None, shut: (false, false), published: None }),
         });
         lock(&net.all).push(Arc::downgrade(&inner));
         Socket(inner)
@@ -316,7 +329,12 @@ impl Socket {
                     }
                     state.options
                 };
-                let port = self.net().take_port(self.0.kind == Kind::Stream, to.ip(), to.port(), &self.0, options.reuse_addr, options.reuse_port)?;
+                let port = self.net().take_port(self.0.kind == Kind::Stream, to.ip(), to.port(), &self.0, options)?;
+                // With the host's network, a UDP port asked for by number is the host's too.
+                if self.0.kind == Kind::Datagram && to.port() != 0 && self.net().config.mode == Mode::Host {
+                    let published = self.net().publish_socket(&self.0, to.ip(), port, Protocol::Udp)?;
+                    self.state().published = Some(published);
+                }
                 self.state().local = Some(Addr::Inet(SocketAddr::new(to.ip(), port)));
                 Ok(())
             }
@@ -348,7 +366,7 @@ impl Socket {
             state.options
         };
         let ip = unspecified(self.0.domain);
-        let port = self.net().take_port(self.0.kind == Kind::Stream, ip, 0, &self.0, options.reuse_addr, options.reuse_port)?;
+        let port = self.net().take_port(self.0.kind == Kind::Stream, ip, 0, &self.0, options)?;
         let addr = SocketAddr::new(ip, port);
         self.state().local = Some(Addr::Inet(addr));
         Ok(addr)
@@ -362,7 +380,12 @@ impl Socket {
             Domain::Unix if self.state().local.as_ref().is_none_or(|a| *a == Addr::Unix(UnixAddr::UNNAMED)) => return Err(Error::Invalid),
             Domain::Unix => {}
             Domain::Inet | Domain::Inet6 => {
-                self.ensure_bound()?;
+                let bound = self.ensure_bound()?;
+                // With the host's network, a listener has the host's port too.
+                if self.net().config.mode == Mode::Host && self.state().published.is_none() && matches!(self.state().conn, Conn::Idle) {
+                    let published = self.net().publish_socket(&self.0, bound.ip(), bound.port(), Protocol::Tcp)?;
+                    self.state().published = Some(published);
+                }
             }
         }
         let mut state = self.state();
@@ -407,6 +430,12 @@ impl Socket {
                     }
                 }
                 match self.net().place(to.ip()) {
+                    // With the host's network, the host's loopback is the machine's: what nothing in the machine
+                    // listens on, the host may.
+                    Place::Local if self.net().config.mode == Mode::Host && is_loopback(to.ip()) => match self.join_tcp(*to) {
+                        Err(Error::ConnectionRefused) => self.connect_out(*to),
+                        other => other,
+                    },
                     Place::Local => self.join_tcp(*to),
                     Place::Gateway => Err(Error::ConnectionRefused),
                     Place::Subnet => Err(Error::HostUnreachable),
@@ -474,6 +503,23 @@ impl Socket {
         Ok(())
     }
 
+    /// A connection a published port accepted on the host, for `listener`'s queue as `server`: connected already, to
+    /// `local`, from `from` (the client as the machine sees it).
+    pub(crate) fn arrive(listener: &Arc<Inner>, server: Socket, stream: Box<dyn HostStream>, local: SocketAddr, from: SocketAddr) -> Result<()> {
+        let options = lock(&listener.state).options;
+        stream.set_nodelay(options.nodelay);
+        stream.set_keepalive(options.keepalive);
+        let seen_from = Addr::Inet(as_domain(listener.domain, from));
+        {
+            let mut state = server.state();
+            state.local = Some(Addr::Inet(as_domain(listener.domain, local)));
+            state.peer = Some(seen_from.clone());
+            state.options = Options { reuse_addr: false, reuse_port: false, ..options };
+            state.conn = Conn::Out { stream, peeked: Vec::new() };
+        }
+        server.queue_on(listener, Socket(server.0.clone()), seen_from)
+    }
+
     fn join_tcp(&self, to: SocketAddr) -> Result<()> {
         let bound = self.ensure_bound()?;
         let pure_v6 = v4_of(to.ip()).is_none();
@@ -523,6 +569,9 @@ impl Socket {
     }
 
     fn connect_out(&self, to: SocketAddr) -> Result<()> {
+        if self.net().config.mode == Mode::None {
+            return Err(Error::NetworkUnreachable);
+        }
         let bound = self.ensure_bound()?;
         // The host connects to an IPv4 address as itself, mapped or not.
         let target = v4_of(to.ip()).map_or(to, |v4| SocketAddr::new(IpAddr::V4(v4), to.port()));
@@ -606,7 +655,17 @@ impl Socket {
                     return Err(Error::MessageTooBig);
                 }
                 let bound = self.ensure_bound()?;
-                match self.net().place(to.ip()) {
+                // An answer to a client of a published port goes back the way it came.
+                if let Some(sent) = self.net().answer(bound.port(), to, data) {
+                    return sent;
+                }
+                let mut place = self.net().place(to.ip());
+                // With the host's network, a datagram to loopback that nothing in the machine is bound for goes to the
+                // host's.
+                if place == Place::Local && self.net().config.mode == Mode::Host && is_loopback(to.ip()) && self.net().bound(false, to.ip(), to.port()).is_empty() {
+                    place = Place::Out;
+                }
+                match place {
                     Place::Local => {
                         let ip = if !bound.ip().is_unspecified() {
                             bound.ip()
@@ -630,6 +689,7 @@ impl Socket {
                         Ok(data.len())
                     }
                     Place::Gateway | Place::Subnet => Ok(data.len()),
+                    Place::Out if self.net().config.mode == Mode::None => Err(Error::NetworkUnreachable),
                     Place::Out => {
                         let target = v4_of(to.ip()).map_or(to, |v4| SocketAddr::new(IpAddr::V4(v4), to.port()));
                         let v6 = target.is_ipv6();
@@ -654,6 +714,12 @@ impl Socket {
         let domain = self.0.domain;
         let shut_read = state.shut.0;
         let peer = state.peer.clone();
+        // What a look ahead found: the connection's error, said once.
+        if matches!(&state.conn, Conn::Out { peeked, .. } if peeked.is_empty())
+            && let Some(error) = state.error.take()
+        {
+            return Err(error);
+        }
         match &mut state.conn {
             Conn::Joined(end) => end.recv(len, peek).map(|got| Received { data: got.data, from: None, extra: got.extra, cred: got.cred, full: got.full }),
             Conn::Out { stream, peeked } => {
@@ -759,6 +825,7 @@ impl Socket {
     pub fn ready(&self) -> Ready {
         let mut state = self.state();
         settle(&mut state);
+        look_ahead(&mut state);
         let (shut, error) = (state.shut, state.error.is_some());
         match &state.conn {
             Conn::Idle => Ready { write: true, hangup: self.0.domain != Domain::Unix, ..Ready::default() },
@@ -767,7 +834,8 @@ impl Socket {
             Conn::Connecting(_) => Ready::default(),
             Conn::Out { stream, peeked } => {
                 let mut ready = stream.ready();
-                ready.read |= !peeked.is_empty();
+                ready.read |= !peeked.is_empty() || error;
+                ready.error |= error;
                 ready
             }
             Conn::Failed => Ready { read: true, write: true, read_closed: true, hangup: true, error },
@@ -795,6 +863,22 @@ impl Socket {
     /// Whether it's listening (`SO_ACCEPTCONN`).
     pub fn is_listening(&self) -> bool {
         self.0.is_listening()
+    }
+}
+
+/// A host connection says what was ready when the host last looked, until a read finds it isn't; a program polling
+/// wants what a read would get now (OpenSSH takes a would-block after POLLIN as fatal). So when the host says
+/// readable and nothing's read ahead, this reads ahead: after it, readable is something read, the end, or an error.
+fn look_ahead(state: &mut State) {
+    let State { conn: Conn::Out { stream, peeked }, error, .. } = state else { return };
+    if peeked.is_empty() && error.is_none() && stream.ready().read {
+        let mut buffer = [0u8; 16 << 10];
+        match stream.read(&mut buffer) {
+            Ok(n) => peeked.extend(&buffer[..n]),
+            // It rearmed: the host says not readable now.
+            Err(Error::WouldBlock) => {}
+            Err(e) => *error = Some(e),
+        }
     }
 }
 

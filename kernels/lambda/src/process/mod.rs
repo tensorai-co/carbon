@@ -468,6 +468,11 @@ impl Task {
             // No one will collect it.
             None => {
                 lock(&self.k.processes).remove(&self.process.pid);
+                // A process started from outside: whoever started it hears.
+                if let Some(ended) = lock(&self.k.entered).remove(&self.process.pid) {
+                    *lock(&ended.0) = Some(status);
+                    ended.1.notify_all();
+                }
             }
         }
     }
@@ -1064,6 +1069,23 @@ pub(crate) fn start_init(k: &Arc<Kernel>, cx: &mut Cx<'_>, argv: &[String], env:
     if let Some(console) = &k.console {
         console.set_session(Some(pid), pid);
     }
+    start(k, cx, pid, argv, env, Files::standard(k.console.clone()), k.console.clone(), (layers::ROOT, "/".to_string()))
+}
+
+/// A process started from outside the machine (`carbon exec`), as `pid`: a session of its own, `files` as its
+/// descriptors and `ctty` its terminal, in `cwd`, with no parent in the machine (0), as Docker's are. Its end is told
+/// to whoever's waiting in `Kernel::entered`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn start_entered(k: &Arc<Kernel>, cx: &mut Cx<'_>, pid: i32, argv: &[String], env: &[String], files: Files, ctty: Option<Arc<crate::tty::Tty>>, cwd: (layers::Ino, String)) -> Result<Task, Errno> {
+    if let Some(tty) = &ctty {
+        tty.set_session(Some(pid), pid);
+    }
+    start(k, cx, pid, argv, env, files, ctty, cwd)
+}
+
+/// A new process `pid`, with no parent, running `argv` in a session and group of its own.
+#[allow(clippy::too_many_arguments)]
+fn start(k: &Arc<Kernel>, cx: &mut Cx<'_>, pid: i32, argv: &[String], env: &[String], files: Files, ctty: Option<Arc<crate::tty::Tty>>, cwd: (layers::Ino, String)) -> Result<Task, Errno> {
     let mut state = ProcState {
         ppid: 0,
         pgid: pid,
@@ -1073,8 +1095,8 @@ pub(crate) fn start_init(k: &Arc<Kernel>, cx: &mut Cx<'_>, argv: &[String], env:
         regions: Regions::default(),
         mmap: 0..0,
         brk: (0, 0),
-        files: Files::standard(k.console.clone()),
-        cwd: (layers::ROOT, "/".to_string()),
+        files,
+        cwd,
         root: (layers::ROOT, "/".to_string()),
         ns: k.boot_ns.clone(),
         umask: 0o022,
@@ -1102,7 +1124,7 @@ pub(crate) fn start_init(k: &Arc<Kernel>, cx: &mut Cx<'_>, argv: &[String], env:
         infos: BTreeMap::new(),
         stopped: None,
         report: None,
-        ctty: k.console.clone(),
+        ctty,
         sigreturn_at: 0,
     };
     let path = argv.first().ok_or(ENOENT)?.clone();

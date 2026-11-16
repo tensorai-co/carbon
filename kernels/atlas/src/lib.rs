@@ -11,8 +11,11 @@
 
 mod abi;
 mod changes;
+mod console;
+mod enter;
 mod crypto;
 pub mod ansi;
+pub use enter::{Entered, Event, Spec};
 mod environment;
 mod exceptions;
 mod files;
@@ -67,6 +70,20 @@ impl layers::Persist for Meta {
 pub type Disk = layers::Fs<Meta>;
 
 /// A new disk for atlas: an empty `C:\`, whose directories fold case.
+/// A program as a Windows machine's first one is found: a path as given; a name alone (`cmd`, `cmd.exe`) as atlas's
+/// own program in System32, or on the disk at the drive's root or in System32. `.exe` is added to a name without an
+/// extension. As the machine names it (`C:\\Windows\\System32\\cmd.exe`), or None if it isn't there.
+pub fn find_program(disk: &Disk, name: &str) -> Option<String> {
+    if name.contains(['\\', '/', ':']) {
+        return Some(name.to_string());
+    }
+    let file = if name.contains('.') { name.to_string() } else { format!("{name}.exe") };
+    if images::program(exec::Isa::host(), &file).is_some() {
+        return Some(format!("C:\\Windows\\System32\\{file}"));
+    }
+    ["", "Windows/System32/"].iter().find(|dir| disk.resolve(layers::ROOT, &format!("/{dir}{file}"), true).is_ok()).map(|dir| format!("C:\\{}{file}", dir.replace('/', "\\")))
+}
+
 pub fn new_disk() -> Disk {
     layers::Fs::new(Meta::default(), true)
 }
@@ -83,6 +100,12 @@ pub struct Options {
     pub stop: Stop,
     /// The machine's GPU, if it has one: what DXGI's adapter and Direct3D's devices are.
     pub gpu: Option<gpu_api::Gpu>,
+    /// Its standard handles are pipes (to the host's stdin and stdout), not a console: `docker run` without `-t`.
+    /// With a console on a terminal, the terminal is raw for as long as the machine runs, and the console edits lines.
+    pub pipes: bool,
+    /// The machine's network, its published ports with it; if None, one of its own on the host's sockets. Either way
+    /// it's named the machine's computer name.
+    pub network: Option<::net::Network>,
 }
 
 /// A running machine, from outside it: how `carbon stop` reaches in, from any thread.
@@ -125,7 +148,9 @@ pub fn boot(exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&str]
     // The registry the machine's disk has, else a fresh machine's.
     let saved = disk.resolve(layers::ROOT, registry::SAVED, true).ok().and_then(|ino| disk.contents(ino).ok()).and_then(|bytes| registry::Registry::load(&bytes));
     let desktop = options.display.clone().unwrap_or_else(|| display::Desktop::shared(win32k::SCREEN.0, win32k::SCREEN.1));
+    let stdio = console::Stdio::host(host.clone(), !options.pipes);
     let kernel = Arc::new(Kernel {
+        stdio,
         registry: Mutex::new(saved.unwrap_or_default()),
         win32k: Mutex::new(win32k::Win32k::new(desktop.clone())),
         exec: Arc::new(Mutex::new(exec)),
@@ -149,7 +174,11 @@ pub fn boot(exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&str]
         changes: Mutex::new(changes::Watches::default()),
         user_security: Mutex::new(HashMap::new()),
         live: (Mutex::new(0), Condvar::new()),
-        net: ::net::Network::on_this_host(::net::Config { hostname: os::sysapi::computer_name().to_string(), dns: None }),
+        net: {
+            let net = options.network.clone().unwrap_or_else(|| ::net::Network::on_this_host(::net::Config::default()));
+            net.set_hostname(os::sysapi::computer_name());
+            net
+        },
         options,
     });
     // Input on the desktop wakes the threads that have windows, to take it as messages.
@@ -177,6 +206,9 @@ pub fn boot(exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&str]
     }
     drop(count);
     let code = lock(&first.ended.0).unwrap_or(0);
+    if kernel.stdio.edits() {
+        kernel.host.set_raw(false);
+    }
     kernel.timers.stop();
     kernel.save_registry();
     // Whatever the machine wrote is kept, if its disk has somewhere to keep it.
@@ -190,6 +222,8 @@ pub fn boot(exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&str]
 
 /// One machine's kernel, shared by its guest threads.
 pub(crate) struct Kernel {
+    /// The machine's console: its first process's, and every process's it starts.
+    stdio: Arc<console::Stdio>,
     #[allow(dead_code)]
     exec: SharedExec,
     host: Arc<dyn Host>,
