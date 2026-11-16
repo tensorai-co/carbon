@@ -9,7 +9,8 @@ members = [
     "exec/windows",
     "layers",
     "images",
-    "machine",
+    "hooks",
+    "carbon",
     "cli",
     "display",
     "display/macos",
@@ -47,7 +48,8 @@ exec-linux = { path = "exec/linux" }
 exec-windows = { path = "exec/windows" }
 layers = { path = "layers" }
 images = { path = "images" }
-machine = { path = "machine" }
+hooks = { path = "hooks" }
+carbon = { path = "carbon" }
 display = { path = "display" }
 display-macos = { path = "display/macos" }
 audio = { path = "audio" }

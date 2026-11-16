@@ -1,7 +1,7 @@
 # cli
 
-`carbon`: the command. It parses its own arguments and calls [`machine`](../machine/README.md) and
-[`images`](../images/README.md); once [`sdk`](../sdk/README.md) exists, it becomes a thin layer over it.
+`carbon`: the command. It parses its own arguments and calls the library [`carbon`](../carbon/README.md), and
+nothing else: every command is something a Rust program can do with the crate.
 
 **Built**, on macOS, Linux and Windows. `carbon help` lists everything.
 
@@ -23,6 +23,11 @@ carbon exec -it app cmd                     # a cmd in a running Windows machine
 carbon run --platform linux/amd64 debian:13 -- uname -m     # x86_64, translated on Apple silicon
 carbon run --isolation vm debian:13 -- ./untrusted.sh       # hardware VM or fail; sandbox forces the sandbox
 carbon run setup.exe                        # a Windows program, with atlas, on a disk of its own
+carbon run --rm debian:13 -- uname -a       # a machine for one command, removed after
+carbon run --deny 0.0.0.0/0 --allow pypi.org:443 debian:13 -- pip install requests   # only there
+carbon run --deny-exec 'rm -rf *' --deny-exec 'shutdown *' debian:13 -- ./agent-step.sh
+carbon watch dev                            # what it does, as it does it: programs, output, connections, lookups
+carbon watch dev --exec --net --json        # as JSON lines, for a program to read
 carbon ls                                   # NAME  FROM  ISOLATION  STATUS
 carbon stop dev                             # SIGTERM to its first process; everything ends 10 s later
 carbon rm dev                               # a stopped machine and its files
@@ -53,7 +58,12 @@ carbon atlas imports ~/installers/          # a folder of them: which load, and 
 | `--gpu auto\|host\|software\|none` | Its GPU: the host's if there is one, else the CPU device (`auto`, the default, which says so when it takes the CPU device), the host's or fail, the CPU device, or none. Linux machines reach it through lambda's Vulkan driver; Windows machines don't yet |
 | `--audio auto\|host\|none\|FILE.wav` | Where its sound goes: the host's speakers when it's on the host's screen (`auto`, the default), the host's speakers or fail, nowhere, or a WAV file of everything played |
 | `-e`, `--env NAME=VALUE` | An environment variable, over the image's |
+| `-w`, `--workdir DIR` | Where its program starts; the image's working directory by default |
 | `--memory SIZE` | How much memory it may use, as `512m` or `4g` (`4g` by default; only what's touched is taken) |
+| `--rm` | Removed, and its files, once it ends |
+| `--deny-exec PATTERN` | Refuses to start programs whose arguments match: the first word is a program's name (`rm`, not `/bin/rm`), each after it one argument, with `*` and `?` as a shell has them, and a last `*` takes any arguments left. In a Linux machine the program gets EACCES (126 from a shell); in a Windows one, ERROR_ACCESS_DENIED; a first program refused is an error |
+| `--deny HOST\|ADDRESS\|NETWORK[:PORT]` | Refuses connections there (TCP connects, and UDP to each new destination): `0.0.0.0/0` and `::/0` for everything |
+| `--allow HOST\|ADDRESS\|NETWORK[:PORT]` | Lets connections there through, whatever `--deny` says: a host takes its subdomains, and matches the name the machine looked up |
 
 `carbon exec [options] NAME COMMAND [ARGS...]` runs a command in a running machine, as `docker exec` does: a process
 of its own (lambda: a session with no parent in the machine; atlas: a console of its own), with the machine's
@@ -61,6 +71,14 @@ environment and working directory unless `-e` and `-w` say otherwise. `-i` relay
 of its own (a pty in lambda, a console in atlas) with this one raw and its size followed, `-d` starts it and leaves
 it. Its exit code is `carbon exec`'s; without `-t`, Ctrl-C and other signals go to it. It goes over the machine's
 control socket, so it's there on macOS and Linux hosts (not yet Windows hosts).
+
+`carbon watch NAME [--exec] [--output] [--net] [--json]` shows what a running machine does as it does it, from any
+process: each program it starts (with its arguments), what it writes, each connection and lookup, and what its rules
+and hooks decided (`[denied]`, `[rewritten: ...]`, `[answered]`). With `--json`, a line each, as
+[`carbon::wire`](../carbon/src/wire.rs) writes them. It reads the machine's control socket, as `carbon exec` does.
+
+`carbon stop NAME` asks the machine over its control socket (a machine run by a program using the library is
+stopped without signalling that program), and signals the process it's in only if it can't.
 
 `carbon import [--platform OS/ARCH] [-c INSTRUCTION]... FILE|- [NAME]` makes an image from a tar of a root file
 system, as `docker import` does. `-c` sets its config with a Dockerfile instruction: `CMD`, `ENTRYPOINT`, `ENV`,
@@ -84,8 +102,8 @@ carbon run --gpu host=NAME …                  # one of several host GPUs
 carbon ls                                     # gains a GPU column beside ISOLATION
 
 
-# net: policy, and networks between machines (ports in are built: -p, --network nat|host|none, carbon port)
-carbon run --net lab --allow pypi.org:443 --deny 0.0.0.0/0 --dns 1.1.1.1 --hostname web …
+# net: networks between machines (ports in, --allow and --deny are built: -p, --network nat|host|none, carbon port)
+carbon run --net lab --dns 1.1.1.1 --hostname web …
 carbon net ls | inspect lab | log web
 
 # remote: serving a desktop, and connecting to one
@@ -93,15 +111,16 @@ carbon run --name app --remote 0.0.0.0:4433 setup.exe
 carbon remote allow ~/.ssh/id_ed25519.pub --name laptop | keys | revoke laptop | start app | stop app
 carbon connect box.example.com/app [--windows] [--view-only] [--headless out/]
 
-# machines
-carbon cp dev:/etc/os-release ./os-release
+# machines, and agents
 carbon fork dev dev-2
+carbon run --policy agent.toml --read-only /etc debian:13 -- bash
+carbon mcp                                    # an MCP server over the library, for agents that speak MCP
 ```
 
 ## To do
 
 - [ ] The options and commands above, as their modules come.
-- [ ] Rewritten over `sdk`, so the CLI and the library can't drift apart.
+- [x] Rewritten over the library `carbon`, so the CLI and the library can't drift apart.
 - [ ] An interactive console on Windows hosts (it works on macOS and Linux): see `host`.
 
 ## Open question

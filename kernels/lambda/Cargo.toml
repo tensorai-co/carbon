@@ -19,6 +19,7 @@ display.workspace = true
 audio.workspace = true
 gpu-api.workspace = true
 gpu-wire.workspace = true
+hooks.workspace = true
 
 [dev-dependencies]
 layers.workspace = true

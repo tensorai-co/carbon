@@ -398,6 +398,21 @@ pub trait Guest {
     }
 }
 
+/// Waits a little for every other thread that has the kernel to let it go, each seeing the machine has ended at its
+/// next look, so what the kernel holds goes when the caller drops it: its exec among it, and a hardware VM, which a
+/// process may have only one of at a time, is free at once for the next machine. Whether they all did: it gives up
+/// after two seconds, for a thread that holds on longer.
+pub fn let_go<T>(kernel: &std::sync::Arc<T>) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::sync::Arc::strong_count(kernel) > 1 {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    true
+}
+
 /// Runs a guest thread on this host thread until it ends.
 pub fn run(cx: &mut Cx<'_>, guest: &mut impl Guest) {
     if guest.start(cx) == Flow::End {

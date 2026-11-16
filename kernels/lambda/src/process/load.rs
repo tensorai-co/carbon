@@ -102,6 +102,12 @@ impl Task {
             Ok(r) => r,
             Err(e) => return Err(e).into(),
         };
+        // The machine's hooks see it first, and may stop it, change it, or answer it.
+        let (path, argv, env) = match self.hook_exec(path, argv, env) {
+            Ok(run) => run,
+            Err(Ok(reply)) => return self.answer_exec(reply),
+            Err(Err(e)) => return Err(e).into(),
+        };
         let mut state = lock(&self.process.state);
         if state.threads.len() > 1 {
             // Ending the other threads first isn't done yet.
@@ -129,6 +135,61 @@ impl Task {
             }
             Err(e) => Err(e).into(),
         }
+    }
+}
+
+/// What to run: a program's path, its arguments and its environment.
+type Run = (String, Vec<String>, Vec<String>);
+
+impl Task {
+    /// What the machine's hooks make of an `execve`: what to run (as asked, or rewritten), an answer to give instead of
+    /// running anything, or EACCES. Nothing is made into an event unless something wants execs.
+    fn hook_exec(&self, path: String, argv: Vec<String>, env: Vec<String>) -> Result<Run, Result<hooks::Reply, Errno>> {
+        let hub = &self.k.options.hooks;
+        if !hub.wants(hooks::Kind::Exec) {
+            return Ok((path, argv, env));
+        }
+        // Whether it's there: a shell trying each folder on its PATH asks about each.
+        let (ppid, cwd, found) = {
+            let state = lock(&self.process.state);
+            let view = crate::fs::mount::View { root: state.root.0, mounts: state.ns.mnt.current() };
+            let found = view.resolve(&lock(&self.k.disk), state.cwd.0, &path, true).is_ok();
+            (state.ppid, state.cwd.1.clone(), found)
+        };
+        let event = hooks::Exec {
+            os: hooks::Os::Linux,
+            origin: hooks::Origin::Program,
+            pid: Some(self.process.pid as u32),
+            parent: Some(ppid as u32),
+            path: exe_path(&cwd, &path),
+            argv,
+            env,
+            cwd: Some(cwd),
+            found,
+        };
+        match hub.exec(event.clone()) {
+            hooks::Decision::Pass | hooks::Decision::Allow => Ok((path, event.argv, event.env)),
+            hooks::Decision::Deny => Err(Err(EACCES)),
+            hooks::Decision::Rewrite(e) => Ok((e.path, e.argv, e.env)),
+            hooks::Decision::Answer(reply) => Err(Ok(reply)),
+        }
+    }
+
+    /// An answered `execve`: no program runs. The process writes the answer's output to its stdout and stderr, as the
+    /// program would have, and ends with its code, as `exit_group` ends it.
+    fn answer_exec(&mut self, reply: hooks::Reply) -> Outcome {
+        for (fd, bytes) in [(1, &reply.stdout), (2, &reply.stderr)] {
+            let Ok(open) = self.file(fd) else { continue };
+            let mut at = 0;
+            while at < bytes.len() {
+                match self.write_to(&open, &bytes[at..], None) {
+                    Ok(n) if n > 0 => at += n,
+                    _ => break,
+                }
+            }
+        }
+        self.process.end(crate::Status::Exited(reply.code & 0xff));
+        Outcome::End
     }
 }
 

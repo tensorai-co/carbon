@@ -1,10 +1,13 @@
 [package]
-name = "machine"
-description = "Puts one machine together (kernel, exec, disk, display, host) and owns its life"
+name = "carbon"
+description = "Carbon as a library: run Linux and Windows programs in machines of their own, and see and decide what they do as they do it"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+repository = "https://github.com/tensorai-co/carbon"
+readme = "README.md"
+rust-version = "1.85"
 
 [lints]
 workspace = true
@@ -20,6 +23,7 @@ net.workspace = true
 gpu-api.workspace = true
 lambda.workspace = true
 atlas.workspace = true
+hooks.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(unix)'.dependencies]

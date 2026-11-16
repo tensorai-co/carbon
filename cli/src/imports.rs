@@ -5,8 +5,8 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use atlas::imports::{self, Import, Report, Status, Tally};
-use exec::Isa;
+use carbon::Isa;
+use carbon::atlas::imports::{self, Import, Report, Status, Tally};
 
 fn is_pe(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "exe" | "dll" | "sys" | "ocx" | "cpl"))

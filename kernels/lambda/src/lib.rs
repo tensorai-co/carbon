@@ -114,6 +114,8 @@ pub struct Options {
     /// The machine's mixer, if it has sound: the kernel answers `$XDG_RUNTIME_DIR/pulse/native` with a PulseAudio
     /// server playing into it.
     pub audio: Option<audio::Mixer>,
+    /// The machine's hooks: each `execve` is asked about, when something wants execs.
+    pub hooks: hooks::Hub,
 }
 
 /// A running machine, from outside it: how `carbon stop` reaches in, from any thread.
@@ -139,6 +141,11 @@ impl Stop {
         true
     }
 
+    /// Whether the machine's kernel is up, and hasn't ended: a process can be started in it from outside.
+    pub fn is_running(&self) -> bool {
+        self.kernel().is_some_and(|k| !k.done.load(Ordering::Acquire))
+    }
+
     /// Ends every process at once, as SIGKILL would.
     pub fn end(&self) {
         if let Some(k) = self.kernel() {
@@ -159,6 +166,7 @@ impl Default for Options {
             display: None,
             gpu: None,
             audio: None,
+            hooks: hooks::Hub::default(),
         }
     }
 }
@@ -274,6 +282,7 @@ pub fn boot(mut exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&
     if let Err(e) = lock(&kernel.disk).sync() {
         kernel.host.write(host::Stream::Err, format!("lambda: saving the disk: {e}\n").as_bytes());
     }
+    kernels_core::thread::let_go(&kernel);
     result
 }
 

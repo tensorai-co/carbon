@@ -1,0 +1,10 @@
+[package]
+name = "hooks"
+description = "What a machine's kernels and network report as it happens (programs started, output, connections, lookups), and what can be decided about each"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

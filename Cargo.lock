@@ -16,6 +16,7 @@ dependencies = [
  "display",
  "exec",
  "gpu-api",
+ "hooks",
  "host",
  "kernels-core",
  "layers",
@@ -53,6 +54,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "carbon"
+version = "0.2.0"
+dependencies = [
+ "atlas",
+ "audio",
+ "audio-macos",
+ "display",
+ "display-macos",
+ "exec",
+ "gpu-api",
+ "hooks",
+ "host",
+ "images",
+ "lambda",
+ "layers",
+ "libc",
+ "net",
+ "serde_json",
+]
+
+[[package]]
 name = "cc"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -72,10 +94,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 name = "cli"
 version = "0.2.0"
 dependencies = [
- "atlas",
- "exec",
- "images",
- "machine",
+ "carbon",
 ]
 
 [[package]]
@@ -281,6 +300,10 @@ name = "gpu-wire-gen"
 version = "0.2.0"
 
 [[package]]
+name = "hooks"
+version = "0.2.0"
+
+[[package]]
 name = "host"
 version = "0.2.0"
 dependencies = [
@@ -429,6 +452,7 @@ dependencies = [
  "exec",
  "gpu-api",
  "gpu-wire",
+ "hooks",
  "host",
  "kernels-core",
  "layers",
@@ -456,26 +480,6 @@ name = "log"
 version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
-
-[[package]]
-name = "machine"
-version = "0.2.0"
-dependencies = [
- "atlas",
- "audio",
- "audio-macos",
- "display",
- "display-macos",
- "exec",
- "gpu-api",
- "host",
- "images",
- "lambda",
- "layers",
- "libc",
- "net",
- "serde_json",
-]
 
 [[package]]
 name = "memchr"

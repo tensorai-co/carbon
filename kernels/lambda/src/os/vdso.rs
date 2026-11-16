@@ -635,9 +635,14 @@ pub(crate) fn start(k: &Arc<Kernel>) {
     k.clock.write(k, &mut kernels_core::lock(&k.clock.state));
     let k = k.clone();
     let _ = std::thread::Builder::new().name("lambda clock".into()).spawn(move || {
+        // Written each half second, and the machine's end seen within a tenth of one.
+        let mut ticks = 0;
         while !k.done.load(Ordering::Acquire) {
-            std::thread::sleep(Duration::from_millis(500));
-            k.clock.write(&k, &mut kernels_core::lock(&k.clock.state));
+            std::thread::sleep(Duration::from_millis(100));
+            ticks += 1;
+            if ticks % 5 == 0 {
+                k.clock.write(&k, &mut kernels_core::lock(&k.clock.state));
+            }
         }
     });
 }

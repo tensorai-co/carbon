@@ -16,6 +16,17 @@ carbon run --name web -p 8080:80 debian:13 -- python3 -m http.server 80   # a po
 carbon exec -it web bash                                       # from another terminal: a shell in it, as docker exec
 carbon run --isolation vm debian:13 -- ./untrusted.sh          # a hardware VM, or fail
 carbon run --platform linux/amd64 debian:13 -- apt-get install -y curl    # x86-64, translated on Apple silicon
+carbon run --deny 0.0.0.0/0 --allow pypi.org:443 --deny-exec 'rm -rf *' debian:13 -- ./agent-step.sh   # rules
+carbon watch web                                               # every program it starts, what it writes, where it connects
+```
+
+And as a Rust library, from GitHub:
+
+```rust
+let carbon = carbon::Carbon::open()?;
+let out = carbon.machine("debian:13").rm(true)
+    .on_exec(Filter::program("curl"), |_| Decision::deny())          // decided as it starts, in the kernel
+    .output(["sh", "-c", "./agent-step.sh"])?;
 ```
 
 [![Hosts](https://img.shields.io/badge/hosts-macOS%20(Apple%20silicon)%20%7C%20Linux%20x86--64%20%7C%20Windows%20x86--64-333333?style=flat-square)](#where-it-runs)
@@ -44,9 +55,11 @@ carbon run --platform linux/amd64 debian:13 -- apt-get install -y curl    # x86-
   source into an image, so `carbon run -it atlas` is a Windows prompt with no Microsoft files anywhere.
 - **Screens for computer use.** One desktop both kernels' windows go on, headless or in the host's own windows (on
   macOS today), with screenshots, clicks and keys from the command line, and later remote viewers over QUIC.
-- **Built for agents.** Because Carbon owns the kernels, the library it's becoming will let a program see, in real
-  time, every command a machine runs, every connection it makes and everything it writes, and allow, block, rewrite or
-  answer each one (see [the order of work](#the-order-of-work), tier 9).
+- **Built for agents.** Because Carbon owns the kernels, a program using it sees, in real time, every program a
+  machine starts, everything it writes, every connection it makes and every name it looks up, and can allow, block,
+  rewrite or answer each one while the machine waits. A container runtime can't, because it doesn't own the kernel.
+- **A Rust library first.** [`carbon`](carbon/README.md) is an ordinary crate, a git dependency away
+  ([below](#as-a-rust-library)); the `carbon` command is a thin layer over it.
 
 ## What comes with Carbon, and what comes in an image
 
@@ -135,6 +148,48 @@ carbon pull debian:13 | import TAR NAME | images | rmi IMAGE | rm NAME
 
 Everything is kept in `CARBON_HOME`, or `~/.carbon`. [`cli`](cli/README.md) has every option, and what's coming.
 
+## As a Rust library
+
+Everything `carbon` does, a Rust program does with the crate [`carbon`](carbon/README.md), from GitHub:
+
+```toml
+[dependencies]
+carbon = { git = "https://github.com/tensorai-co/carbon" }
+```
+
+```rust
+use carbon::hooks::{Decision, Filter, Reply};
+use carbon::{Carbon, Network, Rules};
+
+fn main() -> carbon::Result<()> {
+    carbon::init(); // first: the process sandbox's stub is this binary, run again
+    let carbon = Carbon::open()?;
+
+    // A command in a machine of its own, removed after, and what it wrote.
+    let out = carbon.machine("debian:13").network(Network::None).rm(true).output(["uname", "-a"])?;
+    print!("{}", out.stdout_lossy());
+
+    // A machine whose programs, output and connections are decided as they happen.
+    let dev = carbon
+        .machine("debian:13")
+        .name("dev")
+        .on_exec(Filter::program("apt-get"), |_| Decision::answer(Reply::new().stdout("Done\n").exit(0)))
+        .on_output(Filter::any(), |o| o.replace(o.text().replace("hunter2", "*******")))
+        .rules(Rules::new().deny_exec("chmod 777 *").deny("0.0.0.0/0")?.allow("pypi.org:443")?)
+        .start(["sleep", "infinity"])?;
+    let ls = dev.machine().exec(["ls", "/"]).output()?; // as docker exec
+    print!("{}", ls.stdout_lossy());
+    dev.stop();
+    dev.wait()?;
+    Ok(())
+}
+```
+
+A program using it calls `carbon::init()` first, and on macOS is signed with [`carbon.entitlements`](carbon.entitlements)
+for the hypervisor, as `carbon` is. It needs Rust 1.85 with `rust-src`, and LLVM's `lld-link` and `ld.lld` to build
+Windows' guest code (without them, Linux machines still run). [`carbon`'s README](carbon/README.md) has every type,
+the hooks and what each kernel does with each decision, and [`examples/agent.rs`](carbon/examples/agent.rs) runs.
+
 ## What a machine is
 
 | Part | Module | What it is | State |
@@ -153,16 +208,17 @@ Around them:
 | Module | What it is | State |
 | --- | --- | --- |
 | [`images`](images/README.md) | What machines start from, on the host's disk: pulled OCI images, imports, frozen machines | Built |
-| [`machine`](machine/README.md) | Puts one machine together and owns its life: run, `exec`, stop, freeze, its ports, console and control socket | Built; to become the core of the `carbon` library |
+| [`carbon`](carbon/README.md) | Carbon as a library: puts machines together and owns their lives (run, `exec`, stop, freeze, ports, screens, the control socket), and their hooks and rules | Built: everything the CLI does, and hooks for programs started, output, connections and lookups; workers and more hook points to do |
+| [`hooks`](hooks/README.md) | What hook points report and what can be decided about it: events, decisions, the `Hooks` trait, filters, and the hub every hook point asks | Built |
 | [`remote`](remote/README.md) | A machine's desktop and sound, shown and driven from another computer over QUIC | Not started |
-| [`cli`](cli/README.md) | The `carbon` command | Built; to become a thin layer over the `carbon` library |
-| [`sdk`](sdk/README.md) | Carbon as a Rust library | Being redesigned as the crate `carbon`, with real-time hooks for agents |
+| [`cli`](cli/README.md) | The `carbon` command | Built, as a thin layer over `carbon` |
 
 ```
-cli, sdk ──► machine ──► kernels ──► exec, layers, display, gpu, audio, net, host
-   │            │        (core ◄── lambda, atlas)
-   │            └──────► remote ──► display, audio
-   └──► images ──► layers
+cli ──► carbon ──► kernels ──► exec, layers, display, gpu, audio, net, host
+           │       (core ◄── lambda, atlas)
+           ├─────► images ──► layers
+           └─────► remote ──► display, audio
+hooks ◄── carbon, lambda, atlas
 ```
 
 The kernels make windows and sound; `display` and `audio` decide where they go. Locally that's the host's own
@@ -180,8 +236,9 @@ For the whole project:
 2. **One host, two backends, per host-facing module.** Each host has exactly one `vm` and one `sandbox` backend in
    `exec`. `display`, `gpu`, `audio`, `net` and `host` follow the same pattern: a shared part on top, one folder per host,
    and every host-specific line inside its host's folder.
-3. **Dependencies point one way**, as drawn above. Nothing outside `machine/` depends on a kernel, no kernel knows
-   `remote` exists, and `exec` depends on nothing of Carbon's.
+3. **Dependencies point one way**, as drawn above. Nothing outside `carbon/` depends on a kernel (the CLI depends on
+   `carbon` alone), no kernel knows `remote` exists, `hooks` depends on nothing, and `exec` depends on nothing of
+   Carbon's.
 4. **Backends answer a contract and nothing more.** Anything that isn't about one host is written once, above it.
 5. **Constants live with what they describe.** Facts about a CPU go in `exec::isa`, tunable policy in `Tuning`, a host
    API's numbers in that host's `sys.rs`. There is no `consts.rs`.
@@ -226,6 +283,10 @@ For the whole project:
 | **publish** | Make a machine's port reachable from a host port (`--publish 8080:80`) |
 | **console** | A machine's terminal with `-it`: the host's, in raw mode, with the kernel editing lines (lambda's line discipline, atlas's conhost-like console) |
 | **exec** | Starting a process in a running machine from outside it (`carbon exec`), over its control socket |
+| **hook point** | A place in Carbon's own code a machine's program can't get around (lambda's `execve`, atlas's `CreateProcess`, the host its kernel writes through, its network's host) that makes an event and asks the machine's hooks, on the thread that asked |
+| **event** / **decision** | What a hook point reports (`Exec`, `Output`, `Connect`, `Lookup`) / what's decided about it: pass, allow, deny, rewrite or answer |
+| **hub** | `hooks::Hub`: a machine's hooks, rules, observers and subscribers, which every one of its hook points asks |
+| **rule** | A decision with no code, checked on the asking thread: `--deny-exec`, `--deny`, `--allow` (`carbon::Rules`) |
 
 ## Building and testing
 
@@ -281,7 +342,14 @@ programs and how to build them are in [lambda's](kernels/lambda/README.md#runnin
 - **display** has the desktop on a screen in memory, and on a Mac's screen: whole in one window (`--display host`), or
   each window in a Mac window of its own (`--display host-windows`). **audio** plays: every stream mixed to 48 kHz
   stereo on the Mac's speakers (or a WAV file), and lambda answers PulseAudio's protocol itself, so Linux programs
-  play through their own libpulse and OpenAL. **remote** is designed, not started; the library (**sdk**) is being redesigned.
+  play through their own libpulse and OpenAL. **remote** is designed, not started.
+- **The library**, the crate **`carbon`**, does everything the CLI does (which is now a thin layer over it), from
+  any Rust program, as a git dependency: machines run on this thread, to their end with what they wrote, or started
+  on a thread of their own, `exec`ed into, watched and stopped, and run one after another in one process, each with
+  its own VM. Its **hooks** see and decide every program a machine starts (lambda's `execve`, atlas's
+  `CreateProcess`, a first program, an `exec`), everything it writes, every connection out and every lookup: allow,
+  deny, rewrite, or answer (an exec with output and a code; a lookup with addresses). Rules (`--deny-exec`, `--deny`,
+  `--allow`) and `carbon watch` are built on them.
 - **gpu** reads SPIR-V compute shaders into an IR of its own and runs them on the Mac's GPU through Metal (written as
   AIR libraries, so no shader source is compiled) and on a CPU device, with the same results on its conformance suite.
   Vertex and fragment shaders draw on both too, by Vulkan's rasterization rules, vkcube's among them. `--gpu` gives a
@@ -312,12 +380,12 @@ blocks real work, it moves up. Each item's detail is in the README it links to.
    core, hvf's VM kept until its last CPU is dropped.
 5. kernels-core's last pieces: the clock page, and trimming the page cache under memory pressure.
 
-**2. A machine you can run** ([layers](layers/README.md#to-do), [images](images/README.md#to-do), [machine](machine/README.md#to-do))
+**2. A machine you can run** ([layers](layers/README.md#to-do), [images](images/README.md#to-do), [carbon](carbon/README.md#to-do))
 
 `carbon run -it debian:13 bash` and `carbon exec` work. Left: compacting a running machine's log; zstd layers, registry
 logins, streaming layers, clearing unused chunks; atlas-base on Docker Hub as `tensoraico/atlas` (one multi-ISA
-image), and Windows machines from it by default; the image's working directory and user; `--rm` and `-d`'s logs;
-stopping, screenshots and `exec` from another process on Windows hosts; a worker process per machine.
+image), and Windows machines from it by default; the image's user; `-d`'s logs; stopping, screenshots and `exec` from another process on Windows hosts; a worker
+process per machine, so one program runs several at once on macOS. (`--rm` and `-w` are done.)
 
 **3. lambda runs real Linux software** ([lambda](kernels/lambda/README.md#to-do))
 
@@ -368,8 +436,8 @@ stopping, screenshots and `exec` from another process on Windows hosts; a worker
 
 **6. Networks** ([net](net/README.md#to-do))
 
-1. In, and policy: `--allow` and `--deny` with a log, `--dns`. (`--publish`, `--network none` and `host`, and
-   `carbon port` are done, for lambda and atlas.)
+1. Policy's rest: a rules file, `--dns`. (`--allow`, `--deny` and their log, `carbon watch`, are done as rules on
+   `carbon`'s hooks; `--publish`, `--network none` and `host`, and `carbon port`, for lambda and atlas.)
 2. Between machines: named networks, names in DNS, `carbon net`.
 3. ICMP echo, IPv6 end to end, broadcast and multicast, as programs ask.
 
@@ -387,9 +455,11 @@ stopping, screenshots and `exec` from another process on Windows hosts; a worker
 
 **9. Reach and polish**
 
-1. The library: the crate `carbon`, from `machine`, with the CLI on top of it, and real-time hooks for agents
-   (commands, output, network, files: allow, block, rewrite, answer), rules, workers and an MCP server. The
-   proposal replaces [the old SDK sketch](sdk/README.md).
+1. The library's rest ([carbon](carbon/README.md#to-do), [the proposal](docs/carbon_lib.md)): workers, so a
+   program runs several machines at once on macOS; files, process lifecycle, accepts, data and the registry hooked;
+   an answered Windows exec and an answered connection; a rules file; checkpoints and rollback, forks, record and
+   replay, limits; `carbon mcp`; clients in other languages over the control protocol. (The crate `carbon`, the CLI
+   over it, hooks on programs, output, connections and lookups, rules and `carbon watch` are done.)
 2. Linux ARM64 hosts; ARM64 → x86-64 translation ([exec](exec/README.md#5-more-hosts-and-isas)).
 3. The macOS sandbox: shared memory, x86 programs, the rest of ARM64; the Windows sandbox hardened; winkvm's rest
    (NMIs, VPID, kernel CET, AMD SVM, signing) ([exec](exec/README.md#4-safety-and-robustness)).

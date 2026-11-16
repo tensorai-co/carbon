@@ -107,6 +107,8 @@ pub struct Options {
     /// The machine's network, its published ports with it; if None, one of its own on the host's sockets. Either way
     /// it's named the machine's computer name.
     pub network: Option<::net::Network>,
+    /// The machine's hooks: each `CreateProcess` is asked about, when something wants execs.
+    pub hooks: hooks::Hub,
 }
 
 /// A running machine, from outside it: how `carbon stop` reaches in, from any thread.
@@ -120,6 +122,11 @@ impl std::fmt::Debug for Stop {
 }
 
 impl Stop {
+    /// Whether the machine's kernel is up: a process can be started in it from outside.
+    pub fn is_running(&self) -> bool {
+        lock(&self.0).as_ref().and_then(std::sync::Weak::upgrade).is_some()
+    }
+
     /// Ends every process the machine is running with `code`, as `TerminateProcess` would. Whether any was.
     pub fn end(&self, code: u32) -> bool {
         let Some(k) = lock(&self.0).as_ref().and_then(std::sync::Weak::upgrade) else { return false };
@@ -218,6 +225,10 @@ pub fn boot(exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&str]
     }
     let windows = lock(&kernel.win32k).screenshots();
     let screen = display::desktop::lock(&desktop).screen().clone();
+    let let_go = kernels_core::thread::let_go(&kernel);
+    if std::env::var_os("CARBON_TRACE").is_some() {
+        kernel.host.write(host::Stream::Err, format!("atlas: the kernel was {}let go of\n", if let_go { "" } else { "not " }).as_bytes());
+    }
     Ok(Ended { code, windows, screen })
 }
 

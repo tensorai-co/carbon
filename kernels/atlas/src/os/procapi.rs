@@ -146,6 +146,23 @@ impl Task {
     }
 }
 
+/// A UTF-16 environment block's variables, as `NAME=value`.
+fn environment_vars(block: &[u8]) -> Vec<String> {
+    let units: Vec<u16> = block.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
+    units.split(|&u| u == 0).take_while(|v| !v.is_empty()).map(String::from_utf16_lossy).collect()
+}
+
+/// Variables as a UTF-16 environment block, with its closing NUL.
+fn environment_block(vars: &[String]) -> Vec<u8> {
+    let mut units: Vec<u16> = Vec::new();
+    for var in vars {
+        units.extend(var.encode_utf16());
+        units.push(0);
+    }
+    units.push(0);
+    units.iter().flat_map(|u| u.to_le_bytes()).collect()
+}
+
 /// The program a command line names: its first argument, quoted or up to the first space.
 fn first_argument(line: &str) -> &str {
     let line = line.trim_start();
@@ -170,17 +187,14 @@ fn create_process(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool, token
         Some(app) => task.program_at(app),
         None => task.find_program(cx, first_argument(&command_line)),
     };
-    let Some((_, path, bytes)) = found else { return task.fail(cx, ERROR_FILE_NOT_FOUND) };
-    if Pe::parse(&bytes).map_or(true, |pe| pe.is_dll) {
-        return task.fail(cx, ERROR_BAD_EXE_FORMAT);
-    }
+    let Some((_, mut path, mut bytes)) = found else { return task.fail(cx, ERROR_FILE_NOT_FOUND) };
 
     let environment = match environment {
         0 => Some(task.environment_now(cx)),
         at if wide || flags & CREATE_UNICODE_ENVIRONMENT != 0 => task.wide_block(cx, at),
         at => task.ansi_block(cx, at),
     };
-    let Some(environment) = environment else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
+    let Some(mut environment) = environment else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
     let cwd = match task.string_arg(cx, directory, wide) {
         None => task.cwd(),
         Some(dir) => match task.path_info(&dir) {
@@ -191,6 +205,54 @@ fn create_process(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool, token
             _ => return task.fail(cx, ERROR_DIRECTORY),
         },
     };
+
+    // The machine's hooks see it first, and may stop it or change it. Nothing is made into an event unless something
+    // wants execs.
+    let mut command_line = command_line;
+    let hub = task.k.options.hooks.clone();
+    if hub.wants(hooks::Kind::Exec) {
+        let units: Vec<u16> = command_line.encode_utf16().collect();
+        let argv: Vec<String> = super::shell32::split_command_line(&units).iter().map(|a| String::from_utf16_lossy(a)).collect();
+        let event = hooks::Exec {
+            os: hooks::Os::Windows,
+            origin: hooks::Origin::Program,
+            pid: None,
+            parent: Some(task.process.pid as u32),
+            path: path.clone(),
+            argv,
+            env: environment_vars(&environment),
+            cwd: Some(cwd.clone()),
+            found: true,
+        };
+        match hub.exec(event.clone()) {
+            hooks::Decision::Pass | hooks::Decision::Allow => {}
+            hooks::Decision::Deny => return task.fail(cx, ERROR_ACCESS_DENIED),
+            // An answer needs a process that ends at once with the answer's output and code: not there yet, so it's
+            // refused, and says so where tracing shows it.
+            hooks::Decision::Answer(_) => {
+                if task.k.options.trace {
+                    task.k.host.write(host::Stream::Err, format!("[{}] an answered CreateProcess is refused: answers are lambda's only for now\n", task.tid).as_bytes());
+                }
+                return task.fail(cx, ERROR_ACCESS_DENIED);
+            }
+            hooks::Decision::Rewrite(e) => {
+                let program = if e.path != event.path {
+                    task.program_at(&e.path)
+                } else if e.argv.first() != event.argv.first() {
+                    task.find_program(cx, e.argv.first().map_or("", String::as_str))
+                } else {
+                    Some((String::new(), path.clone(), bytes.clone()))
+                };
+                let Some((_, rewritten, rewritten_bytes)) = program else { return task.fail(cx, ERROR_FILE_NOT_FOUND) };
+                (path, bytes) = (rewritten, rewritten_bytes);
+                command_line = crate::process::command_line(&e.argv);
+                environment = environment_block(&e.env);
+            }
+        }
+    }
+    if Pe::parse(&bytes).map_or(true, |pe| pe.is_dll) {
+        return task.fail(cx, ERROR_BAD_EXE_FORMAT);
+    }
 
     // What it inherits, and its standard handles: STARTUPINFO's (which it has only if it inherited them, as on
     // Windows), else this process's, which share its console.

@@ -582,7 +582,7 @@ impl Task {
         }
     }
 
-    fn write_to(&self, open: &Open, data: &[u8], at: Option<u64>) -> Result<usize, Errno> {
+    pub(crate) fn write_to(&self, open: &Open, data: &[u8], at: Option<u64>) -> Result<usize, Errno> {
         if !open.writable() {
             return Err(EBADF);
         }

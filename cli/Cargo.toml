@@ -9,12 +9,11 @@ publish.workspace = true
 [[bin]]
 name = "carbon"
 path = "src/main.rs"
+# The library `carbon` has the docs.
+doc = false
 
 [lints]
 workspace = true
 
 [dependencies]
-exec.workspace = true
-atlas.workspace = true
-machine.workspace = true
-images.workspace = true
+carbon.workspace = true
