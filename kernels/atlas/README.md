@@ -74,7 +74,7 @@ carbon atlas imports setup.exe                  # what a program imports that at
 ```
 
 The runner uses the host's `vm` backend; `CARBON_ISOLATION=sandbox` (or `auto`) picks the sandbox. 32-bit programs
-run on hvf so far (kvm and winkvm haven't run them yet; the sandboxes don't run them). ntdll is built from source
+run on hvf and winkvm (kvm hasn't run atlas's yet; the sandboxes don't run them). ntdll is built from source
 for all three Windows targets: with rustup, that needs `rustup component add rust-src` and LLVM's `lld-link`
 (Debian's `lld` package has it); on Windows, MSVC (Visual Studio Build Tools) and `lld-link.exe`. `CARBON_TRACE=1`
 prints every host export with its result, and each thread that gives its CPU up, waits for one, or takes one again;
@@ -124,10 +124,16 @@ opening comment says what it checks. `crt.exe` (and `crt-mingw.exe`) want the ar
 | atlas's `security.c`, both ISAs | Tokens and privileges, SIDs, ACLs, descriptors and SDDL, descriptors kept and checked, `AccessCheck`, impersonation |
 | atlas's `resources.c`, both ISAs, with `resources.rc` | Finding, loading and enumerating resources, string tables, and version information |
 
-**On Linux and Windows hosts** (x86-64, GCP VMs with nested virtualization), through kvm and winkvm, the first eight
-pass on x86-64 (`hello`, `loader`, `threads`, `files`, `registry`, `environment`, `windows` and `desktop`),
-`threads.c` with its full 20,000 rounds; the newer ones have been run on macOS. Through the Linux and Windows
-sandboxes they pass too, except what needs a second CPU: `threads.c` and the cross-thread part of `windows.c`.
+**On Linux hosts** (x86-64, a GCP VM with nested virtualization, Debian 13), through kvm, every x86-64 program passes:
+all 34, `d3d11` and `cube` on the CPU device, and `crt.c` built by MinGW-w64 for the UCRT too. Built by Debian's
+default MinGW-w64, `crt.c` imports the older `msvcrt.dll`, which atlas only declares so far. Through the Linux sandbox
+what needs one CPU and one process passes; a second thread (`CreateThread`) or a child process needs the sandboxes'
+second CPU. On Windows hosts (Windows Server 2022, a GCP VM), through winkvm, every program passes: all 35 x86-64 ones and the
+32 built for i686, `wow64.exe` and its 64-bit child included. Through the Windows sandbox (Windows Server 2022, a GCP VM), 15 of
+the 35 x86-64 programs pass; 11 need its second CPU (`CreateThread`), and what starts a process (`process`, `sections`,
+`security`, `shell`) gets "the new process didn't start". Three fail there that pass in the Linux sandbox: `crt`
+(`fopen` to write, and what follows from it), `sysinfo` (`NtQuerySystemInformation`'s classes, the shared data page's
+version and features) and `sandbox` (`NtCreateKey`, then an internal stop at an address in a host DLL).
 
 On Windows, atlas's own x86-64 calls into atlas go through its trampoline (`call::TRAP_AT` in the atlas page), which is
 `syscall` everywhere but the Windows sandbox, where it's that sandbox's gate; the stubs it makes for host exports do
@@ -943,7 +949,7 @@ interface is the to-do, not each export.
 
 | Group | DLLs | To do |
 | --- | --- | --- |
-| C runtime | ucrtbase, msvcrt | **[guest]** ucrtbase's rest, as a MinGW C++ program asks: `setjmp`/`longjmp`, `_beginthreadex`, low-level I/O (`_read`, `_write`, `_fstat64`), wide stdio, `strftime`, the multibyte conversions, math; then msvcrt.dll for older MinGW programs |
+| C runtime | ucrtbase, msvcrt | **[guest]** ucrtbase's rest, as a MinGW C++ program asks: `setjmp`/`longjmp`, `_beginthreadex`, low-level I/O (`_read`, `_write`, `_fstat64`), wide stdio, `strftime`, the multibyte conversions, math; then msvcrt.dll, which Debian's (and most distributions') default MinGW-w64 links against, so `crt.c` built on Linux without the UCRT toolchain doesn't load yet |
 | COM and RPC | combase, ole32, oleaut32, rpcrt4, propsys, urlmon | apartments, the class registry, in-process servers, marshalling, `IStream` and compound files (MSI needs them), OLE automation; WinRT refused cleanly |
 | Shell and common UI | comctl32, comdlg32, uxtheme, dwmapi, riched20, imm32, usp10, windowscodecs, gdiplus | comctl32 6's controls and `TaskDialog`, the common dialogs, flat themes, RichEdit, Uniscribe, WIC's decoders, GDI+ |
 | Graphics | dxgi, d3d9/11/12, d2d1, dwrite, opengl32, vulkan-1, nvcuda | **[gpu]** DXGI and Direct3D 11 first (begun, on the machine's GPU or the CPU device), then 9 and 12, Direct2D, DirectWrite, WGL, Vulkan; `nvcuda` for CUDA programs |
@@ -963,7 +969,7 @@ First `cmd.exe` (variables, `if`, `for`, `goto`, `call`, pipes, redirection, `.b
 - **32-bit x86 (WoW64)** **[exec]** **[guest]**: most installers are 32-bit. In
   order, each phase ending with its tests passing:
   1. [x] **exec runs 32-bit x86** on hvf: the translator's 32-bit mode, checked by exec's conformance suite. kvm
-     and winkvm have a 32-bit code segment in the shim already; their conformance cases still need running there.
+     and winkvm have a 32-bit code segment in the shim, and their conformance cases pass on both.
   2. [x] **The i686 ntdll**, built and embedded beside the others, though nothing runs it until phases 3 and 4 do:
      `atlas-abi` has every layout with pointers in it twice (`teb32`, `peb32`, `ldr32`, `params32`, `record32`, and
      x86's 0x2cc-byte `CONTEXT`), the guest gets its own ISA's; every export takes pointer-sized arguments as
@@ -1118,3 +1124,6 @@ Settled while building:
   `memset`, `memcmp` and `strlen` undefined, and ntdll has no C runtime beneath it to supply them, so it's built with
   `build-std` and `compiler-builtins-mem`, always (`RUSTC_BOOTSTRAP`; rustup needs `rust-src`, Homebrew's Rust
   has the source). The same build runs on macOS, Linux and Windows.
+- **`build.sh` on Linux**: with Debian 13's clang 19 and lld, the x86-64 and ARM64 programs build, but the i686 ones
+  fail to link: `_memcpy` undefined, referenced from `_mainCRTStartup` (the 32-bit decoration, which the Mac's LLVM
+  resolves). To do: give the i686 programs their own `memcpy` or link the import with the decorated name.

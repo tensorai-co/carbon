@@ -1655,6 +1655,30 @@ pub unsafe extern "C" fn AtlasCrtTime64(out: *mut i64) -> i64 {
     t
 }
 
+// ---- The time zone ----
+//
+// A machine's local time is UTC, so its time zone is: no daylight saving, no offset, and UTC by both names. The UCRT
+// gives its globals through functions returning where they are (`__daylight`, `__timezone`, `__tzname`).
+
+static mut DAYLIGHT: i32 = 0;
+static mut TIMEZONE: i32 = 0;
+static mut TZNAME: [*const u8; 2] = [c"UTC".as_ptr().cast(), c"UTC".as_ptr().cast()];
+
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtDaylight() -> *mut i32 {
+    &raw mut DAYLIGHT
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtTimezone() -> *mut i32 {
+    &raw mut TIMEZONE
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtTzname() -> *mut *const u8 {
+    (&raw mut TZNAME).cast()
+}
+
 /// `clock`: milliseconds (CLOCKS_PER_SEC is 1000) since the process started, by the interrupt time.
 #[unsafe(no_mangle)]
 pub extern "C" fn AtlasCrtClock() -> i32 {

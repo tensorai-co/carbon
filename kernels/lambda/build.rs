@@ -54,9 +54,11 @@ fn build(guest: &Path, out: &Path, arch: &str, linker: &str, library: &str, sona
         .current_dir(guest)
         .args(["build", "--release", "--quiet", "--target", &target, "--target-dir"])
         .arg(&target_dir)
-        .env(format!("CARGO_TARGET_{}_LINKER", target.to_uppercase().replace('-', "_")), linker)
-        .env("RUSTFLAGS", format!("-C linker-flavor=ld -C link-arg=-soname={soname}"))
-        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        // The linker as a flag for the driver alone: with `--target`, flags don't reach build scripts, which are the
+        // host's and link as host programs (`CARGO_TARGET_<triple>_LINKER` would reach them too where the host is
+        // the target, as on an x86-64 Linux host). Encoded, so a linker's path may have spaces.
+        .env("CARGO_ENCODED_RUSTFLAGS", ["-C".to_string(), format!("linker={linker}"), "-C".into(), "linker-flavor=ld".into(), "-C".into(), format!("link-arg=-soname={soname}")].join("\x1f"))
+        .env_remove("RUSTFLAGS")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env("RUSTC_BOOTSTRAP", "1")
         .args(["-Zbuild-std=core,alloc,compiler_builtins", "-Zbuild-std-features=compiler-builtins-mem"])

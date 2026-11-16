@@ -172,6 +172,10 @@ dll! {
     guest _time64 => AtlasCrtTime64;
     guest time => AtlasCrtTime64;
     guest clock => AtlasCrtClock;
+    guest __daylight => AtlasCrtDaylight;
+    guest __timezone => AtlasCrtTimezone;
+    guest __tzname => AtlasCrtTzname;
+    guest _tzset => AtlasCrtIgnore;
     guest __C_specific_handler;
     // stdio.
     guest __acrt_iob_func => AtlasCrtIob;

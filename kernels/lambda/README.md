@@ -63,7 +63,12 @@ clang --target=x86_64-linux-gnu -nostdlib -static -ffreestanding -fno-stack-prot
     -fuse-ld=lld -O2 kernels/lambda/tests/programs/hello.c -o hello-x86_64
 ```
 
-On this Mac, through hvf, all of them pass. Each program's opening comment says what it checks.
+On this Mac, through hvf, all of them pass. On a Linux host (x86-64, Debian 13 in a GCP VM with nested
+virtualization), through kvm, all of them pass but `vdso.c`'s clock page, which kvm doesn't give yet (the vDSO
+reads the time by system call there); through the Linux sandbox, what needs neither `fork` nor a second thread. On a
+Windows host (Windows Server 2022 in a GCP VM), through winkvm, the same: all but `vdso.c`'s clock page, `x11.c`
+and `wayland.c` with a desktop (`CARBON_DISPLAY=1280x720`). Each
+program's opening comment says what it checks.
 
 | Program | What it covers |
 | --- | --- |
@@ -336,7 +341,7 @@ curl -sLO https://raw.githubusercontent.com/torvalds/linux/master/arch/x86/entry
   the host, and aren't in `/proc/<pid>/stat`; time slices, so threads that spin rather than wait give a vCPU up (a
   thread blocked in a wait already does); more than one CPU in the process sandbox.
 - **The vDSO:** its counter on hosts other than Apple silicon (it makes system calls there: on KVM the guest's TSC
-  needs calibrating); `time`, `getcpu` and `getrandom` with no system call; unwinding information for its signal
+  needs calibrating, or kvmclock's page; `vdso.c` fails its two clock-page checks on a Linux host for this); `time`, `getcpu` and `getrandom` with no system call; unwinding information for its signal
   return.
 - **sysfs and `/proc`:** a DRM render node's and input devices' entries, with those devices; block devices; cgroups;
   `uevent` over netlink; `/proc/<pid>` and `/proc/net` as listable directories; the rest of `/proc`.

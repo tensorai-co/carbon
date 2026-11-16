@@ -42,6 +42,10 @@ K HRESULT __stdcall D3D11CreateDeviceAndSwapChain(void *, int, HANDLE, UINT, con
 
 #include "d3d11_shaders.h"
 
+// What MSVC's linker looks for in a program that uses floating point; there's no C runtime to have it (older clangs
+// ask for it here too).
+int _fltused;
+
 static int failures;
 
 // What the compiler calls to zero the structures here, as there's no C runtime.

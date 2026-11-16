@@ -11,8 +11,8 @@ typedef unsigned int u32;
 typedef unsigned char u8;
 
 #if defined(__aarch64__)
-enum { SYS_write = 64, SYS_exit = 93, SYS_exit_group = 94, SYS_futex = 98, SYS_clone = 220, SYS_munmap = 215,
-       SYS_mmap = 222, SYS_mprotect = 226 };
+enum { SYS_write = 64, SYS_exit = 93, SYS_exit_group = 94, SYS_futex = 98, SYS_sched_yield = 124, SYS_clone = 220,
+       SYS_munmap = 215, SYS_mmap = 222, SYS_mprotect = 226 };
 static i64 sys(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
     register i64 x8 __asm__("x8") = n, x0 __asm__("x0") = a, x1 __asm__("x1") = b, x2 __asm__("x2") = c,
                  x3 __asm__("x3") = d, x4 __asm__("x4") = e, x5 __asm__("x5") = f;
@@ -46,8 +46,8 @@ static void sync_code(u8 *start, u64 n) {
 }
 static void fetch_fence(void) { __asm__ volatile("isb" ::: "memory"); }
 #else
-enum { SYS_write = 1, SYS_mmap = 9, SYS_mprotect = 10, SYS_munmap = 11, SYS_clone = 56, SYS_exit = 60, SYS_futex = 202,
-       SYS_exit_group = 231 };
+enum { SYS_write = 1, SYS_mmap = 9, SYS_mprotect = 10, SYS_munmap = 11, SYS_sched_yield = 24, SYS_clone = 56, SYS_exit = 60,
+       SYS_futex = 202, SYS_exit_group = 231 };
 static i64 sys(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
     register i64 r10 __asm__("r10") = d, r8 __asm__("r8") = e, r9 __asm__("r9") = f;
     i64 ret;
@@ -225,6 +225,9 @@ void cmain(i64 *sp) {
     emit_const(hot_fn, 7777);
     sync_code(hot_fn, SLOT);
     spawn(hot, 0, stacks[1] + STACK, &tids[1]);
+    // Running before the churn starts, so it runs meanwhile: a new CPU can take longer to start than the churn takes
+    // (under nested virtualization), and with one CPU it runs only when this one gives it up.
+    while (__atomic_load_n(&hot_calls, __ATOMIC_ACQUIRE) == 0) sys(SYS_sched_yield, 0, 0, 0, 0, 0, 0);
     wrong = 0;
     for (u32 round = 0; round < ROUNDS; round++) {
         for (u32 i = 0; i < FUNCTIONS; i++) emit_const(jit + i * SLOT, round * 4096 + i);

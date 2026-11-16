@@ -34,9 +34,9 @@ where a backend says it can't run them yet:
 | --- | --- | --- | --- |
 | `vm/hvf` | 48 of 48 (ARM64, x86-64, 32-bit x86) | all, both ISAs | all, both ISAs |
 | `sandbox/macos` | 12 of 12 (ARM64) | not run there yet | not run there yet |
-| `vm/kvm` | 25 of 25 (x86-64) | all | all |
+| `vm/kvm` | 34 of 34 (x86-64, 32-bit x86) | all (the vDSO's clock page aside) | all x86-64 |
 | `sandbox/linux` | 24 of 24 | all but fork and threads (one CPU) | all but threads (one CPU) |
-| `vm/winkvm` | 25 of 25 | all | all |
+| `vm/winkvm` | 34 of 34 (x86-64, 32-bit x86) | all (the vDSO's clock page aside) | all, x86-64 and i686 |
 | `sandbox/windows` | 9 of 9 (through its gate) | no: needs x86 → x86 rewriting | all that need one CPU |
 
 What the "not yet"s are, in the order they matter, is the to-do list below. `winkvm.sys` passes its own 17 checks
@@ -48,9 +48,9 @@ Which programs each backend runs:
 | --- | --- | --- | --- |
 | `vm/hvf` | **native** | **translated** | **translated** (exec's own cases; atlas's WoW64 to come) |
 | `sandbox/macos` | **rewritten** (one CPU) | translated: not started | not started |
-| `vm/kvm` | translated: not started | **native** | native: needs a 32-bit code segment in the shim |
+| `vm/kvm` | translated: not started | **native** | **native** (exec's own cases; atlas's i686 programs not run yet) |
 | `sandbox/linux` | translated: not started | **native** (one CPU) | not started |
-| `vm/winkvm` | translated: not started | **native** | native: needs a 32-bit code segment in the shim |
+| `vm/winkvm` | translated: not started | **native** | **native** (exec's own cases, and atlas's i686 programs, WoW64 too) |
 | `sandbox/windows` | translated: not started | **native** (one CPU), for atlas; lambda needs x86 → x86 rewriting | not started |
 
 A host with nothing for one isolation still has two backends: `NoVm` or `NoSandbox`, which never open and say why.
@@ -360,10 +360,16 @@ it, in more detail. When an item is done it's ticked here, with what it took.
 - [ ] **More than one CPU in each sandbox**: one stub thread per CPU, sharing the stub's address space, each driven
       by the host thread that owns its CPU (on Linux and Windows, the thread that traces or debugs it). lambda's fork
       and atlas's `CreateThread` need it; it's the last thing between the sandboxes and the vm backends' results.
-- [ ] **Linux**: map runs of pages per call, not one page per `ptrace` round trip.
+- [ ] **Linux**: map runs of pages per call, not one page per `ptrace` round trip. Until there's a second CPU, a
+      program asking for one should fail at once: atlas's `CreateThread` gets `NoMoreCpus` and the program then
+      hangs waiting on a thread that never started (`loader.c` and `windows.c` on a GCP VM), where it should return
+      the error, and the runner exit, straight away.
 - [ ] **Windows**: lambda's `syscall` (x86 → x86 rewriting into gate calls); today it runs atlas only. The
       conformance suite's system-call cases in gate form (fork, a fault answered, the translator's checks), so the
-      sandbox runs all of them.
+      sandbox runs all of them. Child processes (atlas's `CreateProcess` says the new process didn't start). And
+      what differs from the Linux sandbox for atlas's `crt.c`, `sysinfo.c` and `sandbox.c` (see atlas's README): the
+      stub is a real Windows process, so `0x7ffe0000` is the host's own shared data page unless something maps over
+      it, and a stop at a host DLL's address means the program reached code that isn't atlas's.
 - [ ] **macOS**: run the kernels' test programs on it. Share memory instead of copying (16 KiB windows whose frames
       line up as views, copying only the rest, with different protections inside a window: guard pages don't fault
       today); `TPIDR_EL0`; pointer-authenticated branches and literal loads into SIMD registers.
@@ -420,6 +426,10 @@ it, in more detail. When an item is done it's ticked here, with what it took.
       maps its code twice, writable and runnable, as .NET does; `MAP_SHARED` memory another process writes), since
       core guards the page it translated from, not the memory under it. And a block that rewrites one of its own
       later instructions runs the old one: the change shows from the next block.
+- [ ] **A rare miss when another thread rewrites code**: on hvf, lambda's `code.c` built for x86-64 (translated) once
+      failed its section 5 (another thread rewriting a function this one keeps calling) and once hung, in about a
+      dozen runs; ARM64, and kvm's native x86-64, haven't shown it. Likely a window between the writer's fault and
+      the other CPU's next block lookup. Test: section 5 alone, a few hundred runs, `CARBON_EXEC_CODE_CACHE` small.
 - [ ] **A real JIT**: a JavaScript engine (or LuaJIT) running in an x86-64 image, the test the to-do list set.
 - [ ] ASIDs (ARM64) and VPIDs (x86, and in winkvm): switching spaces flushes the CPU's whole TLB today.
 - [ ] hvf moves every register in and out on every exit; move only what's used.
