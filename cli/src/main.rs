@@ -51,7 +51,7 @@ usage: carbon <command> ...
                                              WAV file of everything played
       -e, --env NAME=VALUE                   an environment variable, over the image's
       -w, --workdir DIR                      where its program starts (the image's working directory by default)
-      --memory SIZE                          how much memory it may use, as 512m or 4g (4g by default)
+      --memory SIZE                          how much memory it may use, as 512m or 4g (4g, less in a smaller container)
       -p, --publish [IP:][HOST_PORT:]PORT[/tcp|udp]
                                              a host port that reaches a port in the machine, as Docker's: 2222:22,
                                              127.0.0.1:8080:80, [::1]:8080:80, 5353:53/udp, 8000-8009:8000-8009;

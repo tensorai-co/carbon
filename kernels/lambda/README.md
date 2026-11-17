@@ -65,7 +65,7 @@ clang --target=x86_64-linux-gnu -nostdlib -static -ffreestanding -fno-stack-prot
 
 On this Mac, through hvf, all of them pass. On a Linux host (x86-64, Debian 13 in a GCP VM with nested
 virtualization), through kvm, all of them pass but `vdso.c`'s clock page, which kvm doesn't give yet (the vDSO
-reads the time by system call there); through the Linux sandbox, what needs neither `fork` nor a second thread. On a
+reads the time by system call there); through the Linux sandbox, the same, inside gVisor too. On a
 Windows host (Windows Server 2022 in a GCP VM), through winkvm, the same: all but `vdso.c`'s clock page, `x11.c`
 and `wayland.c` with a desktop (`CARBON_DISPLAY=1280x720`). Each
 program's opening comment says what it checks.
@@ -119,7 +119,7 @@ answer is the compiler's for the same constants, so it passes on real x86 too.
 **On Linux and Windows hosts** (x86-64, GCP VMs with nested virtualization), through kvm and winkvm, these pass on
 x86-64: hello (12), signals (11), `sse`, `x87`, `threads` (9, its 300 threads and 300 processes included), `code`,
 `events` (36) and `net` (36); there `sse` and `x87` run on the real CPU, which confirms their answers. Through the
-Linux sandbox they pass too, except the fork and wait checks, which need a second CPU. lambda doesn't run in the
+Linux sandbox they pass too, fork and threads included (a stub process per CPU). lambda doesn't run in the
 Windows sandbox yet, since its programs' `syscall` needs rewriting into calls to that sandbox's gate.
 
 ## Debian
@@ -347,7 +347,7 @@ curl -sLO https://raw.githubusercontent.com/torvalds/linux/master/arch/x86/entry
   thread's group stop is its own, not its process's. gdb attaching to a multi-threaded process hangs.
 - **Scheduling:** nice, policies, affinity and I/O priority are kept per process, not per thread, change nothing on
   the host, and aren't in `/proc/<pid>/stat`; time slices, so threads that spin rather than wait give a vCPU up (a
-  thread blocked in a wait already does); more than one CPU in the process sandbox.
+  thread blocked in a wait already does).
 - **The vDSO:** its counter on hosts other than Apple silicon (it makes system calls there: on KVM the guest's TSC
   needs calibrating, or kvmclock's page; `vdso.c` fails its two clock-page checks on a Linux host for this); `time`, `getcpu` and `getrandom` with no system call; unwinding information for its signal
   return.

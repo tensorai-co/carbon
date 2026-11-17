@@ -10,6 +10,9 @@ pub enum Regs {
     Arm64(Arm64Regs),
 }
 
+/// Plain register files, copied as values (saved, restored, given to a new CPU), so neither is boxed: x86's is the
+/// larger by AVX's upper halves.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FpRegs {
     X86(X86Fp),

@@ -226,6 +226,8 @@ impl Server {
     fn new(k: Arc<Kernel>, mixer: Mixer, listener: net::Socket) -> Server {
         let signal = Arc::new(Signal::default());
         let s = signal.clone();
+        k.when_done(Box::new(move || s.wake()));
+        let s = signal.clone();
         let watch = listener.watch(Arc::new(move || s.wake()));
         Server { k, mixer, listener, signal, _watch: watch, clients: BTreeMap::new(), next_client: 1, next_input: 0 }
     }

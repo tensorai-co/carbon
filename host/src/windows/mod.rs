@@ -54,6 +54,11 @@ pub fn memory_available() -> u64 {
     status.avail_phys
 }
 
+/// The most memory this process may use, if the host says: not looked up on Windows yet.
+pub fn memory_limit() -> Option<u64> {
+    None
+}
+
 pub fn random(buffer: &mut [u8]) {
     for chunk in buffer.chunks_mut(u32::MAX as usize) {
         // SAFETY: room for `chunk.len()` bytes, from the system's own generator.

@@ -117,7 +117,7 @@ impl StubCpu {
         let c = &self.context;
         // gs's base is the thread's TEB, which Windows sets; fs's isn't used on x64.
         self.regs = Regs::X86(X86Regs { gpr: c.gpr, rip: c.rip, rflags: u64::from(c.eflags), fs_base: 0, gs_base: self.process.teb });
-        self.fp = FpRegs::X86(X86Fp { fxsave: c.fxsave });
+        self.fp = FpRegs::X86(X86Fp { fxsave: c.fxsave, ..X86Fp::default() });
         self.dirty = false;
         Ok(())
     }

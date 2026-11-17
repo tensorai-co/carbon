@@ -258,6 +258,8 @@ impl Server {
     fn new(k: Arc<Kernel>, desktop: Shared, listener: net::Socket) -> Server {
         let signal = Arc::new(Signal::default());
         let s = signal.clone();
+        k.when_done(Box::new(move || s.wake()));
+        let s = signal.clone();
         let watch = listener.watch(Arc::new(move || s.wake()));
         let s = signal.clone();
         let (output, observer) = {

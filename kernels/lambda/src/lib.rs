@@ -218,6 +218,7 @@ pub fn boot(mut exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&
         ptys: Mutex::new(BTreeMap::new()),
         next_pty: AtomicU32::new(0),
         done: AtomicBool::new(false),
+        on_done: Mutex::new(Vec::new()),
         clock: os::vdso::Clock::new(mm::shared::SharedMem::new(exec.clone(), exec::PAGE, 0)),
         exec,
         host,
@@ -263,6 +264,9 @@ pub fn boot(mut exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&
     }
     let result = run_init(&kernel, cpu, argv);
     kernel.done.store(true, Ordering::Release);
+    for wake in lock(&kernel.on_done).drain(..) {
+        wake();
+    }
     kernel.timers.stop();
     if kernel.console.is_some() {
         kernel.host.set_raw(false);
@@ -372,6 +376,9 @@ pub(crate) struct Kernel {
     next_pty: AtomicU32,
     /// The machine has stopped.
     done: AtomicBool,
+    /// Called once the machine has stopped: the kernel's own servers (X11, Wayland, PulseAudio) wake from waiting, see
+    /// `done`, and let the kernel go at once, rather than at their next look.
+    on_done: Mutex<Vec<Box<dyn Fn() + Send>>>,
     /// Told when the host's stdin gets data or ends.
     stdin_watchers: Arc<kernels_core::wait::Watchers>,
     /// The machine's network.
@@ -418,6 +425,17 @@ fn feed_console(k: &Arc<Kernel>) {
 }
 
 impl Kernel {
+    /// `wake` is called once the machine has stopped (or now, if it has).
+    pub(crate) fn when_done(&self, wake: Box<dyn Fn() + Send>) {
+        let mut waiting = lock(&self.on_done);
+        if self.done.load(Ordering::Acquire) {
+            drop(waiting);
+            wake();
+        } else {
+            waiting.push(wake);
+        }
+    }
+
     fn new_id(&self) -> i32 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }

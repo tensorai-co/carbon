@@ -32,6 +32,11 @@ pub fn memory_available() -> u64 {
     (u64::from(stats.free_count) + u64::from(stats.inactive_count) + u64::from(stats.purgeable_count)) * page
 }
 
+/// The most memory this process may use: the Mac's RAM.
+pub fn memory_limit() -> Option<u64> {
+    Some(installed_memory()).filter(|&bytes| bytes > 0)
+}
+
 fn installed_memory() -> u64 {
     let mut bytes = 0u64;
     let mut size = size_of::<u64>();

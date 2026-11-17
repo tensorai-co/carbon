@@ -60,7 +60,7 @@ carbon atlas imports ~/installers/          # a folder of them: which load, and 
 | `--audio auto\|host\|none\|FILE.wav` | Where its sound goes: the host's speakers when it's on the host's screen (`auto`, the default), the host's speakers or fail, nowhere, or a WAV file of everything played |
 | `-e`, `--env NAME=VALUE` | An environment variable, over the image's |
 | `-w`, `--workdir DIR` | Where its program starts; the image's working directory by default |
-| `--memory SIZE` | How much memory it may use, as `512m` or `4g` (`4g` by default; only what's touched is taken) |
+| `--memory SIZE` | How much memory it may use, as `512m` or `4g` (`4g` by default, or ¾ of a container's memory limit if that's less, as on Cloud Run; only what's touched is taken) |
 | `--rm` | Removed, and its files, once it ends |
 | `--deny-exec PATTERN` | Refuses to start programs whose arguments match: the first word is a program's name (`rm`, not `/bin/rm`), each after it one argument, with `*` and `?` as a shell has them, and a last `*` takes any arguments left. In a Linux machine the program gets EACCES (126 from a shell); in a Windows one, ERROR_ACCESS_DENIED; a first program refused is an error |
 | `--deny HOST\|ADDRESS\|NETWORK[:PORT]` | Refuses connections there (TCP connects, and UDP to each new destination): `0.0.0.0/0` and `::/0` for everything |

@@ -35,7 +35,7 @@ where a backend says it can't run them yet:
 | `vm/hvf` | 48 of 48 (ARM64, x86-64, 32-bit x86) | all, both ISAs | all, both ISAs |
 | `sandbox/macos` | 12 of 12 (ARM64) | not run there yet | not run there yet |
 | `vm/kvm` | 34 of 34 (x86-64, 32-bit x86) | all (the vDSO's clock page aside) | all x86-64 |
-| `sandbox/linux` | 24 of 24 | all but fork and threads (one CPU) | all but threads (one CPU) |
+| `sandbox/linux` | 26 of 26, and inside gVisor | all but `vdso.c`'s clock page, as kvm | not run again since it has more CPUs |
 | `vm/winkvm` | 34 of 34 (x86-64, 32-bit x86) | all (the vDSO's clock page aside) | all, x86-64 and i686 |
 | `sandbox/windows` | 9 of 9 (through its gate) | no: needs x86 → x86 rewriting | all that need one CPU |
 
@@ -49,7 +49,7 @@ Which programs each backend runs:
 | `vm/hvf` | **native** | **translated** | **translated** (exec's own cases; atlas's WoW64 to come) |
 | `sandbox/macos` | **rewritten** (one CPU) | translated: not started | not started |
 | `vm/kvm` | translated: not started | **native** | **native** (exec's own cases; atlas's i686 programs not run yet) |
-| `sandbox/linux` | translated: not started | **native** (one CPU) | not started |
+| `sandbox/linux` | translated: not started | **native** (a stub process per CPU, up to 256) | not started |
 | `vm/winkvm` | translated: not started | **native** | **native** (exec's own cases, and atlas's i686 programs, WoW64 too) |
 | `sandbox/windows` | translated: not started | **native** (one CPU), for atlas; lambda needs x86 → x86 rewriting | not started |
 
@@ -139,7 +139,8 @@ Rules the types enforce, and a few they can't:
 - **A dropped CPU's slot is used again** on the vm backends, so a machine can make CPUs for as long as it runs, as many
   at once as `caps().max_cpus`. Core keeps each slot's shim pages; hvf makes a new vCPU, and kvm and winkvm (which
   never take a vCPU back) keep the dropped one for the next CPU, on whatever thread that is, with its FPU reset. A
-  sandbox's slot stays with the host thread that drives its stub, so a sandbox makes as many CPUs as it has, once.
+  sandbox with a stub per CPU (Linux) uses slots again too, with a new stub made by the new CPU's thread; a shared
+  stub's slot stays with the host thread that drives it, so that sandbox makes as many CPUs as it has, once.
   The conformance suite checks it on hvf, kvm and winkvm: `caps().max_cpus + 16` CPUs, each made and dropped in turn.
 
 ## Inside
@@ -175,7 +176,12 @@ memory and the hardware walks them. A TLB flush is a generation count: a CPU tha
 back to its program, and running CPUs are stopped and waited for. The x86 shim is shared by kvm and winkvm.
 
 **sandbox backends** run the program natively in a stub process on the host. Core keeps the same page tables and
-mirrors each change into the stub as host mappings, a page at a time, when the turn ends. System calls reach the
+mirrors each change into the stub as host mappings when the turn ends, comparing what its tables say with what the stub
+shows, so only what changed reaches the host. A stub is either shared by the sandbox's one CPU, which shows one space
+at a time and is told a page at a time (macOS, Windows), or one per CPU (Linux), each an address space of its own that
+shows its CPU's space and is told in merged runs (pages in a row on frames in a row are one mapping; a protection
+change over a range is one). With a stub per CPU, a turn that changes a space other CPUs show stops each of them, as a
+TLB shootdown would, and each brings its own stub up to date in a turn of its own before it runs again. System calls reach the
 kernel however the host allows: Syscall User Dispatch on Linux, rewritten `svc` on macOS, and on Windows, which can't
 send a `syscall` anywhere but its own kernel, a gate the program calls.
 
@@ -240,7 +246,8 @@ pub trait Sandbox: Sized + Send + 'static {
     fn reach(&self) -> Reach;                      // Dispatch (Linux) | Breakpoint (Windows) | Rewrite (macOS)
     fn layout(&self, isa: Isa) -> Layout;
     fn max_cpus(&self) -> usize;
-    fn mirror(&mut self, page: u64, ram_offset: Option<u64>, prot: Prot) -> Result<(), String>;
+    fn space_per_cpu(&self) -> bool { false }     // each CPU's stub an address space of its own (Linux)
+    fn mirror(&mut self, page: u64, ram_offset: Option<u64>, prot: Prot) -> Result<(), String>;  // a shared stub
     fn thread_block(&mut self, size: u64) -> Option<u64> { None }
     fn new_cpu(&self, index: usize) -> Result<Self::Cpu, String>;
 }
@@ -250,6 +257,7 @@ pub trait SandboxCpu: 'static {
     fn fp(&mut self) -> &mut FpRegs;
     fn resume(&mut self) -> SandboxExit;           // Gate(trap) | Fault(HostFault) | Preempted | Failed(code)
     fn preempt_handle(&self) -> RawPreempt;
+    fn mirror(&mut self, runs: &[MirrorRun]) -> Result<(), String>;  // a stub per CPU: Map | Protect | Unmap runs
 }
 ```
 
@@ -270,8 +278,17 @@ that make a hypercall), both in `exec-core`.
 - **`vm/kvm`**: needs `KVM_CAP_SYNC_REGS` and `KVM_CAP_IMMEDIATE_EXIT`. There's no in-kernel interrupt controller: a
   halt in a shim stub exits to the host. Preempted by a real-time signal with `immediate_exit`. Guest RAM is a memfd,
   shared with the sandbox's RAM code.
-- **`sandbox/linux`**: a stub driven by `ptrace`. Syscall User Dispatch sends every `syscall` to the gate, with the
-  selector byte read-only to the program. seccomp narrows what the stub itself may do, and denies it networking.
+- **`sandbox/linux`**: a stub process per CPU, started (with `clone(CLONE_VM | CLONE_VFORK)`, so nothing of Carbon's
+  is copied) and driven by `ptrace` from the thread that owns the CPU, all mapping guest RAM's memfd shared, so a
+  program's threads and a parent and its child run at once (256 CPUs at most). Syscall User Dispatch, with no part of
+  the stub exempt, sends every `syscall` to the gate; Carbon opens the selector (read-only to the program) only for its
+  own calls, so a program that jumps to the trampoline is caught like any other call. Where there's no dispatch (Linux
+  before 5.11, gVisor), `PTRACE_SYSEMU` stops the stub at every call instead, checked when the stub starts;
+  `CARBON_SANDBOX_CATCH=sysemu` or `dispatch` chooses. seccomp kills the stub for any real call but `mmap`, `mprotect`,
+  `munmap` and exit from the trampoline's own address. The stub goes at the top of user space (just under the stack's
+  lowest place if the kernel's there), so programs have the address space below `0x7fff_ffff_d000`. A stub that can't
+  start says which step the host refused (`ptrace`, executing a memfd, with a temporary file tried next). Registers
+  are the general ones and XSAVE's (x87, SSE and AVX's upper halves).
 - **`vm/winkvm` and `winkvm.sys`**: Carbon's own VT-x driver, because WHP needs Hyper-V, which fails or conflicts
   under nested virtualization in the cloud. VMX is turned on on every CPU by IPI. `RUN` is pinned to one CPU and does a
   VMCLEAR at the end. Guest RAM is mapped through EPT. XSAVE state is swapped inside the assembly, MSRs through the
@@ -357,13 +374,29 @@ it, in more detail. When an item is done it's ticked here, with what it took.
 
 ### 1. The sandboxes, finished
 
-- [ ] **More than one CPU in each sandbox**: one stub thread per CPU, sharing the stub's address space, each driven
-      by the host thread that owns its CPU (on Linux and Windows, the thread that traces or debugs it). lambda's fork
-      and atlas's `CreateThread` need it; it's the last thing between the sandboxes and the vm backends' results.
-- [ ] **Linux**: map runs of pages per call, not one page per `ptrace` round trip. Until there's a second CPU, a
-      program asking for one should fail at once: atlas's `CreateThread` gets `NoMoreCpus` and the program then
-      hangs waiting on a thread that never started (`loader.c` and `windows.c` on a GCP VM), where it should return
-      the error, and the runner exit, straight away.
+- [x] **More than one CPU in the Linux sandbox**: a stub *process* per CPU rather than threads sharing one address
+      space, each started and traced by the host thread that owns its CPU, all mapping guest RAM's memfd shared. So
+      each shows its own CPU's space, and a parent and the child it forked run at once, which threads in one stub
+      couldn't. Core keeps a mirror per CPU; a turn that changes a space other CPUs show stops them, and each catches
+      its own stub up in a turn before it runs again (`Core::catch_up_others`, checked by `tests/mock_cpus.rs`). Slots
+      are used again, with a new stub. lambda's `fork`, `clone`, threads, pipelines and `apt-get` work; lambda's
+      programs pass but `vdso.c`'s clock page, the conformance suite's two multi-CPU cases too.
+- [x] **Linux**: map runs of pages per call, not one page per `ptrace` round trip. Core compares what its tables say
+      with what a stub shows and gives it merged runs (`MirrorRun`): a mapping per stretch of pages on frames in a row,
+      one `mprotect` per stretch whose protection changed (a fork's), one `munmap` per stretch taken away; all of a
+      turn's calls are made in one stop, with the registers saved and put back once.
+- [x] **Linux without Syscall User Dispatch** (before 5.11, gVisor: Cloud Run's first generation): `PTRACE_SYSEMU`,
+      checked when the stub starts, with the seccomp filter handing over (`SECCOMP_RET_TRACE`) rather than killing
+      where the host asks seccomp first, as gVisor does. The whole sandbox runs inside gVisor's `runsc`.
+- [x] **Linux's lockdown**: no part of the stub exempt from dispatch (Carbon opens the selector for its own calls), so
+      a program that jumps to the trampoline is caught like any call; seccomp allows only the trampoline's own address.
+- [x] **Linux's reach**: the stub at the top of user space (programs get up to `0x7fff_ffff_d000`, not
+      `0x7f80_0000_0000`), lower only where the kernel won't put it there; XSAVE's AVX state kept; the stub's CPU time
+      counted as the program's (`SandboxCpu::program_time`); no `/proc` needed to start a stub; a temporary file where a
+      memfd can't be executed; and which step the host refused, when a stub can't start.
+- [ ] **macOS and Windows**: more than one CPU. The Linux way (an address space per CPU) needs a host that can map one
+      memory object into several stub processes: Windows can (a section), macOS too (a memory entry). Until then, a
+      program asking for a second CPU there gets `NoMoreCpus` at once.
 - [ ] **Windows**: lambda's `syscall` (x86 → x86 rewriting into gate calls); today it runs atlas only. The
       conformance suite's system-call cases in gate form (fork, a fault answered, the translator's checks), so the
       sandbox runs all of them. Child processes (atlas's `CreateProcess` says the new process didn't start). And

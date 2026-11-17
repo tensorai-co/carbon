@@ -27,6 +27,12 @@ mod sys;
 #[path = "windows/mod.rs"]
 mod sys;
 
+/// The most memory this process may use, in bytes: on Linux its cgroup's limit (a container's) or the host's RAM,
+/// whichever is less; on macOS the Mac's RAM. None where the host doesn't say.
+pub fn memory_limit() -> Option<u64> {
+    sys::memory_limit()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stream {
     Out,

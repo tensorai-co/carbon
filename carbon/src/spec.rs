@@ -162,11 +162,24 @@ impl Output {
 ///
 /// By default a machine has no stdin (it's at its end from the start, as `docker run` without `-i`), writes to this
 /// process's stdout and stderr, gets a hardware VM where there is one (and says so when it falls back), 4 GiB of
-/// memory it takes only as it touches it, a network of its own (NAT), and a 1280×800 screen in memory.
+/// memory (less in a smaller container: [`default_memory`]) it takes only as it touches it, a network of its own (NAT), and a 1280×800 screen in memory.
 pub struct MachineSpec {
     carbon: Carbon,
     launch: Launch,
     invalid: Option<Error>,
+}
+
+/// A machine's memory unless it's told otherwise: 4 GiB, or three quarters of what this process may use if that's
+/// less (a container's limit, as on Cloud Run), and never under 256 MiB. Guest memory is only backed as it's touched,
+/// but it's backed in this process's cgroup, so a machine that filled more than its container has would get the
+/// container killed.
+pub fn default_memory() -> u64 {
+    const MOST: u64 = 4 << 30;
+    const LEAST: u64 = 256 << 20;
+    match host::memory_limit() {
+        Some(limit) => (limit / 4 * 3).clamp(LEAST, MOST) & !((1 << 20) - 1),
+        None => MOST,
+    }
 }
 
 impl MachineSpec {
@@ -182,7 +195,7 @@ impl MachineSpec {
             display: Display::default(),
             gpu: Gpu::Auto,
             audio: Audio::Auto,
-            memory: 4 << 30,
+            memory: default_memory(),
             network: None,
             publish: None,
             stdin: Stdio::Null,

@@ -341,6 +341,8 @@ struct Server {
 impl Server {
     fn new(k: Arc<Kernel>, desktop: Shared, listeners: Vec<net::Socket>) -> Server {
         let signal = Arc::new(Signal::default());
+        let s = signal.clone();
+        k.when_done(Box::new(move || s.wake()));
         let watches = listeners.iter().map(|l| {
             let s = signal.clone();
             l.watch(Arc::new(move || s.wake()))

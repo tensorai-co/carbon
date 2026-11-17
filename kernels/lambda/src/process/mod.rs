@@ -196,6 +196,8 @@ pub(crate) struct Task {
     /// Its CPU time, and the host thread's CPU time when it was last added to.
     pub times: Arc<Times>,
     pub cpu_mark: u64,
+    /// Its CPU's program time when it was last added to, in a process sandbox (`Cx::program_time`).
+    pub program_mark: u64,
     pub robust: Arc<AtomicU64>,
     /// Whether, and by whom, it's traced (`ptrace`).
     pub trace: Arc<ptrace::Trace>,
@@ -226,6 +228,7 @@ impl Task {
             interrupted: None,
             times: Arc::default(),
             cpu_mark,
+            program_mark: 0,
             robust: Arc::default(),
             trace: Arc::default(),
             exit_code: 0,
@@ -254,7 +257,7 @@ impl Guest for Task {
 
     /// The program stopped: what it ran until now was its own time, and dealing with the stop is lambda's.
     fn exit(&mut self, cx: &mut Cx<'_>, exit: Exit) -> Flow {
-        self.account_stop();
+        self.account_stop(cx);
         self.check_cpu_timers();
         let flow = self.stopped(cx, exit);
         self.account_resume();

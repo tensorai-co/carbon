@@ -10,6 +10,42 @@ pub fn memory_available() -> u64 {
     meminfo("MemAvailable:").or_else(|| meminfo("MemTotal:")).unwrap_or(0)
 }
 
+/// The most memory this process may use: its cgroup's limit (a container's, as on Cloud Run or Kubernetes), or the
+/// host's RAM, whichever is less.
+pub fn memory_limit() -> Option<u64> {
+    let total = meminfo("MemTotal:");
+    let cgroup = cgroup_limit();
+    match (total, cgroup) {
+        (Some(total), Some(cgroup)) => Some(total.min(cgroup)),
+        (total, cgroup) => total.or(cgroup),
+    }
+}
+
+/// The memory limit of this process's cgroup, v2's `memory.max` or v1's `memory.limit_in_bytes`, if it has one.
+fn cgroup_limit() -> Option<u64> {
+    let own = std::fs::read_to_string("/proc/self/cgroup").ok().unwrap_or_default();
+    let mut candidates = Vec::new();
+    for line in own.lines() {
+        // v2: "0::/path"; v1: "N:memory:/path" (or with other controllers alongside).
+        let mut parts = line.splitn(3, ':');
+        let (_, controllers, path) = (parts.next(), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+        if controllers.is_empty() {
+            candidates.push(format!("/sys/fs/cgroup{path}/memory.max"));
+        } else if controllers.split(',').any(|c| c == "memory") {
+            candidates.push(format!("/sys/fs/cgroup/memory{path}/memory.limit_in_bytes"));
+        }
+    }
+    // Inside a container the cgroup's own directory is usually the root of what's mounted.
+    candidates.push("/sys/fs/cgroup/memory.max".to_string());
+    candidates.push("/sys/fs/cgroup/memory/memory.limit_in_bytes".to_string());
+    candidates.iter().find_map(|path| {
+        let text = std::fs::read_to_string(path).ok()?;
+        let limit: u64 = text.trim().parse().ok()?;
+        // v1 says "no limit" with a huge number.
+        (limit < 1 << 60).then_some(limit)
+    })
+}
+
 /// A line of `/proc/meminfo`, in bytes.
 fn meminfo(key: &str) -> Option<u64> {
     let text = std::fs::read_to_string("/proc/meminfo").ok()?;

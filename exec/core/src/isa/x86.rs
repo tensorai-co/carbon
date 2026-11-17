@@ -37,10 +37,14 @@ impl X86Regs {
     }
 }
 
-/// A program's x87, MMX and SSE state, as `fxsave` lays it out (the first 512 bytes of `xsave`).
+/// A program's x87, MMX and SSE state, as `fxsave` lays it out (the first 512 bytes of `xsave`), and the upper halves
+/// of AVX's `ymm` registers, as `xsave` lays out its AVX component. A backend that can't reach the AVX state (or a CPU
+/// without it) leaves `ymmh` zero, which is what `vzeroupper` leaves; AVX-512's state isn't kept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct X86Fp {
     pub fxsave: [u8; 512],
+    /// `ymm0`–`ymm15`'s bits 128–255, sixteen bytes each.
+    pub ymmh: [u8; 256],
 }
 
 impl Default for X86Fp {
@@ -52,7 +56,7 @@ impl Default for X86Fp {
         fxsave[0..2].copy_from_slice(&0x37fu16.to_le_bytes());
         fxsave[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
         fxsave[28..32].copy_from_slice(&0xffffu32.to_le_bytes());
-        X86Fp { fxsave }
+        X86Fp { fxsave, ymmh: [0; 256] }
     }
 }
 

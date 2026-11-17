@@ -108,6 +108,16 @@ impl<V: Vm, S: Sandbox> Cpu<V, S> {
         Exit(raw)
     }
 
+    /// The host CPU time its program has had, in nanoseconds, where that isn't the calling thread's own: a sandbox's
+    /// program runs in its stub, another process. None on a vm backend, where the thread that runs a CPU is the one
+    /// whose time it uses, or where the host can't say.
+    pub fn program_time(&self) -> Option<u64> {
+        match &self.inner {
+            CpuInner::Vm { .. } => None,
+            CpuInner::Sandbox { cpu } => cpu.program_time(),
+        }
+    }
+
     /// A handle any thread can use.
     pub fn handle(&self) -> CpuHandle {
         CpuHandle { shared: self.shared.clone() }

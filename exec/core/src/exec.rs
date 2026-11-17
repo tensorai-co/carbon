@@ -5,7 +5,7 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use exec_mmu::{Mmu, Native, PAGE};
+use exec_mmu::{Mmu, Native, PAGE, Prot};
 
 use crate::contract::{GuestRam, Sandbox, SandboxCpu, Vm, VmCpu};
 use crate::cpu::{Cpu, CpuInner, CpuShared, Retire};
@@ -33,7 +33,8 @@ pub type Opened<V, S> = (Core<V, S>, Cpu<V, S>);
 
 pub(crate) enum Mode<V: Vm, S: Sandbox> {
     Vm { vm: V, shim: Arc<V::Shim> },
-    Sandbox { sandbox: S, mirror: Mirror },
+    /// Each CPU's mirror, by its index.
+    Sandbox { sandbox: S, mirrors: Vec<Mirror> },
 }
 
 /// A machine's memory and CPUs, on one of this host's two backends.
@@ -113,7 +114,7 @@ impl<V: Vm, S: Sandbox> Core<V, S> {
         let mmu = Mmu::new(ram.ptr, SANDBOX_BASE, ram.size, ram.stride, ram.granule);
         let backend = Backend { isolation: Isolation::Sandbox, name: S::NAME };
         let caps = Caps { isas: sandbox.isas(), max_cpus: sandbox.max_cpus(), tso: false };
-        let mode = Mode::Sandbox { sandbox, mirror: Mirror::default() };
+        let mode = Mode::Sandbox { sandbox, mirrors: Vec::new() };
         Self::finish(mode, mmu, ram, options, backend, caps)
     }
 
@@ -156,19 +157,21 @@ impl<V: Vm, S: Sandbox> Core<V, S> {
         &self.caps
     }
 
-    /// Another CPU, which belongs to the calling thread. On a vm backend it takes the slot of one that's been dropped,
-    /// if there is one, so a machine can make CPUs for as long as it runs, as many at once as the backend has.
+    /// Another CPU, which belongs to the calling thread. It takes the slot of one that's been dropped, if there is one,
+    /// so a machine can make CPUs for as long as it runs, as many at once as the backend has.
     pub fn add_cpu(&mut self) -> Result<Cpu<V, S>, Error> {
-        let free = match self.mode {
-            Mode::Vm { .. } => self.cpus.lock().unwrap_or_else(PoisonError::into_inner).iter().position(|c| c.gone.load(Ordering::Acquire)),
-            // A sandbox's stub thread belongs to the host thread that drives it, so its slot can't move to another.
-            Mode::Sandbox { .. } => None,
+        let reuse = match &self.mode {
+            Mode::Vm { .. } => true,
+            // A stub per CPU is made by the thread that drives it, so a new thread makes a new one in an old slot. A
+            // shared stub's thread belongs to the host thread that drives it, so its slot can't move to another.
+            Mode::Sandbox { sandbox, .. } => sandbox.space_per_cpu(),
         };
+        let free = if reuse { self.cpus.lock().unwrap_or_else(PoisonError::into_inner).iter().position(|c| c.gone.load(Ordering::Acquire)) } else { None };
         let index = free.unwrap_or(self.roots.len());
         if index >= self.caps.max_cpus {
             return Err(Error::NoMoreCpus);
         }
-        let (inner, preempt) = match &self.mode {
+        let (inner, preempt) = match &mut self.mode {
             Mode::Vm { vm, shim } => {
                 let mut cpu = vm.new_cpu(index).map_err(|_| Error::NoMoreCpus)?;
                 // A slot's pages are the shim's to keep: a CPU made again in it has them again.
@@ -187,8 +190,22 @@ impl<V: Vm, S: Sandbox> Core<V, S> {
                 let preempt = cpu.preempt_handle();
                 (CpuInner::Vm { cpu, shim: shim.clone(), data }, preempt)
             }
-            Mode::Sandbox { sandbox, .. } => {
-                let cpu = sandbox.new_cpu(index).map_err(|_| Error::NoMoreCpus)?;
+            Mode::Sandbox { sandbox, mirrors } => {
+                let cpu = match sandbox.new_cpu(index) {
+                    Ok(cpu) => cpu,
+                    Err(why) => {
+                        if self.debug {
+                            eprintln!("[exec] no CPU {index}: {why}");
+                        }
+                        return Err(Error::NoMoreCpus);
+                    }
+                };
+                // A new stub shows nothing yet.
+                if index < mirrors.len() {
+                    mirrors[index] = Mirror::default();
+                } else {
+                    mirrors.push(Mirror::default());
+                }
                 let preempt = cpu.preempt_handle();
                 (CpuInner::Sandbox { cpu }, preempt)
             }
@@ -243,7 +260,8 @@ impl<V: Vm, S: Sandbox> Core<V, S> {
     }
 
     /// Brings everything up to date after a turn's changes.
-    pub(crate) fn settle(&mut self, index: usize) {
+    pub(crate) fn settle(&mut self, cpu: &mut Cpu<V, S>) {
+        let index = cpu.index;
         match &mut self.mode {
             Mode::Vm { .. } => {
                 if self.mmu.needs_flush {
@@ -251,13 +269,62 @@ impl<V: Vm, S: Sandbox> Core<V, S> {
                     self.flush_others(index);
                 }
             }
-            Mode::Sandbox { sandbox, mirror } => {
+            Mode::Sandbox { sandbox, mirrors } => {
                 self.mmu.needs_flush = false;
                 let root = self.roots.get(index).copied().unwrap_or(0);
-                mirror.apply(sandbox, &self.mmu, root);
+                if let Some(mirror) = mirrors.get_mut(index) {
+                    let changes = mirror.apply(&self.mmu, root);
+                    if !changes.is_empty() {
+                        let shown = if sandbox.space_per_cpu() {
+                            match &mut cpu.inner {
+                                CpuInner::Sandbox { cpu } => cpu.mirror(&mirror.runs(&changes)),
+                                CpuInner::Vm { .. } => Ok(()),
+                            }
+                        } else {
+                            changes.iter().try_for_each(|c| sandbox.mirror(c.page, c.now.map(|(offset, _)| offset), c.now.map_or(Prot::NONE, |(_, prot)| prot)))
+                        };
+                        if let Err(why) = shown {
+                            mirror.broken.get_or_insert(why);
+                        }
+                    }
+                }
+                self.catch_up_others(Some(index));
             }
         }
         self.give_back();
+    }
+
+    /// Every other CPU whose stub has fallen behind its space (this turn changed it, or freed it) is stopped, and made
+    /// to take a turn before it runs again, which brings its stub up to date: so nothing runs on with a page that's
+    /// gone, or with write access a fork took away.
+    pub(crate) fn catch_up_others(&mut self, me: Option<usize>) {
+        let Mode::Sandbox { mirrors, .. } = &mut self.mode else { return };
+        let mut behind = Vec::new();
+        for (index, mirror) in mirrors.iter_mut().enumerate() {
+            if Some(index) != me && !mirror.asked && mirror.behind() {
+                mirror.asked = true;
+                behind.push(index);
+            }
+        }
+        if behind.is_empty() {
+            return;
+        }
+        let cpus = self.cpus.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let asked: Vec<&Arc<CpuShared>> = behind.iter().filter_map(|&index| cpus.get(index)).filter(|cpu| !cpu.gone.load(Ordering::Acquire)).collect();
+        for cpu in &asked {
+            cpu.preempt();
+        }
+        for cpu in asked {
+            let mut spins = 0u32;
+            while cpu.running.load(Ordering::SeqCst) && !cpu.gone.load(Ordering::Acquire) {
+                spins = spins.wrapping_add(1);
+                if spins & 1023 == 0 {
+                    std::thread::yield_now();
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+        }
     }
 
     /// Every other CPU forgets its cached translations before it runs again. One that's running is stopped and waited

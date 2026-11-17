@@ -6,7 +6,22 @@ use std::io::Error;
 /// selector byte says to block.
 pub const PR_SET_SYSCALL_USER_DISPATCH: u64 = 59;
 pub const PR_SYS_DISPATCH_ON: u64 = 1;
+pub const SYSCALL_DISPATCH_FILTER_ALLOW: u8 = 0;
 pub const SYSCALL_DISPATCH_FILTER_BLOCK: u8 = 1;
+
+/// `ptrace`'s system-call emulation: the stub stops at each system call's entry, which then never runs.
+pub const PTRACE_SYSEMU: libc::c_uint = 31;
+/// What a system-call stop's signal reads as with `PTRACE_O_TRACESYSGOOD`.
+pub const SYSCALL_STOP: i32 = libc::SIGTRAP | 0x80;
+/// A seccomp filter's `SECCOMP_RET_TRACE`, as `waitpid`'s status has it above the signal.
+pub const PTRACE_EVENT_SECCOMP: i32 = 7;
+pub const PTRACE_GETREGSET: libc::c_uint = 0x4204;
+pub const PTRACE_SETREGSET: libc::c_uint = 0x4205;
+/// The register set of XSAVE's whole state, in its standard layout.
+pub const NT_X86_XSTATE: u64 = 0x202;
+
+/// memfd_create's flag for a memfd that may be executed, where `vm.memfd_noexec` would make it not.
+pub const MFD_EXEC: u32 = 0x10;
 
 pub const SECCOMP_SET_MODE_FILTER: u64 = 1;
 pub const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
@@ -69,6 +84,23 @@ pub fn cont(pid: i32, signal: i32) -> Result<(), String> {
     result(ptrace(libc::PTRACE_CONT, pid, 0, signal as u64), "PTRACE_CONT").map(|_| ())
 }
 
+/// Carries on until the next system call, which stops it at its entry and never runs.
+pub fn sysemu(pid: i32) -> Result<(), String> {
+    result(ptrace(PTRACE_SYSEMU, pid, 0, 0), "PTRACE_SYSEMU").map(|_| ())
+}
+
+/// The stub's XSAVE state, in its standard layout, into `buffer`; how many bytes the kernel wrote.
+pub fn getxstate(pid: i32, buffer: &mut [u8]) -> Result<usize, String> {
+    let mut iov = libc::iovec { iov_base: buffer.as_mut_ptr().cast(), iov_len: buffer.len() };
+    result(ptrace(PTRACE_GETREGSET, pid, NT_X86_XSTATE, &raw mut iov as u64), "PTRACE_GETREGSET")?;
+    Ok(iov.iov_len)
+}
+
+pub fn setxstate(pid: i32, buffer: &[u8]) -> Result<(), String> {
+    let mut iov = libc::iovec { iov_base: buffer.as_ptr().cast_mut().cast(), iov_len: buffer.len() };
+    result(ptrace(PTRACE_SETREGSET, pid, NT_X86_XSTATE, &raw mut iov as u64), "PTRACE_SETREGSET").map(|_| ())
+}
+
 /// Writes 8 bytes of the stub's memory, whatever its protection.
 pub fn poke(pid: i32, addr: u64, value: u64) -> Result<(), String> {
     result(ptrace(libc::PTRACE_POKEDATA, pid, addr, value), "PTRACE_POKEDATA").map(|_| ())
@@ -99,7 +131,7 @@ pub fn wait(pid: i32) -> Result<i32, String> {
     }
 }
 
-/// Sends a signal to the stub's one thread.
+/// Sends a signal to a stub's one thread.
 pub fn tgkill(pid: i32, signal: i32) {
     // SAFETY: a process this made; a signal it swallows.
     unsafe { libc::syscall(libc::SYS_tgkill, pid, pid, signal) };

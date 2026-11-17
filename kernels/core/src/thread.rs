@@ -85,6 +85,12 @@ impl<'c> Cx<'c> {
         with_cpu(|cpu| cpu.run())
     }
 
+    /// The host CPU time this thread's program has had where it runs in a process of its own (a sandbox's stub), in
+    /// nanoseconds; None where this host thread's own CPU time counts it.
+    pub fn program_time(&mut self) -> Option<u64> {
+        with_cpu(|cpu| cpu.program_time())
+    }
+
     /// A handle any thread can preempt this thread's CPU with, whichever CPU it's on.
     pub fn handle(&self) -> Handle {
         SEAT.with(|s| s.borrow().as_ref().map(|seat| seat.handle.clone()).unwrap_or_default())

@@ -130,12 +130,15 @@ machine with no image (`windows`, or a program from the host such as `carbon run
 | Host | `vm` | `sandbox` |
 | --- | --- | --- |
 | macOS, Apple silicon | `hvf`, Hypervisor.framework: ARM64 natively, x86-64 translated | a stub task running rewritten ARM64 code (one CPU) |
-| Linux x86-64 | `kvm`: native x86-64 | a stub process under `ptrace`, Syscall User Dispatch and seccomp (one CPU) |
+| Linux x86-64 | `kvm`: native x86-64 | a stub process per CPU under `ptrace` and seccomp, catching calls with Syscall User Dispatch, or `PTRACE_SYSEMU` where there's none (gVisor, Linux before 5.11) |
 | Windows x86-64 | `winkvm`, Carbon's own VT-x driver (test-signed) | a stub process under the debug API, a restricted token and a job (one CPU, atlas only) |
 
 All six backends run real programs and pass the same conformance suite. Linux and Windows are tested in GCP VMs with
 nested virtualization: through kvm and winkvm, both kernels' x86-64 test programs pass (but for lambda's vDSO clock
-page), and atlas's 32-bit ones through winkvm. [`exec`](exec/README.md) has what each runs, and what's left.
+page), and atlas's 32-bit ones through winkvm. The Linux sandbox runs the same lambda programs, with no hypervisor
+(an e2 VM without nested virtualization, and inside gVisor, as on Cloud Run): `debian:13`'s shells, pipelines and
+`apt-get install`, and Python's threads and subprocesses. [`exec`](exec/README.md) has what each runs, and what's
+left.
 
 ## Quickstart
 
@@ -384,9 +387,9 @@ blocks real work, it moves up. Each item's detail is in the README it links to.
 
 **1. The foundation: exec, correct and everywhere** ([exec](exec/README.md#to-do), [kernels-core](kernels/README.md#kernels-core-1))
 
-1. The sandboxes finished: more than one CPU in each; lambda on the Windows sandbox (x86 → x86 rewriting); the
-   kernels' programs on the macOS sandbox; whole runs of pages per `ptrace` call on Linux. *Done means:* both kernels'
-   test programs pass on every sandbox.
+1. The sandboxes finished: more than one CPU in the macOS and Windows sandboxes (Linux's has a stub process per CPU,
+   and maps runs of pages per `ptrace` stop); lambda on the Windows sandbox (x86 → x86 rewriting); the kernels'
+   programs on the macOS sandbox. *Done means:* both kernels' test programs pass on every sandbox.
 2. x86-64 programs as they're built: the x87 transcendentals, `pushf`/`popf`, signed 128-bit divides, the remaining
    flags, `cmpxchg16b`; SSE3 and later, then AVX, as programs ask. (Every string instruction is done.)
 3. The translator's speed and safety: code written through a second mapping (JITs like .NET's). *Done means:* a real

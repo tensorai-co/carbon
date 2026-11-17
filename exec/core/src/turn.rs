@@ -33,7 +33,7 @@ impl<V: Vm, S: Sandbox> Drop for Turn<'_, V, S> {
             self.core.note_resume(index, root, regs.elr);
         }
         self.cpu.shared.ran.store(false, Ordering::SeqCst);
-        self.core.settle(index);
+        self.core.settle(self.cpu);
     }
 }
 
@@ -82,8 +82,11 @@ impl<'e, V: Vm, S: Sandbox> Turn<'e, V, S> {
                     stop
                 }
             }
-            (RawExit::Sandbox(exit), CpuInner::Sandbox { cpu }, Mode::Sandbox { sandbox, mirror }) => {
-                if mirror.broken.is_some() {
+            (RawExit::Sandbox(exit), CpuInner::Sandbox { cpu }, Mode::Sandbox { sandbox, mirrors }) => {
+                if let Some(why) = mirrors.get(index).map_or(Some("no mirror"), |mirror| mirror.broken.as_deref()) {
+                    if core.debug {
+                        eprintln!("exec [sandbox/{} cpu {index}] its stub doesn't match: {why}", S::NAME);
+                    }
                     Stop::Internal { pc: cpu.regs().pc(), detail: 0x4000 }
                 } else {
                     if let SandboxExit::Gate(_) = exit {
@@ -144,8 +147,10 @@ impl<'e, V: Vm, S: Sandbox> Turn<'e, V, S> {
                 *root = 0;
             }
         }
-        if let Mode::Sandbox { mirror, .. } = &mut self.core.mode {
-            mirror.forget(id.0);
+        if let Mode::Sandbox { mirrors, .. } = &mut self.core.mode {
+            for mirror in mirrors {
+                mirror.forget(id.0);
+            }
         }
     }
 
@@ -198,10 +203,12 @@ impl<'e, V: Vm, S: Sandbox> Turn<'e, V, S> {
 }
 
 impl<V: Vm, S: Sandbox> Core<V, S> {
-    /// A turn changed `range` of a space: a sandbox's stub must catch up.
+    /// A turn changed `range` of a space: every sandbox stub that shows it must catch up.
     pub(crate) fn changed(&mut self, root: u64, range: Range<u64>) {
-        if let Mode::Sandbox { mirror, .. } = &mut self.mode {
-            mirror.changed(root, range);
+        if let Mode::Sandbox { mirrors, .. } = &mut self.mode {
+            for mirror in mirrors {
+                mirror.changed(root, range.clone());
+            }
         }
     }
 }
@@ -593,6 +600,8 @@ impl<V: Vm, S: Sandbox> Memory<'_, V, S> {
                 self.core.changed(root, va..va + PAGE);
             }
         }
+        // Outside any one CPU's turn: every stub that showed one of them stops until it's caught up.
+        self.core.catch_up_others(None);
     }
 
     pub fn pressure(&mut self, level: Pressure) {

@@ -1,7 +1,7 @@
 //! CPU time. Each thread's is split into time running its program (user) and time in lambda dealing with a stop
 //! (system), from the host's count for the host thread it runs on (`Host::thread_cpu`). In a hardware VM that's the
-//! program's own time; in a process sandbox, where the program runs in another process, only lambda's part is
-//! counted. A process's time is its threads' together, those still running and those that have ended; its children's
+//! program's own time too; in a process sandbox, where the program runs in another process, the program's is that
+//! process's, which its CPU reports (`Cx::program_time`). A process's time is its threads' together, those still running and those that have ended; its children's
 //! is added as each is waited for, with theirs. `times`, `getrusage`, the usage `wait4` and `waitid` give, and the
 //! CPU-time clocks (`CLOCK_PROCESS_CPUTIME_ID`, `CLOCK_THREAD_CPUTIME_ID`, and another's by `clock_getcpuclockid`)
 //! read them.
@@ -43,10 +43,16 @@ impl Process {
 }
 
 impl Task {
-    /// The program has stopped: what ran since the last mark was the program's.
-    pub(crate) fn account_stop(&mut self) {
+    /// The program has stopped: what ran since the last mark was the program's, on this host thread or, in a process
+    /// sandbox, in its stub.
+    pub(crate) fn account_stop(&mut self, cx: &mut Cx<'_>) {
         let now = self.k.host.thread_cpu();
-        self.times.add(now.saturating_sub(self.cpu_mark), 0);
+        let mut user = now.saturating_sub(self.cpu_mark);
+        if let Some(program) = cx.program_time() {
+            user += program.saturating_sub(self.program_mark);
+            self.program_mark = program;
+        }
+        self.times.add(user, 0);
         self.cpu_mark = now;
     }
 

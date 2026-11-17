@@ -129,8 +129,25 @@ pub trait VmCpu: 'static {
     fn preempt_handle(&self) -> RawPreempt;
 }
 
+/// A run of pages a CPU's stub is told to show, for a sandbox whose CPUs each have an address space of their own
+/// (`Sandbox::space_per_cpu`). Core merges what a turn changed into as few runs as it can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirrorRun {
+    /// `len` bytes from `page` show guest RAM from `offset` on, page for page, with `prot`.
+    Map { page: u64, len: u64, offset: u64, prot: Prot },
+    /// `len` bytes from `page`, already showing guest RAM, now with `prot`.
+    Protect { page: u64, len: u64, prot: Prot },
+    /// `len` bytes from `page` show nothing.
+    Unmap { page: u64, len: u64 },
+}
+
 /// A sandbox backend. Program code runs natively in a stub process; core keeps the page tables and mirrors them into
-/// the stub, one page at a time.
+/// the stub.
+///
+/// A stub is one of two kinds. Either every CPU shares one address space, which shows one space at a time and which
+/// `Sandbox::mirror` changes a page at a time (such a sandbox has one CPU); or each CPU's stub is an address space of
+/// its own (`space_per_cpu`), which shows that CPU's space, so CPUs in different spaces run at once, and
+/// `SandboxCpu::mirror` changes it, in runs, from that CPU's own thread.
 pub trait Sandbox: Sized + Send + 'static {
     type Cpu: SandboxCpu;
     const NAME: &'static str;
@@ -141,8 +158,16 @@ pub trait Sandbox: Sized + Send + 'static {
     fn reach(&self) -> Reach;
     fn layout(&self, isa: Isa) -> Layout;
     fn max_cpus(&self) -> usize;
-    /// Makes the stub's page at `page` show guest RAM at `ram_offset` with `prot`, or nothing.
-    fn mirror(&mut self, page: u64, ram_offset: Option<u64>, prot: Prot) -> Result<(), String>;
+    /// Whether each CPU's stub is an address space of its own. A CPU's slot can then be used again by another thread,
+    /// which makes a stub of its own.
+    fn space_per_cpu(&self) -> bool {
+        false
+    }
+    /// Makes the shared stub's page at `page` show guest RAM at `ram_offset` with `prot`, or nothing. Only for a
+    /// sandbox without a space per CPU.
+    fn mirror(&mut self, _page: u64, _ram_offset: Option<u64>, _prot: Prot) -> Result<(), String> {
+        Err("this sandbox's stubs are mirrored per CPU".to_string())
+    }
     /// Where the next thread's environment block must go, on a host that decides that itself.
     fn thread_block(&mut self, _size: u64) -> Option<u64> {
         None
@@ -157,4 +182,14 @@ pub trait SandboxCpu: 'static {
     fn fp(&mut self) -> &mut FpRegs;
     fn resume(&mut self) -> SandboxExit;
     fn preempt_handle(&self) -> RawPreempt;
+    /// Makes this CPU's own stub show `runs`, in order. Only for a sandbox with a space per CPU; called on the CPU's
+    /// own thread, while it isn't running.
+    fn mirror(&mut self, _runs: &[MirrorRun]) -> Result<(), String> {
+        Err("this sandbox's CPUs share one stub".to_string())
+    }
+    /// The host CPU time this CPU's program has had, in nanoseconds, where it runs in a process of its own (so the
+    /// calling thread's own CPU time doesn't count it). None if the host can't say.
+    fn program_time(&self) -> Option<u64> {
+        None
+    }
 }
