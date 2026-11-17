@@ -294,7 +294,8 @@ that make a hypercall), both in `exec-core`.
   needs dispatch). The stub sets itself up from calls Carbon leaves in its mailbox, so `fast` uses no `ptrace` at all.
   atlas's ntdll calls the stub's gate instead of trapping (`Layout::gate`, `CARBON_SANDBOX_GATE=0` to turn it off),
   which saves the signal: the gate saves the program's registers, and XSAVE's state, in a frame laid out as a
-  signal's. seccomp allows real calls only from the handler's page (`futex` on the mailbox, `rt_sigreturn`,
+  signal's. lambda rewrites a Linux program's `mov $nr, %eax; syscall` sites into jumps to its jump gate
+  (`Layout::jump_gate`, which takes the return address in `rcx`; `CARBON_SANDBOX_PATCH=0` to turn it off). seccomp allows real calls only from the handler's page (`futex` on the mailbox, `rt_sigreturn`,
   `arch_prctl` for `fs` and `gs`, and in `fast`, `mmap` of guest RAM, `mprotect` and `munmap` below the stub), and
   kills the stub for anything else. The mailbox is the program's to write, so Carbon reads it as untrusted. The stub
   goes at the top of user space (just under the stack's lowest place if the kernel's there), so programs have the
@@ -387,7 +388,7 @@ it, in more detail. When an item is done it's ticked here, with what it took.
 ### 1. The sandboxes, finished
 
 - [x] **More than one CPU in the Linux sandbox**: a stub *process* per CPU rather than threads sharing one address
-      space, each started and traced by the host thread that owns its CPU, all mapping guest RAM's memfd shared. So
+      space, each started by the host thread that owns its CPU, all mapping guest RAM's memfd shared. So
       each shows its own CPU's space, and a parent and the child it forked run at once, which threads in one stub
       couldn't. Core keeps a mirror per CPU; a turn that changes a space other CPUs show stops them, and each catches
       its own stub up in a turn before it runs again (`Core::catch_up_others`, checked by `tests/mock_cpus.rs`). Slots
@@ -413,19 +414,20 @@ it, in more detail. When an item is done it's ticked here, with what it took.
       map its whole address space up front (200 Python threads: from timing out to 10 s); an instruction running onto
       a page the stub doesn't have is read as the fetch it is, which gVisor reports as an access error; and the stub's
       file kept off the descriptor guest memory goes to, which collided once a process had a hundred open.
-- [x] **Linux, v2: a stub that handles its own traps** (as gVisor's systrap does): a program's calls, faults and
-      preempts are signals to a handler in its stub, on a signal stack in memory Carbon maps too, which meets Carbon
-      through a mailbox and a futex, and maps guest memory into itself as it returns to the program. The stub sets
-      itself up from calls Carbon leaves in the mailbox, so `fast` needs no `ptrace` at all; each side spins only while
-      the other is on another CPU and answers quickly; `fs` and `gs` move by `rdfsbase` and the rest where the kernel
-      allows them. atlas's ntdll calls a gate in the stub instead of trapping, which saves the signal. On an e2 VM (2
-      vCPUs), against v1's `ptrace` stub: `getpid` 32.5 → 5.1 µs, a first-touch fault 96 → 28 µs, `apt-get update &&
-      apt-get install curl` 131 → 49 s, 100 forks 2.8 → 1.0 s, 40,000 Windows calls 340 → 195 ms by the gate.
-      lambda reads the host's CPU-time clocks lazily (a microsecond each in a VM, three a stop before).
-- [ ] **Linux, v2's phase 2 for lambda**: Linux programs' own `mov $nr, %eax; syscall` sites rewritten, lazily, to
-      jump to the stub's gate (with the return address in `rcx`, so the program's stack and red zone are untouched),
-      saving the signal (~3 µs in a VM). Needs a breakpoint-first patch, as Linux's `text_poke_bp` does, so another CPU
-      never runs a half-written site; patches invisible to reads and undone by writes; and thunks kept within ±2 GiB.
+- [x] **Linux: a stub that handles its own traps** (as gVisor's systrap does): a program's calls, faults and preempts
+      are signals to a handler in its stub, on a signal stack in memory Carbon maps too, which meets Carbon through a
+      mailbox and a futex, and maps guest memory into itself as it returns to the program. The stub sets itself up
+      from calls Carbon leaves in the mailbox, so `fast` needs no `ptrace` at all; each side spins only while the other
+      is on another CPU and answers quickly; `fs` and `gs` move by `rdfsbase` and the rest where the kernel allows
+      them. On an e2 VM (2 vCPUs): a first-touch fault ~25 µs, `apt-get update && apt-get install curl` 42–49 s, 100
+      forks 1 s. lambda reads the host's CPU-time clocks lazily (a microsecond each in a VM, three a stop before).
+- [x] **Linux: system calls without the trap.** atlas's ntdll calls the stub's gate instead of trapping (40,000
+      Windows calls: 340 → 195 ms). lambda rewrites a Linux program's `mov $nr, %eax; syscall` at its third trap into
+      a jump, through a thunk, to the stub's jump gate, which takes the return address in `rcx` and leaves the program's
+      stack alone (`kernels/lambda/src/mm/patch.rs`): only while the process has one thread, so no other CPU sees a
+      half-written site; only in its private copy of a page it can't write; unseen by `ptrace` and `process_vm_readv`,
+      and put back when the page is made writable or written from outside. A `getpid` from glibc's call site: 4.3 →
+      1.1 µs (0.85 natively); inside gVisor 84 → 65 µs. `CARBON_SANDBOX_PATCH=0` turns rewriting off.
 - [ ] **Linux, faster faults**: lambda could fault anonymous memory in around the page asked for; and frames freed and
       taken again come back in descending order, so they don't merge into one mapping, which handing them out
       ascending would fix. A fresh frame needn't be zeroed twice (the memfd's pages are), and could be populated in

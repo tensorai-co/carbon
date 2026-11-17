@@ -60,7 +60,7 @@ impl Sandbox for Stub {
     }
 
     fn layout(&self, isa: Isa) -> Layout {
-        Layout { top: exec_core::isa::space_top(isa).min(SPACE_TOP), kept: self.process.kept.clone(), gate: Some(stub::GATE), traps: false }
+        Layout { top: exec_core::isa::space_top(isa).min(SPACE_TOP), kept: self.process.kept.clone(), gate: Some(stub::GATE), traps: false, jump_gate: None }
     }
 
     fn max_cpus(&self) -> usize {

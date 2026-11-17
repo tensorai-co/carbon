@@ -71,6 +71,9 @@ pub struct Stub {
     /// Programs may call the stub's gate rather than trap (`handler.rs`): where XSAVE is on, unless
     /// `CARBON_SANDBOX_GATE=0`.
     gate: bool,
+    /// The kernel may rewrite programs' system calls into jumps to the stub's jump gate (`Layout::jump_gate`): with
+    /// the gate, unless `CARBON_SANDBOX_PATCH=0`.
+    jump_gate: bool,
     /// The first CPU's stub, started by `open` on the thread that will drive it, so a sandbox that can't start here
     /// says why at once.
     first: Mutex<Option<(ThreadId, Process)>>,
@@ -90,7 +93,8 @@ impl Sandbox for Stub {
         let (base, catch, mode) = (process.at.base, process.catch, process.mode);
         let xsave = std::arch::x86_64::__cpuid(1).ecx & (1 << 27) != 0;
         let gate = xsave && std::env::var("CARBON_SANDBOX_GATE").as_deref() != Ok("0");
-        Ok(Stub { ram_fd, base, catch, mode, gate, first: Mutex::new(Some((std::thread::current().id(), process))) })
+        let jump_gate = gate && std::env::var("CARBON_SANDBOX_PATCH").as_deref() != Ok("0");
+        Ok(Stub { ram_fd, base, catch, mode, gate, jump_gate, first: Mutex::new(Some((std::thread::current().id(), process))) })
     }
 
     fn isas(&self) -> &'static [Isa] {
@@ -103,7 +107,8 @@ impl Sandbox for Stub {
 
     fn layout(&self, isa: Isa) -> Layout {
         let gate = (isa == Isa::X86_64 && self.gate).then(|| self.base + handler::gate_at());
-        Layout { top: exec_core::isa::space_top(isa).min(self.base), kept: Vec::new(), gate, traps: true }
+        let jump_gate = (isa == Isa::X86_64 && self.jump_gate).then(|| self.base + handler::jump_gate_at());
+        Layout { top: exec_core::isa::space_top(isa).min(self.base), kept: Vec::new(), gate, traps: true, jump_gate }
     }
 
     fn max_cpus(&self) -> usize {
@@ -132,8 +137,9 @@ impl Sandbox for Stub {
 #[derive(Default)]
 struct Frame {
     signo: i32,
-    /// It came by the gate: `uc` is the gate's frame, and there's no siginfo.
-    gate: bool,
+    /// It came by a gate (`handler::GATE_CALLED` or `GATE_JUMPED`; 0 for a signal): `uc` is the gates' frame, and
+    /// there's no siginfo.
+    gate: u32,
     info: usize,
     uc: usize,
     /// The FP state's offset and length (512, or XSAVE's whole area).
@@ -179,7 +185,8 @@ impl StubCpu {
     fn load(&mut self) -> Result<(), Gone> {
         let mailbox = &self.process.mailbox;
         let signo = mailbox.get(handler::SIGNO) as i32;
-        let gate = mailbox.get(handler::VIA_GATE) as u32 != 0;
+        let via = mailbox.get(handler::VIA_GATE) as u32;
+        let gate = via != 0;
         let (info, uc) = if gate {
             // The gate's frame, always in the same place, and no siginfo.
             if mailbox.get(handler::UC) != mailbox.stub_at + handler::GATE_UC - handler::SHARED {
@@ -211,7 +218,7 @@ impl StubCpu {
             self.bases = (mailbox.get(handler::FS_BASE), mailbox.get(handler::GS_BASE));
         }
         (x.fs_base, x.gs_base) = self.bases;
-        self.frame = Frame { signo, gate, info: info.unwrap_or(0), uc, fpstate };
+        self.frame = Frame { signo, gate: via, info: info.unwrap_or(0), uc, fpstate };
         self.regs = Regs::X86(x);
         self.regs_dirty = false;
         self.fp = None;
@@ -293,10 +300,13 @@ impl StubCpu {
         let code = read_u32(info, 8) as i32;
         let addr = read_u64(info, 16);
         let fault = |kind, addr, access| SandboxExit::Fault(HostFault { kind, addr, access, pc });
-        // A call by the gate, as the Windows sandbox's gate reports one: atlas reads its arguments where its own
-        // convention puts them either way.
-        if self.frame.gate {
-            return SandboxExit::Gate(Trap::Int2e);
+        match self.frame.gate {
+            // A call by the gate, as the Windows sandbox's gate reports one: atlas reads its arguments where its own
+            // convention puts them either way.
+            handler::GATE_CALLED => return SandboxExit::Gate(Trap::Int2e),
+            // A rewritten `syscall`, which this is as far as anyone can tell.
+            handler::GATE_JUMPED => return SandboxExit::Gate(Trap::Syscall),
+            _ => {}
         }
         match self.frame.signo {
             PREEMPT_SIGNAL => SandboxExit::Preempted,

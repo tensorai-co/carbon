@@ -937,6 +937,8 @@ impl Task {
                     Err(_) => break,
                 }
             }
+            // Its rewritten system calls are its kernel's business.
+            state.patches.unseen(addr, &mut out);
         })?;
         if out.is_empty() && len > 0 { Err(EFAULT) } else { Ok(out) }
     }
@@ -950,6 +952,8 @@ impl Task {
     pub(crate) fn write_remote(&mut self, cx: &mut Cx<'_>, process: &Arc<Process>, addr: u64, data: &[u8], force: bool) -> Result<usize, Errno> {
         let mut done = 0;
         self.remote(cx, process, |cx, k, state| {
+            // Rewritten system calls it writes over go back first.
+            crate::mm::patch::restore(k, state, cx, addr..addr.saturating_add(data.len() as u64));
             while done < data.len() {
                 let at = addr.wrapping_add(done as u64);
                 let chunk = (data.len() - done).min((PAGE - at % PAGE) as usize);
@@ -966,14 +970,14 @@ impl Task {
 
     /// `f` with every turn in `process`'s space, and its state held, so its space stays what it is: ESRCH if it has
     /// none any more.
-    fn remote(&mut self, cx: &mut Cx<'_>, process: &Arc<Process>, f: impl FnOnce(&mut Cx<'_>, &crate::Kernel, &super::ProcState)) -> Result<(), Errno> {
+    fn remote(&mut self, cx: &mut Cx<'_>, process: &Arc<Process>, f: impl FnOnce(&mut Cx<'_>, &crate::Kernel, &mut super::ProcState)) -> Result<(), Errno> {
         let k = self.k.clone();
-        let state = lock(&process.state);
+        let mut state = lock(&process.state);
         if state.zombie.is_some() || state.threads.is_empty() {
             return Err(ESRCH);
         }
         let space = state.space;
-        cx.elsewhere(space, |cx| f(cx, &k, &state));
+        cx.elsewhere(space, |cx| f(cx, &k, &mut state));
         Ok(())
     }
 }

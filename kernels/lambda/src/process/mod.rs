@@ -57,6 +57,8 @@ pub(crate) struct ProcState {
     pub isa: Isa,
     pub space: SpaceId,
     pub regions: Regions<Area>,
+    /// Its system calls rewritten to skip their traps (`mm::patch`).
+    pub patches: crate::mm::patch::Patches,
     /// Where `mmap` finds room, top down.
     pub mmap: std::ops::Range<u64>,
     /// The heap: where it starts, and where it ends now.
@@ -205,6 +207,8 @@ pub(crate) struct Task {
     pub trace: Arc<ptrace::Trace>,
     /// What `exit` gave, for its tracer to hear when it ends.
     exit_code: i32,
+    /// Where its backend's jump gate is, if it has one, once asked (`mm::patch`).
+    jump_gate: Option<Option<u64>>,
     /// A traced thread or process `clone` just made, with the event its creator stops at for it.
     forked: Option<(i32, i32)>,
 }
@@ -236,6 +240,7 @@ impl Task {
             robust: Arc::default(),
             trace: Arc::default(),
             exit_code: 0,
+            jump_gate: None,
             forked: None,
         }
     }
@@ -270,6 +275,18 @@ impl Guest for Task {
 }
 
 impl Task {
+    /// Rewrites the system call the program just made, if it can be, so it skips its trap from now on (`mm::patch`).
+    fn rewrite_site(&mut self, cx: &mut Cx<'_>, nr: u64) {
+        let gate = *self.jump_gate.get_or_insert_with(|| cx.turn(|t| t.space().layout().jump_gate));
+        let Some(gate) = gate else { return };
+        if self.isa != Isa::X86_64 {
+            return;
+        }
+        let after = cx.turn(|t| t.thread().regs().pc());
+        let mut state = lock(&self.process.state);
+        crate::mm::patch::rewrite(&self.k, &mut state, cx, gate, after, nr);
+    }
+
     fn stopped(&mut self, cx: &mut Cx<'_>, exit: Exit) -> Flow {
         let stop = cx.turn(|t| t.stop(exit));
         if self.ending() {
@@ -291,7 +308,10 @@ impl Task {
                     None => Outcome::Keep,
                 }
             }
-            Some(Stop::Syscall { nr, args }) => self.syscall(cx, nr, args),
+            Some(Stop::Syscall { nr, args }) => {
+                self.rewrite_site(cx, nr);
+                self.syscall(cx, nr, args)
+            }
             Some(Stop::Fault { addr, access, pc }) => {
                 if self.fault(cx, addr, access).is_err() {
                     // A jump to nowhere (a null function pointer): on ARM64 the link register says who called it.
@@ -1104,6 +1124,7 @@ fn start(k: &Arc<Kernel>, cx: &mut Cx<'_>, pid: i32, argv: &[String], env: &[Str
         isa: Isa::host(),
         space: SpaceId(0),
         regions: Regions::default(),
+        patches: Default::default(),
         mmap: 0..0,
         brk: (0, 0),
         files,

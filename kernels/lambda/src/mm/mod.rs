@@ -4,6 +4,7 @@
 //! of the memory calls (`msync`, `mincore`, `mlock`, `mseal`, NUMA policy, protection keys) are in `control`.
 
 mod control;
+pub(crate) mod patch;
 pub(crate) mod shared;
 
 use std::sync::Arc;
@@ -207,6 +208,9 @@ impl Task {
         } else {
             state.regions.free_below(state.mmap.clone(), len, PAGE).ok_or(ENOMEM)?
         };
+        if fixed {
+            patch::forget(&self.k, &mut state, cx, at..at + len);
+        }
         let replaced = state.regions.remove(at..at + len);
         state.regions.insert(at..at + len, area);
         drop(state);
@@ -226,6 +230,7 @@ impl Task {
         if any_sealed(&state.regions, range.clone()) {
             return Err(EPERM);
         }
+        patch::forget(&self.k, &mut state, cx, range.clone());
         let removed = state.regions.remove(range.clone());
         // What the backend keeps stays.
         for (r, area) in removed {
@@ -255,6 +260,10 @@ impl Task {
                 return Err(ENOMEM);
             }
             at = r.end;
+        }
+        // Code the program can write is its own: its rewritten system calls there go back.
+        if prot.write() {
+            patch::restore(&self.k, &mut state, cx, range.clone());
         }
         state.regions.update(range.clone(), |area| area.prot = prot);
         cx.turn(|t| t.space().protect(range, prot));
@@ -288,6 +297,8 @@ impl Task {
         if covered < old + old_len {
             return Err(EFAULT);
         }
+        // Rewritten system calls don't move: their thunks jump back to where they were.
+        patch::restore(&self.k, &mut state, cx, old..old + old_len);
         // What it grows by continues its last area.
         let (range, area) = state.regions.find(old + old_len - PAGE).map(|(r, a)| (r, a.clone())).ok_or(EFAULT)?;
         if new_len <= old_len {
@@ -316,7 +327,7 @@ impl Task {
         if advice == MADV_DONTNEED {
             // Forget the pages: the next touch fills them again, with zeros, from the file, or with the shared pages.
             let range = addr..addr + page_up(len);
-            let state = lock(&self.process.state);
+            let mut state = lock(&self.process.state);
             // Discarding a sealed private page that can't be written would change what it holds.
             if state.regions.iter().any(|(r, a)| a.sealed && !a.prot.write() && !matches!(a.backing, Backing::Shared { private: false, .. }) && r.start < range.end && range.start < r.end) {
                 return Err(EPERM);
@@ -324,6 +335,7 @@ impl Task {
             if state.regions.iter().any(|(r, a)| matches!(a.backing, Backing::Reserved) && r.start < range.end && range.start < r.end) {
                 return Err(EINVAL);
             }
+            patch::forget(&self.k, &mut state, cx, range.clone());
             cx.turn(|t| t.space().unmap(range));
         }
         Ok(0)

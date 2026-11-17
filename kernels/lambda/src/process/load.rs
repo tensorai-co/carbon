@@ -337,6 +337,7 @@ pub(crate) fn exec_into(k: &Arc<Kernel>, cx: &mut Cx<'_>, state: &mut ProcState,
     state.space = space;
     state.isa = isa;
     state.regions = regions;
+    state.patches = Default::default();
     state.mmap = mmap;
     state.brk = (brk, brk);
     state.exe = exe;

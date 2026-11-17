@@ -337,7 +337,10 @@ programs and how to build them are in [lambda's](kernels/lambda/README.md#runnin
 ## Where it stands
 
 - **exec** runs on all three hosts, both isolations, and all six backends pass its conformance suite. A dropped CPU's
-  slot is used again, so a machine can make threads and processes for as long as it runs.
+  slot is used again, so a machine can make threads and processes for as long as it runs. Linux's sandbox is a stub
+  per CPU that handles its own traps, as gVisor's systrap does, with no `ptrace`: Windows programs call a gate in it,
+  and lambda rewrites a Linux program's system calls into jumps to it, so a `getpid` costs about 1.1 µs (0.85 natively)
+  on a small cloud VM, inside Cloud Run as on any Linux host.
 - **lambda** runs Debian 13, ARM64 natively and x86-64 translated or native: bash with job control on a console,
   ptys, signals, threads, `epoll` and friends, sockets, `sshd`, and `apt-get install` of curl, Python and git, which
   then work over HTTPS. **atlas** runs Windows programs with its loader and SEH, threads, processes and objects,

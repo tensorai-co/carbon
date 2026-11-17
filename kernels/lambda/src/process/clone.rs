@@ -92,6 +92,7 @@ impl Task {
                 isa: state.isa,
                 space,
                 regions: state.regions.clone(),
+                patches: state.patches.clone(),
                 mmap: state.mmap.clone(),
                 brk: state.brk,
                 files: state.files.clone(),

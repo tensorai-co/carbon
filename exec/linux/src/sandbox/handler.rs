@@ -74,8 +74,11 @@ pub const CARBON_CPU: u64 = 0x58;
 pub const STUB_CPU: u64 = 0x5c;
 /// Linux's per-CPU segment selector (`__CPUNODE_SEG`), whose limit is the CPU's number.
 pub const CPU_SEGMENT: u32 = 0x7b;
-/// Nonzero while the event Carbon has came by the gate, not a signal: the handler returns through the gate's way.
+/// Nonzero while the event Carbon has came by a gate, not a signal (`GATE_CALLED` or `GATE_JUMPED`): the handler
+/// returns through the gates' way.
 pub const VIA_GATE: u64 = 0x60;
+pub const GATE_CALLED: u32 = 1;
+pub const GATE_JUMPED: u32 = 2;
 /// Nonzero from the gate's first instruction until it starts giving the program its registers back: a preempt that
 /// comes meanwhile is dropped, as an event is on its way to Carbon anyway.
 pub const IN_GATE: u64 = 0x64;
@@ -315,9 +318,18 @@ global_asm!(
     "mov [rip + carbon_stub_start + {g_r15}], r15",
     "pop qword ptr [rip + carbon_stub_start + {g_rip}]",
     "mov [rip + carbon_stub_start + {g_rsp}], rsp",
+    "mov r15d, {via_call}",
+    // Both gates, once the program's registers are saved, its rip and rsp too: r15 says which.
+    ".Lcarbon_gate_saved:",
     "lea rsp, [rip + carbon_stub_start + {gate_stack}]",
     "pushfq",
     "pop qword ptr [rip + carbon_stub_start + {g_eflags}]",
+    // The jump gate stands in for `syscall`, which leaves the flags in r11.
+    "cmp r15d, {via_jump}",
+    "jne .Lcarbon_gate_flags",
+    "mov rax, [rip + carbon_stub_start + {g_eflags}]",
+    "mov [rip + carbon_stub_start + {g_r11}], rax",
+    ".Lcarbon_gate_flags:",
     "xor ecx, ecx",
     "xgetbv",
     "and eax, 7",
@@ -333,13 +345,39 @@ global_asm!(
     "lea rax, [rip + carbon_stub_start + {gate_xsave}]",
     "mov [rip + carbon_stub_start + {g_fpstate}], rax",
     "lea rbx, [rip + carbon_stub_start + {mailbox}]",
-    "mov dword ptr [rbx + {via_gate}], 1",
+    "mov dword ptr [rbx + {via_gate}], r15d",
     "mov qword ptr [rbx + {signo}], {gate_signo}",
     "mov qword ptr [rbx + {info}], 0",
     "lea rax, [rip + carbon_stub_start + {gate_uc}]",
     "mov [rbx + {uc}], rax",
     "mov qword ptr [rbx + {code}], 0",
     "jmp .Lcarbon_bases",
+    // The jump gate: where a Linux program's `mov $nr, %eax; syscall`, rewritten by its kernel, jumps (through a
+    // thunk of the kernel's, which keeps the number in eax) with the address to come back to in rcx, as `syscall`
+    // would leave it. Nothing goes on the program's stack, so its red zone is untouched. Otherwise as the call gate.
+    ".globl carbon_stub_jump_gate",
+    ".hidden carbon_stub_jump_gate",
+    "carbon_stub_jump_gate:",
+    "mov dword ptr [rip + carbon_stub_start + {mailbox} + {in_gate}], 1",
+    "mov [rip + carbon_stub_start + {g_rax}], rax",
+    "mov [rip + carbon_stub_start + {g_rcx}], rcx",
+    "mov [rip + carbon_stub_start + {g_rdx}], rdx",
+    "mov [rip + carbon_stub_start + {g_rbx}], rbx",
+    "mov [rip + carbon_stub_start + {g_rbp}], rbp",
+    "mov [rip + carbon_stub_start + {g_rsi}], rsi",
+    "mov [rip + carbon_stub_start + {g_rdi}], rdi",
+    "mov [rip + carbon_stub_start + {g_r8}], r8",
+    "mov [rip + carbon_stub_start + {g_r9}], r9",
+    "mov [rip + carbon_stub_start + {g_r10}], r10",
+    "mov [rip + carbon_stub_start + {g_r11}], r11",
+    "mov [rip + carbon_stub_start + {g_r12}], r12",
+    "mov [rip + carbon_stub_start + {g_r13}], r13",
+    "mov [rip + carbon_stub_start + {g_r14}], r14",
+    "mov [rip + carbon_stub_start + {g_r15}], r15",
+    "mov [rip + carbon_stub_start + {g_rip}], rcx",
+    "mov [rip + carbon_stub_start + {g_rsp}], rsp",
+    "mov r15d, {via_jump}",
+    "jmp .Lcarbon_gate_saved",
     // Back to the program from the gate's frame, as Carbon left it: the FP state, the flags, then (from the window
     // on, where a signal takes the frame as the program's) every register, rsp, and a jump to rip.
     ".Lcarbon_gate_return:",
@@ -472,6 +510,8 @@ global_asm!(
     xstate_magic = const 0x4650_5853u32,
     gate_signo = const GATE_SIGNO,
     via_gate = const VIA_GATE,
+    via_call = const GATE_CALLED,
+    via_jump = const GATE_JUMPED,
     in_gate = const IN_GATE,
     preempt = const libc::SIGURG,
     shared_size = const SHARED_SIZE,
@@ -509,6 +549,7 @@ unsafe extern "C" {
     #[cfg(test)]
     static carbon_stub_kick: u8;
     static carbon_stub_gate: u8;
+    static carbon_stub_jump_gate: u8;
     static carbon_stub_setup: u8;
     static carbon_stub_end: u8;
 }
@@ -540,6 +581,12 @@ pub fn restorer_at() -> u64 {
 pub fn gate_at() -> u64 {
     // SAFETY: addresses of labels, not reads.
     HANDLER + unsafe { (address(&carbon_stub_gate) - address(&carbon_stub_start)) as u64 }
+}
+
+/// Where the jump gate is, from the stub's base.
+pub fn jump_gate_at() -> u64 {
+    // SAFETY: addresses of labels, not reads.
+    HANDLER + unsafe { (address(&carbon_stub_jump_gate) - address(&carbon_stub_start)) as u64 }
 }
 
 /// Where the stub starts.

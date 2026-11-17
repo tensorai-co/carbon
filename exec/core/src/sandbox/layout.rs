@@ -6,5 +6,5 @@ use crate::{Isa, Layout};
 
 /// A vm backend's layout: everything below the user top is the program's.
 pub(crate) fn vm(isa: Isa) -> Layout {
-    Layout { top: space_top(isa), kept: Vec::new(), gate: None, traps: true }
+    Layout { top: space_top(isa), kept: Vec::new(), gate: None, traps: true, jump_gate: None }
 }

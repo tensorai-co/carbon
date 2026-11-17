@@ -88,7 +88,7 @@ impl Sandbox for Mock {
     }
 
     fn layout(&self, _: Isa) -> Layout {
-        Layout { top: 1 << 47, kept: Vec::new(), gate: None, traps: true }
+        Layout { top: 1 << 47, kept: Vec::new(), gate: None, traps: true, jump_gate: None }
     }
 
     fn max_cpus(&self) -> usize {

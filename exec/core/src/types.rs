@@ -182,6 +182,9 @@ pub struct Layout {
     pub gate: Option<u64>,
     /// Whether a program's own traps (`syscall`) reach the kernel too, where there's a gate.
     pub traps: bool,
+    /// Where an x86-64 kernel may send a program's `syscall` instead, by rewriting it into a jump there, with the
+    /// number in `eax` and the address after the `syscall` in `rcx`: the same stop, without the trap.
+    pub jump_gate: Option<u64>,
 }
 
 /// A mapped page.
