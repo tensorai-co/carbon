@@ -115,6 +115,23 @@ impl core::error::Error for Error {}
 
 pub type Result<T> = core::result::Result<T, Error>;
 
+/// Every chunk an index names: what the store has to keep for an image, or for the image a machine's disk is over.
+pub fn index_chunks(index: &[u8]) -> Result<Vec<Hash>> {
+    Ok(index::Index::open(index)?.chunk_names())
+}
+
+/// Every chunk a machine's log names: the contents of the files it wrote, whose chunks the store has to keep.
+pub fn log_chunks(log: &[u8]) -> Vec<Hash> {
+    log::read(log)
+        .0
+        .into_iter()
+        .flat_map(|record| match record {
+            log::Record::File { chunks, .. } => chunks.into_iter().filter_map(|(_, hash)| hash).collect(),
+            _ => Vec::new(),
+        })
+        .collect()
+}
+
 /// What's true of a file, whatever kernel looks at it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stat {

@@ -14,6 +14,57 @@ use crate::{Config, Entry, Image, Images, Platform, full_name, store, strings};
 const ACCEPT: &str = "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, \
                       application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json";
 
+/// What a pull is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// Asking the registry for the image's manifest and config.
+    Resolving,
+    /// Downloading a layer.
+    Downloading,
+    /// Unpacking a downloaded layer onto the image's disk.
+    Unpacking,
+    /// Writing the finished image's index.
+    Indexing,
+}
+
+/// Where a pull is: what it's doing, on which layer (from 1) of how many, and how many of all its layers' bytes are
+/// here (`done` of `total`, as the registry sends them, compressed). Reported as each piece arrives, so a progress bar
+/// can follow it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Progress {
+    pub stage: Stage,
+    pub layer: usize,
+    pub layers: usize,
+    pub done: u64,
+    pub total: u64,
+}
+
+impl Progress {
+    /// How far along, from 0 to 1, by bytes.
+    pub fn fraction(&self) -> f64 {
+        match self.stage {
+            Stage::Indexing => 1.0,
+            _ if self.total == 0 => 0.0,
+            _ => (self.done as f64 / self.total as f64).min(1.0),
+        }
+    }
+}
+
+impl std::fmt::Display for Progress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mib = |n: u64| n as f64 / f64::from(1 << 20);
+        match self.stage {
+            Stage::Resolving => f.write_str("finding the image"),
+            Stage::Downloading => write!(f, "layer {} of {}: {:.1} of {:.1} MiB", self.layer, self.layers, mib(self.done), mib(self.total)),
+            Stage::Unpacking => write!(f, "unpacking layer {} of {}", self.layer, self.layers),
+            Stage::Indexing => f.write_str("writing the index"),
+        }
+    }
+}
+
+/// How often a download reports itself: after this many bytes, at most.
+const REPORT_EVERY: u64 = 256 << 10;
+
 /// Where an image is: its registry's host, its repository there, and its tag or digest.
 #[derive(Debug, PartialEq, Eq)]
 struct Reference {
@@ -94,15 +145,41 @@ impl Client {
 
     /// A blob, all of it, checked against its digest.
     fn blob(&self, digest: &str) -> Result<Vec<u8>, String> {
-        let mut bytes = Vec::new();
-        self.get(&format!("{}/blobs/{digest}", self.base))?.into_reader().read_to_end(&mut bytes).map_err(|e| format!("downloading {digest}: {e}"))?;
-        check_digest(digest, &bytes)?;
+        self.blob_reporting(digest, 0, &mut |_| {})
+    }
+
+    /// A blob, read a piece at a time and hashed as it comes, telling `arrived` how many bytes are here so far (at
+    /// most every [`REPORT_EVERY`], and at the end); then checked against its digest. `expected` sizes the buffer.
+    fn blob_reporting(&self, digest: &str, expected: u64, arrived: &mut dyn FnMut(u64)) -> Result<Vec<u8>, String> {
+        let mut reader = self.get(&format!("{}/blobs/{digest}", self.base))?.into_reader();
+        let mut bytes = Vec::with_capacity(usize::try_from(expected).unwrap_or(0).min(1 << 30));
+        let mut hash = Sha256::new();
+        let mut piece = vec![0u8; 64 << 10];
+        let mut told = 0u64;
+        loop {
+            let n = reader.read(&mut piece).map_err(|e| format!("downloading {digest}: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            hash.update(&piece[..n]);
+            bytes.extend_from_slice(&piece[..n]);
+            if bytes.len() as u64 - told >= REPORT_EVERY {
+                told = bytes.len() as u64;
+                arrived(told);
+            }
+        }
+        arrived(bytes.len() as u64);
+        check_hash(digest, &store::hex(&hash.finalize()))?;
         Ok(bytes)
     }
 }
 
+#[cfg(test)]
 fn check_digest(digest: &str, bytes: &[u8]) -> Result<(), String> {
-    let actual = store::hex(&Sha256::digest(bytes));
+    check_hash(digest, &store::hex(&Sha256::digest(bytes)))
+}
+
+fn check_hash(digest: &str, actual: &str) -> Result<(), String> {
     match digest.strip_prefix("sha256:") {
         Some(expected) if expected == actual => Ok(()),
         Some(expected) => Err(format!("a download doesn't match its digest: expected {expected}, got {actual}")),
@@ -124,9 +201,10 @@ fn choose(index: &[Value], platform: &Platform) -> Option<String> {
         .map(String::from)
 }
 
-pub fn pull<M: Persist>(images: &Images, name: &str, platform: &Platform, mut meta: impl FnMut(Entry) -> M, root: M, progress: &mut dyn FnMut(&str)) -> Result<Image, String> {
+pub fn pull<M: Persist>(images: &Images, name: &str, platform: &Platform, mut meta: impl FnMut(Entry) -> M, root: M, progress: &mut dyn FnMut(&Progress)) -> Result<Image, String> {
     let full = full_name(name);
     let reference = reference(name);
+    progress(&Progress { stage: Stage::Resolving, layer: 0, layers: 0, done: 0, total: 0 });
     let client = Client::connect(&reference)?;
     let mut manifest = client.manifest(&reference.tag).map_err(|e| format!("{full}: {e}"))?;
     if let Some(list) = manifest.get("manifests").and_then(Value::as_array) {
@@ -151,13 +229,19 @@ pub fn pull<M: Persist>(images: &Images, name: &str, platform: &Platform, mut me
     };
 
     let layers = manifest.get("layers").and_then(Value::as_array).ok_or("the manifest has no layers")?;
+    let total: u64 = layers.iter().filter_map(|l| l.get("size").and_then(Value::as_u64)).sum();
+    let count = layers.len();
+    let mut before = 0u64;
     let mut disk = layers::Fs::building(root, platform.os == "windows", Box::new(images.store()?));
     for (i, layer) in layers.iter().enumerate() {
         let digest = layer.get("digest").and_then(Value::as_str).ok_or("a layer has no digest")?;
         let media = layer.get("mediaType").and_then(Value::as_str).unwrap_or("");
         let size = layer.get("size").and_then(Value::as_u64).unwrap_or(0);
-        progress(&format!("layer {} of {}: {:.1} MiB", i + 1, layers.len(), size as f64 / f64::from(1 << 20)));
-        let blob = client.blob(digest)?;
+        let at = |stage, done| Progress { stage, layer: i + 1, layers: count, done, total: total.max(done) };
+        progress(&at(Stage::Downloading, before));
+        let blob = client.blob_reporting(digest, size, &mut |here| progress(&at(Stage::Downloading, before + here)))?;
+        before += blob.len() as u64;
+        progress(&at(Stage::Unpacking, before));
         let tar = if media.contains("zstd") {
             return Err(format!("layer {digest} is compressed with zstd, which isn't supported yet"));
         } else if media.contains("gzip") || media.is_empty() {
@@ -169,7 +253,7 @@ pub fn pull<M: Persist>(images: &Images, name: &str, platform: &Platform, mut me
         };
         layers::tar::import(&mut disk, &tar, &mut meta).map_err(|e| format!("layer {digest}: {e}"))?;
     }
-    progress("writing the index");
+    progress(&Progress { stage: Stage::Indexing, layer: count, layers: count, done: before, total: total.max(before) });
     let index = disk.freeze().map_err(|e| format!("writing the index: {e}"))?;
     images.save(name, &index, platform, &image_config, &format!("pulled from {}", reference.host))
 }
@@ -177,6 +261,27 @@ pub fn pull<M: Persist>(images: &Images, name: &str, platform: &Platform, mut me
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reaches the network: `cargo test -p images -- --ignored progress`.
+    #[test]
+    #[ignore]
+    fn progress_climbs_to_the_whole_image() {
+        let home = std::env::temp_dir().join(format!("carbon-pull-progress-{}", std::process::id()));
+        let images = Images::open(Some(&home)).unwrap();
+        let mut seen: Vec<Progress> = Vec::new();
+        let image = images.pull("python:3.13-slim", &Platform::linux_here(), |_| (), (), &mut |p| seen.push(*p)).unwrap();
+        assert!(images.image(&image.name).is_some());
+        assert_eq!(seen.first().map(|p| p.stage), Some(Stage::Resolving));
+        assert_eq!(seen.last().map(|p| p.stage), Some(Stage::Indexing));
+        let downloads: Vec<&Progress> = seen.iter().filter(|p| p.stage == Stage::Downloading).collect();
+        assert!(downloads.len() > 10, "reports as it downloads, not only per layer: {}", downloads.len());
+        assert!(downloads.windows(2).all(|w| w[1].done >= w[0].done), "bytes only climb");
+        assert!(seen.iter().all(|p| p.done <= p.total), "never past the total");
+        let last = seen.last().unwrap();
+        assert_eq!((last.done, last.fraction()), (last.total, 1.0));
+        eprintln!("{} reports, {} layers, {} bytes", seen.len(), last.layers, last.total);
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     #[test]
     fn references() {

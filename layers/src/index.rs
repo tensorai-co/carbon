@@ -90,6 +90,17 @@ impl<'a> Index<'a> {
         u64::from(self.inodes)
     }
 
+    /// Every chunk the index names, holes left out: what a store has to keep for it.
+    pub fn chunk_names(&self) -> Vec<Hash> {
+        (0..self.chunks as usize)
+            .filter_map(|i| {
+                let at = self.chunks_at() + i * CHUNK;
+                let hash: Hash = self.data.get(at..at + CHUNK)?.try_into().ok()?;
+                (hash != NO_HASH).then_some(hash)
+            })
+            .collect()
+    }
+
     fn entries_at(&self) -> usize {
         HEADER + self.inodes as usize * INODE
     }

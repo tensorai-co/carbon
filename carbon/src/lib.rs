@@ -97,7 +97,8 @@ pub use machine::{Button, ExecSpec, Machine, MachineInfo, Port, Process, Process
 pub use rules::Rules;
 pub use spec::{Audio, Display, Exit, MachineSpec, MemorySize, Output, Running, parse_size};
 pub use stdio::{Chunks, Stdin, Stdio};
-pub use store::{Kernel, network_name, parse_network};
+pub use images::{PullProgress, PullStage};
+pub use store::{Kernel, PRUNE_GRACE, Pruned, network_name, parse_network};
 pub use wire::Watch;
 
 /// A hardware VM, the process sandbox, or the best there is.
@@ -241,11 +242,19 @@ impl Carbon {
         self.0.store.images.image(name)
     }
 
-    /// Pulls an image from its registry, for `platform` (Linux for this host's CPU by default).
+    /// Pulls an image from its registry, for `platform` (Linux for this host's CPU by default). Its progress goes to
+    /// [`Carbon::on_notice`] a step at a time; [`Carbon::pull_with`] has it as it happens.
     pub fn pull(&self, name: &str, platform: Option<Platform>) -> Result<Image> {
         let platform = platform.unwrap_or_else(Platform::linux_here);
         let notify = self.notify();
-        self.0.store.pull(name, &platform, &mut |what| notify(Notice::progress(what.to_string())))
+        self.0.store.pull(name, &platform, &mut store::stage_notices(&|what| notify(Notice::progress(what))))
+    }
+
+    /// Pulls an image as [`Carbon::pull`] does, telling `progress` where it is as each piece of each layer arrives:
+    /// what it's doing, which layer, and bytes here of the total, for a progress bar.
+    pub fn pull_with(&self, name: &str, platform: Option<Platform>, mut progress: impl FnMut(&PullProgress)) -> Result<Image> {
+        let platform = platform.unwrap_or_else(Platform::linux_here);
+        self.0.store.pull(name, &platform, &mut progress)
     }
 
     /// An image from a tar of a root file system, as `docker import` makes one: named `name`, for `platform` (else a
@@ -259,6 +268,13 @@ impl Carbon {
     /// Forgets an image.
     pub fn remove_image(&self, name: &str) -> Result<()> {
         self.0.store.images.remove(name).map_err(error::image)
+    }
+
+    /// Frees the disk space of what nothing uses any more: the chunks of removed machines' files and removed images,
+    /// which no image, machine or machine's base still names. Nothing is pruned while any machine runs, and chunks
+    /// written in the last 15 minutes are kept, for a pull still under way. How much went.
+    pub fn prune(&self) -> Result<Pruned> {
+        self.0.store.prune()
     }
 }
 

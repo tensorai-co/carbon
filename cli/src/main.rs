@@ -538,7 +538,23 @@ fn main() {
                 (None, _) => None,
                 _ => usage(),
             };
-            let image = carbon.pull(&name, platform).unwrap_or_else(|e| fail(e));
+            // On a terminal, one line that keeps up: what it's doing and how far, by bytes.
+            let live = std::io::IsTerminal::is_terminal(&std::io::stderr());
+            let image = carbon
+                .pull_with(&name, platform, |p| {
+                    if live {
+                        eprint!("\r\x1b[K{name}: {p} ({:.0}%)", p.fraction() * 100.0);
+                    }
+                })
+                .unwrap_or_else(|e| {
+                    if live {
+                        eprintln!();
+                    }
+                    fail(e)
+                });
+            if live {
+                eprint!("\r\x1b[K");
+            }
             println!("{} ({})", image.short_name(), image.platform);
         }
         "import" => {

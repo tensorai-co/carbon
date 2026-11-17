@@ -13,6 +13,7 @@
 //! from each tar entry by the caller.
 
 mod pull;
+pub use pull::{Progress as PullProgress, Stage as PullStage};
 pub mod store;
 mod tls;
 
@@ -262,7 +263,7 @@ impl Images {
 
     /// Pulls an image from its registry for `platform`, merges its layers into an index, and names it. Each tar
     /// entry's `M` is made by `meta`, the root's is `root`. Nothing is named until every blob has matched its digest.
-    pub fn pull<M: Persist>(&self, name: &str, platform: &Platform, meta: impl FnMut(Entry) -> M, root: M, progress: &mut dyn FnMut(&str)) -> Result<Image, String> {
+    pub fn pull<M: Persist>(&self, name: &str, platform: &Platform, meta: impl FnMut(Entry) -> M, root: M, progress: &mut dyn FnMut(&PullProgress)) -> Result<Image, String> {
         pull::pull(self, name, platform, meta, root, progress)
     }
 }

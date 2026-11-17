@@ -2,6 +2,7 @@
 //! can be started again with its files as it left them, stopped from another process, frozen into an image, copied
 //! into and out of, or removed. And what a new machine's record is made from: an image, or a program on the host.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -164,6 +165,34 @@ pub(crate) fn host_arch() -> &'static str {
 }
 
 /// The machines and images on this host.
+/// How long a chunk is kept after it's written, whatever names it: an image being pulled names its chunks only once
+/// it's all there.
+pub const PRUNE_GRACE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// What [`Store::prune`] deleted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Pruned {
+    pub chunks: u64,
+    pub bytes: u64,
+}
+
+type Hash = layers::Hash;
+
+/// A pull's progress as notices: one each time it starts something new (a layer, unpacking, the index), not one for
+/// every piece of a download.
+pub(crate) fn stage_notices<'a>(notice: &'a dyn Fn(String)) -> impl FnMut(&images::PullProgress) + 'a {
+    let mut last: Option<(images::PullStage, usize)> = None;
+    move |p| {
+        if last != Some((p.stage, p.layer)) {
+            last = Some((p.stage, p.layer));
+            notice(match p.stage {
+                images::PullStage::Downloading => format!("layer {} of {}: {:.1} MiB in all", p.layer, p.layers, p.total as f64 / f64::from(1 << 20)),
+                _ => p.to_string(),
+            });
+        }
+    }
+}
+
 pub(crate) struct Store {
     pub images: Images,
 }
@@ -220,10 +249,81 @@ impl Store {
         Ok(record)
     }
 
-    /// Removes a stopped machine: its record and its writable layer. Its image stays.
+    /// Removes a stopped machine: its record and its writable layer. Its image stays. The chunks of what it wrote stay
+    /// in the store until [`Store::prune`] finds nothing names them.
     pub fn remove(&self, name: &str) -> Result<()> {
         self.stopped(name)?;
         fs::remove_dir_all(self.dir(name)).map_err(|e| Error::io(format!("removing {name}: {e}")))
+    }
+
+    /// Deletes every chunk in the store that nothing names: no image's index, no machine's log, and no index a
+    /// machine's disk is over. A running machine writes chunks before its log names them, so nothing is pruned while
+    /// any machine runs; and a chunk written in the last [`PRUNE_GRACE`] is kept, for an image still being pulled or
+    /// imported, by this process or another. How many chunks went, and their bytes.
+    pub fn prune(&self) -> Result<Pruned> {
+        let records = self.list();
+        if let Some(running) = records.iter().find(|r| r.running()) {
+            return Err(Error::running(&running.name));
+        }
+        let mut store = self.images.store().map_err(error::image)?;
+        let mut live: HashSet<Hash> = HashSet::new();
+        let keep_index = |hash: Hash, store: &mut images::store::DiskStore, live: &mut HashSet<Hash>| -> Result<()> {
+            if !live.insert(hash) {
+                return Ok(());
+            }
+            // An index that can't be read means the store isn't what the records say: prune nothing rather than guess.
+            let index = layers::Store::get(store, &hash).map_err(|_| Error::io(format!("an index named {} is missing or corrupt; nothing pruned", images::store::hex(&hash))))?;
+            live.extend(layers::index_chunks(&index).map_err(|_| Error::io(format!("the index {} can't be read; nothing pruned", images::store::hex(&hash))))?);
+            Ok(())
+        };
+        for image in self.images.images() {
+            let hash = images::store::parse_hash(&image.index).ok_or_else(|| Error::io(format!("{}'s record is corrupt; nothing pruned", image.name)))?;
+            keep_index(hash, &mut store, &mut live)?;
+        }
+        for record in &records {
+            if let Some(index) = record.index.as_deref() {
+                let hash = images::store::parse_hash(index).ok_or_else(|| Error::io(format!("{}'s record is corrupt; nothing pruned", record.name)))?;
+                keep_index(hash, &mut store, &mut live)?;
+            }
+            match fs::read(self.dir(&record.name).join("log")) {
+                Ok(log) => live.extend(layers::log_chunks(&log)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(Error::io(format!("{}'s disk: {e}; nothing pruned", record.name))),
+            }
+        }
+        // Machines whose records can't be read still have logs: their chunks are kept too.
+        if let Ok(dirs) = fs::read_dir(self.images.home().join("machines")) {
+            for dir in dirs.flatten() {
+                if let Ok(log) = fs::read(dir.path().join("log")) {
+                    live.extend(layers::log_chunks(&log));
+                }
+            }
+        }
+
+        let chunks = self.images.home().join("chunks");
+        let young = std::time::SystemTime::now().checked_sub(PRUNE_GRACE).unwrap_or(std::time::UNIX_EPOCH);
+        let mut pruned = Pruned::default();
+        for shard in fs::read_dir(&chunks).map_err(|e| Error::io(format!("{}: {e}", chunks.display())))?.flatten() {
+            let Ok(entries) = fs::read_dir(shard.path()) else { continue };
+            let prefix = shard.file_name().to_string_lossy().into_owned();
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                // A name starting with `.` is a chunk still being written.
+                let Some(hash) = (!name.starts_with('.')).then(|| images::store::parse_hash(&format!("{prefix}{name}"))).flatten() else { continue };
+                if live.contains(&hash) {
+                    continue;
+                }
+                let Ok(meta) = entry.metadata() else { continue };
+                if meta.modified().map_or(true, |m| m > young) {
+                    continue;
+                }
+                if fs::remove_file(entry.path()).is_ok() {
+                    pruned.chunks += 1;
+                    pruned.bytes += meta.len();
+                }
+            }
+        }
+        Ok(pruned)
     }
 
     /// An image from a tar of a root file system, as `docker import` makes one: named `name`, for `platform` (else a
@@ -276,7 +376,7 @@ impl Store {
     }
 
     /// Pulls an image for `platform` (Linux for this host's CPU, if not said).
-    pub fn pull(&self, name: &str, platform: &Platform, progress: &mut dyn FnMut(&str)) -> Result<Image> {
+    pub fn pull(&self, name: &str, platform: &Platform, progress: &mut dyn FnMut(&images::PullProgress)) -> Result<Image> {
         if platform.os == "windows" {
             self.images.pull(name, platform, |_| atlas::Meta::default(), atlas::Meta { attributes: 0x10 }, progress)
         } else {
@@ -391,7 +491,7 @@ impl Store {
                     None => {
                         let platform = platform.cloned().unwrap_or_else(Platform::linux_here);
                         notice(Notice::progress(format!("pulling {} for {platform}", images::full_name(wanted))));
-                        self.pull(wanted, &platform, &mut |what| notice(Notice::progress(what.to_string())))?
+                        self.pull(wanted, &platform, &mut stage_notices(&|what| notice(Notice::progress(what))))?
                     }
                 };
                 let kernel = if image.platform.os == "windows" { Kernel::Atlas } else { Kernel::Lambda };
@@ -558,6 +658,59 @@ mod tests {
         assert_eq!(copy_tree(&disk, "/app", &out).unwrap(), 2);
         assert_eq!(fs::read(out.join("app/sub/b.bin")).unwrap().len(), 5 << 20);
         let _ = fs::remove_dir_all(&host);
+    }
+
+    /// Chunks a removed machine wrote, and a removed image's, go; a kept image's and a kept machine's stay, readable.
+    #[test]
+    fn prune_frees_only_what_nothing_names() {
+        let home = std::env::temp_dir().join(format!("carbon-prune-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        let store = Store::open(Some(&home)).unwrap();
+        let (dir, file) = (lambda::Meta::dir(0o755), lambda::Meta::file(0o644));
+        // Each its own contents, bigger than an index keeps inline, so each is chunks in the store.
+        let contents = |byte: u8| vec![byte; 300 << 10];
+        let image = |name: &str, byte: u8| {
+            let mut disk = layers::Fs::building(dir, false, Box::new(store.images.store().unwrap()));
+            disk.put("/data.bin", layers::New::File, &contents(byte), file, dir).unwrap();
+            let index = disk.freeze().unwrap();
+            store.images.save(name, &index, &Platform::linux_here(), &Config::default(), "test").unwrap()
+        };
+        image("kept:1", 1);
+        image("gone:1", 2);
+        let machine = |name: &str, byte: u8| {
+            let (record, _) = store.create(Some(name), None, &Source::Image("kept:1".into()), &|_| {}).unwrap();
+            store.save_record(&record).unwrap();
+            let mut disk = store.disk::<lambda::Meta>(&record, dir, false).unwrap();
+            disk.put("/written.bin", layers::New::File, &contents(byte), file, dir).unwrap();
+            disk.sync().unwrap();
+            record
+        };
+        let kept = machine("keeps", 3);
+        machine("goes", 4);
+        store.remove("goes").unwrap();
+        store.images.remove("gone:1").unwrap();
+
+        // Nothing written in the last quarter hour goes: all of it is that young now.
+        assert_eq!(store.prune().unwrap(), Pruned::default());
+        // An hour later, by the files' clocks.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for shard in fs::read_dir(home.join("chunks")).unwrap().flatten() {
+            for chunk in fs::read_dir(shard.path()).unwrap().flatten() {
+                fs::File::options().write(true).open(chunk.path()).unwrap().set_modified(old).unwrap();
+            }
+        }
+        let pruned = store.prune().unwrap();
+        assert!(pruned.chunks >= 2 && pruned.bytes >= 2 * (300 << 10) / 64, "{pruned:?}");
+        let has = |bytes: &[u8]| images::store::DiskStore::chunks(home.join("chunks")).unwrap().has(&images::store::sha256(bytes));
+        let chunk = |byte: u8| vec![byte; layers::CHUNK as usize];
+        assert!(has(&chunk(1)) && has(&chunk(3)), "the kept image's and the kept machine's chunks stay");
+        assert!(!has(&chunk(2)) && !has(&chunk(4)), "the removed image's and the removed machine's chunks go");
+        let disk = store.disk::<lambda::Meta>(&kept, dir, false).unwrap();
+        assert_eq!(disk.contents(disk.resolve(ROOT, "/written.bin", false).unwrap()).unwrap(), contents(3));
+        assert_eq!(disk.contents(disk.resolve(ROOT, "/data.bin", false).unwrap()).unwrap(), contents(1));
+        // Pruning again finds nothing more.
+        assert_eq!(store.prune().unwrap(), Pruned::default());
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
