@@ -140,6 +140,19 @@ impl Signals {
         }
     }
 
+    /// Which signals are ignored and which have handlers, as bit sets: `/proc/<pid>/stat`'s and `status`'s.
+    pub fn ignored_and_caught(&self) -> (u64, u64) {
+        let (mut ignored, mut caught) = (0, 0);
+        for (i, action) in self.actions.iter().enumerate() {
+            match action.handler {
+                SIG_DFL => {}
+                SIG_IGN => ignored |= 1 << i,
+                _ => caught |= 1 << i,
+            }
+        }
+        (ignored, caught)
+    }
+
     /// After `execve`, handlers are gone (the code they pointed at is), but ignored signals stay ignored.
     pub fn reset_on_exec(&mut self) {
         for action in &mut self.actions {
@@ -503,6 +516,9 @@ impl Task {
                 state.signals.actions[(signal - 1) as usize] = Action::default();
                 self.signals.mask.fetch_and(!bit(signal), Ordering::AcqRel);
             }
+        }
+        if self.k.options.trace {
+            self.k.host.write(host::Stream::Err, format!("[{}] signal {signal}: {what}\n", self.tid).as_bytes());
         }
         self.signals.pending.fetch_or(bit(signal), Ordering::AcqRel);
         self.fault_info = Some((addr, what.to_string()));

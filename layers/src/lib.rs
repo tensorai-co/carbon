@@ -27,6 +27,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
+mod external;
+pub use external::{ExtStat, External, Mapping};
 pub use index::{INLINE_MAX, MAGIC};
 use log::Record;
 pub use store::{CHUNK, Hash, MemoryStore, Store};
@@ -89,8 +91,14 @@ pub enum Error {
     Loop,
     /// A name that can't be one: empty, `.`, `..`, or with a `/`.
     BadName,
-    /// A link or a move between a volatile tree and the rest, or another volatile tree.
+    /// A link or a move between a volatile or external tree and the rest, or another such tree.
     CrossFs,
+    /// A change to a tree attached read-only.
+    ReadOnly,
+    /// An external tree's host refused it.
+    Denied,
+    /// Something an external tree can't keep (extended attributes).
+    Unsupported,
     /// The store failed, or what's in it (an index, the log, a chunk) is corrupt.
     Io,
 }
@@ -106,6 +114,9 @@ impl core::fmt::Display for Error {
             Error::Loop => "too many symbolic links",
             Error::BadName => "not a name a file can have",
             Error::CrossFs => "not in the same tree",
+            Error::ReadOnly => "attached read-only",
+            Error::Denied => "the host refused it",
+            Error::Unsupported => "not something this tree can keep",
             Error::Io => "the disk's store failed, or what's in it is corrupt",
         })
     }
@@ -241,6 +252,8 @@ pub struct Fs<M> {
     held: BTreeMap<Ino, u32>,
     /// Who's told of changes, if anyone.
     observer: Option<Observer<M>>,
+    /// Folders attached from elsewhere, and what's been found in them (`external`).
+    ext: RefCell<external::Ext<M>>,
 }
 
 impl<M> core::fmt::Debug for Fs<M> {
@@ -257,7 +270,7 @@ impl<M: Clone> Fs<M> {
             ROOT,
             Node { meta: root, modified: 0, generation: 0, links: 2, data: Data::Dir { entries: BTreeMap::new(), parent: ROOT, fold: fold_case }, volatile: None, xattrs: BTreeMap::new() },
         );
-        Fs { nodes, next: ROOT + 1, store: None, cache: RefCell::new(Vec::new()), save: None, dirty: BTreeMap::new(), dirty_bytes: 0, held: BTreeMap::new(), observer: None }
+        Fs { nodes, next: ROOT + 1, store: None, cache: RefCell::new(Vec::new()), save: None, dirty: BTreeMap::new(), dirty_bytes: 0, held: BTreeMap::new(), observer: None, ext: RefCell::new(external::Ext::default()) }
     }
 
     /// Tells `observer` of every change from now on (none: no one).
@@ -279,6 +292,69 @@ impl<M: Clone> Fs<M> {
     /// The volatile tree `ino` is in, if it's in one.
     pub fn volatile(&self, ino: Ino) -> Option<Ino> {
         self.nodes.get(&ino).and_then(|n| n.volatile)
+    }
+
+    /// Attaches a folder from elsewhere as an external tree, and gives its root: a directory in no other, which a
+    /// kernel mounts where it wants it. With `read_only`, nothing in it can be changed (`Error::ReadOnly`).
+    pub fn attach(&mut self, backend: Box<dyn External>, map: Mapping<M>, read_only: bool) -> Result<Ino> {
+        if backend.stat("")?.kind != Kind::Dir {
+            return Err(Error::NotDir);
+        }
+        let mut ext = self.ext.borrow_mut();
+        let root = ext.next;
+        ext.next += 1;
+        ext.files.insert(root, (root, String::new()));
+        ext.trees.insert(root, external::Tree { backend, map, read_only });
+        Ok(root)
+    }
+
+    /// The external tree `ino` is in, by its root, if it's in one.
+    pub fn external(&self, ino: Ino) -> Option<Ino> {
+        self.ext_file(ino).map(|(root, _)| root)
+    }
+
+    /// Whether the external tree with this root was attached read-only.
+    pub fn external_read_only(&self, root: Ino) -> bool {
+        self.ext.borrow().trees.get(&root).is_some_and(|t| t.read_only)
+    }
+
+    fn ext_file(&self, ino: Ino) -> Option<(Ino, String)> {
+        if ino < external::FIRST {
+            return None;
+        }
+        self.ext.borrow().files.get(&ino).cloned()
+    }
+
+    fn with_tree<R>(&self, root: Ino, f: impl FnOnce(&external::Tree<M>) -> Result<R>) -> Result<R> {
+        let ext = self.ext.borrow();
+        f(ext.trees.get(&root).ok_or(Error::NotFound)?)
+    }
+
+    fn ext_stat(&self, root: Ino, path: &str) -> Result<ExtStat> {
+        self.with_tree(root, |t| t.backend.stat(path))
+    }
+
+    fn ext_writable(&self, root: Ino) -> Result<()> {
+        if self.external_read_only(root) { Err(Error::ReadOnly) } else { Ok(()) }
+    }
+
+    fn ext_ino(&self, root: Ino, path: &str) -> Ino {
+        self.ext.borrow_mut().ino(root, path)
+    }
+
+    /// The tree a file is in, if not the disk's own: a volatile tree's root, or an external one's.
+    fn tree_of(&self, ino: Ino) -> Option<Ino> {
+        self.external(ino).or_else(|| self.volatile(ino))
+    }
+
+    fn ext_meta(&self, ino: Ino, root: Ino, path: &str) -> Result<M> {
+        let st = self.ext_stat(root, path)?;
+        let ext = self.ext.borrow();
+        let make = ext.trees.get(&root).ok_or(Error::NotFound)?.map.meta;
+        Ok(match ext.set.get(&ino) {
+            Some(m) => m.clone(),
+            None => make(&st),
+        })
     }
 
     /// Whether a change to `ino` is logged: not in a volatile tree.
@@ -319,6 +395,9 @@ impl<M: Clone> Fs<M> {
 
     /// How many bytes the files under `dir` hold (as `df` asks a tmpfs).
     pub fn tree_size(&self, dir: Ino) -> u64 {
+        if self.ext_file(dir).is_some() {
+            return 0;
+        }
         let mut stack = vec![dir];
         let mut total = 0;
         while let Some(ino) = stack.pop() {
@@ -380,6 +459,10 @@ impl<M: Clone> Fs<M> {
     }
 
     pub fn stat(&self, ino: Ino) -> Result<Stat> {
+        if let Some((root, path)) = self.ext_file(ino) {
+            let s = self.ext_stat(root, &path)?;
+            return Ok(Stat { ino, kind: s.kind, size: s.size, links: s.links, modified: s.modified, generation: s.modified });
+        }
         let node = self.node(ino)?;
         let (kind, size) = match &node.data {
             Data::File(file) => (Kind::File, file.size),
@@ -389,11 +472,27 @@ impl<M: Clone> Fs<M> {
         Ok(Stat { ino, kind, size, links: node.links, modified: node.modified, generation: node.generation })
     }
 
-    pub fn meta(&self, ino: Ino) -> Result<&M> {
-        Ok(&self.node(ino)?.meta)
+    /// A file's `M`.
+    pub fn meta(&self, ino: Ino) -> Result<M> {
+        if let Some((root, path)) = self.ext_file(ino) {
+            return self.ext_meta(ino, root, &path);
+        }
+        Ok(self.node(ino)?.meta.clone())
     }
 
     pub fn set_meta(&mut self, ino: Ino, meta: M) -> Result<()> {
+        if let Some((root, path)) = self.ext_file(ino) {
+            self.ext_writable(root)?;
+            let kept = self.with_tree(root, |t| {
+                t.backend.set_mode(&path, (t.map.mode)(&meta))?;
+                t.backend.keep_meta(&path, (t.map.save)(&meta))
+            })?;
+            if !kept {
+                self.ext.borrow_mut().set.insert(ino, meta);
+            }
+            self.tell(Change::Changed { ino });
+            return Ok(());
+        }
         self.node_mut(ino)?.meta = meta.clone();
         if self.logged(ino) {
             self.record(|save| Record::Meta { ino, meta: save(&meta) })?;
@@ -404,6 +503,21 @@ impl<M: Clone> Fs<M> {
 
     /// The entry `name` in `dir`, without following it if it's a link.
     pub fn lookup(&self, dir: Ino, name: &str) -> Result<Ino> {
+        if let Some((root, path)) = self.ext_file(dir) {
+            if self.ext_stat(root, &path)?.kind != Kind::Dir {
+                return Err(Error::NotDir);
+            }
+            return match name {
+                "" | "." => Ok(dir),
+                ".." if path.is_empty() => Ok(dir),
+                ".." => Ok(self.ext_ino(root, external::parent_of(&path))),
+                _ => {
+                    let child = external::join(&path, name);
+                    self.ext_stat(root, &child)?;
+                    Ok(self.ext_ino(root, &child))
+                }
+            };
+        }
         match &self.node(dir)?.data {
             Data::Dir { entries, parent, fold } => match name {
                 "" | "." => Ok(dir),
@@ -446,14 +560,13 @@ impl<M: Clone> Fs<M> {
         for (index, part) in parts.iter().enumerate() {
             let last = index + 1 == parts.len();
             let next = self.lookup(at, part)?;
-            if let Data::Symlink(target) = &self.node(next)?.data
-                && (!last || follow)
-            {
+            if (!last || follow) && self.kind(next) == Kind::Symlink {
+                let target = self.read_link(next)?;
                 *links += 1;
                 if *links > MOST_LINKS {
                     return Err(Error::Loop);
                 }
-                at = self.walk(at, &target.clone(), true, links)?;
+                at = self.walk(at, &target, true, links)?;
             } else {
                 at = next;
             }
@@ -471,6 +584,9 @@ impl<M: Clone> Fs<M> {
 
     /// Reads from a file at `offset`, giving how much was read: 0 at its end.
     pub fn read(&self, ino: Ino, offset: u64, buffer: &mut [u8]) -> Result<usize> {
+        if let Some((root, path)) = self.ext_file(ino) {
+            return self.with_tree(root, |t| t.backend.read(&path, offset, buffer));
+        }
         let file = self.file(ino)?;
         let count = buffer.len().min(file.size.saturating_sub(offset) as usize);
         let mut done = 0;
@@ -499,6 +615,20 @@ impl<M: Clone> Fs<M> {
 
     /// The whole of a file.
     pub fn contents(&self, ino: Ino) -> Result<Vec<u8>> {
+        if self.ext_file(ino).is_some() {
+            let size = self.stat(ino)?.size as usize;
+            let mut bytes = vec![0; size];
+            let mut done = 0;
+            while done < size {
+                let n = self.read(ino, done as u64, &mut bytes[done..])?;
+                if n == 0 {
+                    break;
+                }
+                done += n;
+            }
+            bytes.truncate(done);
+            return Ok(bytes);
+        }
         let mut bytes = vec![0; self.file(ino)?.size as usize];
         self.read(ino, 0, &mut bytes)?;
         Ok(bytes)
@@ -515,6 +645,12 @@ impl<M: Clone> Fs<M> {
 
     /// Writes to a file at `offset`, growing it as needed. `now` is the time, in nanoseconds since 1970.
     pub fn write(&mut self, ino: Ino, offset: u64, data: &[u8], now: u64) -> Result<usize> {
+        if let Some((root, path)) = self.ext_file(ino) {
+            self.ext_writable(root)?;
+            let n = self.with_tree(root, |t| t.backend.write(&path, offset, data))?;
+            self.tell(Change::Written { ino });
+            return Ok(n);
+        }
         let size_before = self.file(ino)?.size;
         let end = offset.checked_add(data.len() as u64).ok_or(Error::Io)?;
         let mut done = 0;
@@ -552,6 +688,12 @@ impl<M: Clone> Fs<M> {
     }
 
     pub fn truncate(&mut self, ino: Ino, size: u64, now: u64) -> Result<()> {
+        if let Some((root, path)) = self.ext_file(ino) {
+            self.ext_writable(root)?;
+            self.with_tree(root, |t| t.backend.truncate(&path, size))?;
+            self.tell(Change::Written { ino });
+            return Ok(());
+        }
         let size_before = self.file(ino)?.size;
         // The last chunk kept, cut to the new size, so growing again later shows zeroes, not what was cut.
         let last = if size < size_before && !size.is_multiple_of(CHUNK) {
@@ -580,6 +722,18 @@ impl<M: Clone> Fs<M> {
     /// Zeroes `len` bytes of a file from `offset`, keeping its size: what's past its end is left alone. A chunk zeroed
     /// whole keeps no bytes (an empty chunk reads as zeroes), so punching a hole in a big file frees what it held.
     pub fn zero(&mut self, ino: Ino, offset: u64, len: u64, now: u64) -> Result<()> {
+        if self.ext_file(ino).is_some() {
+            let size = self.stat(ino)?.size;
+            let end = offset.saturating_add(len).min(size);
+            let zeroes = vec![0u8; end.saturating_sub(offset).min(CHUNK) as usize];
+            let mut at = offset;
+            while at < end {
+                let n = ((end - at) as usize).min(zeroes.len());
+                self.write(ino, at, &zeroes[..n], now)?;
+                at += n as u64;
+            }
+            return Ok(());
+        }
         let size = self.file(ino)?.size;
         let end = offset.saturating_add(len).min(size);
         if offset >= end {
@@ -616,16 +770,25 @@ impl<M: Clone> Fs<M> {
 
     /// An extended attribute's value, or `None` if the file has no such attribute.
     pub fn get_xattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
+        if self.ext_file(ino).is_some() {
+            return Ok(None);
+        }
         Ok(self.node(ino)?.xattrs.get(name).cloned())
     }
 
     /// Every extended attribute's name, in order.
     pub fn list_xattrs(&self, ino: Ino) -> Result<Vec<String>> {
+        if self.ext_file(ino).is_some() {
+            return Ok(Vec::new());
+        }
         Ok(self.node(ino)?.xattrs.keys().cloned().collect())
     }
 
     /// Sets an extended attribute.
     pub fn set_xattr(&mut self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
+        if self.ext_file(ino).is_some() {
+            return Err(Error::Unsupported);
+        }
         self.node_mut(ino)?.xattrs.insert(name.to_string(), value.to_vec());
         if self.logged(ino) {
             self.record(|_| Record::Xattr { ino, name: name.to_string(), value: Some(value.to_vec()) })?;
@@ -635,6 +798,9 @@ impl<M: Clone> Fs<M> {
 
     /// Removes an extended attribute; whether it was there.
     pub fn remove_xattr(&mut self, ino: Ino, name: &str) -> Result<bool> {
+        if self.ext_file(ino).is_some() {
+            return Ok(false);
+        }
         let had = self.node_mut(ino)?.xattrs.remove(name).is_some();
         if had && self.logged(ino) {
             self.record(|_| Record::Xattr { ino, name: name.to_string(), value: None })?;
@@ -643,15 +809,41 @@ impl<M: Clone> Fs<M> {
     }
 
     /// A link's target.
-    pub fn read_link(&self, ino: Ino) -> Result<&str> {
+    /// What a symbolic link points to.
+    pub fn read_link(&self, ino: Ino) -> Result<String> {
+        if let Some((root, path)) = self.ext_file(ino) {
+            return self.with_tree(root, |t| t.backend.read_link(&path));
+        }
         match &self.node(ino)?.data {
-            Data::Symlink(target) => Ok(target),
+            Data::Symlink(target) => Ok(target.clone()),
             _ => Err(Error::NotFound),
         }
     }
 
     /// Makes `name` in `dir`.
     pub fn create(&mut self, dir: Ino, name: &str, new: New, meta: M, now: u64) -> Result<Ino> {
+        if let Some((root, path)) = self.ext_file(dir) {
+            self.ext_writable(root)?;
+            if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+                return Err(Error::BadName);
+            }
+            let child = external::join(&path, name);
+            let kept = self.with_tree(root, |t| {
+                t.backend.make(&child, &new, (t.map.mode)(&meta))?;
+                t.backend.keep_meta(&child, (t.map.save)(&meta))
+            })?;
+            let ino = self.ext_ino(root, &child);
+            if !kept {
+                self.ext.borrow_mut().set.insert(ino, meta);
+            }
+            let kind = match new {
+                New::File => Kind::File,
+                New::Dir => Kind::Dir,
+                New::Symlink(_) => Kind::Symlink,
+            };
+            self.tell(Change::Created { dir, name, ino, kind });
+            return Ok(ino);
+        }
         let ino = self.next;
         let (kind, target) = match &new {
             New::File => (0, String::new()),
@@ -706,8 +898,16 @@ impl<M: Clone> Fs<M> {
 
     /// Adds another name for an existing file (not a directory): a hard link.
     pub fn link(&mut self, dir: Ino, name: &str, ino: Ino, now: u64) -> Result<()> {
-        if self.volatile(dir) != self.volatile(ino) {
+        if self.tree_of(dir) != self.tree_of(ino) {
             return Err(Error::CrossFs);
+        }
+        if let (Some((root, dir_path)), Some((_, existing))) = (self.ext_file(dir), self.ext_file(ino)) {
+            self.ext_writable(root)?;
+            let path = external::join(&dir_path, name);
+            self.with_tree(root, |t| t.backend.link(&existing, &path))?;
+            self.ext.borrow_mut().by_path.insert((root, path), ino);
+            self.tell(Change::Linked { dir, name, ino });
+            return Ok(());
         }
         self.link_as(dir, name, ino, now)?;
         if self.logged(dir) {
@@ -738,6 +938,12 @@ impl<M: Clone> Fs<M> {
 
     /// Sets a file's modification time, in nanoseconds since 1970.
     pub fn set_modified(&mut self, ino: Ino, now: u64) -> Result<()> {
+        if let Some((root, path)) = self.ext_file(ino) {
+            self.ext_writable(root)?;
+            self.with_tree(root, |t| t.backend.set_modified(&path, now))?;
+            self.tell(Change::Changed { ino });
+            return Ok(());
+        }
         self.node_mut(ino)?.modified = now;
         if self.logged(ino) {
             self.record(|_| Record::Modified { ino, now })?;
@@ -748,6 +954,19 @@ impl<M: Clone> Fs<M> {
 
     /// Takes `name` out of `dir`. A directory must be empty. The file goes when nothing links to it.
     pub fn remove(&mut self, dir: Ino, name: &str, now: u64) -> Result<()> {
+        if let Some((root, dir_path)) = self.ext_file(dir) {
+            self.ext_writable(root)?;
+            if name == "." || name == ".." {
+                return Err(Error::BadName);
+            }
+            let ino = self.lookup(dir, name)?;
+            let kind = self.kind(ino);
+            let path = external::join(&dir_path, name);
+            self.with_tree(root, |t| t.backend.remove(&path, kind == Kind::Dir))?;
+            self.ext.borrow_mut().forget(root, &path);
+            self.tell(Change::Removed { dir, name, ino, kind, gone: true });
+            return Ok(());
+        }
         let ino = self.lookup(dir, name)?;
         let kind = self.kind(ino);
         self.remove_as(dir, name, now)?;
@@ -816,8 +1035,23 @@ impl<M: Clone> Fs<M> {
         let ino = self.lookup(from_dir, from)?;
         let kind = self.kind(ino);
         let replaced = self.lookup(to_dir, to).ok().filter(|r| *r != ino);
-        if self.volatile(from_dir) != self.volatile(to_dir) {
+        if self.tree_of(from_dir) != self.tree_of(to_dir) {
             return Err(Error::CrossFs);
+        }
+        if let (Some((root, from_path)), Some((_, to_path))) = (self.ext_file(from_dir), self.ext_file(to_dir)) {
+            self.ext_writable(root)?;
+            let (from_p, to_p) = (external::join(&from_path, from), external::join(&to_path, to));
+            if from_p == to_p {
+                return Ok(());
+            }
+            self.with_tree(root, |t| t.backend.rename(&from_p, &to_p))?;
+            let mut ext = self.ext.borrow_mut();
+            ext.forget(root, &to_p);
+            ext.moved(root, &from_p, &to_p);
+            drop(ext);
+            let replaced = replaced.map(|r| (r, true));
+            self.tell(Change::Moved { from_dir, from, to_dir, to, ino, kind, replaced });
+            return Ok(());
         }
         if self.rename_as(from_dir, from, to_dir, to, now)? {
             if self.logged(from_dir) {
@@ -856,6 +1090,16 @@ impl<M: Clone> Fs<M> {
 
     /// A directory's entries, as named, in order.
     pub fn entries(&self, dir: Ino) -> Result<Vec<(String, Ino, Kind)>> {
+        if let Some((root, path)) = self.ext_file(dir) {
+            let listed = self.with_tree(root, |t| t.backend.list(&path))?;
+            return Ok(listed
+                .into_iter()
+                .map(|(name, kind)| {
+                    let ino = self.ext_ino(root, &external::join(&path, &name));
+                    (name, ino, kind)
+                })
+                .collect());
+        }
         match &self.node(dir)?.data {
             Data::Dir { entries, .. } => Ok(entries
                 .values()
@@ -1369,7 +1613,7 @@ mod tests {
         assert_eq!(read_all(&fs, "/etc/hard"), big);
         assert_eq!(read_all(&fs, "/etc/small"), b"hello");
         let file = fs.resolve(ROOT, "/etc/big", true).unwrap();
-        assert_eq!(*fs.meta(file).unwrap(), 0o640);
+        assert_eq!(fs.meta(file).unwrap(), 0o640);
         assert_eq!(fs.stat(file).unwrap().links, 2);
         assert_eq!(fs.stat(file).unwrap().modified, 3);
         assert_eq!(fs.resolve(ROOT, "/gone", true), Err(Error::NotFound));

@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use images::{Config, Image, Images, Platform};
-use layers::{Fs, Persist, ROOT};
+use layers::{Fs, Persist};
 use serde_json::{Value, json};
 
 use crate::error::{self, Error, ErrorKind, Result};
@@ -83,6 +83,10 @@ pub(crate) struct Record {
     pub publish: Vec<String>,
     /// The host addresses its ports are published on while it runs (`0.0.0.0:2222->22/tcp`).
     pub ports: Vec<String>,
+    /// How its first process ended, the last time it ran.
+    pub exit: Option<i32>,
+    /// Its mounts, kept for when it runs again.
+    pub mounts: Vec<crate::Mount>,
 }
 
 impl Record {
@@ -94,13 +98,15 @@ impl Record {
             "index": self.index,
             "program": self.program,
             "platform": self.platform.to_string(),
-            "config": { "env": self.config.env, "entrypoint": self.config.entrypoint, "cmd": self.config.cmd, "workdir": self.config.workdir, "user": self.config.user },
+            "config": self.config.to_json(),
             "created": self.created,
             "pid": self.pid,
             "backend": self.backend,
             "network": network_name(self.network),
             "publish": self.publish,
             "ports": self.ports,
+            "exit": self.exit,
+            "mounts": crate::mounts::mounts_json(&self.mounts),
         })
     }
 
@@ -121,19 +127,15 @@ impl Record {
             index: s("index"),
             program: s("program"),
             platform: Platform::parse(&s("platform")?)?,
-            config: Config {
-                env: list(config, "env"),
-                entrypoint: list(config, "entrypoint"),
-                cmd: list(config, "cmd"),
-                workdir: config.and_then(|c| c.get("workdir")).and_then(Value::as_str).unwrap_or_default().into(),
-                user: config.and_then(|c| c.get("user")).and_then(Value::as_str).unwrap_or_default().into(),
-            },
+            config: config.map(Config::from_json).unwrap_or_default(),
             created: v.get("created").and_then(Value::as_u64).unwrap_or(0),
             pid: v.get("pid").and_then(Value::as_u64).map(|p| p as u32),
             backend: s("backend").unwrap_or_default(),
             network: s("network").as_deref().and_then(parse_network).unwrap_or_default(),
             publish: list(Some(v), "publish"),
             ports: list(Some(v), "ports"),
+            exit: v.get("exit").and_then(Value::as_i64).map(|c| c as i32),
+            mounts: crate::mounts::mounts_from_json(v.get("mounts")),
         })
     }
 
@@ -155,6 +157,23 @@ pub(crate) fn alive(pid: u32) -> bool {
     pid == std::process::id()
 }
 
+/// Seconds since 1970 as RFC 3339, as OCI writes a time: `2026-11-17T20:22:00Z`.
+pub(crate) fn rfc3339(secs: u64) -> String {
+    let days = secs / 86_400;
+    let (h, m, s) = (secs % 86_400 / 3600, secs % 3600 / 60, secs % 60);
+    // Civil from days (Howard Hinnant's algorithm).
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(mo <= 2);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
 pub(crate) fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
@@ -174,7 +193,12 @@ pub const PRUNE_GRACE: std::time::Duration = std::time::Duration::from_secs(15 *
 pub struct Pruned {
     pub chunks: u64,
     pub bytes: u64,
+    /// Unnamed images (a build's steps) not used for [`BUILD_CACHE_KEEP`], forgotten.
+    pub images: u64,
 }
+
+/// How long an unnamed image (a build's step, which its cache finds again) is kept after it was last used.
+pub const BUILD_CACHE_KEEP: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
 
 type Hash = layers::Hash;
 
@@ -267,6 +291,7 @@ impl Store {
         }
         let mut store = self.images.store().map_err(error::image)?;
         let mut live: HashSet<Hash> = HashSet::new();
+        let mut pruned_images = 0;
         let keep_index = |hash: Hash, store: &mut images::store::DiskStore, live: &mut HashSet<Hash>| -> Result<()> {
             if !live.insert(hash) {
                 return Ok(());
@@ -276,7 +301,17 @@ impl Store {
             live.extend(layers::index_chunks(&index).map_err(|_| Error::io(format!("the index {} can't be read; nothing pruned", images::store::hex(&hash))))?);
             Ok(())
         };
-        for image in self.images.images() {
+        // Unnamed images (a build's steps, its cache) are kept while they're being used, and forgotten after a while.
+        let stale = std::time::SystemTime::now().checked_sub(BUILD_CACHE_KEEP).unwrap_or(std::time::UNIX_EPOCH);
+        let mut kept = self.images.images();
+        for (image, used) in self.images.unnamed() {
+            if used < stale && self.images.remove_unnamed(&image.name).is_ok() {
+                pruned_images += 1;
+            } else {
+                kept.push(image);
+            }
+        }
+        for image in kept {
             let hash = images::store::parse_hash(&image.index).ok_or_else(|| Error::io(format!("{}'s record is corrupt; nothing pruned", image.name)))?;
             keep_index(hash, &mut store, &mut live)?;
         }
@@ -302,7 +337,7 @@ impl Store {
 
         let chunks = self.images.home().join("chunks");
         let young = std::time::SystemTime::now().checked_sub(PRUNE_GRACE).unwrap_or(std::time::UNIX_EPOCH);
-        let mut pruned = Pruned::default();
+        let mut pruned = Pruned { images: pruned_images, ..Pruned::default() };
         for shard in fs::read_dir(&chunks).map_err(|e| Error::io(format!("{}: {e}", chunks.display())))?.flatten() {
             let Ok(entries) = fs::read_dir(shard.path()) else { continue };
             let prefix = shard.file_name().to_string_lossy().into_owned();
@@ -385,53 +420,35 @@ impl Store {
         .map_err(error::image)
     }
 
-    /// Freezes a stopped machine's disk, as it is, into an image called `image`.
-    pub fn freeze(&self, name: &str, image: &str) -> Result<Image> {
+    /// Freezes a stopped machine's disk, as it is, into an image: named, or unnamed (by id), with the config and the
+    /// history entry `how` says, else the machine's config and `carbon freeze NAME`.
+    pub fn freeze(&self, name: &str, how: &crate::Freeze) -> Result<Image> {
         let record = self.stopped(name)?;
         let index = match record.kernel {
             Kernel::Lambda => self.disk::<lambda::Meta>(&record, lambda::Meta::dir(0o755), false)?.freeze(),
             Kernel::Atlas => self.disk::<atlas::Meta>(&record, atlas::Meta { attributes: 0x10 }, true)?.freeze(),
         }
         .map_err(|e| Error::io(format!("freezing {name}: {e}")))?;
-        self.images.save(image, &index, &record.platform, &record.config, &format!("frozen from machine {name}")).map_err(error::image)
-    }
-
-    /// Copies a stopped machine's file, or folder and all in it, at `path` (as the machine names it: `/etc/hosts`, or
-    /// `C:\\Program Files\\App` on Windows) into the host's folder `to`, under its own name. How many files it copied.
-    /// Symbolic links are left out.
-    pub fn copy_out(&self, name: &str, path: &str, to: &Path) -> Result<usize> {
-        let record = self.stopped(name)?;
-        match record.kernel {
-            Kernel::Lambda => copy_tree(&self.disk::<lambda::Meta>(&record, lambda::Meta::dir(0o755), false)?, path, to),
-            Kernel::Atlas => copy_tree(&self.disk::<atlas::Meta>(&record, atlas::Meta { attributes: 0x10 }, true)?, &windows_path(path), to),
-        }
-    }
-
-    /// Copies the host's file, or folder and all in it, at `from` into a stopped machine's folder `path` (as
-    /// `copy_out` names it), under its own name; a `from` that ends in `/.` copies what's in the folder instead. A
-    /// file already there is replaced, a folder already there is added to. How many files it copied.
-    pub fn copy_in(&self, name: &str, from: &Path, path: &str) -> Result<usize> {
-        let record = self.stopped(name)?;
-        let contents = from.as_os_str().to_string_lossy().ends_with("/.");
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
-        match record.kernel {
-            Kernel::Lambda => {
-                let mut disk = self.disk::<lambda::Meta>(&record, lambda::Meta::dir(0o755), false)?;
-                let metas = (lambda::Meta::dir(0o755), lambda::Meta::file(0o644));
-                let n = copy_tree_in(&mut disk, from, path, contents, &metas, now)?;
-                disk.sync().map_err(|e| Error::io(format!("saving {name}'s disk: {e}")))?;
-                Ok(n)
-            }
-            Kernel::Atlas => {
-                let mut disk = self.disk::<atlas::Meta>(&record, atlas::Meta { attributes: 0x10 }, true)?;
-                // FILE_ATTRIBUTE_DIRECTORY and FILE_ATTRIBUTE_ARCHIVE, as atlas makes them.
-                let metas = (atlas::Meta { attributes: 0x10 }, atlas::Meta { attributes: 0x20 });
-                let n = copy_tree_in(&mut disk, from, &windows_path(path), contents, &metas, now)?;
-                disk.sync().map_err(|e| Error::io(format!("saving {name}'s disk: {e}")))?;
-                Ok(n)
+        // What it was made from, then this step.
+        let base = record.image.as_deref().and_then(|i| self.images.image(i));
+        let mut history = base.as_ref().map(|b| b.history.clone()).unwrap_or_default();
+        match &how.history {
+            Some(whole) => history = whole.clone(),
+            None => {
+                let created_by = how.step.clone().unwrap_or_else(|| format!("carbon freeze {name}"));
+                history.push(images::History { created: rfc3339(now()), created_by, empty_layer: false, comment: how.comment.clone() });
             }
         }
+        let layers = base.map(|b| b.layers).unwrap_or_default();
+        let config = how.config.as_ref().unwrap_or(&record.config);
+        let source = how.source.clone().unwrap_or_else(|| format!("frozen from machine {name}"));
+        match &how.name {
+            Some(image) => self.images.save_with(image, &index, &record.platform, config, &history, &layers, &source),
+            None => self.images.save_unnamed(&index, &record.platform, config, &history, &layers, &source),
+        }
+        .map_err(error::image)
     }
+
 
     /// A machine's disk: its image's index, if it has one, under its own log.
     pub fn disk<M: Persist>(&self, record: &Record, root: M, fold: bool) -> Result<Fs<M>> {
@@ -474,6 +491,8 @@ impl Store {
             network: Network::Nat,
             publish: Vec::new(),
             ports: Vec::new(),
+            exit: None,
+            mounts: Vec::new(),
         };
         match source {
             // `windows`: atlas's system layer and nothing else, running cmd.exe (from an image that has it) unless told
@@ -530,93 +549,15 @@ impl Store {
     }
 }
 
-/// A Windows path on a machine's one drive, as its disk has it.
-fn windows_path(path: &str) -> String {
-    path.strip_prefix("C:").or_else(|| path.strip_prefix("c:")).unwrap_or(path).replace('\\', "/")
-}
-
-/// `path` on `disk`, and all in it, copied into the host's folder `to`. How many files.
-pub(crate) fn copy_tree<M: Persist>(disk: &Fs<M>, path: &str, to: &Path) -> Result<usize> {
-    let ino = disk.resolve(ROOT, path, false).map_err(|e| Error::not_found(format!("{path}: {e:?}")))?;
-    let name = path.trim_end_matches('/').rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or("root");
-    fn walk<M: Persist>(disk: &Fs<M>, ino: layers::Ino, at: &Path) -> Result<usize> {
-        match disk.entries(ino) {
-            Ok(entries) => {
-                fs::create_dir_all(at).map_err(|e| Error::io(format!("{}: {e}", at.display())))?;
-                let mut n = 0;
-                for (name, child, kind) in entries {
-                    match kind {
-                        layers::Kind::Symlink => {}
-                        _ => n += walk(disk, child, &at.join(&name))?,
-                    }
-                }
-                Ok(n)
-            }
-            Err(_) => {
-                let bytes = disk.contents(ino).map_err(|e| Error::io(format!("{}: {e:?}", at.display())))?;
-                fs::write(at, bytes).map_err(|e| Error::io(format!("{}: {e}", at.display())))?;
-                Ok(1)
-            }
-        }
-    }
-    walk(disk, ino, &to.join(name))
-}
-
-/// The host's `from`, and all in it, copied into the folder `path` on `disk` (or what's in `from`, if `contents`),
-/// folders and files made with `metas`. How many files. Symbolic links are left out.
-pub(crate) fn copy_tree_in<M: Persist + Clone>(disk: &mut Fs<M>, from: &Path, path: &str, contents: bool, metas: &(M, M), now: u64) -> Result<usize> {
-    let into = disk.resolve(ROOT, path, true).map_err(|e| Error::not_found(format!("{path}: {e:?}")))?;
-    fn walk<M: Persist + Clone>(disk: &mut Fs<M>, from: &Path, dir: layers::Ino, name: Option<&str>, metas: &(M, M), now: u64) -> Result<usize> {
-        let at = |e: &dyn std::fmt::Display| Error::io(format!("{}: {e}", from.display()));
-        let kind = fs::symlink_metadata(from).map_err(|e| at(&e))?.file_type();
-        if kind.is_symlink() {
-            return Ok(0);
-        }
-        // Where it goes: the folder itself, or a new or existing entry in it.
-        let place = |disk: &mut Fs<M>, new: layers::New, meta: &M| -> Result<layers::Ino> {
-            let Some(name) = name else { return Ok(dir) };
-            match disk.resolve(dir, name, false) {
-                Ok(ino) => Ok(ino),
-                Err(_) => disk.create(dir, name, new, meta.clone(), now).map_err(|e| at(&e)),
-            }
-        };
-        if kind.is_dir() {
-            let ino = place(disk, layers::New::Dir, &metas.0)?;
-            let mut n = 0;
-            let mut entries: Vec<_> = fs::read_dir(from).map_err(|e| at(&e))?.filter_map(std::result::Result::ok).collect();
-            entries.sort_by_key(|e| e.file_name());
-            for entry in entries {
-                let child = entry.file_name().to_string_lossy().into_owned();
-                n += walk(disk, &entry.path(), ino, Some(&child), metas, now)?;
-            }
-            return Ok(n);
-        }
-        let ino = place(disk, layers::New::File, &metas.1)?;
-        disk.truncate(ino, 0, now).map_err(|e| at(&e))?;
-        let mut file = fs::File::open(from).map_err(|e| at(&e))?;
-        let mut buffer = vec![0u8; 4 << 20];
-        let mut offset = 0u64;
-        loop {
-            let got = std::io::Read::read(&mut file, &mut buffer).map_err(|e| at(&e))?;
-            if got == 0 {
-                break;
-            }
-            disk.write(ino, offset, &buffer[..got], now).map_err(|e| at(&e))?;
-            offset += got as u64;
-        }
-        Ok(1)
-    }
-    if contents {
-        walk(disk, from, into, None, metas, now)
-    } else {
-        let name = from.file_name().map(|n| n.to_string_lossy().into_owned()).ok_or_else(|| Error::invalid(format!("{}: no name to copy it in as", from.display())))?;
-        walk(disk, from, into, Some(&name), metas, now)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn times_as_oci_writes_them() {
+        assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339(1_794_946_180), "2026-11-17T20:09:40Z");
+    }
 
     #[test]
     fn records_round_trip() {
@@ -634,30 +575,10 @@ mod tests {
             network: Network::Host,
             publish: vec!["2222:22".into(), "127.0.0.1:5353:53/udp".into()],
             ports: vec!["0.0.0.0:2222->22/tcp".into()],
+            exit: Some(3),
+            mounts: vec![crate::Mount::volume("data", "/data"), crate::Mount::tmpfs("/tmp").read_only()],
         };
         assert_eq!(Record::from_json(&record.to_json()), Some(record));
-    }
-
-    #[test]
-    fn host_folders_copy_in_and_out_again() {
-        let host = std::env::temp_dir().join(format!("carbon-copy-in-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&host);
-        fs::create_dir_all(host.join("app/sub")).unwrap();
-        fs::write(host.join("app/a.txt"), b"one").unwrap();
-        fs::write(host.join("app/sub/b.bin"), vec![7u8; 5 << 20]).unwrap();
-        let mut disk = lambda::Disk::new(lambda::Meta::dir(0o755), false);
-        disk.put("/opt/a.txt", layers::New::File, b"older and longer", lambda::Meta::file(0o644), lambda::Meta::dir(0o755)).unwrap();
-        let metas = (lambda::Meta::dir(0o755), lambda::Meta::file(0o644));
-        // The folder by name, then what's in it over a file already there.
-        assert_eq!(copy_tree_in(&mut disk, &host.join("app"), "/", false, &metas, 1).unwrap(), 2);
-        assert_eq!(copy_tree_in(&mut disk, &host.join("app/."), "/opt", true, &metas, 1).unwrap(), 2);
-        assert_eq!(disk.contents(disk.resolve(ROOT, "/app/a.txt", false).unwrap()).unwrap(), b"one");
-        assert_eq!(disk.contents(disk.resolve(ROOT, "/opt/a.txt", false).unwrap()).unwrap(), b"one");
-        assert_eq!(disk.contents(disk.resolve(ROOT, "/opt/sub/b.bin", false).unwrap()).unwrap(), vec![7u8; 5 << 20]);
-        let out = host.join("out");
-        assert_eq!(copy_tree(&disk, "/app", &out).unwrap(), 2);
-        assert_eq!(fs::read(out.join("app/sub/b.bin")).unwrap().len(), 5 << 20);
-        let _ = fs::remove_dir_all(&host);
     }
 
     /// Chunks a removed machine wrote, and a removed image's, go; a kept image's and a kept machine's stay, readable.
@@ -706,8 +627,8 @@ mod tests {
         assert!(has(&chunk(1)) && has(&chunk(3)), "the kept image's and the kept machine's chunks stay");
         assert!(!has(&chunk(2)) && !has(&chunk(4)), "the removed image's and the removed machine's chunks go");
         let disk = store.disk::<lambda::Meta>(&kept, dir, false).unwrap();
-        assert_eq!(disk.contents(disk.resolve(ROOT, "/written.bin", false).unwrap()).unwrap(), contents(3));
-        assert_eq!(disk.contents(disk.resolve(ROOT, "/data.bin", false).unwrap()).unwrap(), contents(1));
+        assert_eq!(disk.contents(disk.resolve(layers::ROOT, "/written.bin", false).unwrap()).unwrap(), contents(3));
+        assert_eq!(disk.contents(disk.resolve(layers::ROOT, "/data.bin", false).unwrap()).unwrap(), contents(1));
         // Pruning again finds nothing more.
         assert_eq!(store.prune().unwrap(), Pruned::default());
         let _ = fs::remove_dir_all(&home);

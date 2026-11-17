@@ -12,6 +12,7 @@
 //! `<home>` is `CARBON_HOME`, or `.carbon` in the user's home folder. Nothing here knows a kernel: a kernel's `M` is made
 //! from each tar entry by the caller.
 
+mod config;
 mod pull;
 pub use pull::{Progress as PullProgress, Stage as PullStage};
 pub mod store;
@@ -26,15 +27,7 @@ use serde_json::{Value, json};
 pub use layers::tar::Entry;
 pub use store::DiskStore;
 
-/// What an image's config says about running it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Config {
-    pub env: Vec<String>,
-    pub entrypoint: Vec<String>,
-    pub cmd: Vec<String>,
-    pub workdir: String,
-    pub user: String,
-}
+pub use config::{Config, Healthcheck, History, signal_number};
 
 /// Which build of an image: `linux/arm64`, `linux/amd64`, `windows/amd64`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +76,11 @@ pub struct Image {
     pub created: u64,
     /// Where it came from: the registry, a tar, a machine.
     pub source: String,
+    /// Each step that made it, oldest first.
+    pub history: Vec<History>,
+    /// A pulled image's layers, as its registry named them (`sha256:...`), so a push of an image built on it sends only
+    /// what's new. Empty for one made here.
+    pub layers: Vec<String>,
 }
 
 impl Image {
@@ -90,6 +88,14 @@ impl Image {
     pub fn short_name(&self) -> &str {
         self.name.strip_prefix("docker.io/library/").or_else(|| self.name.strip_prefix("docker.io/")).unwrap_or(&self.name)
     }
+}
+
+/// What a gzip stream holds (a pulled layer, or an archive a build adds).
+pub fn gunzip(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    flate2::read::GzDecoder::new(bytes).read_to_end(&mut out).map_err(|e| format!("unpacking gzip: {e}"))?;
+    Ok(out)
 }
 
 /// A name in full: `debian` is `docker.io/library/debian:latest`, `ghcr.io/org/app:1` is itself.
@@ -105,6 +111,14 @@ pub fn full_name(name: &str) -> String {
     };
     let path = if registry == "docker.io" && !path.contains('/') { format!("library/{path}") } else { path.to_string() };
     format!("{registry}/{path}:{tag}")
+}
+
+/// Where unnamed images' records are, under `images/`: a name no registry has, and that listing skips.
+const UNNAMED: &str = ".unnamed";
+
+/// An unnamed image's id, from its name `sha256:<64 hex digits>`.
+fn unnamed_id(name: &str) -> Option<&str> {
+    name.strip_prefix("sha256:").filter(|id| id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 fn strings(value: Option<&Value>) -> Vec<String> {
@@ -167,30 +181,80 @@ impl Images {
         out
     }
 
-    /// An image by name.
+    /// An image by name, or an unnamed one by its id (`sha256:…`, from [`Images::save_unnamed`]).
     pub fn image(&self, name: &str) -> Option<Image> {
-        let text = fs::read_to_string(self.record_path(&full_name(name))).ok()?;
-        Self::parse_record(&text)
+        let path = match unnamed_id(name) {
+            Some(id) => self.unnamed_path(id),
+            None => self.record_path(&full_name(name)),
+        };
+        Self::parse_record(&fs::read_to_string(path).ok()?)
+    }
+
+    fn unnamed_path(&self, id: &str) -> PathBuf {
+        self.home.join("images").join(UNNAMED).join(format!("{id}.json"))
+    }
+
+    /// Keeps an image with no name, by an id made from what it is (its index, platform, config and history), as a
+    /// build's steps are kept: found again by [`Images::image`] with its name, `sha256:<id>`, and never listed by
+    /// [`Images::images`]. Saving the same image again gives the same one, and marks it used.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_unnamed(&self, index: &[u8], platform: &Platform, config: &Config, history: &[History], layers: &[String], source: &str) -> Result<Image, String> {
+        let hash = self.store()?.put(index).map_err(|_| "putting the index in the store".to_string())?;
+        let what = json!({
+            "index": store::hex(&hash),
+            "platform": platform.to_string(),
+            "config": config.to_json(),
+            "history": history.iter().map(History::to_json).collect::<Vec<_>>(),
+        });
+        let id = store::hex(&store::sha256(&serde_json::to_vec(&what).unwrap_or_default()));
+        if let Some(image) = self.image(&format!("sha256:{id}")) {
+            self.touch_unnamed(&image.name);
+            return Ok(image);
+        }
+        let image = Image { name: format!("sha256:{id}"), index: store::hex(&hash), platform: platform.clone(), config: config.clone(), created: now(), source: source.into(), history: history.to_vec(), layers: layers.to_vec() };
+        self.write_record(&image)?;
+        Ok(image)
+    }
+
+    /// Marks an unnamed image used now, so pruning keeps it a while longer.
+    pub fn touch_unnamed(&self, name: &str) {
+        if let Some(id) = unnamed_id(name) {
+            let _ = fs::File::options().append(true).open(self.unnamed_path(id)).and_then(|f| f.set_modified(std::time::SystemTime::now()));
+        }
+    }
+
+    /// Every unnamed image, and when each was last used.
+    pub fn unnamed(&self) -> Vec<(Image, std::time::SystemTime)> {
+        let dir = self.home.join("images").join(UNNAMED);
+        let mut out = Vec::new();
+        for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+            let used = entry.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+            if let Some(image) = fs::read_to_string(entry.path()).ok().as_deref().and_then(Self::parse_record) {
+                out.push((image, used));
+            }
+        }
+        out
+    }
+
+    /// Forgets an unnamed image.
+    pub fn remove_unnamed(&self, name: &str) -> Result<(), String> {
+        let id = unnamed_id(name).ok_or_else(|| format!("{name} isn't an unnamed image's id"))?;
+        fs::remove_file(self.unnamed_path(id)).map_err(|_| format!("there's no image {name}"))
     }
 
     fn parse_record(text: &str) -> Option<Image> {
         let v: Value = serde_json::from_str(text).ok()?;
         let s = |key: &str| v.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
         let platform = Platform::parse(&s("platform"))?;
-        let config = v.get("config");
         Some(Image {
             name: s("name"),
             index: s("index"),
             platform,
-            config: Config {
-                env: strings(config.and_then(|c| c.get("env"))),
-                entrypoint: strings(config.and_then(|c| c.get("entrypoint"))),
-                cmd: strings(config.and_then(|c| c.get("cmd"))),
-                workdir: config.and_then(|c| c.get("workdir")).and_then(Value::as_str).unwrap_or_default().to_string(),
-                user: config.and_then(|c| c.get("user")).and_then(Value::as_str).unwrap_or_default().to_string(),
-            },
+            config: v.get("config").map(Config::from_json).unwrap_or_default(),
             created: v.get("created").and_then(Value::as_u64).unwrap_or(0),
             source: s("source"),
+            history: v.get("history").and_then(Value::as_array).map(|h| h.iter().map(History::from_json).collect()).unwrap_or_default(),
+            layers: strings(v.get("layers")),
         })
     }
 
@@ -201,6 +265,9 @@ impl Images {
         while let Some(dir) = stack.pop() {
             for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
                 let path = entry.path();
+                if entry.file_name().to_string_lossy().starts_with('.') {
+                    continue;
+                }
                 if path.is_dir() {
                     stack.push(path);
                 } else if path.extension().is_some_and(|e| e == "json")
@@ -228,29 +295,51 @@ impl Images {
 
     /// Names an index: puts it in the store and writes the image's record. The name's only taken once it's all there.
     pub fn save(&self, name: &str, index: &[u8], platform: &Platform, config: &Config, source: &str) -> Result<Image, String> {
+        self.save_with(name, index, platform, config, &[], &[], source)
+    }
+
+    /// As [`Images::save`], with its history and (for a pulled image) its registry's layers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_with(&self, name: &str, index: &[u8], platform: &Platform, config: &Config, history: &[History], layers: &[String], source: &str) -> Result<Image, String> {
         let hash = self.store()?.put(index).map_err(|_| "putting the index in the store".to_string())?;
-        let image = Image { name: full_name(name), index: store::hex(&hash), platform: platform.clone(), config: config.clone(), created: now(), source: source.into() };
-        let record = json!({
+        let image = Image { name: full_name(name), index: store::hex(&hash), platform: platform.clone(), config: config.clone(), created: now(), source: source.into(), history: history.to_vec(), layers: layers.to_vec() };
+        self.write_record(&image)?;
+        Ok(image)
+    }
+
+    /// Another name for an image: the same index and config, under `target` too.
+    pub fn tag(&self, source: &str, target: &str) -> Result<Image, String> {
+        let mut image = self.image(source).ok_or_else(|| format!("there's no image {}", full_name(source)))?;
+        image.name = full_name(target);
+        self.write_record(&image)?;
+        Ok(image)
+    }
+
+    fn write_record(&self, image: &Image) -> Result<(), String> {
+        let mut record = json!({
             "name": image.name,
             "index": image.index,
             "platform": image.platform.to_string(),
             "created": image.created,
             "source": image.source,
-            "config": {
-                "env": image.config.env,
-                "entrypoint": image.config.entrypoint,
-                "cmd": image.config.cmd,
-                "workdir": image.config.workdir,
-                "user": image.config.user,
-            },
+            "config": image.config.to_json(),
         });
-        let path = self.record_path(&image.name);
+        if !image.history.is_empty() {
+            record["history"] = json!(image.history.iter().map(History::to_json).collect::<Vec<_>>());
+        }
+        if !image.layers.is_empty() {
+            record["layers"] = json!(image.layers);
+        }
+        let path = match unnamed_id(&image.name) {
+            Some(id) => self.unnamed_path(id),
+            None => self.record_path(&image.name),
+        };
         let dir = path.parent().ok_or("a bad image name")?;
         fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let temporary = path.with_extension("json.new");
         fs::write(&temporary, serde_json::to_vec_pretty(&record).unwrap_or_default()).map_err(|e| format!("{}: {e}", temporary.display()))?;
         fs::rename(&temporary, &path).map_err(|e| format!("{}: {e}", path.display()))?;
-        Ok(image)
+        Ok(())
     }
 
     /// An image from a tar of a root file system (`docker export`, for one): each entry's `M` made by `meta`.
@@ -317,7 +406,16 @@ mod tests {
         let disk: layers::Fs<u32> = layers::Fs::open(Some(&index), Box::new(images.machine_store("m").unwrap()), 0, false).unwrap();
         let file = disk.resolve(layers::ROOT, "/etc/hostname", true).unwrap();
         assert_eq!(disk.contents(file).unwrap(), b"box\n\0");
-        assert_eq!(*disk.meta(file).unwrap(), 0o644);
+        assert_eq!(disk.meta(file).unwrap(), 0o644);
+        // Unnamed: found by id, the same image saved twice is one, never listed, removable.
+        let unnamed = images.save_unnamed(&index, &found.platform, &config, &[], &[], "a build").unwrap();
+        assert!(unnamed.name.starts_with("sha256:"));
+        assert_eq!(images.image(&unnamed.name), Some(unnamed.clone()));
+        assert_eq!(images.save_unnamed(&index, &found.platform, &config, &[], &[], "again").unwrap().name, unnamed.name);
+        assert_eq!(images.images().len(), 1);
+        assert_eq!(images.unnamed().len(), 1);
+        images.remove_unnamed(&unnamed.name).unwrap();
+        assert!(images.image(&unnamed.name).is_none());
         images.remove("box:1").unwrap();
         assert!(images.image("box:1").is_none());
         fs::remove_dir_all(&home).unwrap();

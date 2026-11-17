@@ -117,6 +117,12 @@ pub(crate) struct ProcState {
     pub ctty: Option<Arc<Tty>>,
     /// Where `rt_sigreturn`'s trampoline is, for handlers with no restorer of their own.
     pub sigreturn_at: u64,
+    /// Where its last `execve` put its arguments' and its environment's strings, one after another: what
+    /// `/proc/<pid>/cmdline` and `environ` read, as the program has left them (a process title written over them).
+    pub arg_area: std::ops::Range<u64>,
+    pub env_area: std::ops::Range<u64>,
+    /// When it was made, by the machine's monotonic clock in nanoseconds: `/proc/<pid>/stat`'s start time.
+    pub started: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -592,7 +598,7 @@ impl Task {
             Sys::Ioctl => self.ioctl(cx, a[0] as i32, a[1], a[2]),
             // F_GETLK and F_OFD_GETLK: nothing's in the way.
             Sys::Fcntl if a[1] == crate::fs::F_GETLK || a[1] == 36 => self.get_lock(cx, a[0] as i32, a[2]),
-            Sys::Fcntl => self.fcntl(a[0] as i32, a[1], a[2]),
+            Sys::Fcntl => self.fcntl(cx, a[0] as i32, a[1], a[2]),
             Sys::Dup => self.dup(a[0] as i32),
             Sys::Dup2 => self.dup3(a[0] as i32, a[1] as i32, 0, true),
             Sys::Dup3 => self.dup3(a[0] as i32, a[1] as i32, a[2] as u32, false),
@@ -1100,23 +1106,26 @@ pub(crate) fn start_init(k: &Arc<Kernel>, cx: &mut Cx<'_>, argv: &[String], env:
         Some(dir) => (lock(&k.disk).resolve(layers::ROOT, dir, true).map_err(|_| ENOENT)?, dir.clone()),
         None => (layers::ROOT, "/".to_string()),
     };
-    start(k, cx, pid, argv, env, Files::standard(k.console.clone()), k.console.clone(), cwd)
+    // Its path on the disk, if `argv[0]` is the name it was called by (`sh`), as a shell's `exec` gives both.
+    let path = k.options.program.clone().or_else(|| argv.first().cloned()).ok_or(ENOENT)?;
+    start(k, cx, pid, &path, argv, env, Files::standard(k.console.clone()), k.console.clone(), cwd)
 }
 
 /// A process started from outside the machine (`carbon exec`), as `pid`: a session of its own, `files` as its
 /// descriptors and `ctty` its terminal, in `cwd`, with no parent in the machine (0), as Docker's are. Its end is told
 /// to whoever's waiting in `Kernel::entered`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn start_entered(k: &Arc<Kernel>, cx: &mut Cx<'_>, pid: i32, argv: &[String], env: &[String], files: Files, ctty: Option<Arc<crate::tty::Tty>>, cwd: (layers::Ino, String)) -> Result<Task, Errno> {
+pub(crate) fn start_entered(k: &Arc<Kernel>, cx: &mut Cx<'_>, pid: i32, path: &str, argv: &[String], env: &[String], files: Files, ctty: Option<Arc<crate::tty::Tty>>, cwd: (layers::Ino, String)) -> Result<Task, Errno> {
     if let Some(tty) = &ctty {
         tty.set_session(Some(pid), pid);
     }
-    start(k, cx, pid, argv, env, files, ctty, cwd)
+    start(k, cx, pid, path, argv, env, files, ctty, cwd)
 }
 
-/// A new process `pid`, with no parent, running `argv` in a session and group of its own.
+/// A new process `pid`, with no parent, running the program at `path` with `argv` (its `argv[0]` the name it was
+/// called by) in a session and group of its own.
 #[allow(clippy::too_many_arguments)]
-fn start(k: &Arc<Kernel>, cx: &mut Cx<'_>, pid: i32, argv: &[String], env: &[String], files: Files, ctty: Option<Arc<crate::tty::Tty>>, cwd: (layers::Ino, String)) -> Result<Task, Errno> {
+fn start(k: &Arc<Kernel>, cx: &mut Cx<'_>, pid: i32, path: &str, argv: &[String], env: &[String], files: Files, ctty: Option<Arc<crate::tty::Tty>>, cwd: (layers::Ino, String)) -> Result<Task, Errno> {
     let mut state = ProcState {
         ppid: 0,
         pgid: pid,
@@ -1158,9 +1167,11 @@ fn start(k: &Arc<Kernel>, cx: &mut Cx<'_>, pid: i32, argv: &[String], env: &[Str
         report: None,
         ctty,
         sigreturn_at: 0,
+        arg_area: 0..0,
+        env_area: 0..0,
+        started: k.host.monotonic(),
     };
-    let path = argv.first().ok_or(ENOENT)?.clone();
-    load::exec_into(k, cx, &mut state, &path, argv.to_vec(), env.to_vec())?;
+    load::exec_into(k, cx, &mut state, path, argv.to_vec(), env.to_vec())?;
     let isa = state.isa;
     let process = Process::new(pid, state);
     let task = Task::new(k.clone(), process.clone(), pid, Waiter::new(), ThreadSignals::with_mask(0), isa);

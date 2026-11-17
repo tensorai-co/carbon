@@ -12,9 +12,13 @@
 //! | `resize WxH[@SCALE]`, `clipboard [TEXT]`, `drop X Y text TEXT`, `drop X Y files PATHS` | the desktop's |
 //! | `stop [SIGNAL]`, `kill` | asks the machine to end (as `docker stop`), or ends it now |
 //! | `exec <json>` | starts a process; then frames, below |
+//! | `fs <json>` | an operation on its files (below) |
 //! | `watch <json>` | then a JSON line for each hooked event, as it's decided, until either end closes |
 //!
 //! Text in a request is one line: `%0A` is a new line and `%25` a `%`.
+//!
+//! `fs <json>` is an operation on the machine's files (`crate::files::Op`, as JSON): a `write`'s bytes follow its line;
+//! its answer is a `read`'s bytes, or JSON.
 //!
 //! `exec`'s request is `{"args": [...], "env": [...], "workdir": "...", "tty": [rows, cols], "detach": false}`. After
 //! its `ok 0`, the connection carries frames both ways, a kind byte, a 4-byte little-endian length and that many
@@ -353,13 +357,38 @@ fn read_line(stream: &mut impl std::io::Read) -> std::io::Result<String> {
 // ---------------------------------------------------------------------------------------------------------------
 // The machine's side
 
+/// How a running machine does an operation on its files, on its kernel's disk.
+pub(crate) type FilesFn = Arc<dyn Fn(&crate::files::Op, &[u8]) -> Result<Vec<u8>> + Send + Sync>;
+
 /// What the socket serves for one machine.
 #[derive(Clone)]
 pub(crate) struct Served {
     pub desktop: Option<display::desktop::Shared>,
     pub enter: Option<Enter>,
+    pub files: Option<FilesFn>,
     pub stopper: Stopper,
     pub hub: hooks::Hub,
+}
+
+/// An `fs` connection, after its line: a write's bytes in, then the answer.
+#[cfg(unix)]
+fn run_fs(stream: &mut std::os::unix::net::UnixStream, json: &str, files: &FilesFn) -> std::io::Result<()> {
+    use std::io::{Read, Write};
+    let Some(op) = serde_json::from_str::<Value>(json).ok().as_ref().and_then(crate::files::Op::from_json) else {
+        return stream.write_all(b"error fs's request made no sense\n");
+    };
+    let mut data = Vec::new();
+    if let crate::files::Op::Write { len, .. } = &op {
+        data.resize(*len as usize, 0);
+        stream.read_exact(&mut data)?;
+    }
+    match files(&op, &data) {
+        Ok(answer) => {
+            stream.write_all(format!("ok {}\n", answer.len()).as_bytes())?;
+            stream.write_all(&answer)
+        }
+        Err(e) => stream.write_all(format!("error {}\n", escape(e.message())).as_bytes()),
+    }
 }
 
 /// An `exec` connection, after its request: the session's output out, the client's input in, until it ends.
@@ -436,6 +465,12 @@ fn answer(stream: &mut std::os::unix::net::UnixStream, served: &Served) -> std::
     }
     if let Some(json) = line.strip_prefix("watch") {
         return run_watch(stream, interest_from_json(json.trim()), served);
+    }
+    if let Some(json) = line.strip_prefix("fs ") {
+        return match &served.files {
+            Some(files) => run_fs(stream, json, files),
+            None => stream.write_all(b"error this machine's files can't be reached from outside yet\n"),
+        };
     }
     let line = line.strip_suffix('\r').unwrap_or(&line);
     if line == "kill" {
@@ -802,7 +837,9 @@ pub(crate) fn open(dir: &Path, request: &str) -> Result<(std::os::unix::net::Uni
 fn error_from(why: &str) -> Error {
     let kind = if why.contains("hooks") || why.contains("denied") {
         crate::ErrorKind::Denied
-    } else if why.contains("not found") || why.contains("not on the machine") || why.contains("isn't there") {
+    } else if why.contains("is there already") {
+        crate::ErrorKind::AlreadyExists
+    } else if why.contains("not found") || why.contains("not on the machine") || why.contains("isn't there") || why.contains("no such") {
         crate::ErrorKind::NotFound
     } else if why.contains("no desktop") || why.contains("can't") {
         crate::ErrorKind::Unsupported
@@ -814,6 +851,29 @@ fn error_from(why: &str) -> Error {
 
 #[cfg(not(unix))]
 pub(crate) fn open(_dir: &Path, _request: &str) -> Result<((), String)> {
+    Err(Error::unsupported("reaching a running machine from outside it isn't there yet on Windows hosts"))
+}
+
+/// Does an operation on the files of the running machine whose folder is `dir`: `data` is a write's bytes.
+#[cfg(unix)]
+pub(crate) fn fs(dir: &Path, op: &Value, data: &[u8]) -> Result<Vec<u8>> {
+    use std::io::{Read, Write};
+    let socket = std::fs::read_to_string(dir.join("control")).map_err(|_| Error::new(crate::ErrorKind::NotRunning, "the machine isn't running"))?;
+    let mut stream = std::os::unix::net::UnixStream::connect(socket.trim()).map_err(|e| Error::io(format!("reaching the machine: {e}")))?;
+    stream.write_all(format!("fs {op}\n").as_bytes())?;
+    stream.write_all(data)?;
+    let line = read_line(&mut stream)?;
+    if let Some(why) = line.strip_prefix("error ") {
+        return Err(error_from(&unescape(why)));
+    }
+    let len: usize = line.strip_prefix("ok ").and_then(|n| n.trim().parse().ok()).ok_or_else(|| Error::io("the machine's answer made no sense"))?;
+    let mut bytes = vec![0; len];
+    stream.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn fs(_dir: &Path, _op: &Value, _data: &[u8]) -> Result<Vec<u8>> {
     Err(Error::unsupported("reaching a running machine from outside it isn't there yet on Windows hosts"))
 }
 

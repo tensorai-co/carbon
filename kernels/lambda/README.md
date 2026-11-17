@@ -250,7 +250,10 @@ The root is the image's layers (Debian's, say) plus `os/`'s file systems. lambda
   remounts (a read-only mount's writes are EROFS), sets propagation, and mounts tmpfs (a volatile tree of `layers`',
   never logged or saved, sized by `size=` for `statfs`), proc, devpts and mqueue; `umount2`, lazily too;
   `pivot_root`. `/proc/<pid>/mounts`, `mountinfo` and `/proc/mounts` list them; `statfs` gives each mount's type and
-  flags. The table is a mount namespace's, held by each process: there's one today.
+  flags. The table is a mount namespace's, held by each process: there's one today. A machine boots with the mounts
+  `Options::mounts` gives (`carbon run -v`): a host folder or a volume attached to the disk as an external tree and
+  mounted over its target (`fuse.carbon` in `mountinfo`, FUSE's magic for `statfs`, a device of its own), one file of
+  a folder bound over a file, or a tmpfs; each target made on the disk if it isn't there.
 - **Extended attributes** (`fs/xattr.rs`): the twelve `*xattr` calls and the four `*xattrat` forms, over attributes
   `layers` keeps with each file. Linux's rules: the `user.`, `trusted.`, `security.` and `system.` namespaces, who may
   read or change each (`user.` only on files and directories, `trusted.` for `CAP_SYS_ADMIN`), `XATTR_CREATE` and
@@ -298,8 +301,14 @@ The root is the image's layers (Debian's, say) plus `os/`'s file systems. lambda
   takes back what was changed (orig_rax or `NT_ARM_SYSTEM_CALL` to change or skip a call). Another process's memory
   is read and written in turns in its space (`Cx::elsewhere`), its pages filled as its touch would; a poke to code it
   can't write goes to a private copy of the page. `process_vm_readv`/`writev` use the same way in.
-- **The OS** (`os/`): `/dev` put on the disk at boot, and `/proc/self/{exe,cwd,fd,maps,status}`, `cpuinfo`,
-  `meminfo`, `uptime` made as they're read.
+- **The OS** (`os/`): `/dev` put on the disk at boot, and `/proc` made as it's read (`os/proc.rs` for what `ps`
+  and `top` read). `/proc` lists every process and the machine's files; `/proc/<pid>` lists its own: `cmdline` and
+  `environ` (read from its memory, where `execve` put its strings in Linux's order, so a process title written over
+  them shows, as nginx's and node's do), `stat`, `statm` and `status` (its resident pages counted), `comm`, `exe`,
+  `cwd`, `root`, `fd/`, `task/<tid>/`, `ns/`, `maps`, `mounts`, `mountinfo`; and `cpuinfo`, `meminfo`, `stat`,
+  `loadavg`, `uptime`, `filesystems`, `version`, `/proc/sys/kernel/*`. procps's `ps`, `top`, `pgrep`, `pidof`,
+  `free`, `uptime` and `pstree`, and BusyBox's `ps`, work on it. A process's first `argv[0]` is the name it was run
+  by (`sh`), as Docker runs it, not the path found.
 
 ## To do
 
@@ -334,7 +343,7 @@ curl -sLO https://raw.githubusercontent.com/torvalds/linux/master/arch/x86/entry
   `IN_DELETE_SELF` at an open file's last close rather than the unlink, and `IN_EXCL_UNLINK`; AIO's
   `IOCB_CMD_POLL`; fanotify's FID modes, pidfds and permission events; extended attributes in a frozen image or
   from a tar; `openat2`'s `RESOLVE_NO_MAGICLINKS` checked, not implied.
-- **Mounts and namespaces:** `/proc/<pid>/ns` listable (each link reads, opens and `setns` already); separate PID,
+- **Mounts and namespaces:** separate PID,
   network, user, cgroup and time namespaces (lambda keeps one of each); `open_tree_attr`'s attributes; `nosuid`,
   `nodev` and `noexec` enforced, not only shown; read-only decided by the mount a file is on, not its path;
   unmounting checking for open files; cgroups and overlay mounts (ENODEV today).
@@ -348,13 +357,15 @@ curl -sLO https://raw.githubusercontent.com/torvalds/linux/master/arch/x86/entry
 - **Shared file mappings and POSIX semaphores:** `MAP_SHARED` of a disk file acts as a private mapping, and there's no
   `/dev/shm`, so Python's `multiprocessing` can't make its locks.
 - **Scheduling:** nice, policies, affinity and I/O priority are kept per process, not per thread, change nothing on
-  the host, and aren't in `/proc/<pid>/stat`; time slices, so threads that spin rather than wait give a vCPU up (a
+  the host, and aren't in `/proc/<pid>/stat`, whose state is `R` for the reader and `S` for the rest (lambda doesn't
+  track which threads are runnable), and whose page-fault counts are 0; time slices, so threads that spin rather than wait give a vCPU up (a
   thread blocked in a wait already does).
 - **The vDSO:** its counter on hosts other than Apple silicon (it makes system calls there: on KVM the guest's TSC
   needs calibrating, or kvmclock's page; `vdso.c` fails its two clock-page checks on a Linux host for this); `time`, `getcpu` and `getrandom` with no system call; unwinding information for its signal
   return.
 - **sysfs and `/proc`:** a DRM render node's and input devices' entries, with those devices; block devices; cgroups;
-  `uevent` over netlink; `/proc/<pid>` and `/proc/net` as listable directories; the rest of `/proc`.
+  `uevent` over netlink; `/proc/net` as a listable directory; `/proc/self` as a link to the reader's pid (it's a
+  folder of its own); `/proc/<pid>/{limits,io,smaps,oom_score_adj}`; load averages (0 today).
 - **Other hosts:** `apt install` natively on Linux and Windows hosts (it works on the Mac, in both images); a
   console on Windows hosts, tried with a full-screen editor.
 - **Sound:** a PulseAudio server, `os/pulse`, on `audio`.

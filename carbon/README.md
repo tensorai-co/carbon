@@ -39,6 +39,14 @@ fn main() -> carbon::Result<()> {
     print!("{}", ls.stdout_lossy());
     dev.stop();
     dev.wait()?;
+
+    // One in a process of its own, which outlives this program: its files, its logs, a command with a time limit.
+    let web = carbon.machine("nginx:alpine").name("web").publish_all().launch(Vec::<String>::new())?;
+    web.files().write("/usr/share/nginx/html/index.html", "hello\n", carbon::Write::new().mode(0o644))?;
+    web.exec(["nginx", "-t"]).timeout(std::time::Duration::from_secs(30)).output()?;
+    for line in web.logs(carbon::Logs::new().tail(10))? {
+        print!("{}", line.text());
+    }
     Ok(())
 }
 ```
@@ -69,11 +77,15 @@ libraries.
 
 | Type | What it is |
 | --- | --- |
-| [`Carbon`](src/lib.rs) | Carbon on this host: its folder of machines and images. `machine(image)`, `program(path)`, `again(name)` make a `MachineSpec`; `get(name)`, `machines()`, `images()`, `pull`, `import`, `remove_image`; `on_notice` for what machines fall back to |
-| [`MachineSpec`](src/spec.rs) | A builder: `name`, `isolation`, `platform`, `env`, `workdir`, `memory`, `network`, `publish`, `display`, `gpu`, `audio`, `stdin`/`stdout`/`stderr` ([`Stdio`](src/stdio.rs): inherit, null, piped), `tty`, `relay_signals`, `rm`, and `hooks`, `rules`, `on_exec`, `on_output`, `on_connect`, `on_lookup`. Then `run(argv)` on this thread, `output(argv)` to its end with what it wrote, or `start(argv)` on a thread of its own |
+| [`Carbon`](src/lib.rs) | Carbon on this host: its folder of machines and images. `machine(image)`, `program(path)`, `again(name)` make a `MachineSpec`; `build(context)` a [`Build`](#building); `get(name)`, `machines()`, `images()`, `image(name)` (or an unnamed one's `sha256:…`), `pull`, `import`, `tag`, `remove_image`, `prune`; `on_notice` for what machines fall back to |
+| [`MachineSpec`](src/spec.rs) | A builder: `name`, `isolation`, `platform`, `env`, `workdir`, `memory`, `network`, `publish`, `display`, `gpu`, `audio`, `stdin`/`stdout`/`stderr` ([`Stdio`](src/stdio.rs): inherit, null, piped), `tty`, `relay_signals`, `rm`, `publish_all`, `timeout`, `mount`, and `hooks`, `rules`, `on_exec`, `on_output`, `on_connect`, `on_lookup`. Then `run(argv)` on this thread, `output(argv)` to its end with what it wrote, `start(argv)` on a thread of its own, `launch(argv)` in a process of its own ([workers](#workers)), or `create()` to make it without running it, as `docker create` |
 | [`Running`](src/spec.rs) | A machine this process runs: `take_stdin`, `take_stdout`, `take_stderr` ([`Chunks`](src/stdio.rs), also an `io::Read`), `hooks()`, `machine()`, `stop`, `kill`, `wait` |
-| [`Machine`](src/machine.rs) | A machine by name, in this process or another: `info`, `exec(argv)`, `stop`, `kill`, `wait`, `ports`, `screen`, `watch`, `freeze`, `copy_in`, `copy_out`, `remove` |
-| [`ExecSpec`, `Process`](src/machine.rs) | A process in a running machine, as `docker exec`: `env`, `workdir`, `tty`; then `spawn` (stdin, output as it comes, `resize`, `signal`, `wait`), `output`, `detach`, or `attach` to this terminal |
+| [`Machine`](src/machine.rs) | A machine by name, in this process or another: `info`, `exec(argv)`, `stop`, `kill`, `wait`, `ports`, `screen`, `watch`, `logs`, `files`, `copy_in`, `copy_out`, `freeze`, `freeze_with` ([`Freeze`](src/machine.rs): its name or none, config, step, history), `remove` |
+| [`Files`](src/files.rs) | A machine's files, running or stopped: `stat`, `list`, `read`, `read_to_string`, `write` ([`Write`](src/files.rs): mode, owner, parents, append, time), `mkdir`, `symlink`, `rename`, `remove`, and `copy_in`, `copy_out`, `copy_from` (another machine's disk) ([`Copy`](src/files.rs): `chown`, `chmod`, `exclude` with an ignore file's patterns), which keep kinds, modes, owners, times and links |
+| [`Mount`, `Volume`](src/mounts.rs) | A host's folder (or one file) seen live in a machine (`Mount::bind`), a volume (`Mount::volume`: a folder Carbon keeps that outlives its machines, its files' owners kept), a tmpfs; `read_only`; `Mount::parse` takes Docker's `-v` and `--mount`. `Carbon::volume(name)`: `create`, `path`, `info`; `volumes()`, `remove_volume` |
+| [`Logs`, `LogLine`](src/logs.rs) | What a launched machine wrote, as lines on its stream: `tail(n)`, `follow()` |
+| [`Image`, `ImageConfig`, `History`](../images/src/config.rs) | An image: its whole OCI config (exposed ports, volumes, labels, stop signal, health check, shell, `ONBUILD`), each step that made it, its layers' digests |
+| [`ExecSpec`, `Process`](src/machine.rs) | A process in a running machine, as `docker exec`: `env`, `workdir`, `tty`, `timeout` (killed after it, exit 124); then `spawn` (stdin, output as it comes, `resize`, `signal`, `wait`), `output`, `detach`, or `attach` to this terminal |
 | [`Screen`](src/machine.rs) | A running machine's desktop, for computer use: `screenshot` (PNG), `windows`, `click`, `drag`, `scroll`, `type_text`, `key`, `resize`, `clipboard`, `drop_text`, `drop_files` |
 | [`hooks`](../hooks/README.md) | Events, decisions, the `Hooks` trait, filters, and the `Hub` each machine's hook points ask, with observers and subscriptions |
 | [`Rules`](src/rules.rs) | Decisions with no code: programs that may not start (`deny_exec("rm -rf *")`), where the network may and may not go (`deny("0.0.0.0/0")`, `allow("pypi.org:443")`) |
@@ -113,6 +125,11 @@ A hook point is a place in Carbon's own code a program can't get around. Each ma
 | --- | --- |
 | [`lib.rs`](src/lib.rs) | `Carbon`, `Notice`, `init`, and what's re-exported from the parts below |
 | [`spec.rs`](src/spec.rs) | `MachineSpec`, `Running`, `Exit`, `Output`, `Display`, `Audio` |
+| [`worker.rs`](src/worker.rs) | Workers: `launch`, a machine in this binary run again, and its hook link back to the launcher |
+| [`files.rs`](src/files.rs) | `Files` and copies: each operation one `Op`, done on a stopped disk directly or by a running machine's kernel |
+| [`mounts.rs`](src/mounts.rs) | `Mount`, volumes, and a host folder as an external tree of the machine's disk (`HostTree`) |
+| [`logs.rs`](src/logs.rs) | A launched machine's output, kept as records of each write, and read back as lines |
+| [`build/`](src/build/mod.rs) | Building: `parse` (the Dockerfile's grammar), `lex` (substitution and quoting), `ignore` (ignore files), `archive` (`ADD`'s tars), `run` (the steps, the cache) |
 | [`machine.rs`](src/machine.rs) | `Machine`, `MachineInfo`, `ExecSpec`, `Process`, `Screen` |
 | [`boot.rs`](src/boot.rs) | Making a machine and running it: the kernel, exec with its isolation, the disk, its desktop, sound and network, its control socket, and the hooks on its first program and its `exec`s |
 | [`store.rs`](src/store.rs) | Machines on the host's disk: records, names, and what's done to a stopped one (freeze, copy, import, remove) |
@@ -128,12 +145,91 @@ process ends; each kernel lets go of everything it held before `boot` returns, s
 machine. Its record and log are in `<home>/machines/<name>/`, and while it runs it answers on a Unix socket named
 there ([`wire`](src/wire.rs)), which is how another process `exec`s into it, watches it, takes its screen or stops it.
 
+## Building
+
+`carbon.build(context)` builds an image from a Carbonfile, which is a Dockerfile, exactly: the same grammar, as
+BuildKit's `docker/dockerfile:1` reads it. A build is the library's own calls: each `RUN` a launched machine frozen
+after (`launch`, `freeze_with`), each `COPY` and `ADD` a copy into a machine made but never run (`create`,
+`copy_in`, `copy_from`), every other instruction a change to the image's config. So rules and hooks hold for every
+`RUN`, and `carbon watch` sees each step's machine (`build-<id>-<n>`) as it runs.
+
+```rust
+let built = carbon
+    .build("./app")                                        // ./Carbonfile, else ./Dockerfile; .file(path) for another
+    .tag("app:2")
+    .arg("VERSION", "2")
+    .target("runtime")
+    .rules(Rules::new().deny("0.0.0.0/0")?.allow("pypi.org:443")?)
+    .run_with(|step| eprintln!("{step}"))?;                // each stage, step, cache hit and line a RUN writes
+let file = carbon::build::Carbonfile::parse(&text)?;      // the grammar alone
+```
+
+| Instruction | What a build does |
+| --- | --- |
+| `FROM`, `--platform` | The image, pulled if it isn't here, or an earlier stage; `scratch` is an empty disk. Its `ONBUILD` triggers run first |
+| `RUN` | A machine launched from the step's image with its `ENV`, `ARG`s, `WORKDIR` and `SHELL`, run to its end, frozen with the config and the step; a non-zero exit fails the build. `--network`; here-documents as scripts (a `#!` one run as a file) |
+| `RUN --mount` | `type=cache`: a volume kept between builds (`build-cache-…`, by its `id` or target), left out of the step's key; `bind`: part of the context (a folder or a file), read-only, its contents in the key; `tmpfs`; `secret`: a file the build was given (`Build::secret`, `--secret id=ID,src=FILE`) at `/run/secrets/ID` for that step, or a variable (`env=`), never in the image or the key |
+| `COPY`, `ADD` | Into a machine made but never run: the context's files (the ignore file applied, wildcards matched), a here-document, or another stage's or image's (`--from`, disk to disk). `--chown`, octal `--chmod`, `--exclude`; kinds, modes, times and links kept. `ADD` unpacks a local tar, plain or gzip, found by its contents |
+| `ENV`, `ARG`, `WORKDIR`, `USER`, `CMD`, `ENTRYPOINT`, `SHELL`, `LABEL`, `EXPOSE`, `VOLUME`, `STOPSIGNAL`, `HEALTHCHECK`, `ONBUILD`, `MAINTAINER` | The config and a history entry, nothing on the disk (a `WORKDIR`'s folder is made by the next step that changes the disk) |
+
+**The cache.** Each step's key is a SHA-256 of what it starts from (the stage's key so far, which every instruction
+before it fed), the instruction as resolved, the `ARG`s a `RUN` gets, its network and platform, and what a `COPY`
+reads (each file's path, kind, mode and contents). It names an unnamed image (`sha256:…`, by an id made from what
+the image is) in `<home>/build/cache/<key>.json`, so a step done before is found at once. Keys carry a version
+(`CACHE_VERSION` in [`run.rs`](src/build/run.rs)), changed whenever what a step does changes, so a fix never finds
+what an older build cached. `Carbon::prune` forgets unnamed images unused for `BUILD_CACHE_KEEP` (a week).
+
+**Held to Docker's.** The grammar (`parse.rs`, `lex.rs`, `ignore.rs`) is tested against BuildKit's behavior case by
+case: directives, continuations and comments, flags, every instruction's forms, here-documents, stages, every
+`${…}` modifier, ignore patterns.
+
+## Mounts and volumes
+
+```rust
+let dev = carbon
+    .machine("python:3.13-slim")
+    .mount(Mount::bind("/Users/me/work", "/work"))           // a host folder, live both ways (or one file)
+    .mount(Mount::bind("./config.toml", "/etc/app.toml").read_only())
+    .mount(Mount::volume("pip-cache", "/root/.cache/pip"))   // made if it isn't there
+    .mount(Mount::tmpfs("/scratch"))
+    .launch(["sleep", "infinity"])?;
+```
+
+A bound folder and a volume are both host folders, attached to the machine's disk as an external tree
+(`layers::External`, over `host::folder`) and mounted where the machine wants them by its kernel's mount table: every
+call a program makes on a file there is made on the host's file as it happens. A volume is a folder under
+`<home>/volumes/<name>/data` whose files keep their owners and modes (in an extended attribute), so a database's
+files are its user's when it's mounted again; a new volume is filled from what the image has at its target, as
+Docker's is. A machine keeps its mounts for when it runs again. Linux machines have them; Windows machines don't yet.
+
+## Workers
+
+`launch` runs a machine in a **worker**: this program's own binary, run again, which `carbon::init()` takes over. It
+outlives the program that launched it, a crash in it takes nothing else down, and it has a VM of its own (on macOS a
+process has one, so this is how one program runs several machines on hvf at once). The launcher gets a `Machine`,
+reached over its control socket as any other.
+
+- **Rules** go to the worker as data, and are decided there.
+- **Hooks with code** stay in the launcher. The worker asks it about each event they want, over a hook link (a Unix
+  socket it connects to before its kernel boots), and waits for the decision. Once the launcher is gone, an event a
+  hook with code wanted is **refused** (output passes), so a policy written in code never quietly stops holding.
+- **Logs**: what it writes is kept in `<home>/machines/<name>/output` (8 MiB, then rotated once), read with
+  `Machine::logs`, from any process.
+
 ## Seen working
 
 On macOS, through hvf: `output` of a command in `debian:13`; an `apt-get` answered without running, `uname`
 rewritten, a password redacted from output, `chmod 777` refused by a rule, a connection to an allowed host made and
 one to any other refused; a machine started on a thread, `exec`ed into at once, observed, stopped (143) and removed;
-three machines in a row in one process, each with its own VM. From the CLI: `--deny-exec` in a Linux machine (EACCES,
+three machines in a row in one process, each with its own VM. Two launched machines running at once, each in its own
+worker and VM; a launched machine's `whoami` answered and `uname` rewritten by the launcher's hooks, and refused once
+the launcher had exited. A script copied into a running machine, run at once with its mode kept. `nginx:alpine`
+launched with `-P`: port 80 published from its config, its page served, its logs read, and stopped by its SIGQUIT.
+A host folder bound into a machine: written, linked, renamed and removed on both sides, each seen by the other at
+once while it ran; read-only refusing writes (EROFS); `npm install` of Express into a bound project (67 packages and
+their links, on the host). A volume's file chowned to 999 and chmod 600, the same for the next machine; a new volume
+filled from the image's `/etc/apt`. A build with every `RUN --mount`: `pip`'s cache reused by the next build, a bound
+`requirements.txt`, a secret as a file and as a variable, a tmpfs, and none of it in the image. From the CLI: `--deny-exec` in a Linux machine (EACCES,
 126) and a Windows one (`where` refused when cmd starts it), a refused first program, `--deny` with `--allow`, and
 `carbon watch` showing another process's `carbon exec`, its output, its lookups and its refusals. A program outside
 this repository built with `carbon` as a git dependency, and ran a machine.
@@ -149,10 +245,31 @@ with [`examples/agent.rs`](examples/agent.rs) and `carbon`.
 
 In [the proposal](../docs/carbon_lib.md)'s order:
 
-- [ ] **Workers**: a machine in a process of its own (this binary, run again by `init`), so one program runs several
-      at once on macOS, where hvf allows one VM per process (a second falls back to the sandbox today, and says so),
-      and a machine that crashes doesn't take the program with it. Hook frames over the control socket, under the same
-      API.
+- [x] **Workers** (`launch`), logs and timeouts; **files**, and copies that keep metadata, running or stopped;
+      **images'** whole config, `tag` and history.
+- [x] **Building** from a Carbonfile (the Dockerfile's grammar), with its cache.
+- [x] **Mounts and volumes**, and `RUN --mount` (`cache`, `bind`, `tmpfs`, `secret`).
+- [ ] **The rest of mounts:** in Windows machines (a drive or a folder); an image's `VOLUME`s made volumes at
+      `launch`; `RUN --mount=type=bind,from=` and `rw`, a secret's target outside `/run/secrets`, `type=ssh`;
+      volumes' metadata kept on Windows hosts; seeing a bound folder's changes through inotify.
+- [ ] **Users** (step 9): `MachineSpec::user`, `ExecSpec::user`, and `USER` honored by `RUN` (it warns and runs as
+      root today).
+- [ ] **Registries** (step 10): `login`, `push`, `save`, `load`; a built image pushed a layer per step (each its
+      index's difference from the step before, as a tar with whiteouts), `--squash` for one; `build --output
+      type=tar|oci`.
+- [ ] **Policy and budget** (step 11), held by every build too; **checkpoints** of a running machine (step 12).
+- [ ] **Windows images built**: `FROM atlas`, `RUN` by `cmd.exe` and `powershell`, `COPY` into `C:\`.
+- [ ] **The rest of building**: `ADD` of a URL (`--checksum`) or a git repository, and a tar or git URL as the
+      context; `COPY --parents`; symbolic `--chmod`; bzip2, xz and zstd archives; stages that don't need each
+      other built at once; `HEALTHCHECK` run, its state in `MachineInfo`; BuildKit's own parser test files
+      (`frontend/dockerfile/parser/testfiles`) and substitution cases vendored into the tests; comparing a build's
+      files with `docker build`'s.
+- [ ] **Open, for building:** labels of Carbon's an image could carry (`carbon.network=none`), *recommended* none
+      until images want their own rules; a push's shape, *recommended* a layer per step; `ADD` of a URL fetched on
+      the host or in a machine, *recommended* in a machine (by the build's own network, so `--deny` holds) and git
+      cloned in a small helper image; `RUN` in a worker or on a thread, *recommended* a worker until start-up shows
+      in builds of many short steps.
+- [ ] Workers on Windows hosts: the control socket and hook link are Unix sockets today.
 - [ ] **More hook points**: files (open, create, write, remove, rename), process lifecycle and signals, accepts on
       published ports, connection data, the registry, desktop dialogs, time and randomness.
 - [ ] **Answers**: a Windows program's start answered (a process that ends at once with the answer's output); a

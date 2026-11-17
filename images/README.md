@@ -14,7 +14,7 @@ Everything is under `CARBON_HOME`, or `~/.carbon`:
 
 ```text
 chunks/ab/cdef…                                 every image's and machine's file contents and indexes, by SHA-256, each kept once
-images/docker.io/library/debian/13.json         an image: its index, its platform, what its config says to run
+images/docker.io/library/debian/13.json         an image: its index, its platform, its whole config, its history, its layers' digests
 machines/dev/machine.json                       a machine: its kernel, its image and that image's index (pinned), its process
 machines/dev/log                                its writable layer: every change to its disk since its image
 ```
@@ -27,6 +27,9 @@ machines/dev/log                                its writable layer: every change
 - **HTTPS** (`tls.rs`): rustls, with a verifier that asks [`host`](../host/README.md), so the host's own store and
   rules decide whom to trust.
 - **Importing** a tar, and **saving** a frozen machine as an image.
+- **Config** (`config.rs`): OCI's whole image config (environment, entrypoint, command, user, working folder, exposed
+  ports, volumes, labels, stop signal, health check, shell, `ONBUILD`) and its history, kept from a pull, in one JSON
+  form for images and machine records. **Tagging** names an image again, sharing its index.
 
 `debian:13` pulls in about 15 s, with a 2.2 MB index.
 

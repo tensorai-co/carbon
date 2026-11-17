@@ -118,6 +118,11 @@ pub struct Options {
     pub audio: Option<audio::Mixer>,
     /// The machine's hooks: each `execve` is asked about, when something wants execs.
     pub hooks: hooks::Hub,
+    /// Folders mounted when it boots, in order: a host's folders and volumes, and tmpfs.
+    pub mounts: Vec<Mount>,
+    /// The first program's path on the disk, when `argv[0]` is the name it was called by (`sh`, as an image's `CMD`
+    /// says it) rather than where it is; None runs `argv[0]` as a path.
+    pub program: Option<String>,
 }
 
 /// A running machine, from outside it: how `carbon stop` reaches in, from any thread.
@@ -141,6 +146,14 @@ impl Stop {
         let Some(init) = k.process(1) else { return false };
         k.signal_process(&init, signal);
         true
+    }
+
+    /// Runs `f` on the machine's disk, under the lock its programs' own calls take: what it writes is what they see
+    /// next, and a watching program (inotify, `ReadDirectoryChangesW`) hears of it. None if the kernel isn't up.
+    pub fn with_disk<R>(&self, f: impl FnOnce(&mut Disk) -> R) -> Option<R> {
+        let k = self.kernel()?;
+        let mut disk = lock(&k.disk);
+        Some(f(&mut disk))
     }
 
     /// Whether the machine's kernel is up, and hasn't ended: a process can be started in it from outside.
@@ -170,8 +183,93 @@ impl Default for Options {
             gpu: None,
             audio: None,
             hooks: hooks::Hub::default(),
+            program: None,
+            mounts: Vec::new(),
         }
     }
+}
+
+/// A folder from elsewhere for a mount (a host's, a volume's): taken by the machine that boots with it.
+#[derive(Clone)]
+pub struct Folder(Arc<Mutex<Option<Box<dyn layers::External>>>>);
+
+impl Folder {
+    pub fn new(folder: Box<dyn layers::External>) -> Folder {
+        Folder(Arc::new(Mutex::new(Some(folder))))
+    }
+}
+
+impl std::fmt::Debug for Folder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Folder")
+    }
+}
+
+/// What a mount has.
+#[derive(Debug, Clone)]
+pub enum MountSource {
+    /// A folder from elsewhere, and what `mountinfo` names as its source (the host's path, a volume's name).
+    Folder(Folder, String),
+    /// One file of a folder from elsewhere, by its name in it: a single file bound over a file, as Linux allows.
+    File(Folder, String, String),
+    /// Memory only, gone when the machine is.
+    Tmpfs,
+}
+
+/// A mount a machine boots with.
+#[derive(Debug, Clone)]
+pub struct Mount {
+    /// Where it is in the machine: `/work`.
+    pub target: String,
+    pub source: MountSource,
+    pub read_only: bool,
+}
+
+/// A folder's files' `Meta`: as it keeps it (a volume), else from the host's permission bits, root's, as a bound
+/// folder's files look in a Linux VM on a Mac.
+fn host_meta(st: &layers::ExtStat) -> Meta {
+    if let Some(words) = st.meta {
+        return <Meta as layers::Persist>::load(words);
+    }
+    let kind = match st.kind {
+        layers::Kind::Dir => abi::S_IFDIR,
+        layers::Kind::Symlink => abi::S_IFLNK,
+        layers::Kind::File => abi::S_IFREG,
+    };
+    Meta { mode: kind | st.mode & 0o7777, ..Meta::default() }
+}
+
+/// Attaches the folders a machine boots with, and makes tmpfs trees, each with its folder made on the disk.
+fn boot_mounts(disk: &mut Disk, mounts: &[Mount]) -> Result<Vec<fs::mount::BootMount>, String> {
+    let mut out = Vec::new();
+    for m in mounts {
+        if !m.target.starts_with('/') || m.target.split('/').any(|p| p == "..") {
+            return Err(format!("a mount's target must be an absolute path: {}", m.target));
+        }
+        // What it covers: a folder, or for a single file, a file.
+        let point = if matches!(m.source, MountSource::File(..)) { layers::New::File } else { layers::New::Dir };
+        disk.put(&m.target, point, &[], Meta::file(0o644), Meta::dir(0o755)).map_err(|e| format!("making {} for its mount: {e}", m.target))?;
+        let map = || layers::Mapping { meta: host_meta, mode: |m: &Meta| m.mode & 0o7777, save: <Meta as layers::Persist>::save };
+        let (root, what, source, tree) = match &m.source {
+            MountSource::Folder(folder, source) => {
+                let backend = lock(&folder.0).take().ok_or_else(|| format!("{}: its folder was taken by another machine", m.target))?;
+                let root = disk.attach(backend, map(), m.read_only).map_err(|e| format!("{source}: {e}"))?;
+                (root, fs::mount::What::Host, source.clone(), None)
+            }
+            MountSource::File(folder, name, source) => {
+                let backend = lock(&folder.0).take().ok_or_else(|| format!("{}: its folder was taken by another machine", m.target))?;
+                let top = disk.attach(backend, map(), m.read_only).map_err(|e| format!("{source}: {e}"))?;
+                let root = disk.lookup(top, name).map_err(|e| format!("{source}: {e}"))?;
+                (root, fs::mount::What::Host, source.clone(), None)
+            }
+            MountSource::Tmpfs => {
+                let tree = disk.volatile_root(Meta::dir(0o755), 0);
+                (tree, fs::mount::What::Tmpfs, "tmpfs".to_string(), Some(tree))
+            }
+        };
+        out.push(fs::mount::BootMount { path: m.target.clone(), root, what, source, read_only: m.read_only, tree });
+    }
+    Ok(out)
 }
 
 /// How a process ended.
@@ -199,7 +297,7 @@ impl Status {
     }
 }
 
-/// Boots a machine: runs `argv[0]`, a path on `disk`, as process 1, on this thread with the CPU `Exec::open` gave, and
+/// Boots a machine: runs `options.program` (else `argv[0]`, a path on `disk`) as process 1, on this thread with the CPU `Exec::open` gave, and
 /// returns how it ended. Other processes still running then are ended with it.
 pub fn boot(mut exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&str], options: Options) -> Result<Status, String> {
     let mut disk = disk;
@@ -207,7 +305,8 @@ pub fn boot(mut exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&
     let (display, audio) = (options.display.is_some(), options.audio.is_some());
     own_env(display, audio, &mut options.env);
     os::populate(&mut disk, options.gpu.is_some());
-    let mount_ns = fs::mount::MountNs::new(fs::mount::Mounts::boot(&disk));
+    let extra = boot_mounts(&mut disk, &options.mounts)?;
+    let mount_ns = fs::mount::MountNs::new(fs::mount::Mounts::boot(&disk).with(&disk, extra));
     let boot_ns = ns::Namespaces::boot(mount_ns, admin::Names { host: options.hostname.clone(), domain: "(none)".to_string() });
     let watches = fs::inotify::Registry::default();
     let fanotify = fs::fanotify::Registry::default();

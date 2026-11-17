@@ -63,6 +63,7 @@ dependencies = [
  "display",
  "display-macos",
  "exec",
+ "flate2",
  "gpu-api",
  "hooks",
  "host",

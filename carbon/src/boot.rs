@@ -39,6 +39,8 @@ pub(crate) struct Launch {
     pub memory: u64,
     /// None for what it had last, or NAT for a new machine.
     pub network: Option<Network>,
+    /// Every port its image exposes published, each on a free host port (`-P`).
+    pub publish_all: bool,
     /// As written (`2222:22`); None for what it had last.
     pub publish: Option<Vec<String>>,
     pub stdin: Stdio,
@@ -49,6 +51,10 @@ pub(crate) struct Launch {
     pub relay_signals: bool,
     /// Removed, with its files, once it ends (`--rm`).
     pub remove: bool,
+    /// Stopped (as `stop` does) if it's still running this long after it starts.
+    pub timeout: Option<std::time::Duration>,
+    /// Its mounts; None for what it had last.
+    pub mounts: Option<Vec<crate::Mount>>,
     pub hub: Hub,
 }
 
@@ -94,8 +100,12 @@ pub(crate) fn run(store: &Store, launch: Launch, notify: &Notify, started: &mut 
     if let Some(publish) = &launch.publish {
         record.publish = publish.clone();
     }
+    if let Some(mounts) = &launch.mounts {
+        record.mounts = mounts.clone();
+    }
     let mut ports = Vec::new();
-    for text in &record.publish {
+    let exposed: Vec<String> = if launch.publish_all { record.config.exposed_ports.clone() } else { Vec::new() };
+    for text in record.publish.iter().chain(&exposed) {
         ports.push((text.clone(), Publish::parse(text).map_err(|e| Error::invalid(format!("--publish {e}")))?));
     }
     if !ports.is_empty() && record.network != Network::Nat {
@@ -111,6 +121,20 @@ pub(crate) fn run(store: &Store, launch: Launch, notify: &Notify, started: &mut 
     let host = Arc::new(host);
     let stopper = Stopper::default();
     let mut ends = Some(ends);
+    if let Some(timeout) = launch.timeout {
+        let stopper = stopper.clone();
+        let _ = std::thread::Builder::new().name("carbon machine timeout".into()).spawn(move || {
+            let (step, mut waited) = (std::time::Duration::from_millis(100), std::time::Duration::ZERO);
+            while waited < timeout {
+                if stopper.is_done() {
+                    return;
+                }
+                std::thread::sleep(step);
+                waited += step;
+            }
+            stopper.stop(15);
+        });
+    }
 
     // x86 of either width on Apple silicon wants the CPU's own x86 memory ordering.
     let tso = matches!(record.platform.arch.as_str(), "amd64" | "386") && cfg!(target_arch = "aarch64");
@@ -132,6 +156,7 @@ pub(crate) fn run(store: &Store, launch: Launch, notify: &Notify, started: &mut 
         record.ports = published.iter().flat_map(net::Published::bound).map(|b| b.to_string()).collect();
         record.backend = exec.backend().to_string();
         record.pid = Some(std::process::id());
+        record.exit = None;
         store.save_record(record)?;
         // Its caller hears it's started once it can be reached from outside (or once it's over, if it never could be).
         let name = record.name.clone();
@@ -151,6 +176,7 @@ pub(crate) fn run(store: &Store, launch: Launch, notify: &Notify, started: &mut 
         drop(published);
         record.pid = None;
         record.ports.clear();
+        record.exit = ended.as_ref().ok().copied();
         if launch.remove {
             let _ = std::fs::remove_dir_all(store.dir(&record.name));
         } else {
@@ -331,7 +357,9 @@ fn boot(store: &Store, record: &Record, launch: &Launch, parts: Parts, notify: &
                 First::Run(path, args, env) => (path, args, env),
                 First::Answered(reply) => return answered(reply),
             };
-            let argv: Vec<&str> = std::iter::once(path.as_str()).chain(args[1..].iter().map(String::as_str)).collect();
+            // `argv[0]` as it was asked for (`sh`, not `/usr/bin/sh`), as Docker runs it; the path found is what runs.
+            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+            let program = Some(path.clone());
             let stop = lambda::Stop::default();
             stopper.set(Handle::Lambda(stop.clone()));
             #[cfg(unix)]
@@ -358,18 +386,27 @@ fn boot(store: &Store, record: &Record, launch: &Launch, parts: Parts, notify: &
                     stop.enter(spec).map(|entered| Box::new(entered) as Box<dyn Session>)
                 })
             };
-            let served = Served { desktop: desktop.clone(), enter: Some(hooked_enter(enter, hub.clone(), hooks::Os::Linux)), stopper: stopper.clone(), hub: hub.clone() };
+            let files: wire::FilesFn = {
+                let stop = stop.clone();
+                Arc::new(move |op: &crate::files::Op, data: &[u8]| stop.with_disk(|disk| crate::files::apply(disk, op, data)).unwrap_or_else(|| Err(Error::new(ErrorKind::NotRunning, "the machine's kernel isn't up"))))
+            };
+            let served = Served { desktop: desktop.clone(), enter: Some(hooked_enter(enter, hub.clone(), hooks::Os::Linux)), files: Some(files), stopper: stopper.clone(), hub: hub.clone() };
             let _control = wire::serve(store.dir(&record.name), served);
             ready();
             let gpu = open_gpu(launch.gpu, notify)?;
             let (mixer, _audio) = open_audio(&launch.audio, launch.display, notify)?;
-            let mut options = lambda::Options { stop, display: desktop.clone(), gpu, audio: Some(mixer), env, network: Some(network), hooks: hub, ..lambda::Options::default() };
+            // Its mounts: host folders and volumes attached to its disk, and tmpfs.
+            let mounts = crate::mounts::lambda_mounts(store.images.home(), &record.mounts, &disk)?;
+            let mut options = lambda::Options { stop, display: desktop.clone(), gpu, audio: Some(mixer), env, network: Some(network), hooks: hub, program, mounts, ..lambda::Options::default() };
             options.hostname = record.name.clone();
             options.console = launch.tty;
             options.cwd = workdir.clone();
             lambda::boot(exec, cpu, disk, as_host, &argv, options).map(lambda::Status::code).map_err(Error::from)
         }
         Kernel::Atlas => {
+            if !record.mounts.is_empty() {
+                return Err(Error::unsupported("mounts in a Windows machine aren't there yet: Linux machines have them"));
+            }
             let mut disk = store.disk::<atlas::Meta>(record, atlas::Meta { attributes: 0x10 }, true)?;
             if let (Some(bytes), Some(path)) = (&program, &record.program) {
                 let unix = format!("/{}", path.trim_start_matches("C:\\").replace('\\', "/"));
@@ -403,7 +440,11 @@ fn boot(store: &Store, record: &Record, launch: &Launch, parts: Parts, notify: &
                     stop.enter(spec).map(|entered| Box::new(entered) as Box<dyn Session>)
                 })
             };
-            let served = Served { desktop: desktop.clone(), enter: Some(hooked_enter(enter, hub.clone(), hooks::Os::Windows)), stopper: stopper.clone(), hub: hub.clone() };
+            let files: wire::FilesFn = {
+                let stop = stop.clone();
+                Arc::new(move |op: &crate::files::Op, data: &[u8]| stop.with_disk(|disk| crate::files::apply(disk, op, data)).unwrap_or_else(|| Err(Error::new(ErrorKind::NotRunning, "the machine's kernel isn't up"))))
+            };
+            let served = Served { desktop: desktop.clone(), enter: Some(hooked_enter(enter, hub.clone(), hooks::Os::Windows)), files: Some(files), stopper: stopper.clone(), hub: hub.clone() };
             let _control = wire::serve(store.dir(&record.name), served);
             ready();
             let env = env.iter().filter_map(|e| e.split_once('=')).map(|(k, v)| (k.to_string(), v.to_string())).collect();

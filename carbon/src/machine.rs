@@ -57,6 +57,8 @@ pub struct MachineInfo {
     /// Its ports as they were asked for (`2222:22`), and, while it runs, where they're published.
     pub publish: Vec<String>,
     pub ports: Vec<Port>,
+    /// How its first process ended, the last time it ran (None while it runs, or if it never ended).
+    pub exit: Option<i32>,
 }
 
 impl MachineInfo {
@@ -75,12 +77,60 @@ impl MachineInfo {
             backend: record.backend,
             network: record.network,
             publish: record.publish,
+            exit: record.exit.filter(|_| !running),
         }
     }
 
     /// What it's from, as `carbon ls` shows it: `debian:13`, or the program.
     pub fn from(&self) -> String {
         self.image.as_deref().map(|i| i.strip_prefix("docker.io/library/").unwrap_or(i).to_string()).or(self.program.clone()).unwrap_or_default()
+    }
+}
+
+/// How [`Machine::freeze_with`] makes an image.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Freeze {
+    pub(crate) name: Option<String>,
+    pub(crate) config: Option<images::Config>,
+    pub(crate) step: Option<String>,
+    pub(crate) comment: String,
+    pub(crate) history: Option<Vec<images::History>>,
+    pub(crate) source: Option<String>,
+}
+
+impl Freeze {
+    /// An unnamed image, with the machine's config, and `carbon freeze NAME` as its step.
+    pub fn new() -> Freeze {
+        Freeze::default()
+    }
+    /// What it's called: `app:2`.
+    pub fn name(mut self, name: impl Into<String>) -> Freeze {
+        self.name = Some(name.into());
+        self
+    }
+    /// Its config, instead of the machine's.
+    pub fn config(mut self, config: images::Config) -> Freeze {
+        self.config = Some(config);
+        self
+    }
+    /// What its history says made it: `RUN apt-get install -y curl`.
+    pub fn step(mut self, step: impl Into<String>) -> Freeze {
+        self.step = Some(step.into());
+        self
+    }
+    pub fn comment(mut self, comment: impl Into<String>) -> Freeze {
+        self.comment = comment.into();
+        self
+    }
+    /// Where `carbon images` says it came from, instead of the machine it was frozen from.
+    pub fn source(mut self, source: impl Into<String>) -> Freeze {
+        self.source = Some(source.into());
+        self
+    }
+    /// Its whole history, instead of its base's with one step added.
+    pub fn history(mut self, history: Vec<images::History>) -> Freeze {
+        self.history = Some(history);
+        self
     }
 }
 
@@ -134,7 +184,7 @@ impl Machine {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        ExecSpec { machine: self.clone(), request: ExecRequest { args: argv.into_iter().map(Into::into).collect(), ..ExecRequest::default() } }
+        ExecSpec { machine: self.clone(), request: ExecRequest { args: argv.into_iter().map(Into::into).collect(), ..ExecRequest::default() }, timeout: None }
     }
 
     /// Asks it to end, as `docker stop` does: SIGTERM to a Linux machine's first process (a Windows machine is
@@ -144,7 +194,8 @@ impl Machine {
         if !record.running() {
             return Err(Error::not_running(&self.name));
         }
-        match wire::ask(&self.dir(), "stop") {
+        // The signal its image says stops it (SIGTERM unless it says otherwise).
+        match wire::ask(&self.dir(), &format!("stop {}", record.config.stop_signal_number())) {
             Ok(_) => Ok(()),
             // A machine from before there was a `stop` to ask: the process it's in, signalled.
             Err(_) => signal_process(&self.name, record.pid),
@@ -169,6 +220,13 @@ impl Machine {
         true
     }
 
+    /// What it wrote, kept, as lines: a launched machine's ([`crate::MachineSpec::launch`]), running or not.
+    pub fn logs(&self, logs: crate::Logs) -> Result<crate::LogReader> {
+        let (carbon, name) = (self.carbon.clone(), self.name.clone());
+        let running = Box::new(move || carbon.0.store.record(&name).is_some_and(|r| r.running()));
+        crate::logs::LogReader::open(&self.dir(), logs, running)
+    }
+
     /// Its screen, while it runs.
     pub fn screen(&self) -> Screen {
         Screen { dir: self.dir() }
@@ -183,19 +241,32 @@ impl Machine {
 
     /// An image of its disk as it is now, called `image`, which new machines can start from. It must be stopped.
     pub fn freeze(&self, image: &str) -> Result<Image> {
-        self.carbon.0.store.freeze(&self.name, image)
+        self.freeze_with(&Freeze::new().name(image))
+    }
+
+    /// As [`Machine::freeze`], saying what the image is called (or nothing, for an unnamed one found by its id), its
+    /// config, and the step its history gives for it: what a build does after each step.
+    pub fn freeze_with(&self, how: &Freeze) -> Result<Image> {
+        self.carbon.0.store.freeze(&self.name, how)
+    }
+
+    /// Its files, running or stopped: read, written, listed, made, moved and removed.
+    pub fn files(&self) -> crate::Files {
+        crate::Files { carbon: self.carbon.clone(), name: self.name.clone() }
     }
 
     /// Copies its file, or folder and all in it, at `path` (as it names it: `/etc/hosts`, `C:\Program Files\App`)
-    /// into the host's folder `to`. How many files. It must be stopped.
-    pub fn copy_out(&self, path: &str, to: impl AsRef<Path>) -> Result<usize> {
-        self.carbon.0.store.copy_out(&self.name, path, to.as_ref())
+    /// into the host's folder `to`, under its own name, running or stopped: kinds, modes, times and links kept. How
+    /// many files, folders and links.
+    pub fn copy_out(&self, path: &str, to: impl AsRef<Path>, how: &crate::Copy) -> Result<usize> {
+        self.files().copy_out(path, to.as_ref(), how)
     }
 
-    /// Copies the host's file, or folder and all in it, into its folder `path`; a `from` ending in `/.` copies what's
-    /// in the folder. How many files. It must be stopped.
-    pub fn copy_in(&self, from: impl AsRef<Path>, path: &str) -> Result<usize> {
-        self.carbon.0.store.copy_in(&self.name, from.as_ref(), path)
+    /// Copies the host's file, or folder and all in it, into its folder `into`, under its own name (what's in the
+    /// folder, for a `from` ending in `/.`), running or stopped: kinds, modes, times and links kept; root's unless
+    /// `how` says otherwise. How many files, folders and links.
+    pub fn copy_in(&self, from: impl AsRef<Path>, into: &str, how: &crate::Copy) -> Result<usize> {
+        self.files().copy_in(from.as_ref(), into, how)
     }
 
     /// Removes it, and its files; its image stays. It must be stopped.
@@ -223,6 +294,7 @@ fn signal_process(_name: &str, _pid: Option<u32>) -> Result<()> {
 pub struct ExecSpec {
     machine: Machine,
     request: ExecRequest,
+    timeout: Option<Duration>,
 }
 
 impl ExecSpec {
@@ -235,6 +307,13 @@ impl ExecSpec {
 
     pub fn workdir(mut self, dir: impl Into<String>) -> ExecSpec {
         self.request.workdir = Some(dir.into());
+        self
+    }
+
+    /// Kills it (SIGKILL; in a Windows machine, ends it) if it's still running this long after it starts. Its
+    /// [`Output::timed_out`] says so, and [`Process::timed_out`].
+    pub fn timeout(mut self, timeout: Duration) -> ExecSpec {
+        self.timeout = Some(timeout);
         self
     }
 
@@ -254,7 +333,11 @@ impl ExecSpec {
     /// Starts it, with its stdin, stdout and stderr this program's to use.
     pub fn spawn(self) -> Result<Process> {
         self.checked()?;
-        Process::open(&self.machine.dir(), &self.request)
+        let mut process = Process::open(&self.machine.dir(), &self.request)?;
+        if let Some(timeout) = self.timeout {
+            process.watch(timeout);
+        }
+        Ok(process)
     }
 
     /// Runs it to its end, its stdin closed, and gives what it wrote.
@@ -270,7 +353,7 @@ impl ExecSpec {
                 None => break Exit(255),
             }
         };
-        Ok(Output { exit, stdout, stderr })
+        Ok(Output { exit, stdout, stderr, timed_out: process.timed_out() })
     }
 
     /// Starts it and leaves it running: nothing comes back but whether it started.
@@ -302,13 +385,16 @@ pub struct Process {
     #[cfg(unix)]
     stream: std::os::unix::net::UnixStream,
     exited: Option<i32>,
+    /// Set once its timeout has killed it; its watcher stops once it's ended.
+    timed_out: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ended: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Process {
     #[cfg(unix)]
     fn open(dir: &Path, request: &ExecRequest) -> Result<Process> {
         let (stream, _) = wire::open(dir, &format!("exec {}", wire::request_json(request)))?;
-        Ok(Process { stream, exited: None })
+        Ok(Process { stream, exited: None, timed_out: Default::default(), ended: Default::default() })
     }
 
     #[cfg(not(unix))]
@@ -325,6 +411,36 @@ impl Process {
     #[cfg(not(unix))]
     fn send(&self, _kind: u8, _data: &[u8]) -> Result<()> {
         Err(Error::unsupported("exec isn't there yet on Windows hosts"))
+    }
+
+    /// Kills it if it hasn't ended `timeout` from now.
+    fn watch(&mut self, timeout: Duration) {
+        #[cfg(unix)]
+        if let Ok(stream) = self.stream.try_clone() {
+            let (timed_out, ended) = (self.timed_out.clone(), self.ended.clone());
+            let _ = std::thread::Builder::new().name("carbon exec timeout".into()).spawn(move || {
+                let (step, mut waited) = (Duration::from_millis(50), Duration::ZERO);
+                while waited < timeout {
+                    if ended.load(std::sync::atomic::Ordering::Acquire) {
+                        return;
+                    }
+                    std::thread::sleep(step);
+                    waited += step;
+                }
+                if !ended.load(std::sync::atomic::Ordering::Acquire) {
+                    timed_out.store(true, std::sync::atomic::Ordering::Release);
+                    use std::io::Write;
+                    let _ = (&stream).write_all(&wire::frame(3, &9i32.to_le_bytes()));
+                }
+            });
+        }
+        #[cfg(not(unix))]
+        let _ = timeout;
+    }
+
+    /// Whether its timeout ([`ExecSpec::timeout`]) killed it.
+    pub fn timed_out(&self) -> bool {
+        self.timed_out.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Writes to its stdin.
@@ -362,11 +478,13 @@ impl Process {
                 Some((3, data)) if data.len() >= 4 => {
                     let code = i32::from_le_bytes([data[0], data[1], data[2], data[3]]);
                     self.exited = Some(code);
+                    self.ended.store(true, std::sync::atomic::Ordering::Release);
                     return Some(ProcessEvent::Exit(code));
                 }
                 Some(_) => {}
                 None => {
                     self.exited = Some(255);
+                    self.ended.store(true, std::sync::atomic::Ordering::Release);
                     return Some(ProcessEvent::Exit(255));
                 }
             }

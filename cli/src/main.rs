@@ -36,9 +36,19 @@ usage: carbon <command> ...
       -i, --interactive                      keep stdin: the machine's stdin is this one's (without it, it's empty)
       -t, --tty                              with -i, this terminal is the machine's console: a shell's prompt and
                                              line editing, Ctrl-C, full-screen programs (-it for a shell, as Docker)
+      -d, --detach                           run it in a process of its own, which outlives this one, and print its
+                                             name; what it writes is kept (carbon logs NAME)
+      --timeout DURATION                     stop it if it's still running this long after it starts: 90s, 5m, 2h
       --isolation vm|sandbox|auto            a hardware VM, the process sandbox, or the best there is (the default)
       --name NAME                            the machine's name (else one from its image or program)
       --rm                                   remove it, and its files, once it ends
+      -v, --volume SOURCE:TARGET[:ro]        mount a host folder (/path, ./path, ~/path) or a volume (a name) at TARGET:
+                                             each side sees the other's changes at once; a new volume is filled from
+                                             the image's files at TARGET
+      --mount type=bind|volume|tmpfs,source=...,target=...[,readonly]
+                                             the same, as Docker's --mount
+      --tmpfs TARGET                         a folder in memory only
+      -P, --publish-all                      publish every port its image exposes, each on a free host port
       --platform OS/ARCH                     which build of an image to pull (linux for this CPU by default)
       --display headless=WxH[@SCALE]|host[=WxH]|host-windows|none
                                              where its windows go: a screen in memory (headless=1280x800 by
@@ -73,6 +83,22 @@ usage: carbon <command> ...
       -d, --detach                           start it and leave it running
       -e, --env NAME=VALUE                   an environment variable, over the machine's
       -w, --workdir DIR                      where it starts (the image's working directory by default)
+      --timeout DURATION                     kill it if it hasn't ended this long after it starts (exit 124)
+  build [options] CONTEXT                    build an image from CONTEXT's Carbonfile (else its Dockerfile)
+      -t, --tag NAME                         name it (as many as wanted)
+      -f, --file FILE                        the file to build, or - for stdin (a Dockerfile, exactly)
+      --build-arg NAME=VALUE                 a value for an ARG the file declares
+      --target STAGE                         the stage to build (the last by default)
+      --platform OS/ARCH                     what to build for: linux/amd64 on Apple silicon runs translated
+      --no-cache                             run every step, finding none in the cache
+      --secret id=ID,src=FILE|env=VAR        a secret for RUN --mount=type=secret,id=ID: at /run/secrets/ID for
+                                             that step only, never in the image
+      -o, --output DIR                       also copy what's built to this folder
+      --isolation, --network, --memory, --timeout, --deny, --allow, --deny-exec
+                                             as run's, for every RUN
+      -q, --quiet                            print only the image's name
+  volume create|ls|inspect|rm [NAME]         volumes: folders kept under CARBON_HOME that machines mount and outlive
+  logs [-f] [--tail N] NAME                  what a machine run with -d wrote: -f keeps following until it stops
   watch NAME [--exec] [--output] [--net] [--json]
                                              what a running machine does, as it does it: the programs it starts,
                                              what they write, its connections and lookups, and what its rules and
@@ -83,9 +109,10 @@ usage: carbon <command> ...
   stop NAME                                  stop a running machine (SIGTERM, then everything after 10s)
   rm NAME                                    remove a stopped machine and its files
   freeze NAME IMAGE                          make an image of a stopped machine's disk
-  cp NAME:PATH DIR                           copy a stopped machine's file or folder into DIR on this host
-  cp PATH NAME:DIR                           copy this host's file or folder into a stopped machine's DIR (PATH/.
-                                             for what's in a folder)
+  cp NAME:PATH DIR                           copy a machine's file or folder into DIR on this host, running or not:
+                                             modes, times and links kept
+  cp PATH NAME:DIR                           copy this host's file or folder into a machine's DIR, running or not
+                                             (PATH/. for what's in a folder); root's, as docker cp makes it
   display screenshot NAME [-o FILE]          a running machine's screen, as a PNG (screen.png by default)
   display windows NAME                       a running machine's windows, top first: ID, place, size, state, title
   display move NAME X Y                      moves its pointer
@@ -106,6 +133,9 @@ usage: carbon <command> ...
       --platform OS/ARCH                     its platform (a tar of C:\\ for Windows, as atlas-base's, is found)
       -c, --change INSTRUCTION               its config: CMD, ENTRYPOINT, ENV, WORKDIR or USER, as a Dockerfile
   images                                     the images here
+  inspect IMAGE                              an image's config, history and layers, as JSON
+  history IMAGE                              the steps that made an image, newest first
+  tag IMAGE NAME                             another name for an image: the same disk and config
   rmi IMAGE                                  forget an image
 ";
 
@@ -119,9 +149,151 @@ fn usage() -> ! {
     exit(2)
 }
 
+/// A length of time as `--timeout` takes it: `90` or `90s`, `500ms`, `5m`, `2h`.
+fn duration(text: &str) -> std::time::Duration {
+    let (number, unit) = text.find(|c: char| !c.is_ascii_digit()).map_or((text, ""), |at| text.split_at(at));
+    let n: u64 = number.parse().unwrap_or_else(|_| fail(format!("{text} isn't a length of time: 90, 90s, 500ms, 5m, 2h")));
+    std::time::Duration::from_millis(match unit {
+        "" | "s" => n * 1000,
+        "ms" => n,
+        "m" => n * 60_000,
+        "h" => n * 3_600_000,
+        _ => fail(format!("{text} isn't a length of time: 90, 90s, 500ms, 5m, 2h")),
+    })
+}
+
+/// `carbon build`: its arguments made into a `Build`, and its steps printed.
+fn build(carbon: &Carbon, mut args: impl Iterator<Item = String>) {
+    let (mut context, mut file, mut tags, mut quiet) = (None, None, Vec::new(), false);
+    let mut rules = Rules::new();
+    let mut options: Vec<Box<dyn FnOnce(carbon::build::Build) -> carbon::build::Build>> = Vec::new();
+    while let Some(arg) = args.next() {
+        let (arg, inline) = match arg.split_once('=') {
+            Some((flag, value)) if flag.starts_with("--") => (flag.to_string(), Some(value.to_string())),
+            _ => (arg, None),
+        };
+        let mut value = |what: &str| inline.clone().or_else(|| args.next()).unwrap_or_else(|| fail(format!("{what} needs a value")));
+        match arg.as_str() {
+            "-t" | "--tag" => tags.push(value("--tag")),
+            "-f" | "--file" => file = Some(value("--file")),
+            "--build-arg" => {
+                let pair = value("--build-arg");
+                let (k, v) = match pair.split_once('=') {
+                    Some((k, v)) => (k.to_string(), v.to_string()),
+                    // `--build-arg NAME` takes this process's value, as Docker does.
+                    None => (pair.clone(), std::env::var(&pair).unwrap_or_default()),
+                };
+                options.push(Box::new(move |b| b.arg(k, v)));
+            }
+            "--target" => {
+                let t = value("--target");
+                options.push(Box::new(move |b| b.target(t)));
+            }
+            "--platform" => {
+                let text = value("--platform");
+                let p = Platform::parse(&text).unwrap_or_else(|| fail(format!("--platform {text}: linux/arm64, linux/amd64, windows/amd64…")));
+                options.push(Box::new(move |b| b.platform(p)));
+            }
+            "--isolation" => {
+                let isolation = match value("--isolation").as_str() {
+                    "vm" => Isolation::Vm,
+                    "sandbox" => Isolation::Sandbox,
+                    "auto" => Isolation::Auto,
+                    other => fail(format!("--isolation {other}: vm, sandbox or auto")),
+                };
+                options.push(Box::new(move |b| b.isolation(isolation)));
+            }
+            "--network" | "--net" => {
+                let text = value("--network");
+                let n = carbon::parse_network(&text).unwrap_or_else(|| fail(format!("--network {text}: default, none or host")));
+                options.push(Box::new(move |b| b.network(n)));
+            }
+            "--memory" | "-m" => {
+                let m = value("--memory");
+                options.push(Box::new(move |b| b.memory(m)));
+            }
+            "--timeout" => {
+                let t = duration(&value("--timeout"));
+                options.push(Box::new(move |b| b.timeout(t)));
+            }
+            "--no-cache" => options.push(Box::new(|b| b.no_cache(true))),
+            "--secret" => {
+                // id=ID,src=FILE (or source=), or id=ID,env=VAR: a host variable's value, as Docker takes it.
+                let text = value("--secret");
+                let field = |k: &str| text.split(',').find_map(|p| p.strip_prefix(k).and_then(|r| r.strip_prefix('='))).map(String::from);
+                let id = field("id").unwrap_or_else(|| fail(format!("--secret {text}: id=ID,src=FILE")));
+                let file = match (field("src").or_else(|| field("source")), field("env")) {
+                    (Some(src), _) => std::path::PathBuf::from(src),
+                    (None, Some(var)) => {
+                        let value = std::env::var(&var).unwrap_or_else(|_| fail(format!("--secret {text}: {var} isn't set")));
+                        let temp = std::env::temp_dir().join(format!("carbon-secret-{}-{id}", std::process::id()));
+                        std::fs::write(&temp, value).unwrap_or_else(|e| fail(e));
+                        temp
+                    }
+                    (None, None) => fail(format!("--secret {text}: src=FILE or env=VAR")),
+                };
+                options.push(Box::new(move |b| b.secret(id, file)));
+            }
+            "-o" | "--output" => {
+                let text = value("--output");
+                let dir = text.strip_prefix("type=local,dest=").or_else(|| text.strip_prefix("dest=")).unwrap_or(&text).to_string();
+                options.push(Box::new(move |b| b.output(dir)));
+            }
+            // Accepted as Docker's: one line a step is all there is.
+            "--progress" => {
+                let _ = value("--progress");
+            }
+            "-q" | "--quiet" => quiet = true,
+            "--deny-exec" => rules = rules.deny_exec(&value("--deny-exec")),
+            "--deny" => rules = rules.deny(&value("--deny")).unwrap_or_else(|e| fail(format!("--deny {e}"))),
+            "--allow" => rules = rules.allow(&value("--allow")).unwrap_or_else(|e| fail(format!("--allow {e}"))),
+            flag if flag.starts_with('-') && flag.len() > 1 => fail(format!("build: unknown option {flag}")),
+            path if context.is_none() => context = Some(path.to_string()),
+            extra => fail(format!("build takes one context, not {extra} too")),
+        }
+    }
+    let context = context.unwrap_or_else(|| fail("build needs a context: a folder (.)"));
+    let mut b = carbon.build(&context).rules(rules);
+    if let Some(file) = file {
+        // `-f -`: the file from stdin.
+        let path = if file == "-" {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut text).unwrap_or_else(|e| fail(format!("reading the file from stdin: {e}")));
+            let temp = std::env::temp_dir().join(format!("carbon-build-{}.Carbonfile", std::process::id()));
+            std::fs::write(&temp, text).unwrap_or_else(|e| fail(e));
+            temp
+        } else {
+            std::path::PathBuf::from(file)
+        };
+        b = b.file(path);
+    }
+    for tag in &tags {
+        b = b.tag(tag);
+    }
+    for option in options {
+        b = option(b);
+    }
+    let built = b
+        .run_with(|step| {
+            if quiet {
+                return;
+            }
+            match step {
+                carbon::build::Step::Output { line, .. } => eprint!("    {}", line.text()),
+                carbon::build::Step::Done { .. } => {}
+                other => eprintln!("{other}"),
+            }
+        })
+        .unwrap_or_else(|e| fail(e));
+    if !quiet {
+        eprintln!("built in {:.1}s: {} ran, {} cached", built.took.as_secs_f64(), built.ran, built.cached);
+    }
+    println!("{}", built.image.short_name());
+}
+
 fn run(carbon: &Carbon, mut args: impl Iterator<Item = String>) -> ! {
     let (mut name, mut source, mut argv) = (None, None, Vec::new());
-    let (mut interactive, mut tty) = (false, false);
+    let (mut interactive, mut tty, mut detach) = (false, false, false);
     let mut options: Vec<Box<dyn FnOnce(carbon::MachineSpec) -> carbon::MachineSpec>> = Vec::new();
     let mut rules = Rules::new();
     while let Some(arg) = args.next() {
@@ -141,11 +313,24 @@ fn run(carbon: &Carbon, mut args: impl Iterator<Item = String>) -> ! {
             }
             "-i" | "--interactive" => interactive = true,
             "-t" | "--tty" => tty = true,
+            "-d" | "--detach" => detach = true,
             "--rm" => options.push(Box::new(|s| s.rm(true))),
+            "-v" | "--volume" | "--mount" | "--tmpfs" => {
+                let text = value(&arg);
+                let text = if arg == "--tmpfs" { format!("type=tmpfs,target={}", text.split(':').next().unwrap_or("")) } else { text };
+                let mount = carbon::Mount::parse(&text).unwrap_or_else(|e| fail(format!("{arg} {e}")));
+                options.push(Box::new(move |s| s.mount(mount)));
+            }
+            "-P" | "--publish-all" => options.push(Box::new(|s| s.publish_all())),
+            "--timeout" => {
+                let timeout = duration(&value("--timeout"));
+                options.push(Box::new(move |s| s.timeout(timeout)));
+            }
             // Short flags together, as `-it`.
-            flag if source.is_none() && flag.len() > 2 && !flag.starts_with("--") && flag.starts_with('-') && flag[1..].chars().all(|c| c == 'i' || c == 't') => {
+            flag if source.is_none() && flag.len() > 2 && !flag.starts_with("--") && flag.starts_with('-') && flag[1..].chars().all(|c| "itd".contains(c)) => {
                 interactive |= flag.contains('i');
                 tty |= flag.contains('t');
+                detach |= flag.contains('d');
             }
             "--isolation" => {
                 let isolation = match value("--isolation").as_str() {
@@ -228,6 +413,9 @@ fn run(carbon: &Carbon, mut args: impl Iterator<Item = String>) -> ! {
             }
         }
     }
+    if detach && (interactive || tty) {
+        fail("-d leaves the machine running in a process of its own, with no stdin or terminal: carbon exec -it NAME bash for a shell in it");
+    }
     // As Docker says it: a console needs a terminal to read from.
     if interactive && tty && !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         fail("the input device is not a TTY: -t needs this terminal as stdin (leave out -t to pipe stdin in with -i)");
@@ -243,9 +431,15 @@ fn run(carbon: &Carbon, mut args: impl Iterator<Item = String>) -> ! {
         (None, Some(name)) => carbon.again(name),
         (None, None) => usage(),
     };
-    let mut spec = spec.stdin(if interactive { Stdio::Inherit } else { Stdio::Null }).tty(interactive && tty).relay_signals(true).rules(rules);
+    let mut spec = spec.stdin(if interactive { Stdio::Inherit } else { Stdio::Null }).tty(interactive && tty).relay_signals(!detach).rules(rules);
     for option in options {
         spec = option(spec);
+    }
+    if detach {
+        // In a process of its own, which outlives this one: its name, as Docker prints a container's id.
+        let machine = spec.launch(argv).unwrap_or_else(|e| fail(e));
+        println!("{}", machine.name());
+        exit(0);
     }
     match spec.run(argv) {
         Ok(exit_code) => exit(exit_code.code()),
@@ -256,7 +450,7 @@ fn run(carbon: &Carbon, mut args: impl Iterator<Item = String>) -> ! {
 /// `carbon exec [options] NAME COMMAND [ARGS...]`, as `docker exec`.
 fn exec(carbon: &Carbon, mut args: impl Iterator<Item = String>) -> ! {
     let (mut interactive, mut tty, mut detach) = (false, false, false);
-    let (mut env, mut workdir) = (Vec::new(), None);
+    let (mut env, mut workdir, mut timeout) = (Vec::new(), None, None);
     let mut target = None;
     while let Some(arg) = args.next() {
         let (arg, inline) = match arg.split_once('=') {
@@ -275,6 +469,7 @@ fn exec(carbon: &Carbon, mut args: impl Iterator<Item = String>) -> ! {
                 env.push((key.to_string(), val.to_string()));
             }
             "-w" | "--workdir" => workdir = Some(value("--workdir")),
+            "--timeout" => timeout = Some(duration(&value("--timeout"))),
             flag if flag.len() > 1 && flag.starts_with('-') && !flag.starts_with("--") && flag[1..].chars().all(|c| "itd".contains(c)) => {
                 interactive |= flag.contains('i');
                 tty |= flag.contains('t');
@@ -305,6 +500,20 @@ fn exec(carbon: &Carbon, mut args: impl Iterator<Item = String>) -> ! {
     if tty {
         // Its real size is this terminal's, taken as it starts.
         spec = spec.tty(24, 80);
+    }
+    if let Some(timeout) = timeout {
+        if detach || interactive || tty {
+            fail("--timeout is for a command run to its end: not with -d, -i or -t");
+        }
+        let out = spec.timeout(timeout).output().unwrap_or_else(|e| fail(e));
+        use std::io::Write;
+        let _ = std::io::stdout().write_all(&out.stdout);
+        let _ = std::io::stderr().write_all(&out.stderr);
+        if out.timed_out {
+            eprintln!("carbon: {name}: the command ran past its timeout, and was killed");
+            exit(124);
+        }
+        exit(out.code());
     }
     if detach {
         spec.detach().unwrap_or_else(|e| fail(e));
@@ -367,12 +576,42 @@ fn watch(machine: &Machine, args: impl Iterator<Item = String>) {
     }
 }
 
+/// `carbon logs [-f] [--tail N] NAME`, as `docker logs`: what a launched machine wrote, each stream to this one's.
+fn logs(carbon: &Carbon, args: impl Iterator<Item = String>) {
+    let mut options = carbon::Logs::new();
+    let (mut name, mut args) = (None, args.peekable());
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-f" | "--follow" => options = options.follow(),
+            "-n" | "--tail" => {
+                let n = args.next().and_then(|n| n.parse().ok()).unwrap_or_else(|| fail("--tail needs a number of lines"));
+                options = options.tail(n);
+            }
+            flag if flag.starts_with('-') => fail(format!("logs doesn't know {flag}: -f, --tail N")),
+            _ => name = Some(arg),
+        }
+    }
+    let name = name.unwrap_or_else(|| fail("logs needs a machine's name"));
+    let reader = carbon.get(&name).and_then(|m| m.logs(options)).unwrap_or_else(|e| fail(e));
+    use std::io::Write;
+    for line in reader {
+        let _ = match line.stream {
+            carbon::LogStream::Stdout => std::io::stdout().write_all(&line.bytes),
+            carbon::LogStream::Stderr => std::io::stderr().write_all(&line.bytes),
+        };
+    }
+}
+
 fn ls(carbon: &Carbon) {
     let rows: Vec<[String; 5]> = carbon
         .machines()
         .into_iter()
         .map(|m| {
-            let status = if m.running { format!("running ({})", m.pid.unwrap_or(0)) } else { "stopped".to_string() };
+            let status = match (m.running, m.exit) {
+                (true, _) => format!("running ({})", m.pid.unwrap_or(0)),
+                (false, Some(code)) => format!("exited ({code})"),
+                (false, None) => "stopped".to_string(),
+            };
             let ports = if !m.running {
                 String::new()
             } else if m.network == carbon::Network::Nat {
@@ -459,15 +698,62 @@ fn main() {
                 }
             }
         }
+        "logs" => logs(&carbon, args),
+        "build" => build(&carbon, args),
+        "volume" => {
+            let verb = one("what to do: create, ls, inspect or rm");
+            match verb.as_str() {
+                "create" => {
+                    let name = one("a volume's name");
+                    carbon.volume(&name).create().unwrap_or_else(|e| fail(e));
+                    println!("{name}");
+                }
+                "ls" => {
+                    let rows: Vec<[String; 2]> = carbon.volumes().into_iter().map(|v| [v.name, v.path.display().to_string()]).collect();
+                    table(&["NAME", "FOLDER"], &rows);
+                }
+                "inspect" => {
+                    let name = one("a volume's name");
+                    let info = carbon.volume(&name).info().unwrap_or_else(|| fail(format!("there's no volume {name}")));
+                    println!("{{\n  \"name\": {:?},\n  \"created\": {},\n  \"path\": {:?}\n}}", info.name, info.created, info.path.display().to_string());
+                }
+                "rm" => {
+                    let name = one("a volume's name");
+                    carbon.remove_volume(&name).unwrap_or_else(|e| fail(e));
+                    println!("{name}");
+                }
+                other => fail(format!("volume {other}: create, ls, inspect or rm")),
+            }
+        }
+        "tag" => {
+            let (source, target) = (one("an image"), one("its new name"));
+            let image = carbon.tag(&source, &target).unwrap_or_else(|e| fail(e));
+            println!("{}", image.short_name());
+        }
+        "inspect" => {
+            let name = one("an image");
+            let image = carbon.image(&name).unwrap_or_else(|| fail(format!("there's no image {name}")));
+            println!("{}", carbon::image_json(&image));
+        }
+        "history" => {
+            let name = one("an image");
+            let image = carbon.image(&name).unwrap_or_else(|| fail(format!("there's no image {name}")));
+            let rows: Vec<[String; 3]> = image.history.iter().rev().map(|h| {
+                let by: String = h.created_by.chars().take(90).collect();
+                [h.created.clone(), if h.empty_layer { "config".to_string() } else { "files".to_string() }, by]
+            }).collect();
+            table(&["CREATED", "CHANGED", "CREATED BY"], &rows);
+        }
         "stop" => machine(&one("a machine's name")).stop().unwrap_or_else(|e| fail(e)),
         "rm" => machine(&one("a machine's name")).remove().unwrap_or_else(|e| fail(e)),
         "cp" => {
             let (from, to) = (one("NAME:PATH or a path on this host"), one("a folder on this host or NAME:PATH"));
             // Out of a machine when the first names one, as web:/etc/hosts; else into the machine the second names.
             let named = |arg: &str| arg.split_once(':').and_then(|(name, path)| carbon.get(name).ok().map(|m| (m, path.to_string())));
+            let how = carbon::Copy::new();
             let n = match (named(&from), named(&to)) {
-                (Some((m, path)), _) => m.copy_out(&path, &to),
-                (None, Some((m, path))) => m.copy_in(&from, &path),
+                (Some((m, path)), _) => m.copy_out(&path, &to, &how),
+                (None, Some((m, path))) => m.copy_in(&from, &path, &how),
                 (None, None) => fail("cp copies NAME:PATH DIR out of a machine, or PATH NAME:DIR into one, as web:/etc/hosts".to_string()),
             }
             .unwrap_or_else(|e| fail(e));

@@ -9,7 +9,7 @@ use layers::Persist;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::{Config, Entry, Image, Images, Platform, full_name, store, strings};
+use crate::{Config, Entry, Image, Images, Platform, full_name, store};
 
 const ACCEPT: &str = "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, \
                       application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json";
@@ -218,15 +218,8 @@ pub fn pull<M: Persist>(images: &Images, name: &str, platform: &Platform, mut me
     if os != platform.os {
         return Err(format!("{full} is for {os}, not {}", platform.os));
     }
-    let run = config.get("config");
-    let text = |key: &str| run.and_then(|c| c.get(key)).and_then(Value::as_str).unwrap_or_default().to_string();
-    let image_config = Config {
-        env: strings(run.and_then(|c| c.get("Env"))),
-        entrypoint: strings(run.and_then(|c| c.get("Entrypoint"))),
-        cmd: strings(run.and_then(|c| c.get("Cmd"))),
-        workdir: text("WorkingDir"),
-        user: text("User"),
-    };
+    let image_config = Config::from_oci(config.get("config"));
+    let history: Vec<crate::History> = config.get("history").and_then(Value::as_array).map(|h| h.iter().map(crate::History::from_json).collect()).unwrap_or_default();
 
     let layers = manifest.get("layers").and_then(Value::as_array).ok_or("the manifest has no layers")?;
     let total: u64 = layers.iter().filter_map(|l| l.get("size").and_then(Value::as_u64)).sum();
@@ -255,7 +248,8 @@ pub fn pull<M: Persist>(images: &Images, name: &str, platform: &Platform, mut me
     }
     progress(&Progress { stage: Stage::Indexing, layer: count, layers: count, done: before, total: total.max(before) });
     let index = disk.freeze().map_err(|e| format!("writing the index: {e}"))?;
-    images.save(name, &index, platform, &image_config, &format!("pulled from {}", reference.host))
+    let digests: Vec<String> = layers.iter().filter_map(|l| l.get("digest").and_then(Value::as_str).map(String::from)).collect();
+    images.save_with(name, &index, platform, &image_config, &history, &digests, &format!("pulled from {}", reference.host))
 }
 
 #[cfg(test)]

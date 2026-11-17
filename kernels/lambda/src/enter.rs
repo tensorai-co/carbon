@@ -63,8 +63,8 @@ impl Stop {
         };
         let (events_in, events) = mpsc::channel();
         let pid = k.new_id();
-        let mut argv = spec.argv.clone();
-        argv[0] = path.clone();
+        // `argv[0]` stays the name it was asked for (`bash`), as Docker's exec leaves it; `path` is what runs.
+        let argv = spec.argv.clone();
         // Its descriptors, and the other ends, ours.
         let (files, tty, stdin, outputs) = match spec.tty {
             Some((rows, cols)) => {
@@ -94,7 +94,7 @@ impl Stop {
             k.own_env(&mut env);
             let (k, ctty) = (k.clone(), tty.clone());
             kernels_core::thread::spawn(k.exec.clone(), format!("lambda {pid}"), move |cx| {
-                process::start_entered(&k, cx, pid, &argv, &env, files, ctty, cwd).map_err(|e| format!("exec: {path}: {e:?}"))
+                process::start_entered(&k, cx, pid, &path, &argv, &env, files, ctty, cwd).map_err(|e| format!("exec: {path}: {e:?}"))
             })
         };
         if let Err(why) = started {

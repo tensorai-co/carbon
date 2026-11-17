@@ -315,10 +315,10 @@ pub(crate) fn exec_into(k: &Arc<Kernel>, cx: &mut Cx<'_>, state: &mut ProcState,
                 (AT_CLKTCK, 100),
                 (AT_SECURE, 0),
             ];
-            let sp = write_stack(t, stack_top, &argv, &env, &auxv, &execfn, isa, &random)?;
+            let (sp, areas) = write_stack(t, stack_top, &argv, &env, &auxv, &execfn, isa, &random)?;
             t.thread().start(entry, sp);
             let brk = page_up(base + hi);
-            Ok((regions, mmap, brk, trampoline))
+            Ok((regions, mmap, brk, trampoline, areas))
         })();
         match result {
             Ok(r) => {
@@ -332,12 +332,14 @@ pub(crate) fn exec_into(k: &Arc<Kernel>, cx: &mut Cx<'_>, state: &mut ProcState,
             }
         }
     })?;
-    let (space, (regions, mmap, brk, trampoline)) = loaded;
+    let (space, (regions, mmap, brk, trampoline, (arg_area, env_area))) = loaded;
     state.sigreturn_at = trampoline;
     state.space = space;
     state.isa = isa;
     state.regions = regions;
     state.patches = Default::default();
+    state.arg_area = arg_area;
+    state.env_area = env_area;
     state.mmap = mmap;
     state.brk = (brk, brk);
     state.exe = exe;
@@ -395,12 +397,26 @@ fn map_image(t: &mut Turn<'_>, regions: &mut Regions<Area>, elf: &Elf<'_>, base:
 
 /// The first stack, as Linux lays it out: argc, argv, envp, the auxiliary vector, then the strings they point at.
 #[allow(clippy::too_many_arguments)]
-fn write_stack(t: &mut Turn<'_>, top: u64, argv: &[String], env: &[String], auxv: &[(u64, u64)], exe: &str, isa: Isa, random: &[u8; 16]) -> Result<u64, Errno> {
+/// Gives the stack pointer, and where the arguments' and the environment's strings are.
+fn write_stack(t: &mut Turn<'_>, top: u64, argv: &[String], env: &[String], auxv: &[(u64, u64)], exe: &str, isa: Isa, random: &[u8; 16]) -> Result<(u64, Areas), Errno> {
     let mut stack = StackWriter::new(top);
     stack.push_u64(0);
     let execfn = stack.push_cstr(exe.as_bytes());
-    let env_ptrs: Vec<u64> = env.iter().map(|s| stack.push_cstr(s.as_bytes())).collect();
-    let arg_ptrs: Vec<u64> = argv.iter().map(|s| stack.push_cstr(s.as_bytes())).collect();
+    // The strings in one block, in Linux's order from low to high: argv[0], argv[1], …, then the environment, so each
+    // follows the one before. Programs count on it: libuv takes argv[0] to the end of the last argument as room to
+    // write a process title into (node's `process.title`, which npm sets).
+    let mut block = Vec::new();
+    let mut offsets = Vec::with_capacity(argv.len() + env.len());
+    for s in argv.iter().chain(env) {
+        offsets.push(block.len() as u64);
+        block.extend_from_slice(s.as_bytes());
+        block.push(0);
+    }
+    let base = stack.push(&block);
+    let args_len = offsets.get(argv.len()).copied().unwrap_or(block.len() as u64);
+    let areas = (base..base + args_len, base + args_len..base + block.len() as u64);
+    let arg_ptrs: Vec<u64> = offsets[..argv.len()].iter().map(|o| base + o).collect();
+    let env_ptrs: Vec<u64> = offsets[argv.len()..].iter().map(|o| base + o).collect();
     let platform = stack.push_cstr(if isa == Isa::Arm64 { b"aarch64" } else { b"x86_64" });
     stack.align(16);
     let random_at = stack.push(random);
@@ -426,5 +442,8 @@ fn write_stack(t: &mut Turn<'_>, top: u64, argv: &[String], env: &[String], auxv
         return Err(EINVAL);
     }
     user::write(&mut t.space(), sp, &bytes)?;
-    Ok(sp)
+    Ok((sp, areas))
 }
+
+/// Where a program's arguments' strings are, and its environment's.
+type Areas = (std::ops::Range<u64>, std::ops::Range<u64>);

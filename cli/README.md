@@ -17,6 +17,12 @@ carbon run -it debian:13 bash               # a shell (pulled if it isn't here);
 carbon run debian:13 -- ls /                # a command: its output here, no stdin (-i for stdin, -t for a terminal)
 carbon run --name dev debian:13             # named; `carbon run --name dev` starts it again, files as they were
 carbon exec -it dev bash                    # a shell in the running machine dev, as docker exec
+carbon run -d -P --name web nginx:alpine    # in a process of its own, outliving this one; every exposed port published
+carbon logs -f --tail 20 web                # what it wrote (stdout here, stderr there), and what it writes
+carbon run -v ~/work:/work -v pgdata:/var/lib/postgresql/data postgres:17   # a host folder, live; a volume
+carbon run --mount type=bind,src=./config.toml,dst=/etc/app.toml,readonly --tmpfs /scratch app:1
+carbon volume create pgdata | ls | inspect pgdata | rm pgdata
+carbon exec --timeout 5m web ./check.sh     # killed after five minutes (exit 124); run --timeout for a whole machine
 carbon run -it atlas                        # atlas-base, Carbon's Windows userland, at cmd.exe's prompt
 carbon run -it atlas powershell             # or PowerShell's
 carbon exec -it app cmd                     # a cmd in a running Windows machine
@@ -32,7 +38,8 @@ carbon ls                                   # NAME  FROM  ISOLATION  STATUS
 carbon stop dev                             # SIGTERM to its first process; everything ends 10 s later
 carbon rm dev                               # a stopped machine and its files
 carbon freeze dev mine:1                    # an image of a stopped machine's disk
-carbon cp app:'C:\logs' out/               # a stopped machine's file or folder, copied out to the host
+carbon cp app:'C:\logs' out/               # a machine's file or folder, running or stopped, copied out to the host
+carbon cp ./tool web:/usr/local/bin         # or in: modes, times, symlinks and hard links kept
 carbon display screenshot app -o screen.png # a running machine's screen
 carbon display windows app                  # its windows, top first: ID, place, size, state, title
 carbon display click app 640 400            # input, as a user's: move, click, drag, scroll, type, key
@@ -43,6 +50,12 @@ carbon display clipboard app                # its clipboard's text (with text af
 carbon display drop app 300 200 --files 'C:\notes.txt'  # drops files there, as dragged in from the host (or text)
 carbon pull debian:13 [--platform OS/ARCH] | rmi IMAGE
 carbon images                               # KERNEL  IMAGE  PLATFORM  FROM: atlas for a Windows image, lambda for a Linux one
+carbon inspect nginx:alpine                 # an image as JSON: its whole config (ports, stop signal, labels…), history, layers
+carbon history nginx:alpine                 # CREATED  CHANGED  CREATED BY: each step that made it
+carbon tag nginx:alpine web:1               # another name for the same image
+carbon build -t app:1 .                     # an image from ./Carbonfile, else ./Dockerfile (a Dockerfile, exactly)
+carbon build -f Dockerfile.prod --build-arg VERSION=2 --target runtime -t app:2 .
+carbon build --deny 0.0.0.0/0 --allow pypi.org:443 --allow files.pythonhosted.org:443 -t locked:1 .
 carbon import -c 'CMD ["cmd.exe"]' atlas-base-arm64.tar atlas   # an image from a tar of a root file system
 carbon atlas imports setup.exe              # what a Windows program imports that atlas lacks (--all: everything)
 carbon atlas imports ~/installers/          # a folder of them: which load, and what's wanted most
@@ -62,6 +75,12 @@ carbon atlas imports ~/installers/          # a folder of them: which load, and 
 | `-w`, `--workdir DIR` | Where its program starts; the image's working directory by default |
 | `--memory SIZE` | How much memory it may use, as `512m` or `4g` (`4g` by default, or ¾ of a container's memory limit if that's less, as on Cloud Run; only what's touched is taken) |
 | `--rm` | Removed, and its files, once it ends |
+| `-v`, `--volume SOURCE:TARGET[:ro]` | Mounts a host folder or file (`/path`, `./path`, `~/path`) or a volume (a name, made if it isn't there) at `TARGET`: what either side changes, the other sees at once. A new volume is filled from the image's files at `TARGET`. A machine run again keeps its mounts unless given new ones |
+| `--mount type=bind\|volume\|tmpfs,source=…,target=…[,readonly]` | The same, as Docker's `--mount` |
+| `--tmpfs TARGET` | A folder in memory only |
+| `-d`, `--detach` | In a process of its own (a worker: `carbon` run again), which outlives this one; prints its name. What it writes is kept, for `carbon logs`. Each worker has its own VM, so on macOS several run at once |
+| `--timeout DURATION` | Stopped if it's still running this long after it starts: `90s`, `5m`, `2h` |
+| `-P`, `--publish-all` | Every port its image exposes (`EXPOSE`), each on a free host port |
 | `--deny-exec PATTERN` | Refuses to start programs whose arguments match: the first word is a program's name (`rm`, not `/bin/rm`), each after it one argument, with `*` and `?` as a shell has them, and a last `*` takes any arguments left. In a Linux machine the program gets EACCES (126 from a shell); in a Windows one, ERROR_ACCESS_DENIED; a first program refused is an error |
 | `--deny HOST\|ADDRESS\|NETWORK[:PORT]` | Refuses connections there (TCP connects, and UDP to each new destination): `0.0.0.0/0` and `::/0` for everything |
 | `--allow HOST\|ADDRESS\|NETWORK[:PORT]` | Lets connections there through, whatever `--deny` says: a host takes its subdomains, and matches the name the machine looked up |
@@ -79,7 +98,32 @@ and hooks decided (`[denied]`, `[rewritten: ...]`, `[answered]`). With `--json`,
 [`carbon::wire`](../carbon/src/wire.rs) writes them. It reads the machine's control socket, as `carbon exec` does.
 
 `carbon stop NAME` asks the machine over its control socket (a machine run by a program using the library is
-stopped without signalling that program), and signals the process it's in only if it can't.
+stopped without signalling that program), and signals the process it's in only if it can't. Its first process gets
+the image's stop signal (`STOPSIGNAL`: nginx's SIGQUIT), SIGTERM if it has none.
+
+`carbon logs [-f] [--tail N] NAME` prints what a machine run with `-d` wrote, kept in its folder (8 MiB, then
+rotated once): its stdout to stdout and its stderr to stderr, in the order written. `-f` keeps following until it
+stops. `carbon ls` says how a stopped machine last ended (`exited (143)`).
+
+`carbon cp NAME:PATH DIR` and `carbon cp PATH NAME:DIR` copy a file or folder out of a machine or into it, running
+or stopped. A running machine's files are reached through its own kernel, over its control socket, so its programs
+see a copy at once. Kinds, modes, times, symlinks and hard links are kept.
+
+`carbon build [options] CONTEXT` builds an image from the context folder's `Carbonfile`, else its `Dockerfile`: any
+Dockerfile, unchanged, as `docker build` reads it. `-t NAME` names it (as often as wanted), `-f FILE` (or `-f -` for
+stdin) names the file, `--build-arg NAME=VALUE`, `--target STAGE`, `--platform OS/ARCH` (x86-64 on Apple silicon runs
+translated), `--no-cache`, `-o DIR` copies what's built to a folder, `-q` prints only its name. `--isolation`,
+`--network`, `--memory`, `--timeout`, `--deny`, `--allow` and `--deny-exec` are `run`'s, for every `RUN`, so a build
+can reach only what it's allowed to. `--secret id=ID,src=FILE` (or `env=VAR`) gives a `RUN --mount=type=secret,id=ID`
+its secret, never kept in the image; `RUN --mount=type=cache` keeps its folder (pip's, apt's caches) between builds.
+
+`carbon volume create|ls|inspect|rm NAME` manages volumes: folders under `CARBON_HOME/volumes` that machines mount and
+outlive, each file's owner and mode kept. Each step is printed as it starts, with what a `RUN` writes; a step done before
+is found in the cache. `carbon watch build-<id>-<n>` shows a step's machine as it runs.
+
+`carbon inspect IMAGE` prints an image as JSON: OCI's whole config (environment, entrypoint, command, user, working
+folder, exposed ports, volumes, labels, stop signal, health check, shell, `ONBUILD`), its history, and its layers'
+digests. `carbon history IMAGE` is the history as a table; `carbon tag SOURCE TARGET` names it again.
 
 `carbon import [--platform OS/ARCH] [-c INSTRUCTION]... FILE|- [NAME]` makes an image from a tar of a root file
 system, as `docker import` does. `-c` sets its config with a Dockerfile instruction: `CMD`, `ENTRYPOINT`, `ENV`,

@@ -140,6 +140,8 @@ pub struct Output {
     pub exit: Exit,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    /// It was killed at its timeout ([`crate::ExecSpec::timeout`]); what it wrote until then is here.
+    pub timed_out: bool,
 }
 
 impl Output {
@@ -167,6 +169,10 @@ pub struct MachineSpec {
     carbon: Carbon,
     launch: Launch,
     invalid: Option<Error>,
+    /// Its rules, as data, for a machine launched in a worker ([`MachineSpec::launch`]), where they're decided.
+    rules: Rules,
+    /// Hooks with code were added, or its hub was asked for: a launched machine asks this process about them.
+    code_hooks: std::cell::Cell<bool>,
 }
 
 /// A machine's memory unless it's told otherwise: 4 GiB, or three quarters of what this process may use if that's
@@ -197,6 +203,7 @@ impl MachineSpec {
             audio: Audio::Auto,
             memory: default_memory(),
             network: None,
+            publish_all: false,
             publish: None,
             stdin: Stdio::Null,
             stdout: Stdio::Inherit,
@@ -204,9 +211,11 @@ impl MachineSpec {
             tty: false,
             relay_signals: false,
             remove: false,
+            timeout: None,
+            mounts: None,
             hub: Hub::new(),
         };
-        MachineSpec { carbon, launch, invalid: None }
+        MachineSpec { carbon, launch, invalid: None, rules: Rules::new(), code_hooks: std::cell::Cell::new(false) }
     }
 
     fn invalid(mut self, error: Error) -> MachineSpec {
@@ -273,6 +282,19 @@ impl MachineSpec {
         self
     }
 
+    /// Every port its image says it listens on (`EXPOSE`), each published on a free host port, as Docker's `-P`.
+    pub fn publish_all(mut self) -> MachineSpec {
+        self.launch.publish_all = true;
+        self
+    }
+
+    /// Mounts a host's folder, a volume or a tmpfs in it ([`crate::Mount`]), as many as wanted, in order. A machine
+    /// started again keeps its mounts unless it's given new ones.
+    pub fn mount(mut self, mount: crate::Mount) -> MachineSpec {
+        self.launch.mounts.get_or_insert_with(Vec::new).push(mount);
+        self
+    }
+
     pub fn display(mut self, display: Display) -> MachineSpec {
         self.launch.display = display;
         self
@@ -327,16 +349,24 @@ impl MachineSpec {
         self
     }
 
+    /// Stops it, as [`Running::stop`] does, if it's still running this long after it starts.
+    pub fn timeout(mut self, timeout: std::time::Duration) -> MachineSpec {
+        self.launch.timeout = Some(timeout);
+        self
+    }
+
     /// Adds a policy to its hooks, after any added before.
     pub fn hooks(self, hooks: impl Hooks) -> MachineSpec {
         self.launch.hub.add(hooks);
+        self.code_hooks.set(true);
         self
     }
 
     /// Adds rules to its hooks.
-    pub fn rules(self, rules: Rules) -> MachineSpec {
+    pub fn rules(mut self, rules: Rules) -> MachineSpec {
         if !rules.is_empty() {
-            self.launch.hub.add(rules);
+            self.launch.hub.add(rules.clone());
+            self.rules = std::mem::take(&mut self.rules).merge(rules);
         }
         self
     }
@@ -344,29 +374,34 @@ impl MachineSpec {
     /// Decides the programs it starts that `filter` takes.
     pub fn on_exec(self, filter: Filter, f: impl Fn(&Exec) -> Decision<Exec> + Send + Sync + 'static) -> MachineSpec {
         self.launch.hub.on_exec(filter, f);
+        self.code_hooks.set(true);
         self
     }
 
     /// Decides what it writes to its stdout and stderr (and an `exec`'s).
     pub fn on_output(self, filter: Filter, f: impl Fn(&hooks::Output) -> Decision<hooks::Output> + Send + Sync + 'static) -> MachineSpec {
         self.launch.hub.on_output(filter, f);
+        self.code_hooks.set(true);
         self
     }
 
     /// Decides the connections it makes.
     pub fn on_connect(self, filter: Filter, f: impl Fn(&Connect) -> Decision<Connect> + Send + Sync + 'static) -> MachineSpec {
         self.launch.hub.on_connect(filter, f);
+        self.code_hooks.set(true);
         self
     }
 
     /// Decides the names it looks up.
     pub fn on_lookup(self, filter: Filter, f: impl Fn(&Lookup) -> Decision<Lookup> + Send + Sync + 'static) -> MachineSpec {
         self.launch.hub.on_lookup(filter, f);
+        self.code_hooks.set(true);
         self
     }
 
     /// Its hooks, to observe or subscribe to before it starts: nothing it does is missed.
     pub fn hub(&self) -> &Hub {
+        self.code_hooks.set(true);
         &self.launch.hub
     }
 
@@ -405,14 +440,63 @@ impl MachineSpec {
         let stdout = out.as_mut().map(Chunks::collect_all).unwrap_or_default();
         let stderr = reading.join().unwrap_or_default();
         let exit = running.wait()?;
-        Ok(Output { exit, stdout, stderr })
+        Ok(Output { exit, stdout, stderr, timed_out: false })
+    }
+
+    /// Makes it without running it, as `docker create`: a stopped machine (its image pulled if it isn't here), whose
+    /// [`Machine::files`] can be written before it first runs, and which [`Carbon::again`] runs.
+    pub fn create(self) -> Result<Machine> {
+        let spec = self.with_args(Vec::<String>::new())?;
+        let launch = spec.launch;
+        let store = &spec.carbon.0.store;
+        let source = launch.source.as_ref().ok_or_else(|| Error::invalid("create makes a new machine: give it an image or a program"))?;
+        if let Some(name) = launch.name.as_deref()
+            && store.record(name).is_some()
+        {
+            return Err(Error::new(ErrorKind::AlreadyExists, format!("there's a machine called {name} already")));
+        }
+        let notify = spec.carbon.notify();
+        let (mut record, program) = store.create(launch.name.as_deref(), launch.platform.as_ref(), source, &|n| notify(n))?;
+        if let Some(network) = launch.network {
+            record.network = network;
+        }
+        if let Some(publish) = launch.publish {
+            record.publish = publish;
+        }
+        if let Some(mounts) = launch.mounts {
+            record.mounts = mounts;
+        }
+        store.save_record(&record)?;
+        let machine = Machine::new(spec.carbon.clone(), record.name.clone());
+        if let (Some(bytes), Some(path)) = (program, &record.program) {
+            machine.files().write(path, bytes, crate::Write::new().mode(0o755).parents(true))?;
+        }
+        Ok(machine)
+    }
+
+    /// Launches it in a process of its own, a worker (this binary, run again by [`crate::init`]), and gives it back
+    /// once its kernel is up: a [`Machine`] to `exec` into, read the [`Machine::logs`] of, stop and wait for, from this
+    /// process or any other. It runs on when this process ends, until its first process does.
+    ///
+    /// Its stdin is empty, and what it writes is kept ([`Machine::logs`]). Its [`Rules`] go to the worker, which
+    /// decides them there; hooks with code stay here, and the worker asks this process about each event they want, so
+    /// those decisions need this process running: once it's gone, a launched machine's programs and connections that
+    /// hooks with code wanted are refused (its output passes). Each machine in a worker of its own has a VM of its
+    /// own, so several run at once on macOS, where a process has one.
+    pub fn launch<I, S>(self, argv: I) -> Result<Machine>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let spec = self.with_args(argv)?;
+        crate::worker::launch(&spec.carbon, spec.launch, spec.rules, spec.code_hooks.get())
     }
 
     /// Starts it on a thread of its own, and gives it back once it's made, before its kernel boots: a [`Running`]
     /// machine, with its piped streams, to `exec` into, watch, stop and wait for.
     ///
     /// On macOS, Hypervisor.framework allows one VM in a process at a time, so a second machine started while one runs
-    /// falls back to the sandbox (and says so); machines in processes of their own are coming.
+    /// falls back to the sandbox (and says so): [`MachineSpec::launch`] gives each a process, and a VM, of its own.
     pub fn start<I, S>(self, argv: I) -> Result<Running>
     where
         I: IntoIterator<Item = S>,

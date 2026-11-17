@@ -93,6 +93,9 @@ pub(crate) struct Open {
     pub flags: Mutex<u32>,
     pub offset: Mutex<u64>,
     pub path: String,
+    /// Who SIGIO would go to (`F_SETOWN`: a pid, or a process group negated) and which signal (`F_SETSIG`, 0 for
+    /// SIGIO). Kept and given back; the signal itself isn't sent yet.
+    pub owner: Mutex<(i32, u32)>,
     /// For a file on the disk, what keeps it while it's open.
     _hold: Option<Hold>,
 }
@@ -126,13 +129,13 @@ impl Task {
         };
         disk.hold(ino);
         let hold = Some(Hold { k: Arc::downgrade(&self.k), ino, quiet: true });
-        Ok(Arc::new(Open { node, flags: Mutex::new(flags & !O_CLOEXEC), offset: Mutex::new(0), path: path.to_string(), _hold: hold }))
+        Ok(Arc::new(Open { node, flags: Mutex::new(flags & !O_CLOEXEC), offset: Mutex::new(0), owner: Default::default(), path: path.to_string(), _hold: hold }))
     }
 }
 
 impl Open {
     pub fn new(node: Node, flags: u32, path: impl Into<String>) -> Arc<Open> {
-        Arc::new(Open { node, flags: Mutex::new(flags), offset: Mutex::new(0), path: path.into(), _hold: None })
+        Arc::new(Open { node, flags: Mutex::new(flags), offset: Mutex::new(0), owner: Default::default(), path: path.into(), _hold: None })
     }
 
     /// Whether what's done with it makes inotify and fanotify events.
@@ -277,7 +280,7 @@ fn stat_of(disk: &Disk, ino: Ino) -> Result<Stat, Errno> {
     };
     let mode = if meta.mode & S_IFMT != 0 { meta.mode } else { kind | meta.mode & 0o7777 };
     Ok(Stat {
-        dev: disk.volatile(ino).map_or(0x803, mount::tmpfs_dev),
+        dev: disk.external(ino).map(mount::host_dev).or_else(|| disk.volatile(ino).map(mount::tmpfs_dev)).unwrap_or(0x803),
         ino,
         mode,
         nlink: s.links,
@@ -750,7 +753,7 @@ impl Task {
                 if target.starts_with('/') {
                     walked.clear();
                 }
-                for w in words(target).into_iter().rev() {
+                for w in words(&target).into_iter().rev() {
                     rest.push_front(w);
                 }
                 continue;
@@ -836,7 +839,7 @@ impl Task {
         // openat2 here never traverses a disk symlink into a /proc magic link, so RESOLVE_NO_MAGICLINKS needs nothing
         // more; a /proc file opened directly is an ordinary open.
         let absolute = if how.in_root { path.clone() } else { exe_path(&dir_path, &path) };
-        let made = if how.in_root { None } else { os::open(self, &absolute) };
+        let made = if how.in_root { None } else { self.open_made(cx, &absolute) };
         let open = match made {
             Some(open) => self.opened_made(open, flags)?,
             None => self.open_on_disk(&view, dir, &path, &absolute, flags, mode)?,
@@ -856,10 +859,10 @@ impl Task {
         }
         let (dir, dir_path) = self.start_dir(dirfd)?;
         let absolute = exe_path(&dir_path, &path);
-        let open = match os::open(self, &absolute) {
+        let open = match self.open_made(cx, &absolute) {
             Some(open) => self.opened_made(open, flags)?,
             None => match self.open_on_disk(&self.view(), dir, &path, &absolute, flags, mode) {
-                Err(e) if not_on_disk(e) => match self.through_links(&absolute, flags & O_NOFOLLOW == 0).and_then(|made| os::open(self, &made)) {
+                Err(e) if not_on_disk(e) => match self.through_links(&absolute, flags & O_NOFOLLOW == 0).and_then(|made| self.open_made(cx, &made)) {
                     Some(open) => self.opened_made(open, flags)?,
                     None => return Err(e),
                 },
@@ -892,13 +895,27 @@ impl Task {
                 if read_only {
                     return Err(EROFS);
                 }
-                let (parent, name) = view.resolve_parent(&disk, dir, path)?;
+                // A last name that's a symbolic link to nothing (yet): what it points to is made, as Linux makes it
+                // (unless O_NOFOLLOW, which refuses the link). Along a chain of them, to the last.
+                let (mut at, mut target) = (dir, path.to_string());
+                if flags & O_NOFOLLOW == 0 {
+                    for _ in 0..40 {
+                        let Ok(link) = view.resolve(&disk, at, &target, false) else { break };
+                        if disk.stat(link)?.kind != Kind::Symlink {
+                            break;
+                        }
+                        let next = disk.read_link(link)?.to_string();
+                        at = view.resolve_parent(&disk, at, &target)?.0;
+                        target = next;
+                    }
+                }
+                let (parent, name) = view.resolve_parent(&disk, at, &target)?;
                 (disk.create(parent, name, New::File, Meta::file(mode & !umask & 0o7777), self.k.now())?, true)
             }
             Err(e) => return Err(e.into()),
         };
         let stat = disk.stat(ino)?;
-        let meta = *disk.meta(ino)?;
+        let meta = disk.meta(ino)?;
         let write = flags & O_ACCMODE != 0;
         let node = match stat.kind {
             Kind::Dir if write => return Err(EISDIR),
@@ -967,7 +984,54 @@ impl Task {
             }
             _ => None,
         };
-        Ok(Arc::new(Open { node, flags: Mutex::new(flags & !O_CLOEXEC), offset: Mutex::new(0), path: absolute.to_string(), _hold: hold }))
+        Ok(Arc::new(Open { node, flags: Mutex::new(flags & !O_CLOEXEC), offset: Mutex::new(0), owner: Default::default(), path: absolute.to_string(), _hold: hold }))
+    }
+
+    /// A file lambda makes, opened: `/proc`'s, `/sys`'s, a pty's; those read from a process's memory included
+    /// (`cmdline`, `environ`, `stat`, `statm`), which need this thread to reach it. None if `path` isn't one.
+    fn open_made(&mut self, cx: &mut Cx<'_>, path: &str) -> Option<Result<Arc<Open>, Errno>> {
+        match os::memory_file(self, path) {
+            Some((process, which)) => Some(Ok(Open::new(Node::Made(self.proc_memory(cx, &process, which)), 0, path))),
+            None => os::open(self, path),
+        }
+    }
+
+    /// A `/proc/<pid>` file read from the process's memory. A process that's ended has nothing to read: empty, as a
+    /// zombie's are on Linux (its `stat` still says it's a zombie).
+    fn proc_memory(&mut self, cx: &mut Cx<'_>, process: &Arc<crate::process::Process>, which: os::Memory) -> Vec<u8> {
+        let (args, env) = {
+            let state = lock(&process.state);
+            (state.arg_area.clone(), state.env_area.clone())
+        };
+        let mut read = |range: std::ops::Range<u64>, task: &mut Self| -> Vec<u8> {
+            if range.is_empty() {
+                return Vec::new();
+            }
+            task.peek(cx, process, range.start, (range.end - range.start) as usize).unwrap_or_default()
+        };
+        match which {
+            os::Memory::Cmdline => {
+                let first = read(args, self);
+                // A title written past the arguments goes on into the environment's strings.
+                if first.last().is_some_and(|&b| b != 0) {
+                    let more = read(env, self);
+                    os::proc::cmdline(first, || more)
+                } else {
+                    first
+                }
+            }
+            os::Memory::Environ => read(env, self),
+            os::Memory::Stat | os::Memory::Statm | os::Memory::Status => {
+                let mut usage = exec::SpaceUsage::default();
+                let _ = self.remote(cx, process, |cx, _, _| usage = cx.turn(|t| t.space().usage()));
+                let resident = usage.code + usage.read_only + usage.writable;
+                match which {
+                    os::Memory::Stat => os::proc::stat(self, process, resident).into_bytes(),
+                    os::Memory::Statm => os::proc::statm(process, usage).into_bytes(),
+                    _ => os::status(self, process, Some(resident)).into_bytes(),
+                }
+            }
+        }
     }
 
     pub(crate) fn adopt_terminal(&self, tty: &Arc<Tty>) {
@@ -1178,6 +1242,13 @@ impl Task {
             *flags = if on { *flags | O_NONBLOCK } else { *flags & !O_NONBLOCK };
             return Ok(0);
         }
+        // FIOASYNC: signal-driven I/O asked for, as nginx asks of its workers' channels. Taken, as Linux takes it for any
+        // file; the SIGIO it would bring isn't sent yet (programs that ask also poll, as nginx does with epoll).
+        const FIOASYNC: u64 = 0x5452;
+        if request == FIOASYNC {
+            self.mem(cx, false, |t| user::read_u32(&t.space(), arg))?;
+            return Ok(0);
+        }
         const FIONREAD: u64 = 0x541b;
         match &open.node {
             Node::Tty(tty) => self.tty_ioctl(cx, tty, false, request, arg),
@@ -1344,7 +1415,7 @@ impl Task {
         }
     }
 
-    pub(crate) fn fcntl(&mut self, fd: i32, command: u64, arg: u64) -> Result<u64, Errno> {
+    pub(crate) fn fcntl(&mut self, cx: &mut Cx<'_>, fd: i32, command: u64, arg: u64) -> Result<u64, Errno> {
         let mut state = lock(&self.process.state);
         let entry = state.files.fds.get_mut(&fd).ok_or(EBADF)?;
         match command {
@@ -1366,6 +1437,45 @@ impl Task {
                 let wanted = open_flags_from(self.isa, arg as u32) & (O_APPEND | O_NONBLOCK);
                 let mut flags = lock(&entry.open.flags);
                 *flags = *flags & !(O_APPEND | O_NONBLOCK) | wanted;
+                Ok(0)
+            }
+            // F_SETOWN, F_GETOWN, F_SETSIG, F_GETSIG: where signal-driven I/O's signal goes, as nginx sets for its
+            // workers' channels. Kept, and given back.
+            8 => {
+                lock(&entry.open.owner).0 = arg as i32;
+                Ok(0)
+            }
+            9 => Ok(lock(&entry.open.owner).0 as i64 as u64),
+            10 => {
+                if arg > 64 {
+                    return Err(EINVAL);
+                }
+                lock(&entry.open.owner).1 = arg as u32;
+                Ok(0)
+            }
+            11 => Ok(u64::from(lock(&entry.open.owner).1)),
+            // F_SETOWN_EX and F_GETOWN_EX: the same owner as { type, pid } (type 0 a thread, 1 a process, 2 a group).
+            15 | 16 => {
+                let open = entry.open.clone();
+                drop(state);
+                if command == 15 {
+                    let (kind, pid) = self.mem(cx, false, |t| {
+                        Ok((user::read_u32(&t.space(), arg)?, user::read_u32(&t.space(), arg + 4)? as i32))
+                    })?;
+                    let owner = match kind {
+                        0 | 1 => pid,
+                        2 => -pid,
+                        _ => return Err(EINVAL),
+                    };
+                    lock(&open.owner).0 = owner;
+                } else {
+                    let owner = lock(&open.owner).0;
+                    let (kind, pid) = if owner < 0 { (2u32, -owner) } else { (1, owner) };
+                    self.mem(cx, true, |t| {
+                        user::write_u32(&mut t.space(), arg, kind)?;
+                        user::write_u32(&mut t.space(), arg + 4, pid as u32)
+                    })?;
+                }
                 Ok(0)
             }
             // Locks: there's no one else to lock against yet.
@@ -1525,7 +1635,7 @@ impl Task {
             }
             return Err(e);
         }
-        Ok(Arc::new(Open { node: Node::Fifo(pipe, ino), flags: Mutex::new(flags & !O_CLOEXEC), offset: Mutex::new(0), path, _hold: None }))
+        Ok(Arc::new(Open { node: Node::Fifo(pipe, ino), flags: Mutex::new(flags & !O_CLOEXEC), offset: Mutex::new(0), owner: Default::default(), path, _hold: None }))
     }
 
     /// `mknodat`: a regular file, a FIFO, a device node (needs `CAP_MKNOD`), or a socket file.

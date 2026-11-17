@@ -127,6 +127,14 @@ impl Stop {
         lock(&self.0).as_ref().and_then(std::sync::Weak::upgrade).is_some()
     }
 
+    /// Runs `f` on the machine's disk, under the lock its programs' own calls take: what it writes is what they see
+    /// next, and a watching program (`ReadDirectoryChangesW`) hears of it. None if the kernel isn't up.
+    pub fn with_disk<R>(&self, f: impl FnOnce(&mut Disk) -> R) -> Option<R> {
+        let k = lock(&self.0).as_ref().and_then(std::sync::Weak::upgrade)?;
+        let mut disk = lock(&k.disk);
+        Some(f(&mut disk))
+    }
+
     /// Ends every process the machine is running with `code`, as `TerminateProcess` would. Whether any was.
     pub fn end(&self, code: u32) -> bool {
         let Some(k) = lock(&self.0).as_ref().and_then(std::sync::Weak::upgrade) else { return false };

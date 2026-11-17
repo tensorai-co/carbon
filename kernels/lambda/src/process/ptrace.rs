@@ -970,7 +970,7 @@ impl Task {
 
     /// `f` with every turn in `process`'s space, and its state held, so its space stays what it is: ESRCH if it has
     /// none any more.
-    fn remote(&mut self, cx: &mut Cx<'_>, process: &Arc<Process>, f: impl FnOnce(&mut Cx<'_>, &crate::Kernel, &mut super::ProcState)) -> Result<(), Errno> {
+    pub(crate) fn remote(&mut self, cx: &mut Cx<'_>, process: &Arc<Process>, f: impl FnOnce(&mut Cx<'_>, &crate::Kernel, &mut super::ProcState)) -> Result<(), Errno> {
         let k = self.k.clone();
         let mut state = lock(&process.state);
         if state.zombie.is_some() || state.threads.is_empty() {

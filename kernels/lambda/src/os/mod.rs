@@ -5,6 +5,7 @@
 //! clock page `vdso`, the render node `gpu`, and the files lambda lends every image (its Vulkan driver) `system`.
 
 pub(crate) mod gpu;
+pub(crate) mod proc;
 pub(crate) mod pulse;
 pub(crate) mod sysfs;
 pub(crate) mod system;
@@ -59,7 +60,6 @@ enum Proc<'p> {
     /// `/proc/<pid>/task`: its threads, by their IDs.
     Tasks(Arc<Process>),
     Maps(Arc<Process>),
-    Status(Arc<Process>),
     Global(&'p str),
     /// A process's mounts: `mountinfo`, or `mounts`.
     Mounts(Arc<Process>, bool),
@@ -69,6 +69,28 @@ enum Proc<'p> {
     Net(&'p str),
     /// `/proc/<pid>/ns/<kind>`.
     Ns(Arc<Process>, crate::ns::NsKind),
+    /// `/proc` itself.
+    Root,
+    /// `/proc/<pid>`, and `/proc/<pid>/task/<tid>`.
+    Dir,
+    ThreadDir,
+    /// `/proc/<pid>/ns`.
+    Namespaces,
+    /// `/proc/<pid>/root`: its root folder, a link.
+    RootLink(Arc<Process>),
+    Comm(Arc<Process>),
+    /// Read from its memory: made by `Task::open_proc_memory`.
+    Memory(Arc<Process>, Memory),
+}
+
+/// The files read from a process's memory: its strings, or its resident pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Memory {
+    Cmdline,
+    Environ,
+    Stat,
+    Statm,
+    Status,
 }
 
 /// The namespace a `/proc/<pid>/ns/` leaf names.
@@ -77,17 +99,46 @@ fn ns_kind(leaf: &str) -> Option<crate::ns::NsKind> {
 }
 
 fn parse<'p>(task: &Task, path: &'p str) -> Option<Proc<'p>> {
+    if path == "/proc" || path == "/proc/" {
+        return Some(Proc::Root);
+    }
     let rest = path.strip_prefix("/proc/")?;
     let (who, what) = rest.split_once('/').unwrap_or((rest, ""));
     let process = match who {
         "self" | "thread-self" => Some(task.process.clone()),
         _ => who.parse().ok().and_then(|pid| task.k.process(pid)),
     };
+    // A thread's files are its process's: `task/<tid>/stat` is `stat`.
+    let (what, thread) = match what.strip_prefix("task/").and_then(|t| t.split_once('/').or(Some((t, "")))) {
+        Some((tid, inner)) if tid.parse::<i32>().is_ok() && process.as_ref().is_some_and(|p| lock(&p.state).threads.contains_key(&tid.parse().unwrap_or(0))) => (inner.trim_end_matches('/'), true),
+        _ => (what.trim_end_matches('/'), false),
+    };
+    if thread {
+        let p = process?;
+        return match what {
+            "" => Some(Proc::ThreadDir),
+            "comm" => Some(Proc::Comm(p)),
+            "status" => Some(Proc::Memory(p, Memory::Status)),
+            "cmdline" => Some(Proc::Memory(p, Memory::Cmdline)),
+            "environ" => Some(Proc::Memory(p, Memory::Environ)),
+            "stat" => Some(Proc::Memory(p, Memory::Stat)),
+            "statm" => Some(Proc::Memory(p, Memory::Statm)),
+            _ => None,
+        };
+    }
     match (process, what) {
+        (Some(_), "") => Some(Proc::Dir),
+        (Some(p), "root") => Some(Proc::RootLink(p)),
+        (Some(p), "comm") => Some(Proc::Comm(p)),
+        (Some(p), "cmdline") => Some(Proc::Memory(p, Memory::Cmdline)),
+        (Some(p), "environ") => Some(Proc::Memory(p, Memory::Environ)),
+        (Some(p), "stat") => Some(Proc::Memory(p, Memory::Stat)),
+        (Some(p), "statm") => Some(Proc::Memory(p, Memory::Statm)),
+        (Some(_), "ns") => Some(Proc::Namespaces),
         (Some(p), "exe") => Some(Proc::Exe(p)),
         (Some(p), "cwd") => Some(Proc::Cwd(p)),
         (Some(p), "maps") => Some(Proc::Maps(p)),
-        (Some(p), "status") => Some(Proc::Status(p)),
+        (Some(p), "status") => Some(Proc::Memory(p, Memory::Status)),
         (Some(p), "mounts") => Some(Proc::Mounts(p, false)),
         (Some(p), "mountinfo") => Some(Proc::Mounts(p, true)),
         (Some(p), ns) if ns.strip_prefix("ns/").is_some_and(|k| ns_kind(k).is_some()) => Some(Proc::Ns(p, ns_kind(&ns[3..]).unwrap())),
@@ -97,7 +148,7 @@ fn parse<'p>(task: &Task, path: &'p str) -> Option<Proc<'p>> {
         (Some(p), "task" | "task/") => Some(Proc::Tasks(p)),
         (Some(_), net) if net.starts_with("net/") => Some(Proc::Net(&net[4..])),
         (None, net) if who == "net" => Some(Proc::Net(net)),
-        (None, "") if matches!(who, "cpuinfo" | "meminfo" | "uptime" | "version") => Some(Proc::Global(who)),
+        (None, "") if matches!(who, "cpuinfo" | "meminfo" | "uptime" | "version" | "stat" | "loadavg" | "filesystems") => Some(Proc::Global(who)),
         (None, setting) if who == "sys" && SYSCTLS.contains(&setting) => Some(Proc::Sys(setting)),
         _ => None,
     }
@@ -107,13 +158,19 @@ fn parse<'p>(task: &Task, path: &'p str) -> Option<Proc<'p>> {
 /// files (its own, `self`, always there), the machine's, a setting.
 fn proc_exists(k: &Kernel, rest: &str) -> bool {
     let (who, what) = rest.split_once('/').unwrap_or((rest, ""));
+    let what = what.trim_end_matches('/');
     let process = who == "self" || who == "thread-self" || who.parse().ok().is_some_and(|pid| k.process(pid).is_some());
+    if process && let Some(t) = what.strip_prefix("task/") {
+        let (tid, inner) = t.split_once('/').unwrap_or((t, ""));
+        return tid.parse::<i32>().is_ok() && (inner.is_empty() || proc::THREAD.iter().any(|(n, _)| *n == inner));
+    }
     match (process, what) {
-        (true, "" | "exe" | "cwd" | "maps" | "status" | "mounts" | "mountinfo" | "fd" | "fd/" | "task" | "task/") => true,
+        (true, "" | "fd" | "task" | "ns") => true,
+        (true, name) if proc::is_process_file(name) => true,
         (true, ns) if ns.strip_prefix("ns/").is_some_and(|k| ns_kind(k).is_some()) => true,
         (true, fd) if fd.starts_with("fd/") => fd[3..].parse::<i32>().is_ok(),
         (true, net) => net.starts_with("net/"),
-        (false, "") => matches!(who, "mounts" | "cpuinfo" | "meminfo" | "uptime" | "version" | "net" | "sys"),
+        (false, "") => matches!(who, "mounts" | "cpuinfo" | "meminfo" | "uptime" | "version" | "net" | "sys" | "stat" | "loadavg" | "filesystems"),
         (false, net) if who == "net" => !net.is_empty(),
         (false, setting) => who == "sys" && SYSCTLS.contains(&setting),
     }
@@ -140,7 +197,9 @@ fn cpuinfo(isa: exec::Isa, cpus: usize) -> String {
 }
 
 /// The `/proc/sys` settings there are.
-const SYSCTLS: [&str; 7] = [
+const SYSCTLS: [&str; 9] = [
+    "kernel/pid_max",
+    "kernel/threads-max",
     "kernel/cap_last_cap",
     "kernel/hostname",
     "kernel/domainname",
@@ -158,10 +217,67 @@ fn sysctl(task: &Task, setting: &str) -> String {
         "kernel/hostname" => format!("{}\n", names.host),
         "kernel/domainname" => format!("{}\n", names.domain),
         "kernel/osrelease" => format!("{RELEASE}\n"),
+        "kernel/pid_max" => "4194304\n".to_string(),
+        "kernel/threads-max" => "126974\n".to_string(),
         "kernel/seccomp/actions_avail" => "kill_process kill_thread trap errno trace log allow\n".to_string(),
         // Performance counters are refused: the most paranoid setting says so.
         "kernel/perf_event_paranoid" => "4\n".to_string(),
         _ => "0\n".to_string(),
+    }
+}
+
+/// `/proc/<pid>/status`. `resident` is its resident memory in bytes, when the reader could count it.
+pub(crate) fn status(task: &Task, p: &Process, resident: Option<u64>) -> String {
+        let letter = proc::state_letter(task, p);
+        let state = lock(&p.state);
+        // Its main thread's, as Linux's file is the thread group leader's.
+        let leader = state.threads.get(&p.pid).or_else(|| state.threads.values().next()).map(|l| l.trace.clone());
+        let tracer = leader.and_then(|t| lock(&t.0).tracer).unwrap_or(0);
+        let run = match letter {
+            't' => "t (tracing stop)",
+            'T' => "T (stopped)",
+            'Z' => "Z (zombie)",
+            'R' => "R (running)",
+            _ => "S (sleeping)",
+        };
+        let (u, g, c) = (state.creds.uid, state.creds.gid, state.creds.caps);
+        let seccomp = crate::security::seccomp::Seccomp::mode(&state.security.seccomp);
+        let filters = state.security.seccomp.as_ref().map_or(0, |s| s.filters.len());
+        format!(
+            "Name:\t{}\nState:\t{run}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t{tracer}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nThreads:\t{}\n\
+             CapInh:\t{:016x}\nCapPrm:\t{:016x}\nCapEff:\t{:016x}\nCapBnd:\t{:016x}\nCapAmb:\t{:016x}\nNoNewPrivs:\t{}\n\
+             Seccomp:\t{seccomp}\nSeccomp_filters:\t{filters}\nTgid:\t{}\nSigPnd:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\n{}",
+            Task::comm(&state),
+            p.pid,
+            state.ppid,
+            u[0],
+            u[1],
+            u[2],
+            u[3],
+            g[0],
+            g[1],
+            g[2],
+            g[3],
+            state.threads.len(),
+            c.inheritable,
+            c.permitted,
+            c.effective,
+            c.bounding,
+            c.ambient,
+            u8::from(state.security.no_new_privs),
+            p.pid,
+            state.pending,
+            state.signals.ignored_and_caught().0,
+            state.signals.ignored_and_caught().1,
+            proc::status_memory(&state, resident),
+        )
+    }
+
+/// Which of a process's files a path is that's read from its memory, if it's one.
+pub(crate) fn memory_file(task: &Task, path: &str) -> Option<(Arc<Process>, Memory)> {
+    match parse(task, path)? {
+        Proc::Memory(p, which) => Some((p, which)),
+        _ => None,
     }
 }
 
@@ -209,54 +325,26 @@ pub(crate) fn open(task: &Task, path: &str) -> Option<Result<Arc<Open>, Errno>> 
             let tids: Vec<i32> = lock(&p.state).threads.keys().copied().collect();
             Some(Ok(Open::new(Node::Listing(tids.into_iter().map(|tid| (tid.to_string(), DT_DIR)).collect()), O_DIRECTORY, path)))
         }
-        Proc::Exe(_) | Proc::Cwd(_) => None,
+        Proc::Exe(_) | Proc::Cwd(_) | Proc::RootLink(_) => None,
+        Proc::Root => Some(Ok(Open::new(Node::Listing(proc::root(&task.k)), O_DIRECTORY, path))),
+        Proc::Dir => Some(Ok(Open::new(Node::Listing(proc::entries(&proc::PROCESS)), O_DIRECTORY, path))),
+        Proc::ThreadDir => Some(Ok(Open::new(Node::Listing(proc::entries(&proc::THREAD)), O_DIRECTORY, path))),
+        Proc::Namespaces => Some(Ok(Open::new(Node::Listing(proc::namespaces()), O_DIRECTORY, path))),
+        Proc::Comm(p) => made(format!("{}\n", Task::comm(&lock(&p.state)))),
+        // Its memory is read where a thread can reach it: `Task::open_proc_memory`, which every open goes through
+        // first. Here (`stat` of an open file, say), it's an empty file.
+        Proc::Memory(p, Memory::Status) => made(status(task, &p, None)),
+        Proc::Memory(..) => made(String::new()),
         Proc::Ns(p, kind) => Some(Ok(Open::new(Node::Ns(lock(&p.state).ns.reference(kind)), 0, path))),
         Proc::Maps(p) => made(maps(&p)),
-        Proc::Status(p) => {
-            let state = lock(&p.state);
-            // Its main thread's, as Linux's file is the thread group leader's.
-            let leader = state.threads.get(&p.pid).or_else(|| state.threads.values().next()).map(|l| l.trace.clone());
-            let tracing = leader.as_ref().is_some_and(|t| t.stopped());
-            let tracer = leader.and_then(|t| lock(&t.0).tracer).unwrap_or(0);
-            let run = if tracing {
-                "t (tracing stop)"
-            } else if state.stopped.is_some() {
-                "T (stopped)"
-            } else {
-                "R (running)"
-            };
-            let (u, g, c) = (state.creds.uid, state.creds.gid, state.creds.caps);
-            let seccomp = crate::security::seccomp::Seccomp::mode(&state.security.seccomp);
-            let filters = state.security.seccomp.as_ref().map_or(0, |s| s.filters.len());
-            made(format!(
-                "Name:\t{}\nState:\t{run}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t{tracer}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nThreads:\t{}\n\
-                 CapInh:\t{:016x}\nCapPrm:\t{:016x}\nCapEff:\t{:016x}\nCapBnd:\t{:016x}\nCapAmb:\t{:016x}\nNoNewPrivs:\t{}\n\
-                 Seccomp:\t{seccomp}\nSeccomp_filters:\t{filters}\n",
-                Task::comm(&state),
-                p.pid,
-                state.ppid,
-                u[0],
-                u[1],
-                u[2],
-                u[3],
-                g[0],
-                g[1],
-                g[2],
-                g[3],
-                state.threads.len(),
-                c.inheritable,
-                c.permitted,
-                c.effective,
-                c.bounding,
-                c.ambient,
-                u8::from(state.security.no_new_privs),
-            ))
-        }
         Proc::Global("cpuinfo") => made(cpuinfo(task.isa, task.k.host.cpus())),
         Proc::Global("meminfo") => {
             let size = lock(&task.k.exec).memory().size();
             made(format!("MemTotal:\t{} kB\nMemFree:\t{} kB\nMemAvailable:\t{} kB\n", size.limit / 1024, size.available / 1024, size.available / 1024))
         }
+        Proc::Global("stat") => made(proc::kernel_stat(&task.k)),
+        Proc::Global("loadavg") => made(proc::loadavg(&task.k)),
+        Proc::Global("filesystems") => made(proc::FILESYSTEMS.to_string()),
         Proc::Global("uptime") => {
             let up = task.k.host.monotonic() as f64 / 1e9;
             made(format!("{up:.2} {up:.2}\n"))
@@ -301,10 +389,18 @@ pub(crate) fn stat(k: &Kernel, path: &str) -> Option<Stat> {
     }
     // A process's directory, `/proc/net` and `/proc/sys`, and the directories listed when they're opened.
     let (who, what) = rest.split_once('/').unwrap_or((rest, ""));
-    if is_listing(path) || (what.is_empty() && !matches!(who, "mounts" | "cpuinfo" | "meminfo" | "uptime" | "version")) {
-        return Some(Stat { dev, ino, mode: S_IFDIR | 0o555, nlink: 2, blksize: 4096, ..Stat::default() });
+    let what = what.trim_end_matches('/');
+    let thread_dir = what.strip_prefix("task/").is_some_and(|t| !t.contains('/'));
+    let dir = matches!(what, "ns") || thread_dir || (what.is_empty() && !matches!(who, "mounts" | "cpuinfo" | "meminfo" | "uptime" | "version" | "stat" | "loadavg" | "filesystems"));
+    if is_listing(path) || dir {
+        // Owned by whoever the process runs as, as `ps` reads a process's user from its folder.
+        let (uid, gid) = who.parse().ok().and_then(|pid| k.process(pid)).map_or((0, 0), |p| {
+            let state = lock(&p.state);
+            (state.creds.uid[1], state.creds.gid[1])
+        });
+        return Some(Stat { dev, ino, mode: S_IFDIR | 0o555, nlink: 2, uid, gid, blksize: 4096, ..Stat::default() });
     }
-    let link = rest.ends_with("/exe") || rest.ends_with("/cwd") || rest.contains("/fd/") || rest.rsplit_once("/ns/").is_some_and(|(_, k)| ns_kind(k).is_some());
+    let link = rest.ends_with("/exe") || rest.ends_with("/cwd") || rest.ends_with("/root") || rest.contains("/fd/") || rest.rsplit_once("/ns/").is_some_and(|(_, k)| ns_kind(k).is_some());
     let mode = if link { S_IFLNK | 0o777 } else { S_IFREG | 0o444 };
     Some(Stat { dev, ino, mode, nlink: 1, blksize: 4096, ..Stat::default() })
 }
@@ -344,6 +440,7 @@ pub(crate) fn read_link(task: &Task, path: &str) -> Option<Result<String, Errno>
     }
     match parse(task, path)? {
         Proc::Exe(p) => Some(Ok(lock(&p.state).exe.clone())),
+        Proc::RootLink(p) => Some(Ok(lock(&p.state).root.1.clone())),
         Proc::Cwd(p) => Some(Ok(lock(&p.state).cwd.1.clone())),
         Proc::Fd(p, fd) => Some(lock(&p.state).files.get(fd).map(|open| open.path.clone()).ok_or(ENOENT)),
         Proc::Ns(p, kind) => Some(Ok(format!("{}:[{}]", kind.name(), lock(&p.state).ns.id(kind)))),

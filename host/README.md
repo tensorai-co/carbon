@@ -16,6 +16,10 @@ host's OS itself; it asks a `Host`, so the same kernel runs on any host, and tes
 - **A thread's CPU time** (`thread_cpu`), for the calling thread: `CLOCK_THREAD_CPUTIME_ID` (macOS and Linux) or
   `GetThreadTimes` (Windows). A guest thread runs its program on its own host thread, so in a hardware VM this is the
   program's time as well as the kernel's; lambda splits it at each stop into user and system time.
+- **Folders** (`folder.rs`): a host folder as a machine's mount reaches it, by paths within it, never leaving it
+  (no `..`, links read and not followed). Each call is made on the host's file as it comes, so both sides see each
+  other's changes at once. A volume's folder keeps each file's kernel metadata in an extended attribute
+  (`user.carbon.meta`: `getxattr`/`setxattr` on macOS, `lgetxattr`/`lsetxattr` on Linux; not on Windows yet).
 - **The terminal**: raw mode and window size, for lambda's console (macOS and Linux, in `unix.rs`).
 - **Certificate trust.** Whether the host trusts a chain, for any use, a TLS server (with its name) or a client. It's
   checked offline: nothing is fetched to complete a chain or check revocation. Every failure found is reported at

@@ -5,6 +5,7 @@
 use std::net::IpAddr;
 
 use hooks::{Connect, Decision, Exec, Hooks, Interest};
+use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
 
@@ -64,6 +65,23 @@ impl Target {
             return Err(bad());
         }
         Ok(Target::Name(addr.trim_start_matches("*.").to_ascii_lowercase(), port))
+    }
+
+    /// As [`Target::parse`] reads it back.
+    fn text(&self) -> String {
+        match self {
+            Target::Name(name, None) => name.clone(),
+            Target::Name(name, Some(port)) => format!("{name}:{port}"),
+            Target::Net(ip, prefix, port) => {
+                let most = if ip.is_ipv4() { 32 } else { 128 };
+                let net = if *prefix == most { ip.to_string() } else { format!("{ip}/{prefix}") };
+                match (port, ip.is_ipv6()) {
+                    (None, _) => net,
+                    (Some(port), false) => format!("{net}:{port}"),
+                    (Some(port), true) => format!("[{net}]:{port}"),
+                }
+            }
+        }
     }
 
     fn matches(&self, c: &Connect) -> bool {
@@ -144,6 +162,39 @@ impl Rules {
         self.deny_exec.is_empty() && self.allow.is_empty() && self.deny.is_empty()
     }
 
+    /// These rules and `other`'s together.
+    pub fn merge(mut self, other: Rules) -> Rules {
+        self.deny_exec.extend(other.deny_exec);
+        self.allow.extend(other.allow);
+        self.deny.extend(other.deny);
+        self
+    }
+
+    /// As JSON, as written: `{"deny_exec": ["rm -rf *"], "allow": ["pypi.org:443"], "deny": ["0.0.0.0/0"]}`.
+    pub fn to_json(&self) -> Value {
+        json!({
+            "deny_exec": self.deny_exec.iter().map(|w| w.join(" ")).collect::<Vec<_>>(),
+            "allow": self.allow.iter().map(Target::text).collect::<Vec<_>>(),
+            "deny": self.deny.iter().map(Target::text).collect::<Vec<_>>(),
+        })
+    }
+
+    /// Rules from [`Rules::to_json`]'s JSON.
+    pub fn from_json(v: &Value) -> Result<Rules> {
+        let list = |key: &str| v.get(key).and_then(Value::as_array).map(|l| l.iter().filter_map(Value::as_str).map(String::from).collect::<Vec<_>>()).unwrap_or_default();
+        let mut rules = Rules::new();
+        for pattern in list("deny_exec") {
+            rules = rules.deny_exec(&pattern);
+        }
+        for target in list("allow") {
+            rules = rules.allow(&target)?;
+        }
+        for target in list("deny") {
+            rules = rules.deny(&target)?;
+        }
+        Ok(rules)
+    }
+
     fn exec_denied(&self, e: &Exec) -> bool {
         self.deny_exec.iter().any(|pattern| {
             let mut words = std::iter::once(e.program()).chain(e.args().iter().map(String::as_str));
@@ -210,6 +261,13 @@ mod tests {
         assert!(denied(&["curl", "http://x"]));
         assert!(!denied(&["curl", "-s", "http://x"]));
         assert_eq!(rules.interest(), Interest::exec());
+    }
+
+    #[test]
+    fn rules_go_through_json() {
+        let rules = Rules::new().deny_exec("rm -rf *").deny("0.0.0.0/0").unwrap().deny("[::1]:53").unwrap().allow("pypi.org:443").unwrap().allow("10.89.0.0/16").unwrap();
+        assert_eq!(Rules::from_json(&rules.to_json()).unwrap(), rules);
+        assert_eq!(Rules::new().merge(rules.clone()), rules);
     }
 
     #[test]

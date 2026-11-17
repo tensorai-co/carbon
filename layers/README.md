@@ -25,6 +25,14 @@ kernel (owner and mode to lambda, attributes to atlas) is that kernel's `M`, kep
   `release` lets it go.
 - **Extended attributes.** Each file keeps a map of extended attributes (`get_xattr`, `set_xattr`, `list_xattrs`,
   `remove_xattr`), logged like its metadata and replayed on reopen. (Not yet written into a frozen index.)
+- **External trees** (`external.rs`). `attach` makes a folder from elsewhere (a host's, a volume's) a tree of the
+  disk's, through `External`: its files aren't kept in the tree, log or index; each call on one (lookup, read, write,
+  make, link, rename, remove, metadata) is made on the folder by the file's path as it comes, so what changes there
+  is seen at once. A file gets a number (from 2^48 up) when it's first found, and keeps it while its path does, a
+  move included. Its `M` comes from the folder (`Mapping`): kept with each file by one that keeps it, else made from
+  the host's mode, with what's set kept in memory. Nothing links or moves between it and the rest (`CrossFs`); one
+  attached read-only refuses changes (`ReadOnly`). `meta` and `read_link` give owned values, so no reference into a
+  tree that's read as it's asked is ever handed out.
 - **Volatile trees.** `volatile_root` makes a directory in no other whose tree is never logged, saved or frozen, and
   `drop_tree` lets it go: a kernel's tmpfs. Nothing links or moves between it and the rest (`CrossFs`).
 - **Watching.** An observer (`observe`) is told of each change as it's made: made, linked, removed (and whether that

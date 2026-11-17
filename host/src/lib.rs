@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 mod unix;
+pub mod folder;
 pub mod fonts;
 
 pub use fonts::{FontFace, HostFont, PathOp};

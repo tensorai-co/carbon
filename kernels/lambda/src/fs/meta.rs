@@ -62,7 +62,7 @@ impl Task {
         if disk.stat(ino)?.kind == Kind::Symlink {
             return Err(EOPNOTSUPP);
         }
-        let mut meta = *disk.meta(ino)?;
+        let mut meta = disk.meta(ino)?;
         meta.mode = meta.mode & S_IFMT | mode & 0o7777;
         disk.set_meta(ino, meta)?;
         Ok(0)
@@ -72,7 +72,7 @@ impl Task {
     pub(crate) fn chown(&mut self, cx: &mut Cx<'_>, dirfd: i32, path_at: u64, uid: u32, gid: u32, flags: u64) -> Result<u64, Errno> {
         let Some(ino) = self.meta_target(cx, dirfd, path_at, flags & AT_SYMLINK_NOFOLLOW != 0, flags & AT_EMPTY_PATH != 0 || path_at == 0)? else { return Ok(0) };
         let mut disk = lock(&self.k.disk);
-        let mut meta = *disk.meta(ino)?;
+        let mut meta = disk.meta(ino)?;
         if uid != u32::MAX {
             meta.uid = uid;
         }

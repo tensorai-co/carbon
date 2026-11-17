@@ -126,6 +126,9 @@ impl Task {
                 report: None,
                 ctty: state.ctty.clone(),
                 sigreturn_at: state.sigreturn_at,
+                arg_area: state.arg_area.clone(),
+                env_area: state.env_area.clone(),
+                started: self.k.host.monotonic(),
             };
             drop(state);
             Process::new(tid, copy)

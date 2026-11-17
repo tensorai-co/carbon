@@ -81,6 +81,9 @@ impl From<layers::Error> for Errno {
             layers::Error::BadName => EINVAL,
             layers::Error::CrossFs => EXDEV,
             layers::Error::Io => EIO,
+            layers::Error::ReadOnly => EROFS,
+            layers::Error::Denied => EACCES,
+            layers::Error::Unsupported => EOPNOTSUPP,
         }
     }
 }

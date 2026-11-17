@@ -58,6 +58,8 @@ const MOST_LINKS: usize = 40;
 pub(crate) enum What {
     Disk,
     Tmpfs,
+    /// A host's folder (or a volume's), an external tree of the disk's.
+    Host,
     Proc,
     Sysfs,
     Devpts,
@@ -70,6 +72,8 @@ impl What {
         match self {
             What::Disk => 0xef53,
             What::Tmpfs => 0x0102_1994,
+            // FUSE's, as a host folder shared into a VM usually is.
+            What::Host => 0x6573_5546,
             What::Proc => 0x9fa0,
             What::Sysfs => 0x6265_6572,
             What::Devpts => 0x1cd1,
@@ -169,6 +173,22 @@ fn escape(path: &str) -> String {
         .collect()
 }
 
+/// A host folder's device number, as its files' `st_dev` and `mountinfo` give it: one of its own for each.
+pub(crate) fn host_dev(root: Ino) -> u64 {
+    100 + root % 100
+}
+
+/// A mount the machine boots with: a host's folder (or a volume's) attached to the disk as an external tree, or a
+/// tmpfs.
+pub(crate) struct BootMount {
+    pub path: String,
+    pub root: Ino,
+    pub what: What,
+    pub source: String,
+    pub read_only: bool,
+    pub tree: Option<Ino>,
+}
+
 /// A tmpfs's device number, as its files' `st_dev` and `mountinfo` give it.
 pub(crate) fn tmpfs_dev(tree: Ino) -> u64 {
     40 + tree % 200
@@ -205,6 +225,22 @@ impl Mounts {
             }
         }
         mounts
+    }
+
+    /// Adds what the machine boots with, each over its folder on the disk (made, if it isn't there), in order.
+    pub fn with(mut self, disk: &Disk, extra: Vec<BootMount>) -> Mounts {
+        for m in extra {
+            let Ok(point) = disk.resolve(ROOT, &m.path, true) else { continue };
+            let parent = self.containing(&m.path).id;
+            let fstype = match m.what {
+                What::Tmpfs => "tmpfs",
+                _ => "fuse.carbon",
+            };
+            let flags = MS_RELATIME | MS_NOSUID | MS_NODEV | if m.read_only { MS_RDONLY } else { 0 };
+            let options = if m.what == What::Tmpfs { "mode=755".to_string() } else { String::new() };
+            self.add(Mount { id: 0, parent, point, path: m.path, root: m.root, root_path: "/".to_string(), what: m.what, source: m.source, fstype: fstype.to_string(), flags, propagation: MS_PRIVATE, options, tree: m.tree });
+        }
+        self
     }
 
     fn add(&mut self, mut mount: Mount) -> u32 {
@@ -280,6 +316,7 @@ impl Mount {
         match self.what {
             What::Disk => (8, 3),
             What::Tmpfs => (0, tmpfs_dev(self.tree.unwrap_or(0)) as u32),
+            What::Host => (0, host_dev(self.root) as u32),
             What::Proc => (0, 22),
             What::Sysfs => (0, 21),
             What::Devpts => (0, 24),
@@ -985,6 +1022,7 @@ impl Task {
             What::Devpts => "devpts",
             What::Mqueue => "mqueue",
             What::Disk => "ext4",
+            What::Host => "fuse.carbon",
         };
         let (set_ms, _) = mount_attr(attr, 0)?;
         let detached = Detached { what, root, root_path, source, fstype: fstype.to_string(), flags: mount_flags(set_ms), options, tree };

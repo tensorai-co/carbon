@@ -152,6 +152,8 @@ carbon run -it debian:13 bash                        # pulled if it isn't here; 
 carbon run debian:13 -- ls /                         # a command: its output here, and no stdin (-i gives it this one's)
 carbon run -it --name dev -p 2222:22 debian:13 bash  # named, with a port; `carbon run --name dev` starts it again
 carbon exec -it dev bash                             # from another terminal, a shell in it (-i -t -d -e -w, as docker)
+carbon run -d -P --name web nginx:alpine             # in a process of its own, every port its image exposes published
+carbon logs -f web                                   # what it writes; carbon cp ./site web:/srv works while it runs
 carbon import -c 'CMD ["cmd.exe"]' atlas-base-arm64.tar atlas   # atlas-base, built from its repository (see above)
 carbon run -it atlas                                 # a Windows prompt: atlas-base's cmd.exe (powershell, findstr...)
 carbon run setup.exe                                 # a Windows program from this host, on a disk of its own
@@ -161,6 +163,9 @@ carbon port dev                                      # 22/tcp -> [::]:2222
 carbon stop dev                                      # SIGTERM to its first process; everything ends 10 s later
 carbon freeze dev mine:1                             # an image of a stopped machine's disk
 carbon display screenshot app -o screen.png          # a running machine's screen
+carbon inspect nginx:alpine                          # an image's whole config and history; carbon tag, carbon history
+carbon build -t app:1 .                              # an image from a Carbonfile, which is any Dockerfile, exactly
+carbon run -v ~/work:/work -v data:/data debian:13   # a host folder seen live, and a volume that outlives the machine
 carbon pull debian:13 | import TAR NAME | images | rmi IMAGE | rm NAME
 ```
 
@@ -226,7 +231,7 @@ Around them:
 | Module | What it is | State |
 | --- | --- | --- |
 | [`images`](images/README.md) | What machines start from, on the host's disk: pulled OCI images, imports, frozen machines | Built |
-| [`carbon`](carbon/README.md) | Carbon as a library: puts machines together and owns their lives (run, `exec`, stop, freeze, ports, screens, the control socket), and their hooks and rules | Built: everything the CLI does, and hooks for programs started, output, connections and lookups; workers and more hook points to do |
+| [`carbon`](carbon/README.md) | Carbon as a library: puts machines together and owns their lives (run, `exec`, stop, freeze, ports, screens, the control socket), and their hooks and rules | Built: everything the CLI does; machines in processes of their own, their logs and files; building images from a Carbonfile (any Dockerfile); host folders, volumes and tmpfs mounted; hooks for programs started, output, connections and lookups; users and more hook points to do |
 | [`hooks`](hooks/README.md) | What hook points report and what can be decided about it: events, decisions, the `Hooks` trait, filters, and the hub every hook point asks | Built |
 | [`remote`](remote/README.md) | A machine's desktop and sound, shown and driven from another computer over QUIC | Not started |
 | [`cli`](cli/README.md) | The `carbon` command | Built, as a thin layer over `carbon` |

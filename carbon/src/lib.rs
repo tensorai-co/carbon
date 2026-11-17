@@ -71,11 +71,16 @@
 //! | [`Screen`] | a running machine's desktop: screenshot, windows, click, type, keys, clipboard, drops |
 //! | [`hooks`] | events (programs started, output, connections, lookups), decisions, and the [`hooks::Hub`] every hook point asks |
 //! | [`Rules`] | decisions without code: programs that may not start, where the network may go |
+//! | [`build`] | building images from a Carbonfile (the Dockerfile's grammar, exactly): [`Carbon::build`] |
 //! | [`wire`] | the control protocol other processes and languages use |
 
 mod boot;
+pub mod build;
 mod error;
+mod files;
+pub mod logs;
 mod machine;
+mod mounts;
 mod network;
 mod rules;
 #[cfg(unix)]
@@ -85,6 +90,7 @@ mod stdio;
 mod stop;
 mod store;
 pub mod wire;
+mod worker;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -93,12 +99,15 @@ use std::sync::{Arc, RwLock};
 pub use hooks;
 
 pub use error::{Error, ErrorKind, Result};
-pub use machine::{Button, ExecSpec, Machine, MachineInfo, Port, Process, ProcessEvent, Screen, Window};
+pub use machine::{Button, ExecSpec, Freeze, Machine, MachineInfo, Port, Process, ProcessEvent, Screen, Window};
+pub use files::{Copy, DirEntry, FileInfo, FileKind, Files, MOST_READ, Remove, Write};
+pub use logs::{LogLine, LogReader, LogStream, Logs};
+pub use mounts::{Mount, MountKind, Volume, VolumeInfo};
 pub use rules::Rules;
 pub use spec::{Audio, Display, Exit, MachineSpec, MemorySize, Output, Running, parse_size};
 pub use stdio::{Chunks, Stdin, Stdio};
 pub use images::{PullProgress, PullStage};
-pub use store::{Kernel, PRUNE_GRACE, Pruned, network_name, parse_network};
+pub use store::{BUILD_CACHE_KEEP, Kernel, PRUNE_GRACE, Pruned, network_name, parse_network};
 pub use wire::Watch;
 
 /// A hardware VM, the process sandbox, or the best there is.
@@ -108,9 +117,24 @@ pub use exec::Isa;
 /// Which GPU a machine gets: the host's, the CPU device, the host's if there is one (the default), or none.
 pub use gpu_api::Choice as Gpu;
 /// An image on the host's disk, and the OS and CPU it's for.
-pub use images::{Image, Platform};
+pub use images::{Config as ImageConfig, Healthcheck, History, Image, Platform};
 /// What a machine's network reaches, and a port it publishes on the host's.
 pub use net::{Mode as Network, Publish};
+
+/// An image as JSON, as `carbon inspect` prints it: its name, index, platform, config, history and layers.
+pub fn image_json(image: &Image) -> String {
+    let v = serde_json::json!({
+        "name": image.name,
+        "index": image.index,
+        "platform": image.platform.to_string(),
+        "created": image.created,
+        "source": image.source,
+        "config": image.config.to_json(),
+        "history": image.history.iter().map(History::to_json).collect::<Vec<_>>(),
+        "layers": image.layers,
+    });
+    serde_json::to_string_pretty(&v).unwrap_or_default()
+}
 
 /// What atlas has of Windows' API, for checking programs against it (`carbon atlas imports`).
 pub mod atlas {
@@ -153,10 +177,11 @@ impl std::fmt::Display for Notice {
 }
 
 /// Call first in `main`, before anything else: where Carbon's own uses of this binary take over. The process
-/// sandbox's stub (on macOS) is this binary run again; `init` runs it and never returns, in that process. In any other
-/// it returns at once.
+/// sandbox's stub (on macOS), and a launched machine's worker ([`MachineSpec::launch`]), are this binary run again;
+/// `init` runs them and never returns, in those processes. In any other it returns at once.
 pub fn init() {
     exec::run_if_stub();
+    worker::run_if_worker();
 }
 
 struct Inner {
@@ -242,6 +267,24 @@ impl Carbon {
         self.0.store.images.image(name)
     }
 
+    /// The volume `name`: [`Volume::create`] makes it, and a machine that mounts it makes it if it isn't there.
+    pub fn volume(&self, name: &str) -> Volume {
+        Volume { home: self.home(), name: name.to_string() }
+    }
+
+    /// Every volume.
+    pub fn volumes(&self) -> Vec<VolumeInfo> {
+        mounts::list_volumes(&self.home())
+    }
+
+    /// Removes a volume and its files, unless a running machine mounts it.
+    pub fn remove_volume(&self, name: &str) -> Result<()> {
+        if let Some(machine) = self.0.store.list().into_iter().find(|r| r.running() && r.mounts.iter().any(|m| m.kind == MountKind::Volume(name.to_string()))) {
+            return Err(Error::new(ErrorKind::Running, format!("volume {name} is mounted by {}, which is running", machine.name)));
+        }
+        self.volume(name).remove()
+    }
+
     /// Pulls an image from its registry, for `platform` (Linux for this host's CPU by default). Its progress goes to
     /// [`Carbon::on_notice`] a step at a time; [`Carbon::pull_with`] has it as it happens.
     pub fn pull(&self, name: &str, platform: Option<Platform>) -> Result<Image> {
@@ -263,6 +306,11 @@ impl Carbon {
     pub fn import(&self, name: &str, tar: &[u8], platform: Option<Platform>, changes: &[&str]) -> Result<Image> {
         let changes: Vec<String> = changes.iter().map(|c| c.to_string()).collect();
         self.0.store.import(name, tar, platform, &changes)
+    }
+
+    /// Another name for an image (`app:2` as `registry.example.com/team/app:2`): the same disk and config.
+    pub fn tag(&self, source: &str, target: &str) -> Result<Image> {
+        self.0.store.images.tag(source, target).map_err(error::image)
     }
 
     /// Forgets an image.

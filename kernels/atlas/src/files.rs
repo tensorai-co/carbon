@@ -28,6 +28,8 @@ pub const ERROR_INVALID_NAME: u32 = 123;
 pub const ERROR_DIR_NOT_EMPTY: u32 = 145;
 /// A move or link between two volumes.
 pub const ERROR_NOT_SAME_DEVICE: u32 = 17;
+pub const ERROR_WRITE_PROTECT: u32 = 19;
+pub const ERROR_NOT_SUPPORTED: u32 = 50;
 pub const ERROR_ALREADY_EXISTS: u32 = 183;
 pub const ERROR_DIRECTORY: u32 = 267;
 
@@ -299,6 +301,9 @@ pub(crate) fn layers_error(e: layers::Error) -> u32 {
         layers::Error::BadName => ERROR_INVALID_NAME,
         layers::Error::CrossFs => ERROR_NOT_SAME_DEVICE,
         layers::Error::Io => ERROR_IO_DEVICE,
+        layers::Error::ReadOnly => ERROR_WRITE_PROTECT,
+        layers::Error::Denied => ERROR_ACCESS_DENIED,
+        layers::Error::Unsupported => ERROR_NOT_SUPPORTED,
     }
 }
 
