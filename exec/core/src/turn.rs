@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use exec_mmu::{Format, Frame, Native, PAGE, Prot};
 
-use crate::contract::{Sandbox, SandboxCpu, SandboxExit, Vm, VmCpu, VmExit};
+use crate::contract::{FaultKind, HostFault, Sandbox, SandboxCpu, SandboxExit, Vm, VmCpu, VmExit};
 use crate::cpu::{Cpu, CpuInner, Exit, RawExit};
 use crate::exec::{Core, Mode};
 use crate::sandbox::{self, gate, layout};
@@ -89,6 +89,20 @@ impl<'e, V: Vm, S: Sandbox> Turn<'e, V, S> {
                     }
                     Stop::Internal { pc: cpu.regs().pc(), detail: 0x4000 }
                 } else {
+                    // A page the tables have but its stub doesn't show yet: shown, and the program runs on.
+                    if let SandboxExit::Fault(HostFault { kind: FaultKind::Segv, addr, .. }) = exit
+                        && let Some(mirror) = mirrors.get_mut(index)
+                    {
+                        let changes = mirror.fault_in(&core.mmu, root, addr);
+                        if !changes.is_empty() {
+                            match cpu.mirror(&mirror.runs(&changes)) {
+                                Ok(()) => return None,
+                                Err(why) => {
+                                    mirror.broken.get_or_insert(why);
+                                }
+                            }
+                        }
+                    }
                     if let SandboxExit::Gate(_) = exit {
                         gate::arrived(sandbox.reach(), cpu.regs(), &core.mmu, root);
                     }

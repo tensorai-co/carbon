@@ -96,6 +96,8 @@ pub struct Options {
     pub hostname: String,
     /// The first program's environment.
     pub env: Vec<String>,
+    /// The first program's working directory (an image's `WORKDIR`, or `--workdir`): `/` if None.
+    pub cwd: Option<String>,
     /// Report each system call and its result on stderr.
     pub trace: bool,
     /// Make the host's terminal the machine's console, if stdin and stdout are one: in raw mode, with lambda's own
@@ -159,6 +161,7 @@ impl Default for Options {
         Options {
             hostname: "carbon".to_string(),
             env: vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(), "HOME=/root".to_string()],
+            cwd: None,
             trace: std::env::var_os("CARBON_TRACE").is_some(),
             console: true,
             stop: Stop::default(),

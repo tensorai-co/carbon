@@ -270,7 +270,11 @@ impl StubCpu {
                     // fetch worked, and the instruction wrote to itself. A present page (ACCERR) is readable, so
                     // anything else that faults on one is a write.
                     let fetched = code == sys::SEGV_ACCERR && self.process.is_executable(pc & !0xfff);
-                    let access = if addr == pc && !fetched {
+                    // An instruction that runs onto the next page, which the stub doesn't have executable: its
+                    // fetch, which gVisor (Cloud Run's first generation) reports as an access error even where the
+                    // page isn't there at all.
+                    let straddles = addr > pc && addr - pc < 15 && addr & !0xfff != pc & !0xfff && !self.process.is_executable(addr & !0xfff);
+                    let access = if (addr == pc && !fetched) || straddles {
                         Prot::X
                     } else if code == sys::SEGV_ACCERR {
                         Prot::W

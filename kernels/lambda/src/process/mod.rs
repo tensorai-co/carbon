@@ -1065,14 +1065,18 @@ impl Task {
     }
 }
 
-/// Process 1: `argv[0]` loaded from the disk, with stdin, stdout and stderr the console if there is one, else the
-/// host's own.
+/// Process 1: `argv[0]` loaded from the disk, in the working directory the options say, with stdin, stdout and stderr
+/// the console if there is one, else the host's own.
 pub(crate) fn start_init(k: &Arc<Kernel>, cx: &mut Cx<'_>, argv: &[String], env: &[String]) -> Result<Task, Errno> {
     let pid = k.new_id();
     if let Some(console) = &k.console {
         console.set_session(Some(pid), pid);
     }
-    start(k, cx, pid, argv, env, Files::standard(k.console.clone()), k.console.clone(), (layers::ROOT, "/".to_string()))
+    let cwd = match &k.options.cwd {
+        Some(dir) => (lock(&k.disk).resolve(layers::ROOT, dir, true).map_err(|_| ENOENT)?, dir.clone()),
+        None => (layers::ROOT, "/".to_string()),
+    };
+    start(k, cx, pid, argv, env, Files::standard(k.console.clone()), k.console.clone(), cwd)
 }
 
 /// A process started from outside the machine (`carbon exec`), as `pid`: a session of its own, `files` as its

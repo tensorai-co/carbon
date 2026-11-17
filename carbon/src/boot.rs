@@ -366,6 +366,7 @@ fn boot(store: &Store, record: &Record, launch: &Launch, parts: Parts, notify: &
             let mut options = lambda::Options { stop, display: desktop.clone(), gpu, audio: Some(mixer), env, network: Some(network), hooks: hub, ..lambda::Options::default() };
             options.hostname = record.name.clone();
             options.console = launch.tty;
+            options.cwd = workdir.clone();
             lambda::boot(exec, cpu, disk, as_host, &argv, options).map(lambda::Status::code).map_err(Error::from)
         }
         Kernel::Atlas => {

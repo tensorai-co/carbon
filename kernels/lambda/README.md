@@ -345,6 +345,8 @@ curl -sLO https://raw.githubusercontent.com/torvalds/linux/master/arch/x86/entry
 - **Tracing:** single-stepping (exec has no trap after one instruction, so gdb can't step over a breakpoint),
   hardware breakpoints, `PTRACE_O_TRACESECCOMP`'s stops, `PTRACE_EVENT_VFORK_DONE`, `PTRACE_PEEKSIGINFO`; a traced
   thread's group stop is its own, not its process's. gdb attaching to a multi-threaded process hangs.
+- **Shared file mappings and POSIX semaphores:** `MAP_SHARED` of a disk file acts as a private mapping, and there's no
+  `/dev/shm`, so Python's `multiprocessing` can't make its locks.
 - **Scheduling:** nice, policies, affinity and I/O priority are kept per process, not per thread, change nothing on
   the host, and aren't in `/proc/<pid>/stat`; time slices, so threads that spin rather than wait give a vCPU up (a
   thread blocked in a wait already does).

@@ -5,6 +5,11 @@
 //! thread as that CPU's turn ends. A CPU whose stub has fallen behind (another CPU changed its space) is stopped and
 //! made to take a turn before it runs again (`Core::settle`), so no program ever runs on with a page that's gone.
 //!
+//! A stub per CPU is mirrored lazily: a new one, or one whose CPU moved to another space, shows nothing, and each
+//! page is shown when the program first faults on it (`fault_in`, with the pages around it), so a new thread or a
+//! forked child costs what it touches, not its whole address space. A big change (a fork, a large mapping) reaches
+//! only what it already shows; a small one (the page a fault asked for) is shown at once.
+//!
 //! Bringing a stub up to date compares what core's tables say with what the stub shows, so a page that didn't change
 //! costs the host nothing, and gives the host only what did: page by page for a shared stub (`Sandbox::mirror`), or
 //! merged into as few runs as it can for a stub per CPU (`SandboxCpu::mirror`): pages next to each other on frames next
@@ -31,8 +36,13 @@ pub(crate) struct Change {
     pub before: Option<Shown>,
 }
 
+/// How many pages around a lazy fault are shown with it, aligned: 64 KiB.
+const FAULT_AROUND: u64 = 16;
+
 #[derive(Default)]
 pub(crate) struct Mirror {
+    /// Pages are shown as they're faulted on, not all at once (a stub per CPU).
+    lazy: bool,
     /// The space the stub shows: 0 for none, `u64::MAX` for one that's gone.
     root: u64,
     /// The pages it shows.
@@ -46,6 +56,11 @@ pub(crate) struct Mirror {
 }
 
 impl Mirror {
+    /// A mirror that shows pages as they're faulted on.
+    pub fn lazy() -> Mirror {
+        Mirror { lazy: true, ..Mirror::default() }
+    }
+
     /// A turn changed `range` of a space.
     pub fn changed(&mut self, root: u64, range: Range<u64>) {
         if root == self.root && root != 0 {
@@ -72,7 +87,7 @@ impl Mirror {
         if root != self.root {
             // Another space: everything it shows that the new one doesn't goes, and the new one's pages come.
             let mut target = BTreeMap::new();
-            if root != 0 {
+            if root != 0 && !self.lazy {
                 mmu.visit(root, 0..u64::MAX, &mut |va, entry| {
                     target.insert(va, shown(mmu, entry));
                 });
@@ -92,14 +107,38 @@ impl Mirror {
         let mut pages = BTreeSet::new();
         for range in ranges {
             pages.extend(self.shown.range(range.clone()).map(|(&page, _)| page));
-            mmu.visit(root, range, &mut |va, _| {
-                pages.insert(va);
-            });
+            // Lazily, what it doesn't show yet waits for its fault, but for a small change, as a fault's own page:
+            // shown now, or it would fault again for it.
+            if !self.lazy || range.end.saturating_sub(range.start) <= FAULT_AROUND * PAGE {
+                mmu.visit(root, range, &mut |va, _| {
+                    pages.insert(va);
+                });
+            }
         }
         for page in pages {
             let entry = mmu.descriptor(root, page);
             let now = Native::is_valid(entry).then(|| shown(mmu, entry));
             self.update(page, now, &mut changes);
+        }
+        changes
+    }
+
+    /// The program faulted at `addr` in `root`, which it shows: if the tables have that page and the stub doesn't show
+    /// it yet, it's shown now, with the pages around it the tables have too, and the program just runs again. Empty if
+    /// the stub showed it already (the fault is the kernel's to answer), or the tables don't have it.
+    pub fn fault_in(&mut self, mmu: &Mmu<Native>, root: u64, addr: u64) -> Vec<Change> {
+        let page = addr & !(PAGE - 1);
+        if !self.lazy || root == 0 || root != self.root || self.shown.contains_key(&page) || !Native::is_valid(mmu.descriptor(root, page)) {
+            return Vec::new();
+        }
+        let window = page & !(FAULT_AROUND * PAGE - 1);
+        let mut found = Vec::new();
+        mmu.visit(root, window..window + FAULT_AROUND * PAGE, &mut |va, entry| found.push((va, shown(mmu, entry))));
+        let mut changes = Vec::new();
+        for (va, now) in found {
+            if !self.shown.contains_key(&va) {
+                self.update(va, Some(now), &mut changes);
+            }
         }
         changes
     }

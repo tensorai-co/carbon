@@ -200,11 +200,12 @@ impl<V: Vm, S: Sandbox> Core<V, S> {
                         return Err(Error::NoMoreCpus);
                     }
                 };
-                // A new stub shows nothing yet.
+                // A new stub shows nothing yet; one of its own per CPU shows what's faulted on.
+                let mirror = if sandbox.space_per_cpu() { Mirror::lazy() } else { Mirror::default() };
                 if index < mirrors.len() {
-                    mirrors[index] = Mirror::default();
+                    mirrors[index] = mirror;
                 } else {
-                    mirrors.push(Mirror::default());
+                    mirrors.push(mirror);
                 }
                 let preempt = cpu.preempt_handle();
                 (CpuInner::Sandbox { cpu }, preempt)

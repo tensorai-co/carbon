@@ -180,8 +180,11 @@ mirrors each change into the stub as host mappings when the turn ends, comparing
 shows, so only what changed reaches the host. A stub is either shared by the sandbox's one CPU, which shows one space
 at a time and is told a page at a time (macOS, Windows), or one per CPU (Linux), each an address space of its own that
 shows its CPU's space and is told in merged runs (pages in a row on frames in a row are one mapping; a protection
-change over a range is one). With a stub per CPU, a turn that changes a space other CPUs show stops each of them, as a
-TLB shootdown would, and each brings its own stub up to date in a turn of its own before it runs again. System calls reach the
+change over a range is one). A stub per CPU is mirrored lazily: a new one shows nothing, and core shows each page
+(with the 16 around it) when the program first faults on it, so a new thread or a forked child costs what it
+touches; a small change (a fault's own page) is shown at once. With a stub per CPU, a turn that changes a space other
+CPUs show stops each of them, as a TLB shootdown would, and each brings its own stub up to date in a turn of its own
+before it runs again. System calls reach the
 kernel however the host allows: Syscall User Dispatch on Linux, rewritten `svc` on macOS, and on Windows, which can't
 send a `syscall` anywhere but its own kernel, a gate the program calls.
 
@@ -394,6 +397,13 @@ it, in more detail. When an item is done it's ticked here, with what it took.
       `0x7f80_0000_0000`), lower only where the kernel won't put it there; XSAVE's AVX state kept; the stub's CPU time
       counted as the program's (`SandboxCpu::program_time`); no `/proc` needed to start a stub; a temporary file where a
       memfd can't be executed; and which step the host refused, when a stub can't start.
+- [x] **Linux on Cloud Run** (tested there, both generations): pages mirrored lazily, so a thread or a fork doesn't
+      map its whole address space up front (200 Python threads: from timing out to 10 s); an instruction running onto
+      a page the stub doesn't have is read as the fetch it is, which gVisor reports as an access error; and the stub's
+      file kept off the descriptor guest memory goes to, which collided once a process had a hundred open.
+- [ ] **Linux, faster faults**: each fault is a `ptrace` stop (~70 µs on Cloud Run: touching 900 MiB takes 16 s).
+      lambda could fault anonymous memory in around the page asked for; and frames freed and taken again come back in
+      descending order, so they don't merge into one mapping, which handing them out ascending would fix.
 - [ ] **macOS and Windows**: more than one CPU. The Linux way (an address space per CPU) needs a host that can map one
       memory object into several stub processes: Windows can (a section), macOS too (a memory entry). Until then, a
       program asking for a second CPU there gets `NoMoreCpus` at once.

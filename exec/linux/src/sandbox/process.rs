@@ -434,6 +434,10 @@ fn clone_exec(guest_fd: i32, stub_fd: i32) -> Result<i32, Launch> {
         unsafe { libc::close(stub_fd) };
         return Err(Launch::Failed(format!("making a pipe: {}", std::io::Error::last_os_error())));
     }
+    // The child puts guest memory at GUEST_FD over whatever's there, so neither the stub's file nor the pipe may be
+    // there: in a process with more than a hundred descriptors open (many machines at once), either could be.
+    let (stub_fd, report) = (above_guest_fd(stub_fd), above_guest_fd(pipe[1]));
+    pipe[1] = report;
     // SAFETY: an out-parameter.
     let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
     // SAFETY: as above.
@@ -510,6 +514,22 @@ fn clone_exec(guest_fd: i32, stub_fd: i32) -> Result<i32, Launch> {
         }
     }
     Err(Launch::Taken(format!("the stub didn't start (status {status:#x})")))
+}
+
+/// `fd`, moved above `GUEST_FD` if it's there (closing it where it was), close-on-exec.
+fn above_guest_fd(fd: i32) -> i32 {
+    if fd != GUEST_FD {
+        return fd;
+    }
+    // SAFETY: a descriptor this owns, duplicated, then closed.
+    unsafe {
+        let moved = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, GUEST_FD + 1);
+        if moved < 0 {
+            return fd;
+        }
+        libc::close(fd);
+        moved
+    }
 }
 
 /// The child, from `clone` to the stub's exec: raw calls only, on memory it shares with the thread that started it.
