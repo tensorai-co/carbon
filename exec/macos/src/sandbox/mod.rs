@@ -166,7 +166,7 @@ impl Sandbox for Stub {
 
     fn layout(&self, isa: Isa) -> Layout {
         let kept = self.shared.stub.kept.iter().filter(|r| r.start < SPACE_TOP).cloned().collect();
-        Layout { top: exec_core::isa::space_top(isa).min(SPACE_TOP), kept, gate: None }
+        Layout { top: exec_core::isa::space_top(isa).min(SPACE_TOP), kept, gate: None, traps: true }
     }
 
     fn max_cpus(&self) -> usize {

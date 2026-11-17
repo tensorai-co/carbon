@@ -130,7 +130,7 @@ machine with no image (`windows`, or a program from the host such as `carbon run
 | Host | `vm` | `sandbox` |
 | --- | --- | --- |
 | macOS, Apple silicon | `hvf`, Hypervisor.framework: ARM64 natively, x86-64 translated | a stub task running rewritten ARM64 code (one CPU) |
-| Linux x86-64 | `kvm`: native x86-64 | a stub process per CPU under `ptrace` and seccomp, catching calls with Syscall User Dispatch, or `PTRACE_SYSEMU` where there's none (gVisor, Linux before 5.11) |
+| Linux x86-64 | `kvm`: native x86-64 | a stub process per CPU that handles its own traps, catching calls with Syscall User Dispatch, or seccomp where there's none (gVisor, Linux before 5.11) |
 | Windows x86-64 | `winkvm`, Carbon's own VT-x driver (test-signed) | a stub process under the debug API, a restricted token and a job (one CPU, atlas only) |
 
 All six backends run real programs and pass the same conformance suite. Linux and Windows are tested in GCP VMs with
@@ -388,7 +388,7 @@ blocks real work, it moves up. Each item's detail is in the README it links to.
 **1. The foundation: exec, correct and everywhere** ([exec](exec/README.md#to-do), [kernels-core](kernels/README.md#kernels-core-1))
 
 1. The sandboxes finished: more than one CPU in the macOS and Windows sandboxes (Linux's has a stub process per CPU,
-   and maps runs of pages per `ptrace` stop); lambda on the Windows sandbox (x86 → x86 rewriting); the kernels'
+   each handling its own traps, as gVisor's systrap does); lambda on the Windows sandbox (x86 → x86 rewriting); the kernels'
    programs on the macOS sandbox. *Done means:* both kernels' test programs pass on every sandbox.
 2. x86-64 programs as they're built: the x87 transcendentals, `pushf`/`popf`, signed 128-bit divides, the remaining
    flags, `cmpxchg16b`; SSE3 and later, then AVX, as programs ask. (Every string instruction is done.)

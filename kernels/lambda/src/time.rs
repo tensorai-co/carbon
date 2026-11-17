@@ -32,6 +32,9 @@ impl Task {
         if marker == crate::os::vdso::MARKER {
             crate::os::vdso::sample(&self.k, counter);
         }
+        if matches!(clock as i32, 2 | 3 | ..0) {
+            self.sample(cx);
+        }
         let now = self.clock_reading(clock).ok_or(EINVAL)?;
         self.write_timespec(cx, at, now)?;
         Ok(0)

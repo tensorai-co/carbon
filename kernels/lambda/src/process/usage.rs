@@ -42,37 +42,86 @@ impl Process {
     }
 }
 
+/// How stale a thread's CPU time may get before a stop reads the host's clocks again. Each read is a system call with
+/// no vDSO behind it (about a microsecond in a cloud VM), and reading two or three at every stop cost more than most
+/// system calls do. In between, the monotonic clock marks when the thread went between its program and lambda.
+const SAMPLE_EVERY: u64 = 1_000_000;
+/// A stop at least this long reads them at its end: the thread may have slept, and in a hardware VM, where one clock
+/// counts both, sleeping mustn't count against the split.
+const LONG_STOP: u64 = 50_000;
+
+/// Where a thread's time stands since its CPU time was last read: wall-clock nanoseconds in its program and in lambda,
+/// and when it last went from one to the other.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Wall {
+    pub mark: u64,
+    pub sampled: u64,
+    program: u64,
+    lambda: u64,
+}
+
+impl Wall {
+    pub(crate) fn new(now: u64) -> Wall {
+        Wall { mark: now, sampled: now, program: 0, lambda: 0 }
+    }
+}
+
 impl Task {
     /// The program has stopped: what ran since the last mark was the program's, on this host thread or, in a process
     /// sandbox, in its stub.
     pub(crate) fn account_stop(&mut self, cx: &mut Cx<'_>) {
-        let now = self.k.host.thread_cpu();
-        let mut user = now.saturating_sub(self.cpu_mark);
-        if let Some(program) = cx.program_time() {
-            user += program.saturating_sub(self.program_mark);
-            self.program_mark = program;
+        let now = self.k.host.monotonic();
+        self.wall.program += now.saturating_sub(self.wall.mark);
+        self.wall.mark = now;
+        if now.saturating_sub(self.wall.sampled) >= SAMPLE_EVERY || self.process.cpu_timers.load(std::sync::atomic::Ordering::Relaxed) {
+            self.sample(cx);
         }
-        self.times.add(user, 0);
-        self.cpu_mark = now;
     }
 
-    /// Back to the program (or ending): what ran since the stop was lambda's.
-    pub(crate) fn account_resume(&mut self) {
-        let now = self.k.host.thread_cpu();
-        self.times.add(0, now.saturating_sub(self.cpu_mark));
-        self.cpu_mark = now;
+    /// Back to the program: what ran since the stop was lambda's.
+    pub(crate) fn account_resume(&mut self, cx: &mut Cx<'_>) {
+        let now = self.k.host.monotonic();
+        if now.saturating_sub(self.wall.mark) >= LONG_STOP {
+            self.sample(cx);
+        } else {
+            self.wall.lambda += now.saturating_sub(self.wall.mark);
+            self.wall.mark = now;
+        }
     }
 
-    /// This thread's time, up to now: the stop it's in counts as system time.
+    /// Reads the host's clocks and adds what they counted since the last read: in a process sandbox, the stub's is the
+    /// program's and this thread's is lambda's; where one clock counts both (a hardware VM, on this thread), it's split
+    /// by how long each ran. Called in lambda, so the time since the last mark is lambda's.
+    pub(crate) fn sample(&mut self, cx: &mut Cx<'_>) {
+        let now = self.k.host.monotonic();
+        self.wall.lambda += now.saturating_sub(self.wall.mark);
+        let cpu = self.k.host.thread_cpu();
+        let host = cpu.saturating_sub(self.cpu_mark);
+        self.cpu_mark = cpu;
+        let (user, system) = match cx.program_time() {
+            Some(program) => {
+                let user = program.saturating_sub(self.program_mark);
+                self.program_mark = program;
+                (user, host)
+            }
+            None => {
+                let wall = self.wall.program + self.wall.lambda;
+                let user = if wall == 0 { 0 } else { (u128::from(host) * u128::from(self.wall.program) / u128::from(wall)) as u64 };
+                (user, host - user)
+            }
+        };
+        self.times.add(user, system);
+        self.wall = Wall::new(now);
+    }
+
+    /// This thread's time, as last read (`sample`).
     fn own_times(&self) -> (u64, u64) {
-        let (user, system) = self.times.get();
-        (user, system + self.k.host.thread_cpu().saturating_sub(self.cpu_mark))
+        self.times.get()
     }
 
-    /// This process's time, up to now.
+    /// This process's time, with this thread's as last read and its other threads' as they last read theirs.
     fn own_process_times(&self) -> (u64, u64) {
-        let (user, system) = self.process.cpu_times();
-        (user, system + self.k.host.thread_cpu().saturating_sub(self.cpu_mark))
+        self.process.cpu_times()
     }
 
     /// A CPU-time clock's reading, or None if `clock` isn't one or names no thread or process. 2 and 3 are this
@@ -107,6 +156,7 @@ impl Task {
     /// since the machine started.
     pub(crate) fn times(&mut self, cx: &mut Cx<'_>, at: u64) -> Result<u64, Errno> {
         if at != 0 {
+            self.sample(cx);
             let (user, system) = self.own_process_times();
             let children = lock(&self.process.state).usage.children;
             let bytes: Vec<u8> = [user, system, children.0, children.1].iter().flat_map(|ns| (ns / TICK).to_le_bytes()).collect();
@@ -117,6 +167,7 @@ impl Task {
 
     /// `getrusage`: this process's time, its waited-for children's, or this thread's.
     pub(crate) fn getrusage(&mut self, cx: &mut Cx<'_>, who: i64, at: u64) -> Result<u64, Errno> {
+        self.sample(cx);
         let times = match who {
             RUSAGE_SELF => self.own_process_times(),
             RUSAGE_CHILDREN => lock(&self.process.state).usage.children,

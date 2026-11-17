@@ -198,6 +198,8 @@ pub(crate) struct Task {
     pub cpu_mark: u64,
     /// Its CPU's program time when it was last added to, in a process sandbox (`Cx::program_time`).
     pub program_mark: u64,
+    /// Where its time stands between reads of the host's clocks (`usage.rs`).
+    pub wall: usage::Wall,
     pub robust: Arc<AtomicU64>,
     /// Whether, and by whom, it's traced (`ptrace`).
     pub trace: Arc<ptrace::Trace>,
@@ -213,6 +215,7 @@ const EINTR_RETURN: u64 = (-(EINTR.0 as i64)) as u64;
 impl Task {
     pub fn new(k: Arc<Kernel>, process: Arc<Process>, tid: i32, waiter: Arc<Waiter>, signals: Arc<ThreadSignals>, isa: Isa) -> Task {
         let cpu_mark = k.host.thread_cpu();
+        let wall = usage::Wall::new(k.host.monotonic());
         Task {
             k,
             process,
@@ -229,6 +232,7 @@ impl Task {
             times: Arc::default(),
             cpu_mark,
             program_mark: 0,
+            wall,
             robust: Arc::default(),
             trace: Arc::default(),
             exit_code: 0,
@@ -260,7 +264,7 @@ impl Guest for Task {
         self.account_stop(cx);
         self.check_cpu_timers();
         let flow = self.stopped(cx, exit);
-        self.account_resume();
+        self.account_resume(cx);
         flow
     }
 }
@@ -401,7 +405,7 @@ impl Task {
             let _ = self.mem(cx, true, |t| kernels_core::user::write_u32(&mut t.space(), at, 0));
             self.k.futexes.wake(key, 1);
         }
-        self.account_resume();
+        self.sample(cx);
         let status = lock(&self.process.state).exiting.unwrap_or(Status::Exited(self.exit_code));
         self.ptrace_ended(status);
         let last = {

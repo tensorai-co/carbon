@@ -142,17 +142,21 @@ fn first_gate_stop(isa: Isa, isolation: Isolation, code: &[u8]) -> Result<(Progr
     Ok((p, stop))
 }
 
-/// Where a backend's programs call to reach their kernel, if it's a gate rather than a trap.
+/// Where a backend's programs call to reach their kernel, if there's a gate.
 fn gate_of(isolation: Isolation, isa: Isa) -> Option<u64> {
+    layout_of(isolation, isa)?.gate
+}
+
+fn layout_of(isolation: Isolation, isa: Isa) -> Option<exec::Layout> {
     let (mut exec, mut cpu) = Exec::open(Options { memory: 16 << 20, isolation, ..Options::default() }).ok()?;
-    let gate = {
+    let layout = {
         let mut turn = exec.enter(&mut cpu);
         let space = turn.new_space(isa).ok()?;
         turn.use_space(space);
-        turn.space().layout().gate
+        turn.space().layout()
     };
     drop(cpu);
-    gate
+    Some(layout)
 }
 
 fn expect_at(stop: &Stop, want: &str, matches: bool) -> Result<(), String> {
@@ -743,7 +747,9 @@ fn main() {
         };
         println!("{backend}");
         for isa in [Isa::X86_64, Isa::Arm64] {
-            let gate = isas.contains(&isa) && gate_of(isolation, isa).is_some();
+            let layout = if isas.contains(&isa) { layout_of(isolation, isa) } else { None };
+            let gate = layout.as_ref().is_some_and(|l| l.gate.is_some());
+            let traps = layout.as_ref().is_none_or(|l| l.gate.is_none() || l.traps);
             for case in CASES {
                 let code = if isa == Isa::Arm64 { case.arm64 } else { case.x86 };
                 if code.is_empty() {
@@ -756,7 +762,7 @@ fn main() {
                     continue;
                 }
                 match (case.reach, gate) {
-                    (Reach::Trap, true) => {
+                    (Reach::Trap, true) if !traps => {
                         println!("skip    {label}: {backend}'s programs reach their kernel through its gate");
                         skipped += 1;
                         continue;

@@ -11,7 +11,7 @@ conformance suite:
 | Host | `vm`: a hardware VM | `sandbox`: a process on the host |
 | --- | --- | --- |
 | macOS, Apple silicon | `hvf`, Hypervisor.framework: ARM64 natively, x86-64 translated | a stub task running rewritten ARM64 code |
-| Linux x86-64 | `kvm`, `/dev/kvm` | a stub process under `ptrace`, Syscall User Dispatch, seccomp |
+| Linux x86-64 | `kvm`, `/dev/kvm` | a stub process that handles its own traps, Syscall User Dispatch, seccomp |
 | Windows x86-64 | `winkvm`, Carbon's own VT-x driver | a stub process under the debug API, restricted token and job |
 
 ```sh
@@ -159,7 +159,7 @@ exec/
   mmu/         exec-mmu        4-level page tables (x86 and ARM64 formats), frames, copy-on-write
   translate/   exec-translate  x86-64 → ARM64, ARM64 → ARM64 rewriting, the ARM64 assembler, the code cache's books
   macos/       exec-macos      vm/hvf, sandbox (stub task, Mach exceptions, rewritten code)
-  linux/       exec-linux      vm/kvm, sandbox (ptrace stub, Syscall User Dispatch, seccomp)
+  linux/       exec-linux      vm/kvm, sandbox (a stub with its own handler, Syscall User Dispatch, seccomp)
   windows/     exec-windows    vm/winkvm, sandbox (debug-API stub, section views, restricted token)
     driver/                    winkvm.sys: VMX, EPT, the run loop (C and MASM), and its smoke test
   examples/conformance.rs      the conformance suite: the same programs on both of this host's backends
@@ -282,16 +282,25 @@ that make a hypercall), both in `exec-core`.
   halt in a shim stub exits to the host. Preempted by a real-time signal with `immediate_exit`. Guest RAM is a memfd,
   shared with the sandbox's RAM code.
 - **`sandbox/linux`**: a stub process per CPU, started (with `clone(CLONE_VM | CLONE_VFORK)`, so nothing of Carbon's
-  is copied) and driven by `ptrace` from the thread that owns the CPU, all mapping guest RAM's memfd shared, so a
-  program's threads and a parent and its child run at once (256 CPUs at most). Syscall User Dispatch, with no part of
-  the stub exempt, sends every `syscall` to the gate; Carbon opens the selector (read-only to the program) only for its
-  own calls, so a program that jumps to the trampoline is caught like any other call. Where there's no dispatch (Linux
-  before 5.11, gVisor), `PTRACE_SYSEMU` stops the stub at every call instead, checked when the stub starts;
-  `CARBON_SANDBOX_CATCH=sysemu` or `dispatch` chooses. seccomp kills the stub for any real call but `mmap`, `mprotect`,
-  `munmap` and exit from the trampoline's own address. The stub goes at the top of user space (just under the stack's
-  lowest place if the kernel's there), so programs have the address space below `0x7fff_ffff_d000`. A stub that can't
-  start says which step the host refused (`ptrace`, executing a memfd, with a temporary file tried next). Registers
-  are the general ones and XSAVE's (x87, SSE and AVX's upper halves).
+  is copied) by the thread that owns the CPU, all mapping guest RAM's memfd shared, so a program's threads and a
+  parent and its child run at once (256 CPUs at most). The stub handles its own traps, as gVisor's systrap does: a
+  program's system calls (Syscall User Dispatch, with only the handler's page exempt, or seccomp's `SECCOMP_RET_TRAP`
+  where there's no dispatch: Linux before 5.11, gVisor), its faults and preempts are signals to a small handler in the
+  stub (`handler.rs`), on a signal stack in a second memfd Carbon maps too. Carbon reads and writes the program's
+  registers in that signal frame, and the two meet through a mailbox there with a futex (`mailbox.rs`), each spinning
+  first only while the other is on another CPU and has lately answered quickly. The handler makes the stub's own
+  mapping calls for Carbon as it returns to the program (`fast`, the default), or Carbon makes them through `ptrace`
+  with the stub stopped (`CARBON_SANDBOX=strict`, for machines whose processes mustn't reach each other's memory: it
+  needs dispatch). The stub sets itself up from calls Carbon leaves in its mailbox, so `fast` uses no `ptrace` at all.
+  atlas's ntdll calls the stub's gate instead of trapping (`Layout::gate`, `CARBON_SANDBOX_GATE=0` to turn it off),
+  which saves the signal: the gate saves the program's registers, and XSAVE's state, in a frame laid out as a
+  signal's. seccomp allows real calls only from the handler's page (`futex` on the mailbox, `rt_sigreturn`,
+  `arch_prctl` for `fs` and `gs`, and in `fast`, `mmap` of guest RAM, `mprotect` and `munmap` below the stub), and
+  kills the stub for anything else. The mailbox is the program's to write, so Carbon reads it as untrusted. The stub
+  goes at the top of user space (just under the stack's lowest place if the kernel's there), so programs have the
+  address space below `0x7fff_fffe_a000`. A stub that can't start says which step failed and why. Registers are the
+  general ones and XSAVE's (x87, SSE and AVX's upper halves), from the frame, and `fs` and `gs` by `rdfsbase` and the
+  rest where the kernel allows them (else only Carbon can change them, and keeps them).
 - **`vm/winkvm` and `winkvm.sys`**: Carbon's own VT-x driver, because WHP needs Hyper-V, which fails or conflicts
   under nested virtualization in the cloud. VMX is turned on on every CPU by IPI. `RUN` is pinned to one CPU and does a
   VMCLEAR at the end. Guest RAM is mapped through EPT. XSAVE state is swapped inside the assembly, MSRs through the
@@ -388,12 +397,15 @@ it, in more detail. When an item is done it's ticked here, with what it took.
       with what a stub shows and gives it merged runs (`MirrorRun`): a mapping per stretch of pages on frames in a row,
       one `mprotect` per stretch whose protection changed (a fork's), one `munmap` per stretch taken away; all of a
       turn's calls are made in one stop, with the registers saved and put back once.
-- [x] **Linux without Syscall User Dispatch** (before 5.11, gVisor: Cloud Run's first generation): `PTRACE_SYSEMU`,
-      checked when the stub starts, with the seccomp filter handing over (`SECCOMP_RET_TRACE`) rather than killing
-      where the host asks seccomp first, as gVisor does. The whole sandbox runs inside gVisor's `runsc`.
-- [x] **Linux's lockdown**: no part of the stub exempt from dispatch (Carbon opens the selector for its own calls), so
-      a program that jumps to the trampoline is caught like any call; seccomp allows only the trampoline's own address.
-- [x] **Linux's reach**: the stub at the top of user space (programs get up to `0x7fff_ffff_d000`, not
+- [x] **Linux without Syscall User Dispatch** (before 5.11, gVisor: Cloud Run's first generation): seccomp's
+      `SECCOMP_RET_TRAP` sends a program's calls to the same handler that dispatch does. The whole sandbox runs inside
+      gVisor's `runsc`, which rewrites `mov $nr, %eax; syscall` sites into jumps of its own unless a process sets its
+      `gs`: so every stub sets it first thing, and none of the stub's own calls look like that.
+- [x] **Linux's lockdown**: real calls come only from the stub's handler page, and seccomp allows only the ones it
+      makes, with their arguments checked as far as it can (`seccomp.rs`); the rest kill the stub. The mailbox is the
+      program's to write, so Carbon reads it as untrusted. `strict` keeps a machine's processes out of each other's
+      memory, which the handler's own `mmap` would otherwise let them reach.
+- [x] **Linux's reach**: the stub at the top of user space (programs get up to `0x7fff_fffe_a000`, not
       `0x7f80_0000_0000`), lower only where the kernel won't put it there; XSAVE's AVX state kept; the stub's CPU time
       counted as the program's (`SandboxCpu::program_time`); no `/proc` needed to start a stub; a temporary file where a
       memfd can't be executed; and which step the host refused, when a stub can't start.
@@ -401,9 +413,23 @@ it, in more detail. When an item is done it's ticked here, with what it took.
       map its whole address space up front (200 Python threads: from timing out to 10 s); an instruction running onto
       a page the stub doesn't have is read as the fetch it is, which gVisor reports as an access error; and the stub's
       file kept off the descriptor guest memory goes to, which collided once a process had a hundred open.
-- [ ] **Linux, faster faults**: each fault is a `ptrace` stop (~70 µs on Cloud Run: touching 900 MiB takes 16 s).
-      lambda could fault anonymous memory in around the page asked for; and frames freed and taken again come back in
-      descending order, so they don't merge into one mapping, which handing them out ascending would fix.
+- [x] **Linux, v2: a stub that handles its own traps** (as gVisor's systrap does): a program's calls, faults and
+      preempts are signals to a handler in its stub, on a signal stack in memory Carbon maps too, which meets Carbon
+      through a mailbox and a futex, and maps guest memory into itself as it returns to the program. The stub sets
+      itself up from calls Carbon leaves in the mailbox, so `fast` needs no `ptrace` at all; each side spins only while
+      the other is on another CPU and answers quickly; `fs` and `gs` move by `rdfsbase` and the rest where the kernel
+      allows them. atlas's ntdll calls a gate in the stub instead of trapping, which saves the signal. On an e2 VM (2
+      vCPUs), against v1's `ptrace` stub: `getpid` 32.5 → 5.1 µs, a first-touch fault 96 → 28 µs, `apt-get update &&
+      apt-get install curl` 131 → 49 s, 100 forks 2.8 → 1.0 s, 40,000 Windows calls 340 → 195 ms by the gate.
+      lambda reads the host's CPU-time clocks lazily (a microsecond each in a VM, three a stop before).
+- [ ] **Linux, v2's phase 2 for lambda**: Linux programs' own `mov $nr, %eax; syscall` sites rewritten, lazily, to
+      jump to the stub's gate (with the return address in `rcx`, so the program's stack and red zone are untouched),
+      saving the signal (~3 µs in a VM). Needs a breakpoint-first patch, as Linux's `text_poke_bp` does, so another CPU
+      never runs a half-written site; patches invisible to reads and undone by writes; and thunks kept within ±2 GiB.
+- [ ] **Linux, faster faults**: lambda could fault anonymous memory in around the page asked for; and frames freed and
+      taken again come back in descending order, so they don't merge into one mapping, which handing them out
+      ascending would fix. A fresh frame needn't be zeroed twice (the memfd's pages are), and could be populated in
+      batches.
 - [ ] **macOS and Windows**: more than one CPU. The Linux way (an address space per CPU) needs a host that can map one
       memory object into several stub processes: Windows can (a section), macOS too (a memory entry). Until then, a
       program asking for a second CPU there gets `NoMoreCpus` at once.

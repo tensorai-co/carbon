@@ -196,7 +196,10 @@ pub fn cdecl(dll: &str, name: &str) -> bool {
 
 /// The atlas page's code: two stubs, 32 bytes apart, that come into atlas with the program's return value kept (in
 /// `x0`, or moved to `r10`, or on x86 to `edx`, since x86's stub needs `eax` for the number); then, at `TRAP_AT`,
-/// x86-64's trampoline into atlas: `syscall; ret`, or a jump to the backend's `gate`.
+/// x86-64's trampoline into atlas: `syscall; ret`, or, with a `gate`, a call to a jump to it, then `ret`. So the gate
+/// is reached with a return address to the trampoline's `ret` on the stack, and above it the trampoline's caller's,
+/// whichever called it (atlas's ntdll, or a stub that jumped there): popping the first, as a gate does, leaves the
+/// program where a `syscall` at the trampoline would have it.
 pub fn atlas_page(isa: Isa, gate: Option<u64>) -> Vec<u8> {
     let mut page = Vec::new();
     for nr in [THREAD_RETURN, UPCALL_RETURN] {
@@ -234,8 +237,9 @@ pub fn atlas_page(isa: Isa, gate: Option<u64>) -> Vec<u8> {
     if isa == Isa::X86_64 {
         page.resize((atlas_abi::call::TRAP_AT - atlas_abi::call::ATLAS_PAGE64) as usize, 0xcc);
         match gate {
-            // mov r11, gate; jmp r11: the caller's return address stays, for the gate to return to.
+            // call +1 (over the ret); ret; then mov r11, gate; jmp r11
             Some(gate) => {
+                page.extend([0xe8, 1, 0, 0, 0, 0xc3]);
                 page.extend([0x49, 0xbb]);
                 page.extend(gate.to_le_bytes());
                 page.extend([0x41, 0xff, 0xe3]);

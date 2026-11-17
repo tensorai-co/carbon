@@ -177,8 +177,11 @@ pub struct Layout {
     pub top: u64,
     /// Ranges the backend keeps for itself, which the kernel must never give a program.
     pub kept: Vec<Range<u64>>,
-    /// Where a program calls instead of trapping, for a sandbox that can't stop it at the trap itself.
+    /// Where a program calls instead of trapping: for a sandbox that can't stop it at the trap itself, the only way
+    /// in; for one that can, a quicker one.
     pub gate: Option<u64>,
+    /// Whether a program's own traps (`syscall`) reach the kernel too, where there's a gate.
+    pub traps: bool,
 }
 
 /// A mapped page.

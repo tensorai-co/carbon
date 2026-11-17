@@ -21,8 +21,8 @@ pub enum Body {
 }
 
 /// A stub that traps into atlas with call number `nr`, then returns to its caller with the result, popping `pop`
-/// bytes of arguments on x86. With `gate`, an x86-64 stub comes in through atlas's trampoline (`TRAP_AT`) rather than
-/// `syscall`.
+/// bytes of arguments on x86. With `gate`, an x86-64 stub jumps to atlas's trampoline (`TRAP_AT`) rather than making a
+/// `syscall`, so the trampoline's caller is the stub's, and its arguments are where they'd be at the `syscall`.
 pub fn stub(isa: Isa, nr: u64, pop: u16, gate: bool) -> Vec<u8> {
     let mut code = Vec::with_capacity(STUB);
     match isa {
@@ -47,17 +47,16 @@ pub fn stub(isa: Isa, nr: u64, pop: u16, gate: bool) -> Vec<u8> {
             code.resize(STUB, 0);
         }
         _ => {
-            // mov r10, rcx; mov eax, nr; then syscall, or mov r11, TRAP_AT; call r11; then ret
+            // mov r10, rcx; mov eax, nr; then syscall; ret, or mov r11, TRAP_AT; jmp r11
             code.extend([0x4c, 0x8b, 0xd1, 0xb8]);
             code.extend((nr as u32).to_le_bytes());
             if gate {
                 code.extend([0x49, 0xbb]);
                 code.extend(atlas_abi::call::TRAP_AT.to_le_bytes());
-                code.extend([0x41, 0xff, 0xd3]);
+                code.extend([0x41, 0xff, 0xe3]);
             } else {
-                code.extend([0x0f, 0x05]);
+                code.extend([0x0f, 0x05, 0xc3]);
             }
-            code.push(0xc3);
             code.resize(STUB, 0xcc);
         }
     }

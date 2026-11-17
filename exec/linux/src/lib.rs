@@ -1,5 +1,5 @@
-//! exec on Linux: `vm` is KVM, `sandbox` is a stub process driven by `ptrace`, with Syscall User Dispatch sending its
-//! system calls to the gate.
+//! exec on Linux: `vm` is KVM, `sandbox` is a stub process per CPU whose own handler catches its program's system calls
+//! and faults and meets Carbon through shared memory.
 #![cfg(target_os = "linux")]
 
 #[cfg(target_arch = "x86_64")]
