@@ -205,7 +205,10 @@ The same with REST over a Unix socket with curl.
 
 - [ ] The rest of the Engine API: `machines.events` and `watch` as streams, `images.build`, `.save`, `.load`,
       `.history`, `volumes.*`, `display.*`, `rules` on a running machine.
+- [ ] `files.move`, and copies in and out (whole folders, as `carbon cp`), in the Engine API.
 - [ ] REST streams: exec, logs and events upgrading to a WebSocket at their own paths.
+- [ ] API versions: `/v1` and `engine/` now; how a client asks for a version over a WebSocket.
+- [ ] `carbon start NAME` in the CLI, to match `machines.start` (a stopped machine starts with `run --name` today).
 - [ ] OAuth 2.1 for MCP's clients; `subscriptions/listen`.
 - [ ] The Tasks extension, for builds and commands longer than a client waits.
 - [ ] Machines labeled with who started them, for one server shared by several users.
