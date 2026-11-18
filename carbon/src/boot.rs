@@ -120,6 +120,19 @@ pub(crate) fn run(store: &Store, launch: Launch, notify: &Notify, started: &mut 
     if let Some(hosts) = &launch.extra_hosts {
         record.extra_hosts = hosts.clone();
     }
+    // Its env, working folder and user, kept in its config as `create` keeps them, and as Docker keeps a container's:
+    // it has them each time it runs, and an exec into it has its env.
+    for var in &launch.env {
+        let key = var.split('=').next().unwrap_or("");
+        record.config.env.retain(|e| e.split('=').next() != Some(key));
+        record.config.env.push(var.clone());
+    }
+    if let Some(workdir) = &launch.workdir {
+        record.config.workdir = workdir.clone();
+    }
+    if let Some(user) = launch.user.as_deref().filter(|u| !u.is_empty()) {
+        record.config.user = user.to_string();
+    }
     let mut ports = Vec::new();
     let exposed: Vec<String> = if launch.publish_all { record.config.exposed_ports.clone() } else { Vec::new() };
     for text in record.publish.iter().chain(&exposed) {
@@ -349,6 +362,15 @@ fn boot(store: &Store, record: &Record, launch: &Launch, parts: Parts, notify: &
             let mut disk = store.disk::<lambda::Meta>(record, lambda::Meta::dir(0o755), false)?;
             if let (Some(bytes), Some(path)) = (&program, &record.program) {
                 disk.put(path, layers::New::File, bytes, lambda::Meta::file(0o755), lambda::Meta::dir(0o755)).map_err(|e| Error::io(format!("putting {path} on the disk: {e}")))?;
+            }
+            // Its working folder (--workdir, or the image's WORKDIR) is made if it isn't there, root's, as Docker
+            // makes it: a machine starts there, rather than failing to. (An exec's own -w isn't: as Docker's, it
+            // must be there.)
+            if let Some(dir) = workdir.as_deref().filter(|d| d.starts_with('/'))
+                && disk.resolve(layers::ROOT, dir, true).is_err()
+            {
+                disk.put(dir, layers::New::Dir, &[], lambda::Meta::dir(0o755), lambda::Meta::dir(0o755))
+                    .map_err(|e| Error::invalid(format!("--workdir {dir}: it isn't there, and can't be made: {e}")))?;
             }
             // An image's own environment takes the place of lambda's, and few set HOME: it's the image user's home
             // from its passwd file, as a container runtime makes it.

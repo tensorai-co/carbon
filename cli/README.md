@@ -82,9 +82,9 @@ carbon atlas imports ~/installers/          # a folder of them: which load, and 
 | `--display headless=WxH[@SCALE]\|host[=WxH]\|host-windows\|none` | Where its windows go: a screen in memory (`headless=1280x800` by default), the whole desktop in a window on this Mac's screen (which closing stops the machine), or each window in a Mac window of its own |
 | `--gpu auto\|host\|software\|none` | Its GPU: the host's if there is one, else the CPU device (`auto`, the default, which says so when it takes the CPU device), the host's or fail, the CPU device, or none. Linux machines reach it through lambda's Vulkan driver; Windows machines don't yet |
 | `--audio auto\|host\|none\|FILE.wav` | Where its sound goes: the host's speakers when it's on the host's screen (`auto`, the default), the host's speakers or fail, nowhere, or a WAV file of everything played |
-| `-e`, `--env NAME=VALUE` | An environment variable, over the image's |
+| `-e`, `--env NAME=VALUE` | An environment variable, over the image's. `-e`, `-w` and `-u` are kept for when it runs again, and `exec` gets its env |
 | `--env-file FILE` | Environment variables from a file, as Docker reads one: a `NAME=VALUE` line each, the value as written (quotes and all); `NAME` alone takes this shell's, and is left out if it has none; `#` lines are comments. `carbon exec` takes it too |
-| `-w`, `--workdir DIR` | Where its program starts; the image's working directory by default |
+| `-w`, `--workdir DIR` | Where its program starts; the image's working directory by default. Made (root's) if it isn't there, as Docker makes it; `exec -w` must name one that is |
 | `-u`, `--user USER[:GROUP]` | Who its programs run as: a name or a number from the image's `/etc/passwd` and `/etc/group`; the image's `USER` by default, else root. Linux machines only, for now |
 | `--memory SIZE` | How much memory it may use, as `512m` or `4g` (`4g` by default, or ¾ of a container's memory limit if that's less, as on Cloud Run; only what's touched is taken) |
 | `--rm` | Removed, and its files, once it ends |

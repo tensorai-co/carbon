@@ -147,6 +147,7 @@ path's and query's parts join the JSON body as params.
 
 - **Files on a running machine are what its programs see:** a file written into a tmpfs is in the tmpfs. Secrets go in
   one (`HostConfig.Tmpfs: {"/run/secrets": ""}`) because a tmpfs isn't the disk: `commit` never saves it.
+- **`WorkingDir`** is made, root's, if the image hasn't it, as Docker makes it.
 - **`Cmd`:** as in Docker, a machine runs its image's command, and `bash` with no stdin ends at once. A machine meant
   for `exec` is given one that waits, `["sleep", "infinity"]` (MCP's `start_machine` does this itself).
 - **A stream's frames can follow its request at once.** The stream opens as the request arrives, before its handler

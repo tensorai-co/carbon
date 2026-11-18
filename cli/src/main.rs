@@ -67,7 +67,8 @@ usage: carbon <command> ...
       -e, --env NAME=VALUE                   an environment variable, over the image's
       --env-file FILE                        environment variables from a file, as Docker reads one: a NAME=VALUE
                                              line each (NAME alone takes this one's), # for comments
-      -w, --workdir DIR                      where its program starts (the image's working directory by default)
+      -w, --workdir DIR                      where its program starts (the image's working directory by default),
+                                             made if it isn't there
       -u, --user USER[:GROUP]                who it runs as, by name or number from the image's /etc/passwd (the
                                              image's USER by default, else root)
       --memory SIZE                          how much memory it may use, as 512m or 4g (4g, less in a smaller container)
