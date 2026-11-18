@@ -213,6 +213,7 @@ impl MachineSpec {
             remove: false,
             timeout: None,
             mounts: None,
+            user: None,
             hub: Hub::new(),
         };
         MachineSpec { carbon, launch, invalid: None, rules: Rules::new(), code_hooks: std::cell::Cell::new(false) }
@@ -285,6 +286,14 @@ impl MachineSpec {
     /// Every port its image says it listens on (`EXPOSE`), each published on a free host port, as Docker's `-P`.
     pub fn publish_all(mut self) -> MachineSpec {
         self.launch.publish_all = true;
+        self
+    }
+
+    /// Who its first program runs as: `name`, `uid`, `name:group` or `uid:gid`, from its image's `/etc/passwd` and
+    /// `/etc/group` (Docker's `--user`). The image's `USER` by default, else root. Anyone but root runs without root's
+    /// capabilities, and files are checked against them.
+    pub fn user(mut self, user: impl Into<String>) -> MachineSpec {
+        self.launch.user = Some(user.into());
         self
     }
 

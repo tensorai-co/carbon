@@ -78,14 +78,14 @@ libraries.
 | Type | What it is |
 | --- | --- |
 | [`Carbon`](src/lib.rs) | Carbon on this host: its folder of machines and images. `machine(image)`, `program(path)`, `again(name)` make a `MachineSpec`; `build(context)` a [`Build`](#building); `get(name)`, `machines()`, `images()`, `image(name)` (or an unnamed one's `sha256:…`), `pull`, `import`, `tag`, `remove_image`, `prune`; `on_notice` for what machines fall back to |
-| [`MachineSpec`](src/spec.rs) | A builder: `name`, `isolation`, `platform`, `env`, `workdir`, `memory`, `network`, `publish`, `display`, `gpu`, `audio`, `stdin`/`stdout`/`stderr` ([`Stdio`](src/stdio.rs): inherit, null, piped), `tty`, `relay_signals`, `rm`, `publish_all`, `timeout`, `mount`, and `hooks`, `rules`, `on_exec`, `on_output`, `on_connect`, `on_lookup`. Then `run(argv)` on this thread, `output(argv)` to its end with what it wrote, `start(argv)` on a thread of its own, `launch(argv)` in a process of its own ([workers](#workers)), or `create()` to make it without running it, as `docker create` |
+| [`MachineSpec`](src/spec.rs) | A builder: `name`, `isolation`, `platform`, `user`, `env`, `workdir`, `memory`, `network`, `publish`, `display`, `gpu`, `audio`, `stdin`/`stdout`/`stderr` ([`Stdio`](src/stdio.rs): inherit, null, piped), `tty`, `relay_signals`, `rm`, `publish_all`, `timeout`, `mount`, and `hooks`, `rules`, `on_exec`, `on_output`, `on_connect`, `on_lookup`. Then `run(argv)` on this thread, `output(argv)` to its end with what it wrote, `start(argv)` on a thread of its own, `launch(argv)` in a process of its own ([workers](#workers)), or `create()` to make it without running it, as `docker create` |
 | [`Running`](src/spec.rs) | A machine this process runs: `take_stdin`, `take_stdout`, `take_stderr` ([`Chunks`](src/stdio.rs), also an `io::Read`), `hooks()`, `machine()`, `stop`, `kill`, `wait` |
 | [`Machine`](src/machine.rs) | A machine by name, in this process or another: `info`, `exec(argv)`, `stop`, `kill`, `wait`, `ports`, `screen`, `watch`, `logs`, `files`, `copy_in`, `copy_out`, `freeze`, `freeze_with` ([`Freeze`](src/machine.rs): its name or none, config, step, history), `remove` |
 | [`Files`](src/files.rs) | A machine's files, running or stopped: `stat`, `list`, `read`, `read_to_string`, `write` ([`Write`](src/files.rs): mode, owner, parents, append, time), `mkdir`, `symlink`, `rename`, `remove`, and `copy_in`, `copy_out`, `copy_from` (another machine's disk) ([`Copy`](src/files.rs): `chown`, `chmod`, `exclude` with an ignore file's patterns), which keep kinds, modes, owners, times and links |
 | [`Mount`, `Volume`](src/mounts.rs) | A host's folder (or one file) seen live in a machine (`Mount::bind`), a volume (`Mount::volume`: a folder Carbon keeps that outlives its machines, its files' owners kept), a tmpfs; `read_only`; `Mount::parse` takes Docker's `-v` and `--mount`. `Carbon::volume(name)`: `create`, `path`, `info`; `volumes()`, `remove_volume` |
 | [`Logs`, `LogLine`](src/logs.rs) | What a launched machine wrote, as lines on its stream: `tail(n)`, `follow()` |
 | [`Image`, `ImageConfig`, `History`](../images/src/config.rs) | An image: its whole OCI config (exposed ports, volumes, labels, stop signal, health check, shell, `ONBUILD`), each step that made it, its layers' digests |
-| [`ExecSpec`, `Process`](src/machine.rs) | A process in a running machine, as `docker exec`: `env`, `workdir`, `tty`, `timeout` (killed after it, exit 124); then `spawn` (stdin, output as it comes, `resize`, `signal`, `wait`), `output`, `detach`, or `attach` to this terminal |
+| [`ExecSpec`, `Process`](src/machine.rs) | A process in a running machine, as `docker exec`: `user`, `env`, `workdir`, `tty`, `timeout` (killed after it, exit 124); then `spawn` (stdin, output as it comes, `resize`, `signal`, `wait`), `output`, `detach`, or `attach` to this terminal |
 | [`Screen`](src/machine.rs) | A running machine's desktop, for computer use: `screenshot` (PNG), `windows`, `click`, `drag`, `scroll`, `type_text`, `key`, `resize`, `clipboard`, `drop_text`, `drop_files` |
 | [`hooks`](../hooks/README.md) | Events, decisions, the `Hooks` trait, filters, and the `Hub` each machine's hook points ask, with observers and subscriptions |
 | [`Rules`](src/rules.rs) | Decisions with no code: programs that may not start (`deny_exec("rm -rf *")`), where the network may and may not go (`deny("0.0.0.0/0")`, `allow("pypi.org:443")`) |
@@ -128,6 +128,7 @@ A hook point is a place in Carbon's own code a program can't get around. Each ma
 | [`worker.rs`](src/worker.rs) | Workers: `launch`, a machine in this binary run again, and its hook link back to the launcher |
 | [`files.rs`](src/files.rs) | `Files` and copies: each operation one `Op`, done on a stopped disk directly or by a running machine's kernel |
 | [`mounts.rs`](src/mounts.rs) | `Mount`, volumes, and a host folder as an external tree of the machine's disk (`HostTree`) |
+| [`users.rs`](src/users.rs) | Who a machine's programs run as: `name[:group]` or `uid[:gid]`, read from the machine's own `/etc/passwd` and `/etc/group` as Docker reads them |
 | [`logs.rs`](src/logs.rs) | A launched machine's output, kept as records of each write, and read back as lines |
 | [`build/`](src/build/mod.rs) | Building: `parse` (the Dockerfile's grammar), `lex` (substitution and quoting), `ignore` (ignore files), `archive` (`ADD`'s tars), `run` (the steps, the cache) |
 | [`machine.rs`](src/machine.rs) | `Machine`, `MachineInfo`, `ExecSpec`, `Process`, `Screen` |
@@ -167,10 +168,10 @@ let file = carbon::build::Carbonfile::parse(&text)?;      // the grammar alone
 | Instruction | What a build does |
 | --- | --- |
 | `FROM`, `--platform` | The image, pulled if it isn't here, or an earlier stage; `scratch` is an empty disk. Its `ONBUILD` triggers run first |
-| `RUN` | A machine launched from the step's image with its `ENV`, `ARG`s, `WORKDIR` and `SHELL`, run to its end, frozen with the config and the step; a non-zero exit fails the build. `--network`; here-documents as scripts (a `#!` one run as a file) |
+| `RUN` | A machine launched from the step's image with its `ENV`, `ARG`s, `WORKDIR`, `SHELL` and `USER`, run to its end, frozen with the config and the step; a non-zero exit fails the build. `--network`; here-documents as scripts (a `#!` one run as a file) |
 | `RUN --mount` | `type=cache`: a volume kept between builds (`build-cache-…`, by its `id` or target), left out of the step's key; `bind`: part of the context (a folder or a file), read-only, its contents in the key; `tmpfs`; `secret`: a file the build was given (`Build::secret`, `--secret id=ID,src=FILE`) at `/run/secrets/ID` for that step, or a variable (`env=`), never in the image or the key |
 | `COPY`, `ADD` | Into a machine made but never run: the context's files (the ignore file applied, wildcards matched), a here-document, or another stage's or image's (`--from`, disk to disk). `--chown`, octal `--chmod`, `--exclude`; kinds, modes, times and links kept. `ADD` unpacks a local tar, plain or gzip, found by its contents |
-| `ENV`, `ARG`, `WORKDIR`, `USER`, `CMD`, `ENTRYPOINT`, `SHELL`, `LABEL`, `EXPOSE`, `VOLUME`, `STOPSIGNAL`, `HEALTHCHECK`, `ONBUILD`, `MAINTAINER` | The config and a history entry, nothing on the disk (a `WORKDIR`'s folder is made by the next step that changes the disk) |
+| `ENV`, `ARG`, `WORKDIR`, `USER` (who the next `RUN`s and the image's machines run as), `CMD`, `ENTRYPOINT`, `SHELL`, `LABEL`, `EXPOSE`, `VOLUME`, `STOPSIGNAL`, `HEALTHCHECK`, `ONBUILD`, `MAINTAINER` | The config and a history entry, nothing on the disk (a `WORKDIR`'s folder is made by the next step that changes the disk) |
 
 **The cache.** Each step's key is a SHA-256 of what it starts from (the stage's key so far, which every instruction
 before it fed), the instruction as resolved, the `ARG`s a `RUN` gets, its network and platform, and what a `COPY`
@@ -202,6 +203,28 @@ call a program makes on a file there is made on the host's file as it happens. A
 files are its user's when it's mounted again; a new volume is filled from what the image has at its target, as
 Docker's is. A machine keeps its mounts for when it runs again. Linux machines have them; Windows machines don't yet.
 
+## Users
+
+```rust
+let app = carbon.machine("node:22-slim").user("node").launch(["sleep", "infinity"])?;  // or "1000:1000", "node:staff"
+app.exec(["id"]).output()?;                         // node, as the machine runs
+app.exec(["apt-get", "update"]).user("root").output()?;
+```
+
+A machine's programs run as its `user`, else its image's `USER`, else root, as Docker's do: a name or a number, and
+optionally a group, read from the machine's own `/etc/passwd` and `/etc/group` (a number it hasn't got is taken as it
+is, with group 0), with that user's home as `HOME` and the groups that list it as its supplementary groups. An `exec`
+runs as the machine does unless it's given a user. A build's `RUN` runs as the `USER` before it.
+
+lambda then checks what they do as Linux does: each file's owner, group and other bits (and folders' search bits on
+the way), `CAP_DAC_OVERRIDE` and `CAP_DAC_READ_SEARCH`, sticky folders, the setgid bit on new files' folders, who may
+`chmod`, `chown` and set times, `access`'s real IDs, and setuid and setgid programs at `execve` (not on a `nosuid`
+mount, nor traced), so `su` works, and a program that drops root to its own user (nginx's
+workers, `apt`'s `_apt`) can't reach root's files. Root, every machine's user unless it's given another, is checked
+for nothing but running a file with no execute bit, so it pays nothing. A bound folder's files are owned by the
+machine's user, so whoever it runs as can use them, as on Docker Desktop; a volume's keep their own owners.
+Windows machines don't take a user yet.
+
 ## Workers
 
 `launch` runs a machine in a **worker**: this program's own binary, run again, which `carbon::init()` takes over. It
@@ -228,7 +251,7 @@ launched with `-P`: port 80 published from its config, its page served, its logs
 A host folder bound into a machine: written, linked, renamed and removed on both sides, each seen by the other at
 once while it ran; read-only refusing writes (EROFS); `npm install` of Express into a bound project (67 packages and
 their links, on the host). A volume's file chowned to 999 and chmod 600, the same for the next machine; a new volume
-filled from the image's `/etc/apt`. A build with every `RUN --mount`: `pip`'s cache reused by the next build, a bound
+filled from the image's `/etc/apt`. As users: `-u node` refused `/root`, `/etc/shadow` and `/usr/local` and given its own home; an image's `USER` taken by default and by `exec`; `exec -u nobody` and `-u 1234:1234`; a setuid root copy of `id` (`euid=0`) and a setgid one; `/tmp`'s sticky bit refusing another user's `rm`; `chown` refused to a user; `su` as root, and refused without a password; nginx's workers as `nginx`; a build that `useradd`s, then `USER app`, `COPY --chown` and a `RUN` as `app`. A build with every `RUN --mount`: `pip`'s cache reused by the next build, a bound
 `requirements.txt`, a secret as a file and as a variable, a tmpfs, and none of it in the image. From the CLI: `--deny-exec` in a Linux machine (EACCES,
 126) and a Windows one (`where` refused when cmd starts it), a refused first program, `--deny` with `--allow`, and
 `carbon watch` showing another process's `carbon exec`, its output, its lookups and its refusals. A program outside
@@ -252,8 +275,10 @@ In [the proposal](../docs/carbon_lib.md)'s order:
 - [ ] **The rest of mounts:** in Windows machines (a drive or a folder); an image's `VOLUME`s made volumes at
       `launch`; `RUN --mount=type=bind,from=` and `rw`, a secret's target outside `/run/secrets`, `type=ssh`;
       volumes' metadata kept on Windows hosts; seeing a bound folder's changes through inotify.
-- [ ] **Users** (step 9): `MachineSpec::user`, `ExecSpec::user`, and `USER` honored by `RUN` (it warns and runs as
-      root today).
+- [x] **Users**: `MachineSpec::user`, `ExecSpec::user`, the image's `USER` (by `RUN` too), and lambda checking
+      files' permissions, setuid and setgid against them.
+- [ ] **The rest of users:** in Windows machines (refused today); `--group-add`; `user` in a `Files` operation (they
+      are root's); file capabilities (`security.capability`) at `execve`.
 - [ ] **Registries** (step 10): `login`, `push`, `save`, `load`; a built image pushed a layer per step (each its
       index's difference from the step before, as a tar with whiteouts), `--squash` for one; `build --output
       type=tar|oci`.

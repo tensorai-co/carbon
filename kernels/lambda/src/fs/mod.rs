@@ -8,6 +8,7 @@ pub(crate) mod fanotify;
 pub(crate) mod inotify;
 mod io;
 pub(crate) mod mount;
+pub(crate) mod perm;
 pub(crate) mod xattr;
 mod meta;
 mod pipe;
@@ -824,7 +825,7 @@ impl Task {
         };
         // The view whose root the open uses: the dirfd itself under RESOLVE_IN_ROOT.
         let base = self.view();
-        let view = if how.in_root { mount::View { root: dir, mounts: base.mounts.clone() } } else { base };
+        let view = if how.in_root { mount::View { root: dir, mounts: base.mounts.clone(), who: base.who.clone() } } else { base };
         // Enforce the restrictions by resolving the target (or, to create it, its parent) under them.
         let follow = flags & O_NOFOLLOW == 0;
         let exists = view.resolve_how(&lock(&self.k.disk), dir, &path, follow, &how);
@@ -887,6 +888,7 @@ impl Task {
         if read_only && (flags & O_ACCMODE != 0 || flags & O_TRUNC != 0) && flags & O_PATH == 0 {
             return Err(EROFS);
         }
+        let who = self.who();
         let mut disk = lock(&self.k.disk);
         let (ino, created) = match view.resolve(&disk, dir, path, flags & O_NOFOLLOW == 0) {
             Ok(_) if flags & O_CREAT != 0 && flags & O_EXCL != 0 => return Err(EEXIST),
@@ -910,13 +912,29 @@ impl Task {
                     }
                 }
                 let (parent, name) = view.resolve_parent(&disk, at, &target)?;
-                (disk.create(parent, name, New::File, Meta::file(mode & !umask & 0o7777), self.k.now())?, true)
+                perm::may_change(&disk, &who, parent)?;
+                let meta = perm::new_meta(&disk, &who, parent, mode & !umask & 0o7777, false);
+                (disk.create(parent, name, New::File, meta, self.k.now())?, true)
             }
             Err(e) => return Err(e.into()),
         };
         let stat = disk.stat(ino)?;
         let meta = disk.meta(ino)?;
         let write = flags & O_ACCMODE != 0;
+        // What it's opened for, unless it was made just now (its maker may always open it) or it's only a handle.
+        if !created && flags & O_PATH == 0 && stat.kind != Kind::Symlink && !who.unchecked() {
+            let mut want = match flags & O_ACCMODE {
+                0 => perm::MAY_READ,
+                1 => perm::MAY_WRITE,
+                _ => perm::MAY_READ | perm::MAY_WRITE,
+            };
+            if flags & O_TRUNC != 0 {
+                want |= perm::MAY_WRITE;
+            }
+            if !who.may(&meta, stat.kind == Kind::Dir, want) {
+                return Err(EACCES);
+            }
+        }
         let node = match stat.kind {
             Kind::Dir if write => return Err(EISDIR),
             Kind::Dir => Node::Dir(ino),
@@ -1539,15 +1557,35 @@ impl Task {
         Ok(0)
     }
 
-    pub(crate) fn faccessat(&mut self, cx: &mut Cx<'_>, dirfd: i32, path_at: u64) -> Result<u64, Errno> {
+    /// `access`, `faccessat` and `faccessat2`: whether the file is there (`F_OK`) and, for `R_OK`, `W_OK` and `X_OK`,
+    /// whether the process could read, write or run it: as its real IDs (its effective ones with `AT_EACCESS`).
+    pub(crate) fn faccessat(&mut self, cx: &mut Cx<'_>, dirfd: i32, path_at: u64, mode: u32, flags: u64) -> Result<u64, Errno> {
+        const AT_EACCESS: u64 = 0x200;
+        if mode & !7 != 0 || flags & !(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+            return Err(EINVAL);
+        }
         let path = self.read_path(cx, path_at)?;
         let (dir, dir_path) = self.start_dir(dirfd)?;
         let absolute = exe_path(&dir_path, &path);
         if os::stat(&self.k, &absolute).is_some() || os::system::stat(self, &absolute).is_some() {
             return Ok(0);
         }
-        let view = self.view();
-        let found = view.resolve(&lock(&self.k.disk), dir, &path, true).map_err(Errno::from);
+        let who = {
+            let state = lock(&self.process.state);
+            if flags & AT_EACCESS != 0 { perm::Who::of(&state.creds) } else { perm::Who::real(&state.creds) }
+        };
+        if mode & 2 != 0 {
+            self.writable(&absolute)?;
+        }
+        let view = mount::View { who: (!who.unchecked()).then(|| Arc::new(who.clone())), ..self.view() };
+        let disk = lock(&self.k.disk);
+        let found = view.resolve(&disk, dir, &path, flags & AT_SYMLINK_NOFOLLOW == 0).map_err(Errno::from);
+        if let Ok(ino) = found
+            && mode != 0
+        {
+            perm::check(&disk, &who, ino, mode)?;
+        }
+        drop(disk);
         match found {
             Ok(_) => Ok(0),
             Err(e) if not_on_disk(e) && self.through_links(&absolute, true).is_some_and(|made| os::stat(&self.k, &made).is_some() || os::system::stat(self, &made).is_some()) => Ok(0),
@@ -1586,6 +1624,7 @@ impl Task {
         let view = self.view();
         let read_only = self.writable(&exe_path(&dir_path, &path));
         os::system::copy_up(self, &exe_path(&dir_path, &path));
+        let who = self.who();
         let mut disk = lock(&self.k.disk);
         // `/`, `.` and `..` are always there, as `tar` and `dpkg-deb` find making the directory they extract into.
         if path.trim_end_matches('/').is_empty() {
@@ -1599,7 +1638,9 @@ impl Task {
         if matches!(name, "" | "." | "..") {
             return Err(EEXIST);
         }
-        disk.create(parent, name, New::Dir, Meta::dir(mode & !umask & 0o7777), self.k.now())?;
+        perm::may_change(&disk, &who, parent)?;
+        let meta = perm::new_meta(&disk, &who, parent, mode & !umask & 0o7777, true);
+        disk.create(parent, name, New::Dir, meta, self.k.now())?;
         Ok(0)
     }
 
@@ -1653,8 +1694,10 @@ impl Task {
         os::system::copy_up(self, &crate::process::exe_path(&dir_path, &path));
         let umask = lock(&self.process.state).umask;
         let view = self.view();
+        let who = self.who();
         let mut disk = lock(&self.k.disk);
         let (parent, name) = view.resolve_parent(&disk, dir, &path)?;
+        perm::may_change(&disk, &who, parent)?;
         if disk.lookup(parent, name).is_ok() {
             return Err(EEXIST);
         }
@@ -1665,6 +1708,8 @@ impl Task {
             S_IFCHR | S_IFBLK => Meta { mode: kind | perm, rdev: dev, ..Meta::default() },
             _ => Meta { mode: kind | perm, ..Meta::default() },
         };
+        let owner = perm::new_meta(&disk, &who, parent, 0, false);
+        let meta = Meta { uid: owner.uid, gid: owner.gid, ..meta };
         disk.create(parent, name, New::File, meta, self.k.now())?;
         Ok(0)
     }
@@ -1674,9 +1719,11 @@ impl Task {
         let (dir, dir_path) = self.start_dir(dirfd)?;
         let view = self.view();
         let read_only = self.writable(&exe_path(&dir_path, &path));
+        let who = self.who();
         let mut disk = lock(&self.k.disk);
         let (parent, name) = view.resolve_parent(&disk, dir, &path)?;
         let child = disk.lookup(parent, name)?;
+        perm::may_remove(&disk, &who, parent, child)?;
         // A mount point is busy.
         if view.mounts.cover(child) != child {
             return Err(EBUSY);
@@ -1704,9 +1751,22 @@ impl Task {
         if view.mounts.containing(&self.ns_path(&old_abs)).id != view.mounts.containing(&self.ns_path(&new_abs)).id {
             return Err(EXDEV);
         }
+        let who = self.who();
         let mut disk = lock(&self.k.disk);
         let (from, from_name) = view.resolve_parent(&disk, from_dir, &old)?;
         let (to, to_name) = view.resolve_parent(&disk, to_dir, &new)?;
+        if !who.unchecked() {
+            let moving = disk.lookup(from, from_name)?;
+            perm::may_remove(&disk, &who, from, moving)?;
+            perm::may_change(&disk, &who, to)?;
+            if let Ok(replaced) = disk.lookup(to, to_name) {
+                perm::may_remove(&disk, &who, to, replaced)?;
+            }
+            // A folder moved to another folder has its `..` changed: it must be writable itself.
+            if from != to && disk.stat(moving)?.kind == Kind::Dir {
+                perm::check(&disk, &who, moving, perm::MAY_WRITE)?;
+            }
+        }
         disk.rename(from, from_name, to, to_name, self.k.now())?;
         Ok(0)
     }
@@ -1717,9 +1777,12 @@ impl Task {
         self.writable(&exe_path(&dir_path, &path))?;
         os::system::copy_up(self, &exe_path(&dir_path, &path));
         let view = self.view();
+        let who = self.who();
         let mut disk = lock(&self.k.disk);
         let (parent, name) = view.resolve_parent(&disk, dir, &path)?;
-        disk.create(parent, name, New::Symlink(target), Meta::file(0o777), self.k.now())?;
+        perm::may_change(&disk, &who, parent)?;
+        let meta = perm::new_meta(&disk, &who, parent, 0o777, false);
+        disk.create(parent, name, New::Symlink(target), meta, self.k.now())?;
         Ok(0)
     }
 
@@ -1798,6 +1861,9 @@ impl Task {
         if disk.stat(ino)?.kind != Kind::Dir {
             return Err(ENOTDIR);
         }
+        if let Some(who) = &view.who {
+            perm::check(&disk, who, ino, perm::MAY_EXEC)?;
+        }
         // Its real path, links followed, as `getcwd` gives it.
         let absolute = view.real_path(&disk, &state.cwd.1, &path).unwrap_or_else(|_| exe_path(&state.cwd.1, &path));
         state.cwd = (ino, absolute);
@@ -1807,6 +1873,10 @@ impl Task {
     pub(crate) fn fchdir(&mut self, fd: i32) -> Result<u64, Errno> {
         let open = self.file(fd)?;
         let Node::Dir(ino) = open.node else { return Err(ENOTDIR) };
+        let who = self.who();
+        if !who.unchecked() {
+            perm::check(&lock(&self.k.disk), &who, ino, perm::MAY_EXEC)?;
+        }
         lock(&self.process.state).cwd = (ino, open.path.clone());
         Ok(0)
     }

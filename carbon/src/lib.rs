@@ -81,6 +81,7 @@ mod files;
 pub mod logs;
 mod machine;
 mod mounts;
+mod users;
 mod network;
 mod rules;
 #[cfg(unix)]

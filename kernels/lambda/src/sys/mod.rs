@@ -32,6 +32,7 @@ pub enum Sys {
     Dup3,
     Pipe2,
     Faccessat,
+    Faccessat2,
     Readlinkat,
     Mkdirat,
     Unlinkat,

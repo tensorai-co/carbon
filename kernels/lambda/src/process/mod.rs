@@ -603,7 +603,8 @@ impl Task {
             Sys::Dup2 => self.dup3(a[0] as i32, a[1] as i32, 0, true),
             Sys::Dup3 => self.dup3(a[0] as i32, a[1] as i32, a[2] as u32, false),
             Sys::Pipe2 => self.pipe2(cx, a[0], a[1] as u32),
-            Sys::Faccessat => self.faccessat(cx, a[0] as i32, a[1]),
+            Sys::Faccessat => self.faccessat(cx, a[0] as i32, a[1], a[2] as u32, 0),
+            Sys::Faccessat2 => self.faccessat(cx, a[0] as i32, a[1], a[2] as u32, a[3]),
             Sys::Readlinkat => self.readlinkat(cx, a[0] as i32, a[1], a[2], a[3]),
             Sys::Mkdirat => self.mkdirat(cx, a[0] as i32, a[1], a[2] as u32),
             Sys::Unlinkat => self.unlinkat(cx, a[0] as i32, a[1], a[2]),
@@ -1108,24 +1109,24 @@ pub(crate) fn start_init(k: &Arc<Kernel>, cx: &mut Cx<'_>, argv: &[String], env:
     };
     // Its path on the disk, if `argv[0]` is the name it was called by (`sh`), as a shell's `exec` gives both.
     let path = k.options.program.clone().or_else(|| argv.first().cloned()).ok_or(ENOENT)?;
-    start(k, cx, pid, &path, argv, env, Files::standard(k.console.clone()), k.console.clone(), cwd)
+    start(k, cx, pid, &path, argv, env, Files::standard(k.console.clone()), k.console.clone(), cwd, k.options.user.as_ref())
 }
 
 /// A process started from outside the machine (`carbon exec`), as `pid`: a session of its own, `files` as its
 /// descriptors and `ctty` its terminal, in `cwd`, with no parent in the machine (0), as Docker's are. Its end is told
 /// to whoever's waiting in `Kernel::entered`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn start_entered(k: &Arc<Kernel>, cx: &mut Cx<'_>, pid: i32, path: &str, argv: &[String], env: &[String], files: Files, ctty: Option<Arc<crate::tty::Tty>>, cwd: (layers::Ino, String)) -> Result<Task, Errno> {
+pub(crate) fn start_entered(k: &Arc<Kernel>, cx: &mut Cx<'_>, pid: i32, path: &str, argv: &[String], env: &[String], files: Files, ctty: Option<Arc<crate::tty::Tty>>, cwd: (layers::Ino, String), user: Option<&crate::User>) -> Result<Task, Errno> {
     if let Some(tty) = &ctty {
         tty.set_session(Some(pid), pid);
     }
-    start(k, cx, pid, path, argv, env, files, ctty, cwd)
+    start(k, cx, pid, path, argv, env, files, ctty, cwd, user.or(k.options.user.as_ref()))
 }
 
 /// A new process `pid`, with no parent, running the program at `path` with `argv` (its `argv[0]` the name it was
 /// called by) in a session and group of its own.
 #[allow(clippy::too_many_arguments)]
-fn start(k: &Arc<Kernel>, cx: &mut Cx<'_>, pid: i32, path: &str, argv: &[String], env: &[String], files: Files, ctty: Option<Arc<crate::tty::Tty>>, cwd: (layers::Ino, String)) -> Result<Task, Errno> {
+fn start(k: &Arc<Kernel>, cx: &mut Cx<'_>, pid: i32, path: &str, argv: &[String], env: &[String], files: Files, ctty: Option<Arc<crate::tty::Tty>>, cwd: (layers::Ino, String), user: Option<&crate::User>) -> Result<Task, Errno> {
     let mut state = ProcState {
         ppid: 0,
         pgid: pid,
@@ -1171,7 +1172,16 @@ fn start(k: &Arc<Kernel>, cx: &mut Cx<'_>, pid: i32, path: &str, argv: &[String]
         env_area: 0..0,
         started: k.host.monotonic(),
     };
+    // As its user, before its program is found, so the program must be one the user may run. Root's capabilities go
+    // as Linux's rules for leaving root say.
+    if let Some(user) = user.filter(|u| u.uid != 0 || u.gid != 0 || !u.groups.is_empty()) {
+        state.creds.setgroups(user.groups.clone())?;
+        state.creds.setresgid(user.gid, user.gid, user.gid)?;
+        state.creds.setresuid(user.uid, user.uid, user.uid)?;
+    }
     load::exec_into(k, cx, &mut state, path, argv.to_vec(), env.to_vec())?;
+    load::set_ids(k, &mut state);
+    state.creds.exec();
     let isa = state.isa;
     let process = Process::new(pid, state);
     let task = Task::new(k.clone(), process.clone(), pid, Waiter::new(), ThreadSignals::with_mask(0), isa);

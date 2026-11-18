@@ -234,8 +234,9 @@ pub(crate) fn list_volumes(home: &Path) -> Vec<VolumeInfo> {
 // ---------------------------------------------------------------------------------------------------------------
 // A host folder as an external tree
 
-/// A host folder, as the tree a machine's disk attaches.
-pub(crate) struct HostTree(pub Folder);
+/// A host folder, as the tree a machine's disk attaches, and who its files are said to be owned by when they don't
+/// keep an owner of their own: the machine's user.
+pub(crate) struct HostTree(pub Folder, pub (u32, u32));
 
 fn layers_error(e: std::io::Error) -> layers::Error {
     use std::io::ErrorKind as K;
@@ -265,7 +266,7 @@ fn kind(k: FileKind) -> layers::Kind {
 impl layers::External for HostTree {
     fn stat(&self, path: &str) -> layers::Result<layers::ExtStat> {
         let s = self.0.stat(path).map_err(layers_error)?;
-        Ok(layers::ExtStat { kind: kind(s.kind), size: s.size, modified: s.modified, mode: s.mode, uid: s.uid, gid: s.gid, links: s.links, meta: s.meta })
+        Ok(layers::ExtStat { kind: kind(s.kind), size: s.size, modified: s.modified, mode: s.mode, uid: self.1.0, gid: self.1.1, links: s.links, meta: s.meta })
     }
     fn list(&self, path: &str) -> layers::Result<Vec<(String, layers::Kind)>> {
         Ok(self.0.list(path).map_err(layers_error)?.into_iter().map(|(n, k)| (n, kind(k))).collect())
@@ -312,7 +313,7 @@ impl layers::External for HostTree {
 
 /// The folders a machine's mounts have, ready for its kernel: each bound folder opened (it must be there), each
 /// volume made if it isn't (and, if it's new, filled from what `disk` has at its target), each tmpfs as it is.
-pub(crate) fn lambda_mounts(home: &Path, mounts: &[Mount], disk: &lambda::Disk) -> Result<Vec<lambda::Mount>> {
+pub(crate) fn lambda_mounts(home: &Path, mounts: &[Mount], disk: &lambda::Disk, owner: (u32, u32)) -> Result<Vec<lambda::Mount>> {
     let mut out = Vec::new();
     for m in mounts {
         let source = match &m.kind {
@@ -321,12 +322,12 @@ pub(crate) fn lambda_mounts(home: &Path, mounts: &[Mount], disk: &lambda::Disk) 
                 let shown = path.to_string_lossy().into_owned();
                 if std::fs::metadata(path).map_err(missing)?.is_dir() {
                     let folder = Folder::open(path, false).map_err(missing)?;
-                    lambda::MountSource::Folder(lambda::Folder::new(Box::new(HostTree(folder))), shown)
+                    lambda::MountSource::Folder(lambda::Folder::new(Box::new(HostTree(folder, owner))), shown)
                 } else {
                     // One file: its folder attached, and only the file mounted.
                     let (parent, name) = (path.parent().unwrap_or(Path::new("/")), path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
                     let folder = Folder::open(parent, false).map_err(missing)?;
-                    lambda::MountSource::File(lambda::Folder::new(Box::new(HostTree(folder))), name, shown)
+                    lambda::MountSource::File(lambda::Folder::new(Box::new(HostTree(folder, owner))), name, shown)
                 }
             }
             MountKind::Volume(name) => {
@@ -336,7 +337,7 @@ pub(crate) fn lambda_mounts(home: &Path, mounts: &[Mount], disk: &lambda::Disk) 
                 if made {
                     fill_volume(disk, &m.target, &folder)?;
                 }
-                lambda::MountSource::Folder(lambda::Folder::new(Box::new(HostTree(folder))), name.clone())
+                lambda::MountSource::Folder(lambda::Folder::new(Box::new(HostTree(folder, owner))), name.clone())
             }
             MountKind::Tmpfs => lambda::MountSource::Tmpfs,
         };
@@ -354,6 +355,10 @@ fn fill_volume(disk: &lambda::Disk, target: &str, folder: &Folder) -> Result<()>
     }
     let io = |e: std::io::Error| Error::io(format!("filling a volume from {target}: {e}"));
     let lay = |e: layers::Error| Error::io(format!("filling a volume from {target}: {e}"));
+    // Its top takes the image's folder's owner and mode, as a database's data folder needs.
+    let top_meta = disk.meta(top).map_err(lay)?;
+    folder.set_mode("", top_meta.mode & 0o7777).map_err(io)?;
+    folder.keep_meta("", <lambda::Meta as layers::Persist>::save(&lambda::Meta { mode: top_meta.mode & 0o7777 | 0o040000, ..top_meta })).map_err(io)?;
     let mut todo = vec![(top, String::new())];
     while let Some((dir, rel)) = todo.pop() {
         for (name, ino, k) in disk.entries(dir).map_err(lay)? {
@@ -399,7 +404,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("src/a.txt"), "from the host").unwrap();
         let mut disk = lambda::Disk::new(lambda::Meta::dir(0o755), false);
-        let root = disk.attach(Box::new(HostTree(Folder::open(&dir, true).unwrap())), map(), false).unwrap();
+        let root = disk.attach(Box::new(HostTree(Folder::open(&dir, true).unwrap(), (0, 0))), map(), false).unwrap();
         assert_eq!(disk.external(root), Some(root));
         // Read what the host has.
         let a = disk.resolve(root, "src/a.txt", true).unwrap();
@@ -429,7 +434,7 @@ mod tests {
         disk.remove(root, "c.txt", 0).unwrap();
         assert!(!dir.join("c.txt").exists());
         // Read-only: nothing changes.
-        let ro = disk.attach(Box::new(HostTree(Folder::open(&dir, false).unwrap())), map(), true).unwrap();
+        let ro = disk.attach(Box::new(HostTree(Folder::open(&dir, false).unwrap(), (0, 0))), map(), true).unwrap();
         assert_eq!(disk.create(ro, "nope", layers::New::File, lambda::Meta::file(0o644), 0), Err(layers::Error::ReadOnly));
         std::fs::remove_dir_all(&dir).unwrap();
     }

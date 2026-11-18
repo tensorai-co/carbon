@@ -198,7 +198,9 @@ The root is the image's layers (Debian's, say) plus `os/`'s file systems. lambda
   `fork_space`; a new thread joins its process before it can run, so one that ends at once is never left listed);
   `wait4` with `WUNTRACED` and `WCONTINUED`; exit and orphans; futexes; sessions and process groups; credentials
   (`creds.rs`: real, effective, saved and filesystem IDs and supplementary groups, with Linux's rules, so a program
-  that drops root, as `apt` does to `_apt`, can't get it back; files' permissions aren't checked against them yet), and
+  that drops root, as `apt` does to `_apt`, can't get it back; files' permissions are checked against them as Linux's
+  `generic_permission` checks them, in `fs/perm.rs`, with sticky folders, setgid folders, and setuid and setgid
+  programs at `execve`), and
   capabilities: effective, permitted, inheritable, bounding and ambient sets and securebits, changed as Linux changes
   them when user IDs change and at `execve`; changing IDs asks `CAP_SETUID` and `CAP_SETGID`.
 - **Sockets** (`net/`): the socket system calls on `net` (`socket`, `socketpair`, `bind`, `listen`, `accept4`,
@@ -338,7 +340,7 @@ curl -sLO https://raw.githubusercontent.com/torvalds/linux/master/arch/x86/entry
   x86-64's `MAP_32BIT`; i386 programs (`sys/i386.rs`, with exec's 32-bit translation).
 - **Memory:** `MAP_SHARED` of a file on the disk written back and kept in step with `read` and `write` (anonymous
   shared memory, memfds and SysV segments are shared already).
-- **Files:** permissions checked against credentials (the credentials are done); locks that hold between processes
+- **Files:** locks that hold between processes
   (`flock`, record and OFD locks); `EPOLLEXCLUSIVE` and `EPOLLWAKEUP` (accepted, ignored); inotify's
   `IN_DELETE_SELF` at an open file's last close rather than the unlink, and `IN_EXCL_UNLINK`; AIO's
   `IOCB_CMD_POLL`; fanotify's FID modes, pidfds and permission events; extended attributes in a frozen image or
@@ -347,7 +349,7 @@ curl -sLO https://raw.githubusercontent.com/torvalds/linux/master/arch/x86/entry
   network, user, cgroup and time namespaces (lambda keeps one of each); `open_tree_attr`'s attributes; `nosuid`,
   `nodev` and `noexec` enforced, not only shown; read-only decided by the mount a file is on, not its path;
   unmounting checking for open files; cgroups and overlay mounts (ENODEV today).
-- **Security:** seccomp filters per thread, and user notification; file capabilities and setuid bits at `execve`;
+- **Security:** seccomp filters per thread, and user notification; file capabilities at `execve`;
   capabilities, not effective root, asked for IPC, limits and nice; Landlock enforced.
 - **IPC:** SysV objects' permission bits; `mq_notify`'s `SIGEV_THREAD`, and a registration dropped when its
   descriptor closes; futex2's masks, sizes other than 32 bits, and `FUTEX2_NUMA`.

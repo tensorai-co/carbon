@@ -55,6 +55,8 @@ pub(crate) struct Launch {
     pub timeout: Option<std::time::Duration>,
     /// Its mounts; None for what it had last.
     pub mounts: Option<Vec<crate::Mount>>,
+    /// Who its first program runs as (`name[:group]`, `uid[:gid]`); None for the image's `USER`, else root.
+    pub user: Option<String>,
     pub hub: Hub,
 }
 
@@ -348,9 +350,11 @@ fn boot(store: &Store, record: &Record, launch: &Launch, parts: Parts, notify: &
             if host::Host::is_terminal(&*host) && !env.iter().any(|e| e.starts_with("TERM=")) {
                 env.push("TERM=xterm".into());
             }
+            // Who it runs as: as asked, else the image's USER, else root; and that user's home.
+            let user_spec = launch.user.clone().unwrap_or_else(|| record.config.user.clone());
+            let who = crate::users::from_disk(&disk, &user_spec)?;
             if !env.iter().any(|e| e.starts_with("HOME=")) {
-                let passwd = disk.resolve(ROOT, "/etc/passwd", true).and_then(|ino| disk.contents(ino)).unwrap_or_default();
-                env.push(format!("HOME={}", home_of(&String::from_utf8_lossy(&passwd), &record.config.user)));
+                env.push(format!("HOME={}", who.home));
             }
             let path = find_program(&disk, &args[0], &env).ok_or_else(|| Error::not_found(format!("{}: not found on the machine's disk", args[0])))?;
             let (path, args, env) = match hook_first(&hub, hooks::Os::Linux, path, args, env, workdir.clone(), |name, env| find_program(&disk, name, env))? {
@@ -382,7 +386,23 @@ fn boot(store: &Store, record: &Record, launch: &Launch, parts: Parts, notify: &
                     if request.tty.is_some() && !env.iter().any(|e| e.starts_with("TERM=")) {
                         env.push("TERM=xterm".into());
                     }
-                    let spec = lambda::Spec { argv: request.args, env, cwd: request.workdir.or_else(|| workdir.clone()), tty: request.tty };
+                    // Another user, as asked: read from the machine's own files as they are now.
+                    let user = match request.user.as_deref() {
+                        Some(spec) => match stop.with_disk(|disk| crate::users::from_disk(disk, spec)) {
+                            Some(Ok(who)) => {
+                                // Its own home, unless the request says otherwise, as Docker's exec gives it.
+                                if !request.env.iter().any(|e| e.starts_with("HOME=")) {
+                                    env.retain(|e| !e.starts_with("HOME="));
+                                    env.push(format!("HOME={}", who.home));
+                                }
+                                Some(who.user)
+                            }
+                            Some(Err(e)) => return Err(e.to_string()),
+                            None => return Err("the machine's kernel isn't up".to_string()),
+                        },
+                        None => None,
+                    };
+                    let spec = lambda::Spec { argv: request.args, env, cwd: request.workdir.or_else(|| workdir.clone()), tty: request.tty, user };
                     stop.enter(spec).map(|entered| Box::new(entered) as Box<dyn Session>)
                 })
             };
@@ -396,8 +416,8 @@ fn boot(store: &Store, record: &Record, launch: &Launch, parts: Parts, notify: &
             let gpu = open_gpu(launch.gpu, notify)?;
             let (mixer, _audio) = open_audio(&launch.audio, launch.display, notify)?;
             // Its mounts: host folders and volumes attached to its disk, and tmpfs.
-            let mounts = crate::mounts::lambda_mounts(store.images.home(), &record.mounts, &disk)?;
-            let mut options = lambda::Options { stop, display: desktop.clone(), gpu, audio: Some(mixer), env, network: Some(network), hooks: hub, program, mounts, ..lambda::Options::default() };
+            let mounts = crate::mounts::lambda_mounts(store.images.home(), &record.mounts, &disk, (who.user.uid, who.user.gid))?;
+            let mut options = lambda::Options { stop, display: desktop.clone(), gpu, audio: Some(mixer), env, network: Some(network), hooks: hub, program, mounts, user: Some(who.user), ..lambda::Options::default() };
             options.hostname = record.name.clone();
             options.console = launch.tty;
             options.cwd = workdir.clone();
@@ -406,6 +426,9 @@ fn boot(store: &Store, record: &Record, launch: &Launch, parts: Parts, notify: &
         Kernel::Atlas => {
             if !record.mounts.is_empty() {
                 return Err(Error::unsupported("mounts in a Windows machine aren't there yet: Linux machines have them"));
+            }
+            if launch.user.as_deref().is_some_and(|u| !u.is_empty()) {
+                return Err(Error::unsupported("--user in a Windows machine isn't there yet: Linux machines have it"));
             }
             let mut disk = store.disk::<atlas::Meta>(record, atlas::Meta { attributes: 0x10 }, true)?;
             if let (Some(bytes), Some(path)) = (&program, &record.program) {
@@ -436,6 +459,9 @@ fn boot(store: &Store, record: &Record, launch: &Launch, parts: Parts, notify: &
                 let stop = stop.clone();
                 let workdir = workdir.clone();
                 Arc::new(move |request: ExecRequest| {
+                    if request.user.as_deref().is_some_and(|u| !u.is_empty()) {
+                        return Err("--user in a Windows machine isn't there yet: Linux machines have it".to_string());
+                    }
                     let spec = atlas::Spec { argv: request.args, env: request.env, cwd: request.workdir.or_else(|| workdir.clone()), tty: request.tty };
                     stop.enter(spec).map(|entered| Box::new(entered) as Box<dyn Session>)
                 })
@@ -523,19 +549,6 @@ fn find_program(disk: &lambda::Disk, program: &str, env: &[String]) -> Option<St
     })
 }
 
-/// The home folder of an image's `user` (`name` or `uid`, with an optional `:group`; root when empty) in a passwd
-/// file's text, or `/` when it isn't there, as runc decides HOME.
-fn home_of(passwd: &str, user: &str) -> String {
-    let user = user.split(':').next().filter(|u| !u.is_empty()).unwrap_or("root");
-    let root = user == "root" || user == "0";
-    passwd
-        .lines()
-        .map(|line| line.split(':').collect::<Vec<_>>())
-        .find(|f| f.len() >= 6 && (f[0] == user || f[2] == user))
-        .map(|f| f[5].to_string())
-        .unwrap_or_else(|| if root { "/root" } else { "/" }.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,16 +561,6 @@ mod tests {
         assert_eq!(find_program(&disk, "bash", &env).as_deref(), Some("/usr/bin/bash"));
         assert_eq!(find_program(&disk, "zsh", &env), None);
         assert_eq!(find_program(&disk, "/bin/sh", &env).as_deref(), Some("/bin/sh"));
-    }
-
-    #[test]
-    fn home_is_the_image_users() {
-        let passwd = "root:x:0:0:root:/root:/bin/bash\nwww-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\n";
-        assert_eq!(home_of(passwd, ""), "/root");
-        assert_eq!(home_of(passwd, "www-data"), "/var/www");
-        assert_eq!(home_of(passwd, "33:33"), "/var/www");
-        assert_eq!(home_of(passwd, "nobody"), "/");
-        assert_eq!(home_of("", "0"), "/root");
     }
 
     #[test]

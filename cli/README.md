@@ -73,6 +73,7 @@ carbon atlas imports ~/installers/          # a folder of them: which load, and 
 | `--audio auto\|host\|none\|FILE.wav` | Where its sound goes: the host's speakers when it's on the host's screen (`auto`, the default), the host's speakers or fail, nowhere, or a WAV file of everything played |
 | `-e`, `--env NAME=VALUE` | An environment variable, over the image's |
 | `-w`, `--workdir DIR` | Where its program starts; the image's working directory by default |
+| `-u`, `--user USER[:GROUP]` | Who its programs run as: a name or a number from the image's `/etc/passwd` and `/etc/group`; the image's `USER` by default, else root. Linux machines only, for now |
 | `--memory SIZE` | How much memory it may use, as `512m` or `4g` (`4g` by default, or ¾ of a container's memory limit if that's less, as on Cloud Run; only what's touched is taken) |
 | `--rm` | Removed, and its files, once it ends |
 | `-v`, `--volume SOURCE:TARGET[:ro]` | Mounts a host folder or file (`/path`, `./path`, `~/path`) or a volume (a name, made if it isn't there) at `TARGET`: what either side changes, the other sees at once. A new volume is filled from the image's files at `TARGET`. A machine run again keeps its mounts unless given new ones |
@@ -87,7 +88,7 @@ carbon atlas imports ~/installers/          # a folder of them: which load, and 
 
 `carbon exec [options] NAME COMMAND [ARGS...]` runs a command in a running machine, as `docker exec` does: a process
 of its own (lambda: a session with no parent in the machine; atlas: a console of its own), with the machine's
-environment and working directory unless `-e` and `-w` say otherwise. `-i` relays stdin, `-t` gives it a terminal
+environment, working directory and user unless `-e`, `-w` and `-u` say otherwise. `-i` relays stdin, `-t` gives it a terminal
 of its own (a pty in lambda, a console in atlas) with this one raw and its size followed, `-d` starts it and leaves
 it. Its exit code is `carbon exec`'s; without `-t`, Ctrl-C and other signals go to it. It goes over the machine's
 control socket, so it's there on macOS and Linux hosts (not yet Windows hosts).

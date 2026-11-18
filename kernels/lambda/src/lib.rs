@@ -120,6 +120,8 @@ pub struct Options {
     pub hooks: hooks::Hub,
     /// Folders mounted when it boots, in order: a host's folders and volumes, and tmpfs.
     pub mounts: Vec<Mount>,
+    /// Who the first program runs as: root if None.
+    pub user: Option<User>,
     /// The first program's path on the disk, when `argv[0]` is the name it was called by (`sh`, as an image's `CMD`
     /// says it) rather than where it is; None runs `argv[0]` as a path.
     pub program: Option<String>,
@@ -185,8 +187,18 @@ impl Default for Options {
             hooks: hooks::Hub::default(),
             program: None,
             mounts: Vec::new(),
+            user: None,
         }
     }
+}
+
+/// Who a process runs as: its user, group and supplementary groups (from the image's `/etc/passwd` and `/etc/group`,
+/// which the caller reads). Anyone but root starts with no capabilities, as Linux's rules for leaving root give.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct User {
+    pub uid: u32,
+    pub gid: u32,
+    pub groups: Vec<u32>,
 }
 
 /// A folder from elsewhere for a mount (a host's, a volume's): taken by the machine that boots with it.
@@ -225,8 +237,8 @@ pub struct Mount {
     pub read_only: bool,
 }
 
-/// A folder's files' `Meta`: as it keeps it (a volume), else from the host's permission bits, root's, as a bound
-/// folder's files look in a Linux VM on a Mac.
+/// A folder's files' `Meta`: as it keeps it (a volume), else from the host's permission bits, owned as its tree says
+/// (the machine's user, for a bound folder: so whoever the machine runs as can use it, as on Docker Desktop).
 fn host_meta(st: &layers::ExtStat) -> Meta {
     if let Some(words) = st.meta {
         return <Meta as layers::Persist>::load(words);
@@ -236,7 +248,7 @@ fn host_meta(st: &layers::ExtStat) -> Meta {
         layers::Kind::Symlink => abi::S_IFLNK,
         layers::Kind::File => abi::S_IFREG,
     };
-    Meta { mode: kind | st.mode & 0o7777, ..Meta::default() }
+    Meta { mode: kind | st.mode & 0o7777, uid: st.uid, gid: st.gid, ..Meta::default() }
 }
 
 /// Attaches the folders a machine boots with, and makes tmpfs trees, each with its folder made on the disk.

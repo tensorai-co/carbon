@@ -61,6 +61,8 @@ usage: carbon <command> ...
                                              WAV file of everything played
       -e, --env NAME=VALUE                   an environment variable, over the image's
       -w, --workdir DIR                      where its program starts (the image's working directory by default)
+      -u, --user USER[:GROUP]                who it runs as, by name or number from the image's /etc/passwd (the
+                                             image's USER by default, else root)
       --memory SIZE                          how much memory it may use, as 512m or 4g (4g, less in a smaller container)
       -p, --publish [IP:][HOST_PORT:]PORT[/tcp|udp]
                                              a host port that reaches a port in the machine, as Docker's: 2222:22,
@@ -83,6 +85,7 @@ usage: carbon <command> ...
       -d, --detach                           start it and leave it running
       -e, --env NAME=VALUE                   an environment variable, over the machine's
       -w, --workdir DIR                      where it starts (the image's working directory by default)
+      -u, --user USER[:GROUP]                who it runs as (the machine's first program's user by default)
       --timeout DURATION                     kill it if it hasn't ended this long after it starts (exit 124)
   build [options] CONTEXT                    build an image from CONTEXT's Carbonfile (else its Dockerfile)
       -t, --tag NAME                         name it (as many as wanted)
@@ -382,6 +385,10 @@ fn run(carbon: &Carbon, mut args: impl Iterator<Item = String>) -> ! {
                 let dir = value("--workdir");
                 options.push(Box::new(move |s| s.workdir(dir)));
             }
+            "-u" | "--user" => {
+                let user = value("--user");
+                options.push(Box::new(move |s| s.user(user)));
+            }
             "--memory" => {
                 let text = value("--memory");
                 if carbon::parse_size(&text).is_none() {
@@ -450,7 +457,7 @@ fn run(carbon: &Carbon, mut args: impl Iterator<Item = String>) -> ! {
 /// `carbon exec [options] NAME COMMAND [ARGS...]`, as `docker exec`.
 fn exec(carbon: &Carbon, mut args: impl Iterator<Item = String>) -> ! {
     let (mut interactive, mut tty, mut detach) = (false, false, false);
-    let (mut env, mut workdir, mut timeout) = (Vec::new(), None, None);
+    let (mut env, mut workdir, mut timeout, mut user) = (Vec::new(), None, None, None::<String>);
     let mut target = None;
     while let Some(arg) = args.next() {
         let (arg, inline) = match arg.split_once('=') {
@@ -469,6 +476,7 @@ fn exec(carbon: &Carbon, mut args: impl Iterator<Item = String>) -> ! {
                 env.push((key.to_string(), val.to_string()));
             }
             "-w" | "--workdir" => workdir = Some(value("--workdir")),
+            "-u" | "--user" => user = Some(value("--user")),
             "--timeout" => timeout = Some(duration(&value("--timeout"))),
             flag if flag.len() > 1 && flag.starts_with('-') && !flag.starts_with("--") && flag[1..].chars().all(|c| "itd".contains(c)) => {
                 interactive |= flag.contains('i');
@@ -493,6 +501,9 @@ fn exec(carbon: &Carbon, mut args: impl Iterator<Item = String>) -> ! {
     let mut spec = machine.exec(command);
     for (key, val) in &env {
         spec = spec.env(key, val);
+    }
+    if let Some(user) = user {
+        spec = spec.user(user);
     }
     if let Some(dir) = workdir {
         spec = spec.workdir(dir);

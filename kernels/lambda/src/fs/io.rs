@@ -379,6 +379,9 @@ impl Task {
         if disk.stat(ino)?.kind == layers::Kind::Dir {
             return Err(EISDIR);
         }
+        if let Some(who) = &view.who {
+            super::perm::check(&disk, who, ino, super::perm::MAY_WRITE)?;
+        }
         if !matches!(disk.meta(ino)?.mode & S_IFMT, 0 | S_IFREG) {
             return Err(EINVAL);
         }

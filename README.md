@@ -410,13 +410,12 @@ blocks real work, it moves up. Each item's detail is in the README it links to.
 
 `carbon run -it debian:13 bash` and `carbon exec` work. Left: compacting a running machine's log; zstd layers, registry
 logins, streaming layers, clearing unused chunks; atlas-base on Docker Hub as `tensoraico/atlas` (one multi-ISA
-image), and Windows machines from it by default; the image's user; `-d`'s logs; stopping, screenshots and `exec` from another process on Windows hosts; a worker
+image), and Windows machines from it by default; `-d`'s logs; stopping, screenshots and `exec` from another process on Windows hosts; a worker
 process per machine, so one program runs several at once on macOS. (`--rm` and `-w` are done.)
 
 **3. lambda runs real Linux software** ([lambda](kernels/lambda/README.md#to-do))
 
-1. Processes: `execve` with other threads running, a `vfork` that shares memory, `clone3`, `rseq`, permissions checked
-   against credentials.
+1. Processes: `execve` with other threads running, a `vfork` that shares memory, `clone3`, `rseq`.
 2. Memory and files: shared file mappings written back, `msync`; more of sysfs and `/proc`.
 3. The vDSO's counter on every host (Apple silicon's reads it already), and `time`, `getcpu` and `getrandom` in it.
 4. Signals' remainder: queued real-time signals, `rt_sigtimedwait`, `setitimer`, `alarm`, SIGTTOU, the FP state in the

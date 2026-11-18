@@ -121,6 +121,10 @@ impl Task {
                 // Its SysV attachments and AIO contexts went with its old memory.
                 let attached = !std::mem::take(&mut state.shm_attached).is_empty();
                 state.aio.clear();
+                // A setuid or setgid program runs as its file's owner or group (not when traced).
+                if !self.traced() {
+                    set_ids(&self.k, &mut state);
+                }
                 // Its capabilities as execve works them out; its name is its new program's; it's dumpable again.
                 state.creds.exec();
                 state.comm = None;
@@ -154,7 +158,7 @@ impl Task {
         // Whether it's there: a shell trying each folder on its PATH asks about each.
         let (ppid, cwd, found) = {
             let state = lock(&self.process.state);
-            let view = crate::fs::mount::View { root: state.root.0, mounts: state.ns.mnt.current() };
+            let view = crate::fs::mount::View::of(&state);
             let found = view.resolve(&lock(&self.k.disk), state.cwd.0, &path, true).is_ok();
             (state.ppid, state.cwd.1.clone(), found)
         };
@@ -349,14 +353,41 @@ pub(crate) fn exec_into(k: &Arc<Kernel>, cx: &mut Cx<'_>, state: &mut ProcState,
     Ok(())
 }
 
+/// A setuid or setgid program's IDs: its file's owner (the effective, saved and filesystem user IDs) or group, unless
+/// it's on a `nosuid` mount. Before `Creds::exec` works out the capabilities, so a setuid root program gets root's.
+pub(crate) fn set_ids(k: &Kernel, state: &mut ProcState) {
+    let view = crate::fs::mount::View::of(state);
+    let found = {
+        let disk = lock(&k.disk);
+        view.resolve(&disk, state.root.0, &state.exe, true).ok().and_then(|ino| disk.meta(ino).ok())
+    };
+    let nosuid = view.mounts.containing(&state.exe).flags & crate::fs::mount::MS_NOSUID != 0;
+    let Some(meta) = found.filter(|_| !nosuid) else { return };
+    if meta.mode & crate::fs::perm::S_ISUID != 0 {
+        state.creds.uid[1] = meta.uid;
+        state.creds.uid[2] = meta.uid;
+        state.creds.uid[3] = meta.uid;
+    }
+    // Setgid without group execute is mandatory locking's mark, not setgid.
+    if meta.mode & crate::fs::perm::S_ISGID != 0 && meta.mode & 0o010 != 0 {
+        state.creds.gid[1] = meta.gid;
+        state.creds.gid[2] = meta.gid;
+        state.creds.gid[3] = meta.gid;
+    }
+}
+
 /// The whole of a file on the disk, found from the process's working directory.
 fn read_file(k: &Kernel, state: &ProcState, path: &str) -> Result<Vec<u8>, Errno> {
-    let view = crate::fs::mount::View { root: state.root.0, mounts: state.ns.mnt.current() };
+    let view = crate::fs::mount::View::of(state);
     let disk = lock(&k.disk);
     let ino = view.resolve(&disk, state.cwd.0, path, true)?;
+    // Run only what the process may: searchable folders on the way (the walk), and the file's execute bit for it.
     let meta = disk.meta(ino)?;
-    if meta.mode & 0o111 == 0 {
-        return Err(EPERM);
+    if disk.stat(ino)?.kind == layers::Kind::Dir {
+        return Err(EACCES);
+    }
+    if !crate::fs::perm::Who::of(&state.creds).may(&meta, false, crate::fs::perm::MAY_EXEC) {
+        return Err(EACCES);
     }
     Ok(disk.contents(ino)?.to_vec())
 }

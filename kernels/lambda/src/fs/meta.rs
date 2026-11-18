@@ -57,13 +57,22 @@ impl Task {
     /// `fchmodat` and `fchmod`: the permission bits, keeping what kind of file it is.
     pub(crate) fn chmod(&mut self, cx: &mut Cx<'_>, dirfd: i32, path_at: u64, mode: u32, flags: u64) -> Result<u64, Errno> {
         let Some(ino) = self.meta_target(cx, dirfd, path_at, flags & AT_SYMLINK_NOFOLLOW != 0, flags & AT_EMPTY_PATH != 0 || path_at == 0)? else { return Ok(0) };
+        let who = self.who();
         let mut disk = lock(&self.k.disk);
         // A link's own mode can't be changed, as on Linux.
         if disk.stat(ino)?.kind == Kind::Symlink {
             return Err(EOPNOTSUPP);
         }
         let mut meta = disk.meta(ino)?;
-        meta.mode = meta.mode & S_IFMT | mode & 0o7777;
+        // Only its owner (or CAP_FOWNER) may; and the setgid bit only sticks for a member of its group (or CAP_FSETID).
+        if !who.owns(&meta) {
+            return Err(EPERM);
+        }
+        let mut mode = mode & 0o7777;
+        if mode & super::perm::S_ISGID != 0 && !who.in_group(meta.gid) && !who.can(super::perm::CAP_FSETID) && disk.stat(ino)?.kind != Kind::Dir {
+            mode &= !super::perm::S_ISGID;
+        }
+        meta.mode = meta.mode & S_IFMT | mode;
         disk.set_meta(ino, meta)?;
         Ok(0)
     }
@@ -71,8 +80,22 @@ impl Task {
     /// `fchownat`, `fchown` and `lchown`: -1 leaves an ID as it is.
     pub(crate) fn chown(&mut self, cx: &mut Cx<'_>, dirfd: i32, path_at: u64, uid: u32, gid: u32, flags: u64) -> Result<u64, Errno> {
         let Some(ino) = self.meta_target(cx, dirfd, path_at, flags & AT_SYMLINK_NOFOLLOW != 0, flags & AT_EMPTY_PATH != 0 || path_at == 0)? else { return Ok(0) };
+        let who = self.who();
         let mut disk = lock(&self.k.disk);
         let mut meta = disk.meta(ino)?;
+        // A new owner needs CAP_CHOWN; a new group, CAP_CHOWN or owning the file and being in the group.
+        let new_owner = uid != u32::MAX && uid != meta.uid;
+        let new_group = gid != u32::MAX && gid != meta.gid;
+        if new_owner && !who.can(super::perm::CAP_CHOWN) {
+            return Err(EPERM);
+        }
+        if new_group && !who.can(super::perm::CAP_CHOWN) && !(who.uid == meta.uid && who.in_group(gid)) {
+            return Err(EPERM);
+        }
+        // An unprivileged change takes away a regular file's setuid and setgid bits, as on Linux.
+        if (new_owner || new_group) && !who.can(super::perm::CAP_FSETID) && disk.stat(ino)?.kind == Kind::File {
+            meta.mode &= !(super::perm::S_ISUID | super::perm::S_ISGID);
+        }
         if uid != u32::MAX {
             meta.uid = uid;
         }
@@ -87,19 +110,31 @@ impl Task {
     pub(crate) fn utimensat(&mut self, cx: &mut Cx<'_>, dirfd: i32, path_at: u64, times_at: u64, flags: u64) -> Result<u64, Errno> {
         let Some(ino) = self.meta_target(cx, dirfd, path_at, flags & AT_SYMLINK_NOFOLLOW != 0, true)? else { return Ok(0) };
         let now = self.k.now();
-        let modified = if times_at == 0 {
-            Some(now)
+        let (modified, given) = if times_at == 0 {
+            (Some(now), false)
         } else {
             let (sec, nsec) = self.mem(cx, false, |t| Ok((user::read_u64(&t.space(), times_at + 16)?, user::read_u64(&t.space(), times_at + 24)?)))?;
             match nsec {
-                UTIME_OMIT => None,
-                UTIME_NOW => Some(now),
-                n if n < 1_000_000_000 => Some(sec.saturating_mul(1_000_000_000).saturating_add(n)),
+                UTIME_OMIT => (None, false),
+                UTIME_NOW => (Some(now), false),
+                n if n < 1_000_000_000 => (Some(sec.saturating_mul(1_000_000_000).saturating_add(n)), true),
                 _ => return Err(EINVAL),
             }
         };
+        let who = self.who();
+        let mut disk = lock(&self.k.disk);
+        // A time given needs the owner (or CAP_FOWNER); "now" needs the owner or write permission.
+        if !who.unchecked() && modified.is_some() {
+            let meta = disk.meta(ino)?;
+            if given && !who.owns(&meta) {
+                return Err(EPERM);
+            }
+            if !given && !who.owns(&meta) {
+                super::perm::check(&disk, &who, ino, super::perm::MAY_WRITE)?;
+            }
+        }
         if let Some(modified) = modified {
-            lock(&self.k.disk).set_modified(ino, modified)?;
+            disk.set_modified(ino, modified)?;
         }
         Ok(0)
     }
@@ -160,11 +195,13 @@ impl Task {
         self.writable(&crate::process::exe_path(&dir_path, &new))?;
         crate::os::system::copy_up(self, &crate::process::exe_path(&dir_path, &new));
         let view = self.view();
+        let who = self.who();
         let mut disk = lock(&self.k.disk);
         if disk.stat(ino)?.kind == Kind::Dir {
             return Err(EPERM);
         }
         let (parent, name) = view.resolve_parent(&disk, dir, &new)?;
+        super::perm::may_change(&disk, &who, parent)?;
         disk.link(parent, name, ino, self.k.now())?;
         Ok(0)
     }

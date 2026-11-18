@@ -49,6 +49,8 @@ pub(crate) struct ExecRequest {
     pub tty: Option<(u16, u16)>,
     /// Started and left running: nothing comes back but whether it started.
     pub detach: bool,
+    /// Who it runs as (`name[:group]`, `uid[:gid]`): the machine's first program's user if None.
+    pub user: Option<String>,
 }
 
 /// What comes out of a process `exec` started.
@@ -193,14 +195,14 @@ impl Session for Hooked {
 }
 
 pub(crate) fn request_json(r: &ExecRequest) -> String {
-    json!({ "args": r.args, "env": r.env, "workdir": r.workdir, "tty": r.tty.map(|(rows, cols)| [rows, cols]), "detach": r.detach }).to_string()
+    json!({ "args": r.args, "env": r.env, "workdir": r.workdir, "tty": r.tty.map(|(rows, cols)| [rows, cols]), "detach": r.detach, "user": r.user }).to_string()
 }
 
 fn request_from_json(text: &str) -> Option<ExecRequest> {
     let v: Value = serde_json::from_str(text).ok()?;
     let list = |key: &str| v.get(key).and_then(|l| l.as_array()).map(|l| l.iter().filter_map(|s| s.as_str().map(String::from)).collect()).unwrap_or_default();
     let tty = v.get("tty").and_then(|t| t.as_array()).and_then(|t| Some((t.first()?.as_u64()? as u16, t.get(1)?.as_u64()? as u16)));
-    Some(ExecRequest { args: list("args"), env: list("env"), workdir: v.get("workdir").and_then(|w| w.as_str()).map(String::from), tty, detach: v.get("detach").and_then(|d| d.as_bool()).unwrap_or(false) })
+    Some(ExecRequest { args: list("args"), env: list("env"), workdir: v.get("workdir").and_then(|w| w.as_str()).map(String::from), tty, detach: v.get("detach").and_then(|d| d.as_bool()).unwrap_or(false), user: v.get("user").and_then(|u| u.as_str()).map(String::from) })
 }
 
 // ---------------------------------------------------------------------------------------------------------------

@@ -730,9 +730,6 @@ impl Run<'_> {
         if self.restore_cached(state, &key) {
             return Ok(true);
         }
-        if !state.config.user.is_empty() && !matches!(state.config.user.as_str(), "root" | "0" | "0:0") {
-            self.say(Step::Warning(format!("line {}: USER {} isn't honored yet: RUN runs as root", ins.line, state.config.user)));
-        }
         let temp = self.create(state)?;
         if let Some((path, content)) = &script_file {
             temp.get().files().write(path, content, Write::new().mode(0o755))?;

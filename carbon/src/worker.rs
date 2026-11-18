@@ -130,6 +130,7 @@ fn spec_json(home: &Path, launch: &Launch, rules: &Rules, link: Option<(&Path, I
         "remove": launch.remove,
         "timeout_ms": launch.timeout.map(|t| t.as_millis() as u64),
         "mounts": launch.mounts.as_deref().map(crate::mounts::mounts_json),
+        "user": launch.user,
         "rules": rules.to_json(),
         "link": link.map(|(path, interest)| json!({ "path": path, "kinds": kinds(interest) })),
     })
@@ -200,6 +201,7 @@ fn spec_from_json(v: &Value) -> Result<(PathBuf, Launch, Rules, Option<(PathBuf,
         remove: v.get("remove").and_then(Value::as_bool).unwrap_or(false),
         timeout: v.get("timeout_ms").and_then(Value::as_u64).map(Duration::from_millis),
         mounts: v.get("mounts").filter(|m| !m.is_null()).map(|m| crate::mounts::mounts_from_json(Some(m))),
+        user: s("user"),
         hub: Hub::new(),
     };
     let rules = Rules::from_json(v.get("rules").unwrap_or(&Value::Null))?;
@@ -583,6 +585,7 @@ mod tests {
             remove: true,
             timeout: Some(Duration::from_secs(5)),
             mounts: Some(vec![crate::Mount::volume("data", "/data")]),
+            user: Some("node".into()),
             hub: Hub::new(),
         };
         let rules = Rules::new().deny_exec("rm -rf *").deny("0.0.0.0/0").unwrap();

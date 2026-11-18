@@ -24,7 +24,7 @@ use crate::process::{Task, exe_path};
 use crate::{Disk, Meta};
 
 pub(crate) const MS_RDONLY: u64 = 1;
-const MS_NOSUID: u64 = 2;
+pub(crate) const MS_NOSUID: u64 = 2;
 const MS_NODEV: u64 = 4;
 const MS_NOEXEC: u64 = 8;
 const MS_REMOUNT: u64 = 32;
@@ -367,6 +367,8 @@ impl Mount {
 pub(crate) struct View {
     pub root: Ino,
     pub mounts: Arc<Mounts>,
+    /// Who walks, if each folder walked must let them search it: None for root's capabilities.
+    pub who: Option<Arc<super::perm::Who>>,
 }
 
 impl View {
@@ -418,7 +420,8 @@ impl View {
 
     /// How `state`'s process sees paths.
     pub(crate) fn of(state: &crate::process::ProcState) -> View {
-        View { root: state.root.0, mounts: state.ns.mnt.current() }
+        let who = super::perm::Who::of(&state.creds);
+        View { root: state.root.0, mounts: state.ns.mnt.current(), who: (!who.unchecked()).then(|| Arc::new(who)) }
     }
 
     /// Like `resolve`, but stops at the last component's directory, giving it and the last name.
@@ -453,6 +456,13 @@ impl View {
         let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty() && *p != ".").collect();
         for (i, part) in parts.iter().enumerate() {
             let last = i + 1 == parts.len();
+            // Each folder walked through must let the walker search it.
+            if let Some(who) = &self.who
+                && disk.stat(at).is_ok_and(|s| s.kind == Kind::Dir)
+                && !who.may(&disk.meta(at).map_err(Walk::from)?, true, super::perm::MAY_EXEC)
+            {
+                return Err(Walk(Error::Denied, Some(EACCES)));
+            }
             if *part == ".." {
                 // RESOLVE_BENEATH forbids climbing above the start; RESOLVE_IN_ROOT pins `..` at the root.
                 if how.beneath && at == start {
@@ -544,8 +554,7 @@ fn mount_flags(flags: u64) -> u64 {
 impl Task {
     /// How this process sees paths now.
     pub(crate) fn view(&self) -> View {
-        let state = lock(&self.process.state);
-        View { root: state.root.0, mounts: state.ns.mnt.current() }
+        View::of(&lock(&self.process.state))
     }
 
     /// A path as this process sees it (absolute, from its root), as it is in the namespace.
@@ -1361,7 +1370,7 @@ mod tests {
         let mut mounts = Mounts::boot(&disk);
         // b bound onto a: a's own "up" is hidden; ".." from a's mount goes to the root.
         mounts.add(Mount { id: 0, parent: 1, point: a, path: "/a".into(), root: b, root_path: "/b".into(), ..mounts.list[0].clone() });
-        let view = View { root: ROOT, mounts: Arc::new(mounts) };
+        let view = View { root: ROOT, mounts: Arc::new(mounts), who: None };
         assert_eq!(view.resolve(&disk, ROOT, "/a/inside", true), Ok(inside));
         assert_eq!(view.resolve(&disk, ROOT, "/a/up", true), Err(Error::NotFound));
         assert_eq!(view.resolve(&disk, ROOT, "/a/../b/inside", true), Ok(inside));
@@ -1383,7 +1392,7 @@ mod tests {
         disk.put("/usr/bin/firefox-esr", layers::New::Symlink("../lib/firefox-esr/firefox-esr".into()), &[], link, dir).unwrap();
         disk.put("/opt", layers::New::Symlink("/usr/lib".into()), &[], link, dir).unwrap();
         disk.put("/loop", layers::New::Symlink("/loop".into()), &[], link, dir).unwrap();
-        let view = View { root: ROOT, mounts: Arc::new(Mounts::boot(&disk)) };
+        let view = View { root: ROOT, mounts: Arc::new(Mounts::boot(&disk)), who: None };
         let real = |cwd: &str, path: &str| view.real_path(&disk, cwd, path);
         assert_eq!(real("/", "/usr/bin/firefox-esr").as_deref(), Ok("/usr/lib/firefox-esr/firefox-esr"));
         assert_eq!(real("/usr/bin", "firefox-esr").as_deref(), Ok("/usr/lib/firefox-esr/firefox-esr"));

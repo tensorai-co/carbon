@@ -310,6 +310,13 @@ impl ExecSpec {
         self
     }
 
+    /// Who it runs as (`docker exec --user`): `name`, `uid`, `name:group`, `uid:gid`, from the machine's own
+    /// `/etc/passwd` and `/etc/group`; the machine's first program's user by default.
+    pub fn user(mut self, user: impl Into<String>) -> ExecSpec {
+        self.request.user = Some(user.into());
+        self
+    }
+
     /// Kills it (SIGKILL; in a Windows machine, ends it) if it's still running this long after it starts. Its
     /// [`Output::timed_out`] says so, and [`Process::timed_out`].
     pub fn timeout(mut self, timeout: Duration) -> ExecSpec {

@@ -26,6 +26,8 @@ pub struct Spec {
     pub cwd: Option<String>,
     /// A terminal of its own, this many rows and columns: `-t`. Without one, its stdin, stdout and stderr are pipes.
     pub tty: Option<(u16, u16)>,
+    /// Who it runs as: the machine's first program's user if None.
+    pub user: Option<crate::User>,
 }
 
 /// What comes out of a process started from outside.
@@ -65,6 +67,7 @@ impl Stop {
         let pid = k.new_id();
         // `argv[0]` stays the name it was asked for (`bash`), as Docker's exec leaves it; `path` is what runs.
         let argv = spec.argv.clone();
+        let user = spec.user.clone();
         // Its descriptors, and the other ends, ours.
         let (files, tty, stdin, outputs) = match spec.tty {
             Some((rows, cols)) => {
@@ -94,7 +97,7 @@ impl Stop {
             k.own_env(&mut env);
             let (k, ctty) = (k.clone(), tty.clone());
             kernels_core::thread::spawn(k.exec.clone(), format!("lambda {pid}"), move |cx| {
-                process::start_entered(&k, cx, pid, &path, &argv, &env, files, ctty, cwd).map_err(|e| format!("exec: {path}: {e:?}"))
+                process::start_entered(&k, cx, pid, &path, &argv, &env, files, ctty, cwd, user.as_ref()).map_err(|e| format!("exec: {path}: {e:?}"))
             })
         };
         if let Err(why) = started {
