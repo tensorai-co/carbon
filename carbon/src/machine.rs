@@ -81,54 +81,62 @@ impl MachineInfo {
         }
     }
 
-    /// What it's from, as `carbon ls` shows it: `debian:13`, or the program.
+    /// What it's from, as `carbon ps` shows it: `debian:13`, or the program.
     pub fn from(&self) -> String {
         self.image.as_deref().map(|i| i.strip_prefix("docker.io/library/").unwrap_or(i).to_string()).or(self.program.clone()).unwrap_or_default()
     }
 }
 
-/// How [`Machine::freeze_with`] makes an image.
+/// How [`Machine::commit_with`] makes an image, as `docker commit`'s options do.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Freeze {
+pub struct Commit {
     pub(crate) name: Option<String>,
     pub(crate) config: Option<images::Config>,
+    pub(crate) changes: Vec<String>,
     pub(crate) step: Option<String>,
     pub(crate) comment: String,
     pub(crate) history: Option<Vec<images::History>>,
     pub(crate) source: Option<String>,
 }
 
-impl Freeze {
-    /// An unnamed image, with the machine's config, and `carbon freeze NAME` as its step.
-    pub fn new() -> Freeze {
-        Freeze::default()
+impl Commit {
+    /// An unnamed image, with the machine's config, and `carbon commit NAME` as its step.
+    pub fn new() -> Commit {
+        Commit::default()
     }
     /// What it's called: `app:2`.
-    pub fn name(mut self, name: impl Into<String>) -> Freeze {
+    pub fn name(mut self, name: impl Into<String>) -> Commit {
         self.name = Some(name.into());
         self
     }
     /// Its config, instead of the machine's.
-    pub fn config(mut self, config: images::Config) -> Freeze {
+    pub fn config(mut self, config: images::Config) -> Commit {
         self.config = Some(config);
         self
     }
+    /// A Dockerfile instruction to apply to its config (`--change`): `CMD`, `ENTRYPOINT`, `ENV`, `EXPOSE`, `LABEL`,
+    /// `ONBUILD`, `USER`, `VOLUME` or `WORKDIR`, as many as wanted, in order.
+    pub fn change(mut self, instruction: impl Into<String>) -> Commit {
+        self.changes.push(instruction.into());
+        self
+    }
     /// What its history says made it: `RUN apt-get install -y curl`.
-    pub fn step(mut self, step: impl Into<String>) -> Freeze {
+    pub fn step(mut self, step: impl Into<String>) -> Commit {
         self.step = Some(step.into());
         self
     }
-    pub fn comment(mut self, comment: impl Into<String>) -> Freeze {
+    /// Its history entry's comment (`--message`).
+    pub fn comment(mut self, comment: impl Into<String>) -> Commit {
         self.comment = comment.into();
         self
     }
-    /// Where `carbon images` says it came from, instead of the machine it was frozen from.
-    pub fn source(mut self, source: impl Into<String>) -> Freeze {
+    /// Where `carbon images` says it came from, instead of the machine it was committed from.
+    pub fn source(mut self, source: impl Into<String>) -> Commit {
         self.source = Some(source.into());
         self
     }
     /// Its whole history, instead of its base's with one step added.
-    pub fn history(mut self, history: Vec<images::History>) -> Freeze {
+    pub fn history(mut self, history: Vec<images::History>) -> Commit {
         self.history = Some(history);
         self
     }
@@ -239,15 +247,17 @@ impl Machine {
         Watch::open(&self.dir(), interest)
     }
 
-    /// An image of its disk as it is now, called `image`, which new machines can start from. It must be stopped.
-    pub fn freeze(&self, image: &str) -> Result<Image> {
-        self.freeze_with(&Freeze::new().name(image))
+    /// An image of its disk as it is now, called `image`, which new machines can start from, as `docker commit`
+    /// makes one: its image, and one more layer of what it changed. Running or stopped: a running machine's writes
+    /// wait while its disk is read, so the image is the disk at one moment.
+    pub fn commit(&self, image: &str) -> Result<Image> {
+        self.commit_with(&Commit::new().name(image))
     }
 
-    /// As [`Machine::freeze`], saying what the image is called (or nothing, for an unnamed one found by its id), its
+    /// As [`Machine::commit`], saying what the image is called (or nothing, for an unnamed one found by its id), its
     /// config, and the step its history gives for it: what a build does after each step.
-    pub fn freeze_with(&self, how: &Freeze) -> Result<Image> {
-        self.carbon.0.store.freeze(&self.name, how)
+    pub fn commit_with(&self, how: &Commit) -> Result<Image> {
+        self.carbon.0.store.commit(&self.name, how)
     }
 
     /// Its files, running or stopped: read, written, listed, made, moved and removed.

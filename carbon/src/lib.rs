@@ -66,7 +66,7 @@
 //! | [`Carbon`] | the store on the host's disk: [`Carbon::machine`] and [`Carbon::program`] to make a [`MachineSpec`]; machines, images, pull, import |
 //! | [`MachineSpec`] | a builder: name, isolation, memory, platform, env, network and ports, display, GPU, sound, streams, hooks and rules; then [`MachineSpec::run`], [`MachineSpec::output`] or [`MachineSpec::start`] |
 //! | [`Running`] | a machine this process runs: its piped streams, its hooks, `stop`, `kill`, `wait` |
-//! | [`Machine`] | a machine by name, in this process or another: `exec`, `stop`, `ports`, `screen`, `watch`, `freeze`, `copy_in`, `copy_out`, `remove` |
+//! | [`Machine`] | a machine by name, in this process or another: `exec`, `stop`, `ports`, `screen`, `watch`, `commit`, `copy_in`, `copy_out`, `remove` |
 //! | [`Process`] | what [`Machine::exec`] started: stdin, output as it comes, signals, its exit |
 //! | [`Screen`] | a running machine's desktop: screenshot, windows, click, type, keys, clipboard, drops |
 //! | [`hooks`] | events (programs started, output, connections, lookups), decisions, and the [`hooks::Hub`] every hook point asks |
@@ -100,7 +100,7 @@ use std::sync::{Arc, RwLock};
 pub use hooks;
 
 pub use error::{Error, ErrorKind, Result};
-pub use machine::{Button, ExecSpec, Freeze, Machine, MachineInfo, Port, Process, ProcessEvent, ProcessHandle, Screen, Window};
+pub use machine::{Button, ExecSpec, Commit, Machine, MachineInfo, Port, Process, ProcessEvent, ProcessHandle, Screen, Window};
 pub use files::{Copy, DirEntry, FileInfo, FileKind, Files, MOST_READ, Remove, Write};
 pub use logs::{LogLine, LogReader, LogStream, Logs};
 pub use mounts::{Mount, MountKind, Volume, VolumeInfo};

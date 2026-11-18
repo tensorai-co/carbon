@@ -261,6 +261,9 @@ pub(crate) enum Op {
     Link { path: String, to: String },
     Rename { from: String, to: String },
     Remove { path: String, recursive: bool },
+    /// The whole disk as an index, as it is now, with every chunk in the store: what `commit` makes an image of. A
+    /// running machine does it on its own disk, so its writes wait while it's done.
+    Snapshot,
 }
 
 impl Op {
@@ -275,6 +278,7 @@ impl Op {
             Op::Link { path, to } => json!({ "op": "link", "path": path, "to": to }),
             Op::Rename { from, to } => json!({ "op": "rename", "from": from, "to": to }),
             Op::Remove { path, recursive } => json!({ "op": "remove", "path": path, "recursive": recursive }),
+            Op::Snapshot => json!({ "op": "snapshot" }),
         }
     }
 
@@ -293,13 +297,14 @@ impl Op {
             "link" => Op::Link { path: s("path")?, to: s("to")? },
             "rename" => Op::Rename { from: s("from")?, to: s("to")? },
             "remove" => Op::Remove { path: s("path")?, recursive: b("recursive") },
+            "snapshot" => Op::Snapshot,
             _ => return None,
         })
     }
 
     /// Whether it changes the disk (a stopped machine's is saved after).
     fn changes(&self) -> bool {
-        !matches!(self, Op::Stat { .. } | Op::List { .. } | Op::Read { .. })
+        !matches!(self, Op::Stat { .. } | Op::List { .. } | Op::Read { .. } | Op::Snapshot)
     }
 }
 
@@ -532,6 +537,7 @@ pub(crate) fn apply<M: Meta>(disk: &mut Fs<M>, op: &Op, data: &[u8]) -> Result<V
             }
             done()
         }
+        Op::Snapshot => disk.freeze().map_err(|e| Error::io(format!("reading the disk for an image: {e}"))),
     }
 }
 
@@ -761,6 +767,7 @@ fn paths(op: Op, kernel: Kernel) -> Op {
         Op::Link { path, to } => Op::Link { path: p(path), to: p(to) },
         Op::Rename { from, to } => Op::Rename { from: p(from), to: p(to) },
         Op::Remove { path, recursive } => Op::Remove { path: p(path), recursive },
+        Op::Snapshot => Op::Snapshot,
     }
 }
 
@@ -1200,7 +1207,7 @@ pub(crate) mod tests {
 
         // Frozen unnamed, with a config and a step; found by its id, never listed.
         let config = images::Config { workdir: "/srv/app".into(), ..images::Config::default() };
-        let image = b.freeze_with(&crate::Freeze::new().config(config).step("COPY --from=a /app /srv")).unwrap();
+        let image = b.commit_with(&crate::Commit::new().config(config).step("COPY --from=a /app /srv")).unwrap();
         assert!(image.name.starts_with("sha256:"));
         assert_eq!(image.history.last().unwrap().created_by, "COPY --from=a /app /srv");
         assert_eq!(carbon.image(&image.name).unwrap().config.workdir, "/srv/app");

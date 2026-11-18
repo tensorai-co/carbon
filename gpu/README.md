@@ -70,7 +70,7 @@ graphics API breaks there, so `gpu` meets programs lower down: at the device, an
 
 ## On the command line
 
-Built in `cli`, but for `host=NAME` and `carbon ls`'s column:
+Built in `cli`, but for `host=NAME` and `carbon ps`'s column:
 
 | Option | What the machine gets | Says |
 | --- | --- | --- |
@@ -88,7 +88,7 @@ carbon run --gpu none  setup.exe       # no device at all: programs take their o
 ```
 
 `carbon gpu` lists the host's device and the software one, with the backend each uses and its subgroup width. To
-come: `carbon ls` gets a `GPU` column beside `ISOLATION`. Only lambda reaches the device yet; atlas's DXGI is step 5.
+come: `carbon ps` gets a `GPU` column beside `ISOLATION`. Only lambda reaches the device yet; atlas's DXGI is step 5.
 
 ## What gpu sees
 

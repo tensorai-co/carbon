@@ -80,7 +80,7 @@ libraries.
 | [`Carbon`](src/lib.rs) | Carbon on this host: its folder of machines and images. `machine(image)`, `program(path)`, `again(name)` make a `MachineSpec`; `build(context)` a [`Build`](#building); `get(name)`, `machines()`, `images()`, `image(name)` (or an unnamed one's `sha256:…`), `pull`, `push`, `push_with` ([`Push`](#registries)), `login`, `logout`, `save`, `load`, `import`, `tag`, `remove_image`, `prune`; `on_notice` for what machines fall back to |
 | [`MachineSpec`](src/spec.rs) | A builder: `name`, `isolation`, `platform`, `user`, `env`, `workdir`, `memory`, `network`, `publish`, `display`, `gpu`, `audio`, `stdin`/`stdout`/`stderr` ([`Stdio`](src/stdio.rs): inherit, null, piped), `tty`, `relay_signals`, `rm`, `publish_all`, `timeout`, `mount`, and `hooks`, `rules`, `on_exec`, `on_output`, `on_connect`, `on_lookup`. Then `run(argv)` on this thread, `output(argv)` to its end with what it wrote, `start(argv)` on a thread of its own, `launch(argv)` in a process of its own ([workers](#workers)), or `create()` to make it without running it, as `docker create` |
 | [`Running`](src/spec.rs) | A machine this process runs: `take_stdin`, `take_stdout`, `take_stderr` ([`Chunks`](src/stdio.rs), also an `io::Read`), `hooks()`, `machine()`, `stop`, `kill`, `wait` |
-| [`Machine`](src/machine.rs) | A machine by name, in this process or another: `info`, `exec(argv)`, `stop`, `kill`, `wait`, `ports`, `screen`, `watch`, `logs`, `files`, `copy_in`, `copy_out`, `freeze`, `freeze_with` ([`Freeze`](src/machine.rs): its name or none, config, step, history), `remove` |
+| [`Machine`](src/machine.rs) | A machine by name, in this process or another: `info`, `exec(argv)`, `stop`, `kill`, `wait`, `ports`, `screen`, `watch`, `logs`, `files`, `copy_in`, `copy_out`, `commit`, `commit_with` ([`Commit`](src/machine.rs): its name or none, config, `--change`s, step, comment, history), `remove` |
 | [`Files`](src/files.rs) | A machine's files, running or stopped: `stat`, `list`, `read`, `read_to_string`, `write` ([`Write`](src/files.rs): mode, owner, parents, append, time), `mkdir`, `symlink`, `rename`, `remove`, and `copy_in`, `copy_out`, `copy_from` (another machine's disk) ([`Copy`](src/files.rs): `chown`, `chmod`, `exclude` with an ignore file's patterns), which keep kinds, modes, owners, times and links |
 | [`Mount`, `Volume`](src/mounts.rs) | A host's folder (or one file) seen live in a machine (`Mount::bind`), a volume (`Mount::volume`: a folder Carbon keeps that outlives its machines, its files' owners kept), a tmpfs; `read_only`; `Mount::parse` takes Docker's `-v` and `--mount`. `Carbon::volume(name)`: `create`, `path`, `info`; `volumes()`, `remove_volume` |
 | [`Logs`, `LogLine`](src/logs.rs) | What a launched machine wrote, as lines on its stream: `tail(n)`, `follow()` |
@@ -134,7 +134,7 @@ A hook point is a place in Carbon's own code a program can't get around. Each ma
 | [`build/`](src/build/mod.rs) | Building: `parse` (the Dockerfile's grammar), `lex` (substitution and quoting), `ignore` (ignore files), `archive` (`ADD`'s tars), `run` (the steps, the cache) |
 | [`machine.rs`](src/machine.rs) | `Machine`, `MachineInfo`, `ExecSpec`, `Process`, `Screen` |
 | [`boot.rs`](src/boot.rs) | Making a machine and running it: the kernel, exec with its isolation, the disk, its desktop, sound and network, its control socket, and the hooks on its first program and its `exec`s |
-| [`store.rs`](src/store.rs) | Machines on the host's disk: records, names, and what's done to a stopped one (freeze, copy, import, remove) |
+| [`store.rs`](src/store.rs) | Machines on the host's disk: records, names, and what's done to a stopped one (commit, copy, import, remove) |
 | [`stdio.rs`](src/stdio.rs) | A machine's standard streams, and the `host::Host` its kernel writes through |
 | [`network.rs`](src/network.rs) | The `net::Host` a machine's network runs on, asking its hooks |
 | [`rules.rs`](src/rules.rs) | `Rules` |
@@ -150,8 +150,8 @@ there ([`wire`](src/wire.rs)), which is how another process `exec`s into it, wat
 ## Building
 
 `carbon.build(context)` builds an image from a Carbonfile, which is a Dockerfile, exactly: the same grammar, as
-BuildKit's `docker/dockerfile:1` reads it. A build is the library's own calls: each `RUN` a launched machine frozen
-after (`launch`, `freeze_with`), each `COPY` and `ADD` a copy into a machine made but never run (`create`,
+BuildKit's `docker/dockerfile:1` reads it. A build is the library's own calls: each `RUN` a launched machine committed
+after (`launch`, `commit_with`), each `COPY` and `ADD` a copy into a machine made but never run (`create`,
 `copy_in`, `copy_from`), every other instruction a change to the image's config. So rules and hooks hold for every
 `RUN`, and `carbon watch` sees each step's machine (`build-<id>-<n>`) as it runs.
 
@@ -169,7 +169,7 @@ let file = carbon::build::Carbonfile::parse(&text)?;      // the grammar alone
 | Instruction | What a build does |
 | --- | --- |
 | `FROM`, `--platform` | The image, pulled if it isn't here, or an earlier stage; `scratch` is an empty disk. Its `ONBUILD` triggers run first |
-| `RUN` | A machine launched from the step's image with its `ENV`, `ARG`s, `WORKDIR`, `SHELL` and `USER`, run to its end, frozen with the config and the step; a non-zero exit fails the build. `--network`; here-documents as scripts (a `#!` one run as a file) |
+| `RUN` | A machine launched from the step's image with its `ENV`, `ARG`s, `WORKDIR`, `SHELL` and `USER`, run to its end, committed with the config and the step; a non-zero exit fails the build. `--network`; here-documents as scripts (a `#!` one run as a file) |
 | `RUN --mount` | `type=cache`: a volume kept between builds (`build-cache-…`, by its `id` or target), left out of the step's key; `bind`: part of the context (a folder or a file), read-only, its contents in the key; `tmpfs`; `secret`: a file the build was given (`Build::secret`, `--secret id=ID,src=FILE`) at `/run/secrets/ID` for that step, or a variable (`env=`), never in the image or the key |
 | `COPY`, `ADD` | Into a machine made but never run: the context's files (the ignore file applied, wildcards matched), a here-document, or another stage's or image's (`--from`, disk to disk). `--chown`, octal `--chmod`, `--exclude`; kinds, modes, times and links kept. `ADD` unpacks a local tar, plain or gzip, found by its contents |
 | `ENV`, `ARG`, `WORKDIR`, `USER` (who the next `RUN`s and the image's machines run as), `CMD`, `ENTRYPOINT`, `SHELL`, `LABEL`, `EXPOSE`, `VOLUME`, `STOPSIGNAL`, `HEALTHCHECK`, `ONBUILD`, `MAINTAINER` | The config and a history entry, nothing on the disk (a `WORKDIR`'s folder is made by the next step that changes the disk) |
@@ -238,7 +238,7 @@ let loaded = carbon.load("images.tar")?;                          // docker save
 ```
 
 An image keeps its **lineage**: the layers a pulled base came as, and each disk a step made since (a build's every
-`RUN`, `COPY` and `ADD`, a `carbon freeze`). A push sends a layer per disk: the base's layers as the registry has
+`RUN`, `COPY` and `ADD`, a `carbon commit`). A push sends a layer per disk: the base's layers as the registry has
 them (taken from the base's own repository on the same registry with nothing sent, or fetched from another), then a
 layer of what each step changed, with whiteouts for what it removed, made from the two disks as it's sent. A step
 that changed nothing makes no layer, and the image's history says which steps made one, as OCI's config wants. The

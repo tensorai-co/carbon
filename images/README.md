@@ -3,7 +3,7 @@
 What machines start from, kept on the host's disk. An image is an index (its layers, merged: see
 [`layers`](../layers/README.md)), its platform, what its config says to run, and its lineage: what it was made from.
 Images are pulled from OCI registries over HTTPS and pushed back to them, saved to and loaded from archives as
-`docker save` writes them, imported from a tar of a root file system, or saved from a machine's frozen disk. Every chunk of every
+`docker save` writes them, imported from a tar of a root file system, or committed from a machine's disk. Every chunk of every
 image and machine is in one store, by its SHA-256, so what images share is kept once.
 
 **Built.** `machine`, the CLI and the SDK use it; no kernel ever does. Nothing in it knows a kernel: a kernel's `M` is
@@ -33,8 +33,8 @@ machines/dev/log                                its writable layer: every change
   stacked with their whiteouts and frozen into one index. What the registry had is kept as the image's lineage: the
   repository and each layer's digest, size, media type and diff ID.
 - **Lineage** (`Lineage` in `lib.rs`): where an image's first disk came from (a repository and its layers there, for
-  a pulled one), and each disk it was made through since, with where in its history each was made. A machine frozen
-  into an image adds the disk it began from; a build's steps are freezes, so a built image has a disk per step.
+  a pulled one), and each disk it was made through since, with where in its history each was made. A machine committed
+  into an image adds the disk it began from; a build's steps are commits, so a built image has a disk per step.
 - **Pushing** (`push.rs`): a layer per disk. The first is the registry's own layers when it was pulled: already there,
   mounted from the repository it came from on the same registry (nothing sent), or fetched from that registry and
   sent to another. Each disk after it is a layer of what differs from the disk before (`layers::tar::export`, gzipped),
@@ -47,7 +47,7 @@ machines/dev/log                                its writable layer: every change
   layer's disk is kept as the loaded image's lineage, so it pushes and saves again as the layers it came as.
 - **HTTPS** (`tls.rs`): rustls, with a verifier that asks [`host`](../host/README.md), so the host's own store and
   rules decide whom to trust.
-- **Importing** a tar, and **saving** a frozen machine as an image.
+- **Importing** a tar, and **saving** a committed machine as an image.
 - **Config** (`config.rs`): OCI's whole image config (environment, entrypoint, command, user, working folder, exposed
   ports, volumes, labels, stop signal, health check, shell, `ONBUILD`) and its history, kept from a pull, in one JSON
   form for images and machine records. **Tagging** names an image again, sharing its index.

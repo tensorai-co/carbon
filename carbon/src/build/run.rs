@@ -15,7 +15,7 @@ use serde_json::json;
 use super::{Args, Build, Built, Carbonfile, Instruction, Lexer, Patterns, Step};
 use crate::error::{Error, ErrorKind, Result};
 use crate::store::{now, rfc3339};
-use crate::{Copy, Freeze, Logs, Machine, Network, Write};
+use crate::{Copy, Commit, Logs, Machine, Network, Write};
 
 /// Build arguments every build has without an `ARG` for them to reach `RUN`.
 const PROXY_ARGS: &[&str] = &["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "FTP_PROXY", "ftp_proxy", "NO_PROXY", "no_proxy", "ALL_PROXY", "all_proxy"];
@@ -32,6 +32,9 @@ fn sha(parts: &[&str]) -> String {
 struct State {
     /// The image the last disk step made (or the base).
     image: Image,
+    /// What the stage started from: its `FROM` image, or the stage it's built on as that stage left its disk. A
+    /// squashed build is this image's layers and one more.
+    from: Image,
     config: Config,
     history: Vec<History>,
     key: String,
@@ -228,6 +231,7 @@ pub(super) fn build(build: Build, progress: &mut dyn FnMut(&Step)) -> Result<Bui
     let mut state = run.stages[target].clone().ok_or_else(|| Error::new(ErrorKind::Failed, "the target stage wasn't built"))?;
     run.flush_dirs(&mut state, target)?;
     let image = run.materialize(&state)?;
+    let image = if build.squash { run.squash(&state, image)? } else { image };
     for name in build.args.keys() {
         if !run.used_args.contains(name) && !PROXY_ARGS.contains(&name.as_str()) {
             (run.progress)(&Step::Warning(format!("build argument {name} isn't used by any ARG")));
@@ -357,6 +361,29 @@ impl Run<'_> {
         images.save_unnamed(&index, &state.platform, &state.config, &state.history, &state.image.lineage, "built").map_err(crate::error::image)
     }
 
+    /// The built image as `docker build --squash` makes it: what the stage started from, as it was, and one disk for
+    /// every step since, so a push sends the base's layers and one more. Nothing to squash if no step changed files.
+    fn squash(&self, state: &State, image: Image) -> Result<Image> {
+        if image.index == state.from.index {
+            return Ok(image);
+        }
+        let lineage = images::Lineage::after(&state.from);
+        if lineage == image.lineage {
+            return Ok(image);
+        }
+        // Its history says so too, as Docker's does: the steps since the base made one layer, the last that changed
+        // files. (That also makes it an image of its own, not the unsquashed one with the same disk.)
+        let made_by = lineage.disks.last().map_or(0, |d| d.history);
+        let mut history = image.history.clone();
+        let last = history.iter().rposition(|h| !h.empty_layer).filter(|&i| i >= made_by);
+        for (i, h) in history.iter_mut().enumerate().skip(made_by) {
+            h.empty_layer = Some(i) != last;
+        }
+        let images = &self.build.carbon.0.store.images;
+        let index = images.index(&image).map_err(crate::error::image)?;
+        images.save_unnamed(&index, &image.platform, &image.config, &history, &lineage, "built, squashed").map_err(crate::error::image)
+    }
+
     /// An empty disk, for `FROM scratch`.
     fn scratch(&self, platform: &Platform) -> Result<Image> {
         let images = &self.build.carbon.0.store.images;
@@ -385,12 +412,12 @@ impl Run<'_> {
             Some(j) => {
                 let mut s = self.stages[j].clone().ok_or_else(|| self.bad(&stage.from, format!("stage {base} wasn't built")))?;
                 self.flush_dirs(&mut s, j)?;
-                State { args: Vec::new(), cmd_set: false, ..s }
+                State { args: Vec::new(), cmd_set: false, from: s.image.clone(), ..s }
             }
             None => {
                 let image = if base.eq_ignore_ascii_case("scratch") { self.scratch(&platform)? } else { self.image(&base, &platform)? };
                 let key = sha(&[CACHE_VERSION, "from", &image.index, &image.config.to_json().to_string(), &image.platform.to_string()]);
-                State { config: image.config.clone(), history: image.history.clone(), key, platform: image.platform.clone(), image, args: Vec::new(), pending_dirs: Vec::new(), cmd_set: false }
+                State { config: image.config.clone(), history: image.history.clone(), key, platform: image.platform.clone(), from: image.clone(), image, args: Vec::new(), pending_dirs: Vec::new(), cmd_set: false }
             }
         };
         // What the base said to do when built on, first.
@@ -614,9 +641,9 @@ impl Run<'_> {
         Ok(temp)
     }
 
-    /// Freezes a step's machine, and moves the state on to it.
+    /// Commits a step's machine, and moves the state on to it.
     fn finish(&mut self, state: &mut State, temp: Temp, created_by: String, key: String) -> Result<()> {
-        let image = temp.get().freeze_with(&Freeze::new().source("built").config(state.config.clone()).step(created_by))?;
+        let image = temp.get().commit_with(&Commit::new().source("built").config(state.config.clone()).step(created_by))?;
         drop(temp);
         self.remember(&key, &image);
         state.history = image.history.clone();
@@ -656,7 +683,7 @@ impl Run<'_> {
             for entry in history.iter_mut().rev().take_while(|h| h.empty_layer).filter(|h| h.created_by.starts_with("WORKDIR ")) {
                 entry.empty_layer = false;
             }
-            let image = temp.get().freeze_with(&Freeze::new().source("built").config(state.config.clone()).history(history))?;
+            let image = temp.get().commit_with(&Commit::new().source("built").config(state.config.clone()).history(history))?;
             drop(temp);
             self.remember(&key, &image);
             state.history = image.history.clone();
@@ -960,7 +987,7 @@ impl Run<'_> {
                     None => {
                         let image = self.image(f, &state.platform.clone())?;
                         let key = sha(&[CACHE_VERSION, "from", &image.index]);
-                        State { config: image.config.clone(), history: image.history.clone(), key, platform: image.platform.clone(), image, args: Vec::new(), pending_dirs: Vec::new(), cmd_set: false }
+                        State { config: image.config.clone(), history: image.history.clone(), key, platform: image.platform.clone(), from: image.clone(), image, args: Vec::new(), pending_dirs: Vec::new(), cmd_set: false }
                     }
                 };
                 inputs.push(state.key.clone());
@@ -1143,7 +1170,7 @@ impl Run<'_> {
 
 /// A state's variables, owned, for a lookup that outlives borrowing it.
 fn lookup_owned(state: &State) -> impl Fn(&str) -> Option<String> + use<> {
-    let state = State { image: state.image.clone(), config: state.config.clone(), history: Vec::new(), key: String::new(), platform: state.platform.clone(), args: state.args.clone(), pending_dirs: Vec::new(), cmd_set: false };
+    let state = State { image: state.image.clone(), from: state.from.clone(), config: state.config.clone(), history: Vec::new(), key: String::new(), platform: state.platform.clone(), args: state.args.clone(), pending_dirs: Vec::new(), cmd_set: false };
     move |name: &str| state.get(name)
 }
 

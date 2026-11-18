@@ -1,5 +1,5 @@
 //! Machines on the host's disk: each kept by name, with its record and its log in `<home>/machines/<name>/`, so it
-//! can be started again with its files as it left them, stopped from another process, frozen into an image, copied
+//! can be started again with its files as it left them, stopped from another process, committed into an image, copied
 //! into and out of, or removed. And what a new machine's record is made from: an image, or a program on the host.
 
 use std::collections::HashSet;
@@ -372,33 +372,7 @@ impl Store {
         });
         let windows = platform.os == "windows";
         let mut config = Config::default();
-        for change in changes {
-            let bad = |why: String| Error::invalid(format!("--change {change}: {why}"));
-            let (instruction, rest) = change.trim().split_once(char::is_whitespace).ok_or_else(|| bad("an instruction and its value".into()))?;
-            let rest = rest.trim();
-            // `["a", "b"]`, or a shell's line, as Docker reads them.
-            let argv = || -> Result<Vec<String>> {
-                if rest.starts_with('[') {
-                    serde_json::from_str::<Vec<String>>(rest).map_err(|e| bad(e.to_string()))
-                } else if windows {
-                    Ok(vec!["cmd".into(), "/S".into(), "/C".into(), rest.to_string()])
-                } else {
-                    Ok(vec!["/bin/sh".into(), "-c".into(), rest.to_string()])
-                }
-            };
-            match instruction.to_ascii_uppercase().as_str() {
-                "CMD" => config.cmd = argv()?,
-                "ENTRYPOINT" => config.entrypoint = argv()?,
-                "WORKDIR" => config.workdir = rest.to_string(),
-                "USER" => config.user = rest.to_string(),
-                "ENV" => {
-                    let (k, v) = rest.split_once(['=', ' ']).ok_or_else(|| bad("ENV NAME=VALUE".into()))?;
-                    config.env.retain(|e| e.split('=').next() != Some(k));
-                    config.env.push(format!("{k}={}", v.trim_matches('"')));
-                }
-                other => return Err(bad(format!("{other} isn't CMD, ENTRYPOINT, ENV, WORKDIR or USER"))),
-            }
-        }
+        apply_changes(&mut config, changes, windows)?;
         if windows {
             self.images.import(name, tar, &platform, &config, |_| atlas::Meta::default(), atlas::Meta { attributes: 0x10 })
         } else {
@@ -470,31 +444,38 @@ impl Store {
         .map_err(error::image)
     }
 
-    /// Freezes a stopped machine's disk, as it is, into an image: named, or unnamed (by id), with the config and the
-    /// history entry `how` says, else the machine's config and `carbon freeze NAME`.
-    pub fn freeze(&self, name: &str, how: &crate::Freeze) -> Result<Image> {
-        let record = self.stopped(name)?;
-        let index = match record.kernel {
-            Kernel::Lambda => self.disk::<lambda::Meta>(&record, lambda::Meta::dir(0o755), false)?.freeze(),
-            Kernel::Atlas => self.disk::<atlas::Meta>(&record, atlas::Meta { attributes: 0x10 }, true)?.freeze(),
-        }
-        .map_err(|e| Error::io(format!("freezing {name}: {e}")))?;
+    /// Commits a machine's disk, as it is, into an image, as `docker commit` does: named, or unnamed (by id), with the
+    /// config and the history entry `how` says, else the machine's config and `carbon commit NAME`. A running
+    /// machine's disk is read by the machine itself, its writes waiting meanwhile, so the image is one moment of it.
+    pub fn commit(&self, name: &str, how: &crate::Commit) -> Result<Image> {
+        let record = self.get(name)?;
+        let index = if record.running() {
+            crate::wire::fs(&self.dir(name), &crate::files::Op::Snapshot.to_json(), &[])?
+        } else {
+            let record = self.stopped(name)?;
+            match record.kernel {
+                Kernel::Lambda => self.disk::<lambda::Meta>(&record, lambda::Meta::dir(0o755), false)?.freeze(),
+                Kernel::Atlas => self.disk::<atlas::Meta>(&record, atlas::Meta { attributes: 0x10 }, true)?.freeze(),
+            }
+            .map_err(|e| Error::io(format!("committing {name}: {e}")))?
+        };
         // What it was made from, then this step.
         let base = record.image.as_deref().and_then(|i| self.images.image(i));
         let mut history = base.as_ref().map(|b| b.history.clone()).unwrap_or_default();
         match &how.history {
             Some(whole) => history = whole.clone(),
             None => {
-                let created_by = how.step.clone().unwrap_or_else(|| format!("carbon freeze {name}"));
+                let created_by = how.step.clone().unwrap_or_else(|| format!("carbon commit {name}"));
                 history.push(images::History { created: rfc3339(now()), created_by, empty_layer: false, comment: how.comment.clone() });
             }
         }
         let lineage = base.as_ref().map(images::Lineage::after).unwrap_or_default();
-        let config = how.config.as_ref().unwrap_or(&record.config);
-        let source = how.source.clone().unwrap_or_else(|| format!("frozen from machine {name}"));
+        let mut config = how.config.clone().unwrap_or_else(|| record.config.clone());
+        apply_changes(&mut config, &how.changes, record.platform.os == "windows")?;
+        let source = how.source.clone().unwrap_or_else(|| format!("committed from machine {name}"));
         match &how.name {
-            Some(image) => self.images.save_with(image, &index, &record.platform, config, &history, &lineage, &source),
-            None => self.images.save_unnamed(&index, &record.platform, config, &history, &lineage, &source),
+            Some(image) => self.images.save_with(image, &index, &record.platform, &config, &history, &lineage, &source),
+            None => self.images.save_unnamed(&index, &record.platform, &config, &history, &lineage, &source),
         }
         .map_err(error::image)
     }
@@ -604,6 +585,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn changes_as_docker_takes_them() {
+        let mut c = Config::default();
+        let changes: Vec<String> = [
+            "CMD [\"node\", \"app.js\"]",
+            "ENTRYPOINT tini --",
+            "ENV A=1 B=\"two words\"",
+            "ENV OLD form",
+            "ENV A=3",
+            "EXPOSE 80 53/udp",
+            "LABEL team=infra version=\"1 beta\"",
+            "VOLUME [\"/data\"]",
+            "VOLUME /logs",
+            "WORKDIR /srv",
+            "USER app",
+            "ONBUILD RUN make",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        apply_changes(&mut c, &changes, false).unwrap();
+        assert_eq!(c.cmd, ["node", "app.js"]);
+        assert_eq!(c.entrypoint, ["/bin/sh", "-c", "tini --"]);
+        assert_eq!(c.env, ["B=two words", "OLD=form", "A=3"]);
+        assert_eq!(c.exposed_ports, ["80/tcp", "53/udp"]);
+        assert_eq!(c.labels.get("team").map(String::as_str), Some("infra"));
+        assert_eq!(c.labels.get("version").map(String::as_str), Some("1 beta"));
+        assert_eq!(c.volumes, ["/data", "/logs"]);
+        assert_eq!((c.workdir.as_str(), c.user.as_str()), ("/srv", "app"));
+        assert_eq!(c.onbuild, ["RUN make"]);
+        assert!(apply_changes(&mut c, &["HEALTHCHECK NONE".to_string()], false).is_err());
+        assert!(apply_changes(&mut c, &["CMD".to_string()], false).is_err());
+    }
+
+    #[test]
     fn times_as_oci_writes_them() {
         assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
         assert_eq!(rfc3339(1_794_946_180), "2026-11-17T20:09:40Z");
@@ -701,4 +716,99 @@ mod tests {
         assert_eq!((record.name.as_str(), record.kernel), ("windows", Kernel::Atlas));
         let _ = fs::remove_dir_all(&home);
     }
+}
+
+/// Applies Dockerfile instructions to a config, as `docker import --change` and `docker commit --change` do: `CMD`,
+/// `ENTRYPOINT`, `ENV`, `EXPOSE`, `LABEL`, `ONBUILD`, `USER`, `VOLUME` and `WORKDIR`.
+pub(crate) fn apply_changes(config: &mut Config, changes: &[String], windows: bool) -> Result<()> {
+    for change in changes {
+        let bad = |why: String| Error::invalid(format!("--change {change}: {why}"));
+        let (instruction, rest) = change.trim().split_once(char::is_whitespace).ok_or_else(|| bad("an instruction and its value".into()))?;
+        let rest = rest.trim();
+        // `["a", "b"]`, or a shell's line, as Docker reads them.
+        let argv = || -> Result<Vec<String>> {
+            if rest.starts_with('[') {
+                serde_json::from_str::<Vec<String>>(rest).map_err(|e| bad(e.to_string()))
+            } else if windows {
+                Ok(vec!["cmd".into(), "/S".into(), "/C".into(), rest.to_string()])
+            } else {
+                Ok(vec!["/bin/sh".into(), "-c".into(), rest.to_string()])
+            }
+        };
+        // `KEY=VALUE KEY2="VALUE 2"`, or the older `KEY VALUE`.
+        let pairs = || -> Result<Vec<(String, String)>> {
+            if !rest.contains('=') {
+                let (k, v) = rest.split_once(char::is_whitespace).ok_or_else(|| bad("NAME=VALUE".into()))?;
+                return Ok(vec![(k.to_string(), v.trim().to_string())]);
+            }
+            let mut out = Vec::new();
+            let mut chars = rest.chars().peekable();
+            while chars.peek().is_some() {
+                while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                    chars.next();
+                }
+                let key: String = chars.by_ref().take_while(|&c| c != '=').collect();
+                if key.is_empty() {
+                    break;
+                }
+                let mut value = String::new();
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if c == '"' {
+                            break;
+                        }
+                        value.push(c);
+                    }
+                } else {
+                    value = chars.by_ref().take_while(|c| !c.is_whitespace()).collect();
+                }
+                out.push((key, value));
+            }
+            Ok(out)
+        };
+        // `["/data"]` or `/data /logs`.
+        let list = || -> Result<Vec<String>> {
+            if rest.starts_with('[') {
+                serde_json::from_str::<Vec<String>>(rest).map_err(|e| bad(e.to_string()))
+            } else {
+                Ok(rest.split_whitespace().map(String::from).collect())
+            }
+        };
+        match instruction.to_ascii_uppercase().as_str() {
+            "CMD" => config.cmd = argv()?,
+            "ENTRYPOINT" => config.entrypoint = argv()?,
+            "WORKDIR" => config.workdir = rest.to_string(),
+            "USER" => config.user = rest.to_string(),
+            "ENV" => {
+                for (k, v) in pairs()? {
+                    config.env.retain(|e| e.split('=').next() != Some(k.as_str()));
+                    config.env.push(format!("{k}={v}"));
+                }
+            }
+            "LABEL" => {
+                for (k, v) in pairs()? {
+                    config.labels.insert(k, v);
+                }
+            }
+            "EXPOSE" => {
+                for port in rest.split_whitespace() {
+                    let port = if port.contains('/') { port.to_string() } else { format!("{port}/tcp") };
+                    if !config.exposed_ports.contains(&port) {
+                        config.exposed_ports.push(port);
+                    }
+                }
+            }
+            "VOLUME" => {
+                for v in list()? {
+                    if !config.volumes.contains(&v) {
+                        config.volumes.push(v);
+                    }
+                }
+            }
+            "ONBUILD" => config.onbuild.push(rest.to_string()),
+            other => return Err(bad(format!("{other} isn't CMD, ENTRYPOINT, ENV, EXPOSE, LABEL, ONBUILD, USER, VOLUME or WORKDIR"))),
+        }
+    }
+    Ok(())
 }

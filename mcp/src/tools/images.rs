@@ -1,8 +1,8 @@
-//! Images and volumes, as Docker's commands have them: pull, build, freeze, tag, push, remove, save, load.
+//! Images and volumes, as Docker's commands have them: pull, build, commit, tag, push, remove, save, load.
 
 use std::time::{Duration, Instant};
 
-use carbon::{Copy, Freeze, Platform, Push};
+use carbon::{Copy, Commit, Platform, Push};
 use serde_json::{Value, json};
 
 use super::{Is, Tool, prop, strings_prop};
@@ -67,15 +67,15 @@ pub(crate) fn tools() -> Vec<Tool> {
             run: build,
         },
         Tool {
-            name: "freeze_machine",
+            name: "commit_machine",
             title: "Make an image of a machine",
-            description: "Makes an image of a stopped machine's disk, as docker commit: to start other machines from, or to keep a known-good state. Stop the machine first.",
+            description: "Makes an image of a machine's disk, as docker commit: its image plus one layer of what it changed, to start other machines from, or to keep a known-good state. Running or stopped.",
             properties: json!({ "machine": prop("string", "The machine, by name"), "name": prop("string", "The image's name: dev-snapshot:1") }),
             required: &["machine", "name"],
             is: Is::Changes,
             on_machine: false,
             host: false,
-            run: freeze,
+            run: commit,
         },
         Tool {
             name: "tag_image",
@@ -292,12 +292,9 @@ fn build(server: &Server, args: &Args, progress: &Progress) -> Outcome {
     }
 }
 
-fn freeze(server: &Server, args: &Args, _: &Progress) -> Outcome {
+fn commit(server: &Server, args: &Args, _: &Progress) -> Outcome {
     let machine = server.carbon.get(&args.str("machine")?)?;
-    if machine.is_running() {
-        return Err(Failure(format!("{} is running: stop_machine first (an image of a running machine isn't there yet)", machine.name())));
-    }
-    let image = machine.freeze_with(&Freeze::new().name(args.str("name")?))?;
+    let image = machine.commit_with(&Commit::new().name(args.str("name")?))?;
     Ok(shape::data(image_row(&image)))
 }
 

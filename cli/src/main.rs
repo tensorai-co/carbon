@@ -12,7 +12,7 @@
 //! carbon run --deny-exec 'rm -rf *' debian:13 -- ./agent-step.sh
 //! carbon watch dev                          # what a running machine does: programs, output, connections, lookups
 //! carbon exec -it NAME bash                 # a shell in a running machine
-//! carbon ls | stop NAME | rm NAME | freeze NAME IMAGE
+//! carbon ps | stop NAME | rm NAME | commit NAME [IMAGE]
 //! carbon display screenshot NAME -o screen.png
 //! carbon pull IMAGE | import TAR NAME | images | rmi IMAGE
 //! ```
@@ -100,6 +100,7 @@ usage: carbon <command> ...
       --output type=docker|oci,dest=FILE     also write the image as an archive, as carbon save does
       --isolation, --network, --memory, --timeout, --deny, --allow, --deny-exec
                                              as run's, for every RUN
+      --squash                               what the steps did as one layer, on the base's layers as they are
       -q, --quiet                            print only the image's name
   volume create|ls|inspect|rm [NAME]         volumes: folders kept under CARBON_HOME that machines mount and outlive
   logs [-f] [--tail N] NAME                  what a machine run with -d wrote: -f keeps following until it stops
@@ -107,12 +108,16 @@ usage: carbon <command> ...
                                              what a running machine does, as it does it: the programs it starts,
                                              what they write, its connections and lookups, and what its rules and
                                              hooks decided (everything unless some are named; --json: a line each)
-  ls                                         the machines, and which are running
+  ps                                         the machines, and which are running (ls too)
   port NAME [PORT[/tcp|udp]]                 what a running machine publishes: 22/tcp -> 0.0.0.0:2222
   gpu                                        the devices a machine's GPU can be: this host's, and the CPU device
   stop NAME                                  stop a running machine (SIGTERM, then everything after 10s)
   rm NAME                                    remove a stopped machine and its files
-  freeze NAME IMAGE                          make an image of a stopped machine's disk
+  commit [options] NAME [IMAGE]              an image of a machine's disk, running or not, as docker commit: its
+                                             image and one more layer of what it changed (unnamed without IMAGE)
+      -m, --message TEXT                     its history entry's comment
+      -c, --change INSTRUCTION               its config: CMD, ENTRYPOINT, ENV, EXPOSE, LABEL, ONBUILD, USER,
+                                             VOLUME or WORKDIR, as a Dockerfile
   cp NAME:PATH DIR                           copy a machine's file or folder into DIR on this host, running or not:
                                              modes, times and links kept
   cp PATH NAME:DIR                           copy this host's file or folder into a machine's DIR, running or not
@@ -141,7 +146,8 @@ usage: carbon <command> ...
       --network, --memory, --timeout         defaults for every machine it starts, as carbon run's
       --tools NAME,...                       list only these tools
   push [--squash] IMAGE                      push an image to its registry, a layer per step of what made it
-      --squash                               its whole disk as one layer
+      --squash                               its whole disk as one layer, base included (build --squash keeps the
+                                             base's layers and makes one more)
   login [options] [REGISTRY]                 log in to a registry (docker.io by default), for pushes and private pulls
       -u, --username USER                    who to be (asked for if not given)
       --password-stdin                       the password or token on stdin (else asked for, unseen)
@@ -151,7 +157,8 @@ usage: carbon <command> ...
                                              without -i)
   import [options] FILE|- [NAME]             an image from a tar of a root file system, as docker import
       --platform OS/ARCH                     its platform (a tar of C:\\ for Windows, as atlas-base's, is found)
-      -c, --change INSTRUCTION               its config: CMD, ENTRYPOINT, ENV, WORKDIR or USER, as a Dockerfile
+      -c, --change INSTRUCTION               its config: CMD, ENTRYPOINT, ENV, EXPOSE, LABEL, ONBUILD, USER,
+                                             VOLUME or WORKDIR, as a Dockerfile
   images                                     the images here
   inspect IMAGE                              an image's config, history and layers, as JSON
   history IMAGE                              the steps that made an image, newest first
@@ -260,6 +267,7 @@ fn build(carbon: &Carbon, mut args: impl Iterator<Item = String>) {
                 options.push(Box::new(move |b| b.timeout(t)));
             }
             "--no-cache" => options.push(Box::new(|b| b.no_cache(true))),
+            "--squash" => options.push(Box::new(|b| b.squash(true))),
             "--secret" => {
                 // id=ID,src=FILE (or source=), or id=ID,env=VAR: a host variable's value, as Docker takes it.
                 let text = value("--secret");
@@ -860,9 +868,26 @@ fn main() {
             .unwrap_or_else(|e| fail(e));
             println!("{n} files");
         }
-        "freeze" => {
-            let (name, image) = (one("a machine's name"), one("a name for the image"));
-            let image = machine(&name).freeze(&image).unwrap_or_else(|e| fail(e));
+        "commit" => {
+            let (mut how, mut rest) = (carbon::Commit::new(), Vec::new());
+            while let Some(arg) = args.next() {
+                let (flag, inline) = match arg.split_once('=') {
+                    Some((f, v)) if f.starts_with("--") => (f.to_string(), Some(v.to_string())),
+                    _ => (arg.clone(), None),
+                };
+                let mut value = |what: &str| inline.clone().or_else(|| args.next()).unwrap_or_else(|| fail(format!("{what} needs a value")));
+                match flag.as_str() {
+                    "-m" | "--message" => how = how.comment(value("--message")),
+                    "-c" | "--change" => how = how.change(value("--change")),
+                    f if f.starts_with('-') => fail(format!("commit {f}: -m MESSAGE or -c INSTRUCTION")),
+                    _ => rest.push(arg),
+                }
+            }
+            let Some(name) = rest.first() else { fail("commit needs a machine: carbon commit dev mine:1") };
+            if let Some(image) = rest.get(1) {
+                how = how.name(image.clone());
+            }
+            let image = machine(name).commit_with(&how).unwrap_or_else(|e| fail(e));
             println!("{}", image.short_name());
         }
         "display" => {

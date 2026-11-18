@@ -22,7 +22,7 @@ speak today. Every tool is a call or two into the library `carbon`; nothing belo
 | **Machines** | `run` (a command in a new machine, removed after, as `docker run --rm`), `start_machine` (`docker run -d`; a Linux machine runs `sleep infinity` unless given a command, so it's there for `exec`), `restart_machine`, `stop_machine`, `remove_machine`, `list_machines`, `inspect_machine`, `machine_logs` |
 | **Processes** | `exec` (waited for, with its exit code, stdout and stderr; or `background`), `process_output`, `process_input`, `process_signal` |
 | **Files** (running or stopped) | `read_file` (by bytes or lines; pictures as images; binary as base64), `write_file`, `edit_file` (an exact string replaced, keeping the file's mode and owner), `list_files`, `move_file`, `remove_file`, `make_folder`, `copy_to_machine`, `copy_from_machine`, `copy_between_machines` |
-| **Images** | `list_images`, `inspect_image`, `pull_image`, `build_image` (its context as files in the call, a folder in a machine, or a shared host folder), `freeze_machine`, `tag_image`, `push_image`, `remove_image`, `save_image`, `load_image` |
+| **Images** | `list_images`, `inspect_image`, `pull_image`, `build_image` (its context as files in the call, a folder in a machine, or a shared host folder), `commit_machine`, `tag_image`, `push_image`, `remove_image`, `save_image`, `load_image` |
 | **Volumes** | `list_volumes`, `create_volume`, `remove_volume`; a machine's `mounts` as `docker run --mount` |
 | **Screens** | `screenshot`, `screen_input` (click, drag, scroll, type, keys), `list_windows`, `clipboard`, `resize_screen` |
 | **Events** | `machine_events`: each program a machine starts, its connections and lookups, and what the rules decided |
@@ -82,14 +82,13 @@ stdin to `exec`; a background process read by cursor, written to, and killed (13
 stopped, started again with it. A `--deny-exec` rule refusing `python3 -c` (126). Copies to and from a shared host
 folder, and `..`, an outside path and an outside bind refused. An image built from a Dockerfile an agent wrote in a
 machine, and one from files in the call, each with progress, then run; saved, removed, loaded; tagged; a stopped
-machine frozen and run; a volume kept between two runs; a read-only bind. `--machine`: 19 tools, no `machine`
+machine committed and run; a volume kept between two runs; a read-only bind. `--machine`: 19 tools, no `machine`
 argument, another machine refused; a screenshot (18 KB), the clipboard, a click; resources. `--tools`.
 
 ## To do
 
 - [ ] Streamable HTTP (`--http`), with tokens, `Origin` checks and TLS; OAuth 2.1; `subscriptions/listen`.
 - [ ] The Tasks extension, for builds and commands longer than a client waits.
-- [ ] `freeze_machine` on a running machine, once the library has checkpoints.
 - [ ] Machines labeled with who started them, for one HTTP server shared by several users (the library has no
       labels yet).
 - [ ] `notifications/cancelled` ending the call it names (a call runs to its end, or its timeout, today).

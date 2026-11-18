@@ -34,10 +34,10 @@ carbon run --deny 0.0.0.0/0 --allow pypi.org:443 debian:13 -- pip install reques
 carbon run --deny-exec 'rm -rf *' --deny-exec 'shutdown *' debian:13 -- ./agent-step.sh
 carbon watch dev                            # what it does, as it does it: programs, output, connections, lookups
 carbon watch dev --exec --net --json        # as JSON lines, for a program to read
-carbon ls                                   # NAME  FROM  ISOLATION  STATUS
+carbon ps                                   # NAME  FROM  ISOLATION  STATUS
 carbon stop dev                             # SIGTERM to its first process; everything ends 10 s later
 carbon rm dev                               # a stopped machine and its files
-carbon freeze dev mine:1                    # an image of a stopped machine's disk
+carbon commit dev mine:1                    # an image of a machine's disk, running or not, as docker commit
 carbon cp app:'C:\logs' out/               # a machine's file or folder, running or stopped, copied out to the host
 carbon cp ./tool web:/usr/local/bin         # or in: modes, times, symlinks and hard links kept
 carbon display screenshot app -o screen.png # a running machine's screen
@@ -109,7 +109,7 @@ the image's stop signal (`STOPSIGNAL`: nginx's SIGQUIT), SIGTERM if it has none.
 
 `carbon logs [-f] [--tail N] NAME` prints what a machine run with `-d` wrote, kept in its folder (8 MiB, then
 rotated once): its stdout to stdout and its stderr to stderr, in the order written. `-f` keeps following until it
-stops. `carbon ls` says how a stopped machine last ended (`exited (143)`).
+stops. `carbon ps` says how a stopped machine last ended (`exited (143)`).
 
 `carbon cp NAME:PATH DIR` and `carbon cp PATH NAME:DIR` copy a file or folder out of a machine or into it, running
 or stopped. A running machine's files are reached through its own kernel, over its control socket, so its programs
@@ -118,7 +118,8 @@ see a copy at once. Kinds, modes, times, symlinks and hard links are kept.
 `carbon build [options] CONTEXT` builds an image from the context folder's `Carbonfile`, else its `Dockerfile`: any
 Dockerfile, unchanged, as `docker build` reads it. `-t NAME` names it (as often as wanted), `-f FILE` (or `-f -` for
 stdin) names the file, `--build-arg NAME=VALUE`, `--target STAGE`, `--platform OS/ARCH` (x86-64 on Apple silicon runs
-translated), `--no-cache`, `-o DIR` copies what's built to a folder, `-q` prints only its name. `--isolation`,
+translated), `--no-cache`, `--squash` makes what the steps did one layer on the base's layers as they are (as
+`docker build --squash`), `-o DIR` copies what's built to a folder, `-q` prints only its name. `--isolation`,
 `--network`, `--memory`, `--timeout`, `--deny`, `--allow` and `--deny-exec` are `run`'s, for every `RUN`, so a build
 can reach only what it's allowed to. `--secret id=ID,src=FILE` (or `env=VAR`) gives a `RUN --mount=type=secret,id=ID`
 its secret, never kept in the image; `RUN --mount=type=cache` keeps its folder (pip's, apt's caches) between builds.
@@ -146,7 +147,8 @@ credential helper), so `docker login` is enough. `carbon logout [REGISTRY]` forg
 step that made it is a layer: the layers of a base it was built on, pulled from the same registry, are taken from the
 base's repository with nothing sent; from another registry, they're fetched from there and sent. A step that changed
 no files makes no layer. A second push of the same image sends nothing and gets the same digest. `--squash` pushes
-it as one layer. Tag an image first to push it somewhere else (`carbon tag app:1 ghcr.io/team/app:1`).
+it as one layer, base included, so the base is sent again; `build --squash` keeps the base's layers and makes one
+more. Tag an image first to push it somewhere else (`carbon tag app:1 ghcr.io/team/app:1`).
 
 `carbon save [-o FILE] IMAGE...` writes images as one archive (to stdout without `-o`): an OCI image layout with
 Docker's `manifest.json`, as Docker 25 and later write, a layer per step, which `docker load` reads. `carbon load
@@ -172,7 +174,7 @@ Each module's README has its part; together:
 ```sh
 # gpu (`--gpu` and `carbon gpu`, listing the host's device and the CPU one, are built)
 carbon run --gpu host=NAME …                  # one of several host GPUs
-carbon ls                                     # gains a GPU column beside ISOLATION
+carbon ps                                     # gains a GPU column beside ISOLATION
 
 
 # net: networks between machines (ports in, --allow and --deny are built: -p, --network nat|host|none, carbon port)

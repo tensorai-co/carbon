@@ -107,7 +107,7 @@ impl Publish {
     }
 }
 
-/// A host address a machine's port is published on, as `carbon port` and `carbon ls` show it.
+/// A host address a machine's port is published on, as `carbon port` and `carbon ps` show it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Bound {
     pub host: SocketAddr,

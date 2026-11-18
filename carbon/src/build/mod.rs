@@ -1,6 +1,6 @@
 //! Building images from a Carbonfile: the Dockerfile's grammar, exactly ([`Carbonfile`]), and a build made of the
-//! library's own calls: each `RUN` a launched machine ([`crate::MachineSpec::launch`]) frozen after
-//! ([`crate::Machine::freeze_with`]), each `COPY` a copy into a machine that's made but never run
+//! library's own calls: each `RUN` a launched machine ([`crate::MachineSpec::launch`]) committed after
+//! ([`crate::Machine::commit_with`]), each `COPY` a copy into a machine that's made but never run
 //! ([`crate::MachineSpec::create`]), every other instruction a change to the image's config.
 //!
 //! ```no_run
@@ -51,6 +51,7 @@ pub struct Build {
     pub(crate) exec_hooks: Vec<ExecHook>,
     pub(crate) connect_hooks: Vec<ConnectHook>,
     pub(crate) no_cache: bool,
+    pub(crate) squash: bool,
     pub(crate) output: Option<PathBuf>,
     pub(crate) secrets: BTreeMap<String, PathBuf>,
 }
@@ -75,6 +76,7 @@ impl Carbon {
             exec_hooks: Vec::new(),
             connect_hooks: Vec::new(),
             no_cache: false,
+            squash: false,
             output: None,
             secrets: BTreeMap::new(),
         }
@@ -164,6 +166,13 @@ impl Build {
     /// Runs every step, finding none in the cache (`--no-cache`).
     pub fn no_cache(mut self, no_cache: bool) -> Build {
         self.no_cache = no_cache;
+        self
+    }
+
+    /// Makes what the build's steps did one layer, on the layers of what the built stage starts from, as they are
+    /// (`--squash`, as `docker build --squash`): a push sends the base as it is and one layer more.
+    pub fn squash(mut self, squash: bool) -> Build {
+        self.squash = squash;
         self
     }
 

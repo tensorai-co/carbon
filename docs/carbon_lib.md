@@ -47,7 +47,7 @@ carbon/                 crate `carbon`
     spec.rs             MachineSpec, Running, Exit, Output, Display, Audio
     machine.rs          Machine, MachineInfo, ExecSpec, Process, Screen
     boot.rs             making a machine and running it (from machine/)
-    store.rs            machines on the host's disk: records, freeze, copy, import, remove (from machine/)
+    store.rs            machines on the host's disk: records, commit, copy, import, remove (from machine/)
     stdio.rs            a machine's streams, and the host::Host its kernel writes through: output's hook point
     network.rs          the net::Host its network runs on: connect's and lookup's hook point
     rules.rs            Rules
@@ -104,7 +104,7 @@ fn main() -> carbon::Result<()> {
 
     dev.stop();
     dev.wait()?;
-    carbon.get("dev")?.freeze("dev:1")?; // an image of its disk, which new machines can start from
+    carbon.get("dev")?.commit("dev:1")?; // an image of its disk, as docker commit, which new machines can start from
     Ok(())
 }
 ```
@@ -114,19 +114,19 @@ fn main() -> carbon::Result<()> {
 | `Carbon` | the store on the host's disk, opened once and shared by cloning: `machine(image)`, `program(path)` and `again(name)` make a `MachineSpec`; `get(name)`, `machines()`, `images()`, `pull`, `import`, `remove_image`; `on_notice` for what machines fall back to and warn of (stderr by default, since Carbon never falls back silently) |
 | `MachineSpec` | a builder: name, isolation, memory, platform, env, workdir, network and publish, display, gpu, audio, `stdin`/`stdout`/`stderr` (`Stdio::Inherit`, `Null`, `Piped`), tty, `relay_signals`, `rm`, hooks and rules; `run(argv)` on this thread to the end, `output(argv)` with what it wrote, `start(argv)` on a thread of its own |
 | `Running` | what `start` gives, once the machine's kernel is up: its piped streams, `hooks()`, `machine()`, `stop`, `kill`, `wait` |
-| `Machine` | a machine by name, running or not, in this process or another: `info`, `exec`, `stop`, `kill`, `wait`, `ports`, `screen`, `watch`, `freeze`, `copy_in`, `copy_out`, `remove` |
+| `Machine` | a machine by name, running or not, in this process or another: `info`, `exec`, `stop`, `kill`, `wait`, `ports`, `screen`, `watch`, `commit`, `copy_in`, `copy_out`, `remove` |
 | `ExecSpec`, `Process` | what `exec` makes and starts: `env`, `workdir`, `tty`; `spawn` (stdin, output as it comes, `resize`, `signal`, `wait`), `output`, `detach`, `attach` (to this terminal, as `carbon exec`) |
 | `Screen` | a running machine's desktop: screenshot, windows, click, drag, scroll, type, key, clipboard, drop, resize |
-| `Image` | pulled, frozen, or imported: its name, platform and config |
+| `Image` | pulled, committed, built or imported: its name, platform and config |
 | `Error` | a kind to match on (`NotFound`, `AlreadyExists`, `Running`, `NotRunning`, `InvalidInput`, `Unsupported`, `Denied`, `Image`, `Io`, `Failed`) and a message in words |
 
 Every CLI command maps onto these: `run` is `machine(...)` or `program(...)` or `again(...)`, then `.run`; `exec` is
 `Machine::exec(...).attach`; `port` is `Machine::ports`; `display ...` is `Screen`; `cp` is `copy_in` and `copy_out`;
-`freeze` is `Machine::freeze`; `watch` is `Machine::watch`.
+`commit` is `Machine::commit`; `watch` is `Machine::watch`.
 
 **Where it differs from the sketch, and why**: `run(...).output()` became `output(...)`, since a run has nothing to
 configure after it's named; `publish` takes Docker's text and checks it, as `memory` does, with errors held until the
-machine runs, so a builder chain needs no `?`; `freeze`, `copy_in` and the rest are `Machine`'s, not `Running`'s,
+machine runs, so a builder chain needs no `?`; `commit`, `copy_in` and the rest are `Machine`'s, not `Running`'s,
 since they need a stopped machine; and `rm` was added, since a program running many commands would otherwise keep a
 machine for each.
 
@@ -297,7 +297,7 @@ package is a thin layer over the socket, not a second implementation.
 | --- | --- |
 | `carbon run [-i] [-t] [--rm] [-p] [--network] [-w] IMAGE CMD` | `carbon.machine(image)`, `.program(path)` or `.again(name)`, then `.run` |
 | `carbon exec [-i] [-t] [-d] NAME CMD` | `Machine::exec`, then `.attach` or `.detach` |
-| `carbon ls`, `port`, `stop`, `rm`, `freeze`, `cp`, `display ...` | `Carbon::machines`; `Machine::ports`, `stop`, `remove`, `freeze`, `copy_in`, `copy_out`; `Screen` |
+| `carbon ps`, `port`, `stop`, `rm`, `commit`, `cp`, `display ...` | `Carbon::machines`; `Machine::ports`, `stop`, `remove`, `commit`, `copy_in`, `copy_out`; `Screen` |
 | `carbon watch NAME [--exec] [--output] [--net] [--json]` | `Machine::watch` |
 | `carbon run --deny-exec`, `--allow`, `--deny` | `Rules` |
 | `carbon mcp` | an MCP server over the library ([`mcp`](../mcp/README.md)): stdio built, HTTP to do |
@@ -307,8 +307,8 @@ package is a thin layer over the socket, not a second implementation.
 What the parts already make cheap, which the library should name (step 6):
 
 - **Checkpoints and rollback.** A machine's disk is layers, so a checkpoint is a layer frozen and rolling back is
-  dropping what's above it. (Today a machine must be stopped to freeze; checkpointing a running one needs `layers` to
-  freeze its top layer in place.)
+  dropping what's above it. (`commit` already takes a running machine's disk at one moment; rolling one back in
+  place needs `layers` to drop what's above a layer.)
 - **Forks.** A second machine from a checkpoint, to try two things at once.
 - **Record and replay.** Every hooked event and its decision, as a log (`watch`'s lines are most of it): what an
   agent's step did, to audit, or to run again with the same answers.
