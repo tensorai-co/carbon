@@ -1,0 +1,485 @@
+openapi: 3.1.0
+info:
+  title: Carbon Engine API
+  version: "1"
+  summary: The control plane of `carbon mcp --engine`, as REST.
+  description: |
+    Machines, their files, and images, for the programs that run agents. Each route is the same method as the
+    JSON-RPC `engine/…` call of the same name on `carbon mcp`'s WebSocket, where byte streams (exec's stdin and output,
+    a file's bytes) go as binary frames instead. Here a file's bytes are the body.
+
+    Path and query parts join the JSON body as the method's params (`?path=` is `Path`, `?mode=` is `Mode`, …).
+    Every route needs a token with the `carbon:engine` scope, unless the server was started on a Unix socket, on
+    loopback without `--token-file`, or with `--no-auth`.
+servers:
+  - url: http://127.0.0.1:8080/v1
+security:
+  - bearer: []
+tags:
+  - name: system
+  - name: machines
+  - name: files
+  - name: images
+
+paths:
+  /version:
+    get:
+      tags: [system]
+      operationId: system.version
+      responses:
+        "200":
+          description: The server's version.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Version" }
+  /_ping:
+    get:
+      tags: [system]
+      operationId: system.ping
+      responses:
+        "200":
+          description: OK
+          content:
+            text/plain:
+              schema: { type: string, const: OK }
+
+  /machines:
+    get:
+      tags: [machines]
+      operationId: machines.list
+      responses:
+        "200":
+          description: Every machine.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/MachineRow" }
+    post:
+      tags: [machines]
+      operationId: machines.create
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MachineCreate" }
+      responses:
+        "201":
+          description: Made, not started.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  Id: { type: string }
+                  Warnings: { type: array, items: { type: string } }
+        "400": { $ref: "#/components/responses/Error" }
+        "501": { $ref: "#/components/responses/Error" }
+
+  /machines/{name}:
+    parameters: [{ $ref: "#/components/parameters/Name" }]
+    get:
+      tags: [machines]
+      operationId: machines.inspect
+      responses:
+        "200":
+          description: The machine.
+          content:
+            application/json:
+              schema: { type: object }
+        "404": { $ref: "#/components/responses/Error" }
+    delete:
+      tags: [machines]
+      operationId: machines.remove
+      parameters:
+        - { name: force, in: query, schema: { type: boolean }, description: Kill it first if it's running. }
+      responses:
+        "204": { description: Removed, with its files. }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+
+  /machines/{name}/start:
+    parameters: [{ $ref: "#/components/parameters/Name" }]
+    post:
+      tags: [machines]
+      operationId: machines.start
+      parameters:
+        - { name: timeout, in: query, schema: { type: integer }, description: Seconds it may run before it's stopped. }
+      responses:
+        "204": { description: Started. }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+  /machines/{name}/stop:
+    parameters: [{ $ref: "#/components/parameters/Name" }]
+    post:
+      tags: [machines]
+      operationId: machines.stop
+      description: Asks it to stop (SIGTERM), waits `timeout` seconds, then kills it. Answered once it has stopped.
+      parameters:
+        - { name: timeout, in: query, schema: { type: integer, default: 10 } }
+      responses:
+        "204": { description: Stopped. }
+        "409": { $ref: "#/components/responses/Error" }
+  /machines/{name}/kill:
+    parameters: [{ $ref: "#/components/parameters/Name" }]
+    post:
+      tags: [machines]
+      operationId: machines.kill
+      responses:
+        "204": { description: Killed. }
+  /machines/{name}/wait:
+    parameters: [{ $ref: "#/components/parameters/Name" }]
+    post:
+      tags: [machines]
+      operationId: machines.wait
+      parameters:
+        - { name: timeout, in: query, schema: { type: integer } }
+      responses:
+        "200":
+          description: How it ended, or that it hasn't yet.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  StatusCode: { type: integer }
+                  Ended: { type: boolean }
+  /machines/{name}/logs:
+    parameters: [{ $ref: "#/components/parameters/Name" }]
+    get:
+      tags: [machines]
+      operationId: machines.logs
+      parameters:
+        - { name: tail, in: query, schema: { type: integer } }
+      responses:
+        "200":
+          description: Its output, a line each.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    Stream: { type: string, enum: [stdout, stderr] }
+                    Text: { type: string }
+  /machines/{name}/exec:
+    parameters: [{ $ref: "#/components/parameters/Name" }]
+    post:
+      tags: [machines]
+      operationId: machines.exec
+      description: Runs a command to its end. Streamed stdin and output are the WebSocket's (`Stream`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [Cmd]
+              properties:
+                Cmd: { type: array, items: { type: string } }
+                Env: { type: array, items: { type: string }, description: "NAME=VALUE" }
+                WorkingDir: { type: string }
+                User: { type: string }
+                Timeout: { type: integer, description: Seconds. }
+      responses:
+        "200":
+          description: How it ended, and what it wrote.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ExitCode: { type: integer }
+                  Stdout: { type: string }
+                  Stderr: { type: string }
+                  TimedOut: { type: boolean }
+        "409": { $ref: "#/components/responses/Error" }
+  /machines/{name}/commit:
+    parameters: [{ $ref: "#/components/parameters/Name" }]
+    post:
+      tags: [machines]
+      operationId: machines.commit
+      description: An image of its disk, running or stopped. A tmpfs isn't the disk, so what's in one isn't saved.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                Repo: { type: string }
+                Tag: { type: string, default: latest }
+                Comment: { type: string }
+                Changes: { type: array, items: { type: string }, description: "Dockerfile instructions: CMD, ENV, …" }
+      responses:
+        "201":
+          description: The image.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  Id: { type: string }
+
+  /machines/{name}/files:
+    parameters:
+      - { $ref: "#/components/parameters/Name" }
+      - { name: path, in: query, required: true, schema: { type: string } }
+    get:
+      tags: [files]
+      operationId: files.read
+      responses:
+        "200":
+          description: The file's bytes.
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "404": { $ref: "#/components/responses/Error" }
+    put:
+      tags: [files]
+      operationId: files.write
+      description: Writes the body as the file. On a running machine, it's where its programs see it (a tmpfs's file is in the tmpfs).
+      parameters:
+        - { name: mode, in: query, schema: { type: integer }, description: "Decimal: 384 is 0600." }
+        - { name: owner, in: query, schema: { type: string }, description: "A user, user:group, or uid:gid." }
+        - { name: parents, in: query, schema: { type: boolean } }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        "200":
+          description: Written.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  Size: { type: integer }
+    delete:
+      tags: [files]
+      operationId: files.remove
+      parameters:
+        - { name: recursive, in: query, schema: { type: boolean } }
+      responses:
+        "204": { description: Removed. }
+  /machines/{name}/files/stat:
+    parameters:
+      - { $ref: "#/components/parameters/Name" }
+      - { name: path, in: query, required: true, schema: { type: string } }
+    get:
+      tags: [files]
+      operationId: files.stat
+      responses:
+        "200":
+          description: What's known of the file.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FileInfo" }
+        "404": { $ref: "#/components/responses/Error" }
+  /machines/{name}/files/list:
+    parameters:
+      - { $ref: "#/components/parameters/Name" }
+      - { name: path, in: query, required: true, schema: { type: string } }
+    get:
+      tags: [files]
+      operationId: files.list
+      responses:
+        "200":
+          description: A folder's entries.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  allOf:
+                    - { $ref: "#/components/schemas/FileInfo" }
+                    - type: object
+                      properties:
+                        Name: { type: string }
+
+  /images:
+    get:
+      tags: [images]
+      operationId: images.list
+      responses:
+        "200":
+          description: The images here.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ImageRow" }
+  /images/pull:
+    post:
+      tags: [images]
+      operationId: images.pull
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [Name]
+              properties:
+                Name: { type: string }
+                Tag: { type: string }
+                Platform: { type: string, examples: [linux/arm64] }
+      responses:
+        "200":
+          description: Pulled.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  Id: { type: string }
+                  Platform: { type: string }
+  /images/{image}:
+    parameters: [{ $ref: "#/components/parameters/Image" }]
+    get:
+      tags: [images]
+      operationId: images.inspect
+      responses:
+        "200":
+          description: The image, its config and history.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ImageRow" }
+        "404": { $ref: "#/components/responses/Error" }
+    delete:
+      tags: [images]
+      operationId: images.remove
+      responses:
+        "200": { description: Forgotten. }
+  /images/{image}/push:
+    parameters: [{ $ref: "#/components/parameters/Image" }]
+    post:
+      tags: [images]
+      operationId: images.push
+      description: A layer per step of what made it, with the host's login for its registry.
+      parameters:
+        - { name: squash, in: query, schema: { type: boolean }, description: Its whole disk as one layer. }
+        - { name: to, in: query, schema: { type: string }, description: Another name to push it as. }
+      responses:
+        "200": { description: Pushed. }
+  /images/{image}/tag:
+    parameters: [{ $ref: "#/components/parameters/Image" }]
+    post:
+      tags: [images]
+      operationId: images.tag
+      parameters:
+        - { name: repo, in: query, required: true, schema: { type: string } }
+        - { name: tag, in: query, schema: { type: string, default: latest } }
+      responses:
+        "200": { description: Tagged. }
+
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      description: A token from `carbon mcp token`, whose line in `--token-file` has the `carbon:engine` scope.
+  parameters:
+    Name:
+      name: name
+      in: path
+      required: true
+      schema: { type: string }
+      description: The machine's name.
+    Image:
+      name: image
+      in: path
+      required: true
+      schema: { type: string }
+      description: The image's name, slashes and all (`docker.io/library/debian:13`).
+  responses:
+    Error:
+      description: "What went wrong: 400 invalid, 403 forbidden, 404 not found, 409 conflict, 501 unsupported, 500 failed."
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              message: { type: string }
+              kind: { type: string, enum: [invalid, forbidden, not_found, conflict, unsupported, failed, no_method] }
+  schemas:
+    Version:
+      type: object
+      properties:
+        Version: { type: string }
+        ApiVersion: { type: string }
+        Os: { type: string }
+        Arch: { type: string }
+    MachineCreate:
+      type: object
+      required: [Image]
+      properties:
+        Image: { type: string }
+        Name: { type: string }
+        Hostname: { type: string }
+        Platform: { type: string }
+        Env: { type: array, items: { type: string }, description: "NAME=VALUE" }
+        Cmd:
+          type: array
+          items: { type: string }
+          description: What it runs; the image's command when absent. A machine for exec is given one that waits, `["sleep", "infinity"]`.
+        WorkingDir: { type: string }
+        User: { type: string }
+        HostConfig:
+          type: object
+          properties:
+            NetworkMode: { type: string, enum: [nat, bridge, default, none, host] }
+            Memory: { type: integer, description: Bytes. }
+            Tmpfs:
+              type: object
+              additionalProperties: { type: string }
+              description: 'Targets, as keys: `{"/run/secrets": ""}`.'
+            Binds: { type: array, items: { type: string }, description: "SOURCE:TARGET[:ro]: a host folder under --host-dir, or a volume." }
+            Mounts:
+              type: array
+              items:
+                type: object
+                required: [Target]
+                properties:
+                  Type: { type: string, enum: [bind, volume, tmpfs] }
+                  Source: { type: string }
+                  Target: { type: string }
+                  ReadOnly: { type: boolean }
+        Rules:
+          type: object
+          description: Carbon's own. Merged with the server's rules.
+          properties:
+            Deny: { type: array, items: { type: string }, examples: [["0.0.0.0/0"]] }
+            Allow: { type: array, items: { type: string }, examples: [["pypi.org:443"]] }
+            DenyExec: { type: array, items: { type: string }, examples: [["rm -rf *"]] }
+    MachineRow:
+      type: object
+      properties:
+        Id: { type: string }
+        Name: { type: string }
+        Image: { type: string }
+        Created: { type: string, format: date-time }
+        State: { type: string, enum: [created, running, exited] }
+        Platform: { type: string }
+    FileInfo:
+      type: object
+      properties:
+        Kind: { type: string, enum: [file, dir, symlink] }
+        Size: { type: integer }
+        Mode: { type: integer }
+        Uid: { type: integer }
+        Gid: { type: integer }
+        Modified: { type: string, format: date-time }
+        Link: { type: [string, "null"] }
+    ImageRow:
+      type: object
+      properties:
+        Id: { type: string }
+        RepoTags: { type: array, items: { type: string } }
+        Platform: { type: string }
+        Created: { type: string, format: date-time }
+        Source: { type: string }
+        Config: { type: object }
+        History: { type: array, items: { type: object } }

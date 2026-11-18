@@ -23,6 +23,8 @@ pub(crate) type Notify = Arc<dyn Fn(Notice) + Send + Sync>;
 /// Everything a run is asked for.
 pub(crate) struct Launch {
     pub name: Option<String>,
+    /// Its host name, as `uname` and its network give it (`--hostname`); None for what it had, or its name.
+    pub hostname: Option<String>,
     /// What a new machine starts from; None starts the machine called `name` again.
     pub source: Option<Source>,
     /// The program and its arguments; empty for what the image says (its entrypoint and command).
@@ -105,6 +107,9 @@ pub(crate) fn run(store: &Store, launch: Launch, notify: &Notify, started: &mut 
     if let Some(mounts) = &launch.mounts {
         record.mounts = mounts.clone();
     }
+    if let Some(hostname) = &launch.hostname {
+        record.hostname = Some(hostname.clone());
+    }
     let mut ports = Vec::new();
     let exposed: Vec<String> = if launch.publish_all { record.config.exposed_ports.clone() } else { Vec::new() };
     for text in record.publish.iter().chain(&exposed) {
@@ -145,7 +150,7 @@ pub(crate) fn run(store: &Store, launch: Launch, notify: &Notify, started: &mut 
         let (exec, cpu) = open_exec(launch.isolation, tso, launch.memory, notify)?;
         // Its network, with its ports published on the host's before anything runs: a host port that's taken stops
         // it here, saying which. Its connections and lookups go through its hooks.
-        let config = net::Config { hostname: record.name.clone(), mode: record.network, ..net::Config::default() };
+        let config = net::Config { hostname: record.host_name(), mode: record.network, ..net::Config::default() };
         let network = net::Network::new(config, Arc::new(crate::network::HookedNet::new(launch.hub.clone())));
         let mut published = Vec::new();
         for (text, ports) in &ports {
@@ -408,7 +413,11 @@ fn boot(store: &Store, record: &Record, launch: &Launch, parts: Parts, notify: &
             };
             let files: wire::FilesFn = {
                 let stop = stop.clone();
-                Arc::new(move |op: &crate::files::Op, data: &[u8]| stop.with_disk(|disk| crate::files::apply(disk, op, data)).unwrap_or_else(|| Err(Error::new(ErrorKind::NotRunning, "the machine's kernel isn't up"))))
+                // As its programs see paths, through its mounts: a file written into a tmpfs is in the tmpfs.
+                Arc::new(move |op: &crate::files::Op, data: &[u8]| {
+                    stop.with_files(|disk, paths| crate::files::apply_with(disk, &crate::files::Mounted(paths), op, data))
+                        .unwrap_or_else(|| Err(Error::new(ErrorKind::NotRunning, "the machine's kernel isn't up")))
+                })
             };
             let served = Served { desktop: desktop.clone(), enter: Some(hooked_enter(enter, hub.clone(), hooks::Os::Linux)), files: Some(files), stopper: stopper.clone(), hub: hub.clone() };
             let _control = wire::serve(store.dir(&record.name), served);
@@ -418,7 +427,7 @@ fn boot(store: &Store, record: &Record, launch: &Launch, parts: Parts, notify: &
             // Its mounts: host folders and volumes attached to its disk, and tmpfs.
             let mounts = crate::mounts::lambda_mounts(store.images.home(), &record.mounts, &disk, (who.user.uid, who.user.gid))?;
             let mut options = lambda::Options { stop, display: desktop.clone(), gpu, audio: Some(mixer), env, network: Some(network), hooks: hub, program, mounts, user: Some(who.user), ..lambda::Options::default() };
-            options.hostname = record.name.clone();
+            options.hostname = record.host_name();
             options.console = launch.tty;
             options.cwd = workdir.clone();
             lambda::boot(exec, cpu, disk, as_host, &argv, options).map(lambda::Status::code).map_err(Error::from)

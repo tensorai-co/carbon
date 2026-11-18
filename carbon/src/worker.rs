@@ -110,6 +110,7 @@ fn spec_json(home: &Path, launch: &Launch, rules: &Rules, link: Option<(&Path, I
     json!({
         "home": home,
         "name": launch.name,
+        "hostname": launch.hostname,
         "source": match &launch.source {
             Some(Source::Image(image)) => json!({ "image": image }),
             Some(Source::Program(path)) => json!({ "program": path }),
@@ -170,6 +171,7 @@ fn spec_from_json(v: &Value) -> Result<(PathBuf, Launch, Rules, Option<(PathBuf,
     };
     let launch = Launch {
         name: s("name"),
+        hostname: s("hostname"),
         source,
         args: list("args").unwrap_or_default(),
         isolation: match s("isolation").as_deref() {
@@ -564,6 +566,7 @@ mod tests {
     fn a_launch_goes_to_the_worker_and_back() {
         let launch = Launch {
             name: Some("dev".into()),
+            hostname: Some("sbx-8f3a".into()),
             source: Some(Source::Image("debian:13".into())),
             args: vec!["sleep".into(), "infinity".into()],
             isolation: Isolation::Sandbox,
@@ -597,6 +600,7 @@ mod tests {
         assert!(matches!(back.gpu, Gpu::None));
         assert_eq!((back.display, back.audio, back.memory), (launch.display, launch.audio, launch.memory));
         assert_eq!((back.network, back.publish, back.remove, back.timeout, back.publish_all), (launch.network, launch.publish, true, launch.timeout, true));
+        assert_eq!(back.hostname.as_deref(), Some("sbx-8f3a"));
         assert_eq!(rules_back, rules);
         assert_eq!(link, Some((PathBuf::from("/tmp/link.sock"), Interest::exec() | Interest::lookup())));
     }

@@ -87,6 +87,10 @@ pub(crate) struct Record {
     pub exit: Option<i32>,
     /// Its mounts, kept for when it runs again.
     pub mounts: Vec<crate::Mount>,
+    /// Its host name (`--hostname`); None for its name.
+    pub hostname: Option<String>,
+    /// Rules it was made with ([`crate::MachineSpec::create`]), added to any it's started with.
+    pub rules: crate::Rules,
 }
 
 impl Record {
@@ -107,7 +111,14 @@ impl Record {
             "ports": self.ports,
             "exit": self.exit,
             "mounts": crate::mounts::mounts_json(&self.mounts),
+            "hostname": self.hostname,
+            "rules": if self.rules.is_empty() { Value::Null } else { self.rules.to_json() },
         })
+    }
+
+    /// The host name it runs with: its own, or its name.
+    pub fn host_name(&self) -> String {
+        self.hostname.clone().unwrap_or_else(|| self.name.clone())
     }
 
     fn from_json(v: &Value) -> Option<Record> {
@@ -136,6 +147,8 @@ impl Record {
             ports: list(Some(v), "ports"),
             exit: v.get("exit").and_then(Value::as_i64).map(|c| c as i32),
             mounts: crate::mounts::mounts_from_json(v.get("mounts")),
+            hostname: s("hostname"),
+            rules: v.get("rules").filter(|r| !r.is_null()).and_then(|r| crate::Rules::from_json(r).ok()).unwrap_or_default(),
         })
     }
 
@@ -524,6 +537,8 @@ impl Store {
             ports: Vec::new(),
             exit: None,
             mounts: Vec::new(),
+            hostname: None,
+            rules: crate::Rules::new(),
         };
         match source {
             // `windows`: atlas's system layer and nothing else, running cmd.exe (from an image that has it) unless told
@@ -642,6 +657,8 @@ mod tests {
             ports: vec!["0.0.0.0:2222->22/tcp".into()],
             exit: Some(3),
             mounts: vec![crate::Mount::volume("data", "/data"), crate::Mount::tmpfs("/tmp").read_only()],
+            hostname: Some("sbx-8f3a".into()),
+            rules: crate::Rules::new().deny("0.0.0.0/0").unwrap().allow("pypi.org:443").unwrap(),
         };
         assert_eq!(Record::from_json(&record.to_json()), Some(record));
     }

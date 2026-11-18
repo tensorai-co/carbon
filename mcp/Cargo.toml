@@ -11,4 +11,22 @@ workspace = true
 
 [dependencies]
 carbon.workspace = true
+images.workspace = true
 serde_json.workspace = true
+rustls.workspace = true
+pki-types.workspace = true
+sha2.workspace = true
+base64 = "0.22"
+getrandom = "0.2"
+# The network transports (-H): HTTP and WebSocket on one address, TLS.
+tokio = { version = "1.47", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "signal", "macros"] }
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "ws", "json", "query"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower-service = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
+
+[dev-dependencies]
+tungstenite = "0.28"
+ureq.workspace = true

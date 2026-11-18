@@ -2,9 +2,11 @@
 //! carries its version and the client's capabilities); one that begins with `initialize` is the older handshake's, as
 //! clients of 2025-11-25 and before speak it. The tools and resources answer the same either way.
 
+use std::sync::Arc;
+
 use serde_json::{Value, json};
 
-use crate::Server;
+use crate::{Peer, Server};
 
 /// The stateless revision.
 pub const VERSION: &str = "2026-07-28";
@@ -42,10 +44,13 @@ fn complete(id: Value, mut result: Value, modern: bool) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
 
-pub(crate) fn handle(server: &Server, message: Value) -> Option<Value> {
+/// JSON-RPC's error for a method the connection's scopes don't reach.
+pub(crate) const FORBIDDEN: i64 = -32001;
+
+pub(crate) fn handle(server: &Server, peer: &Arc<Peer>, message: Value) -> Option<Value> {
     // A batch (2025-03-26 had them): each, and the answers together.
     if let Some(batch) = message.as_array() {
-        let answers: Vec<Value> = batch.iter().filter_map(|m| handle(server, m.clone())).collect();
+        let answers: Vec<Value> = batch.iter().filter_map(|m| handle(server, peer, m.clone())).collect();
         return (!answers.is_empty()).then_some(Value::Array(answers));
     }
     let method = message.get("method").and_then(Value::as_str).unwrap_or("").to_string();
@@ -56,6 +61,24 @@ pub(crate) fn handle(server: &Server, message: Value) -> Option<Value> {
     if method.is_empty() {
         return None;
     }
+    // The Engine API: there only with --engine, and only for a connection whose scopes reach it. Not MCP: no _meta,
+    // no eras.
+    if let Some(name) = method.strip_prefix("engine/") {
+        if !server.engine() {
+            return Some(error(id, -32601, &format!("{method} isn't a method this server has (the Engine API is off: carbon mcp --engine)"), None));
+        }
+        if !peer.scopes.engine {
+            return Some(error(id, FORBIDDEN, &format!("{method}: this connection's token doesn't reach the Engine API (carbon:engine)"), None));
+        }
+        peer.log(&format!("called engine/{name}"));
+        return Some(match crate::engine::call(server, peer, name, &params) {
+            Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+            Err(e) => error(id, e.rpc_code(), &e.message, Some(json!({ "kind": e.kind }))),
+        });
+    }
+    if !peer.scopes.mcp {
+        return Some(error(id, FORBIDDEN, &format!("{method}: this connection's token doesn't reach MCP's tools (carbon:mcp)"), None));
+    }
     let meta = params.get("_meta");
     let version = meta.and_then(|m| m.get(META_VERSION)).and_then(Value::as_str);
     let modern = version.is_some();
@@ -64,7 +87,7 @@ pub(crate) fn handle(server: &Server, message: Value) -> Option<Value> {
     {
         return Some(error(id, -32022, "Unsupported protocol version", Some(json!({ "supported": [VERSION], "requested": v }))));
     }
-    let progress = server.progress(meta.and_then(|m| m.get("progressToken")).cloned());
+    let progress = server.progress(peer, meta.and_then(|m| m.get("progressToken")).cloned());
     let result = match method.as_str() {
         "initialize" => {
             let asked = params.get("protocolVersion").and_then(Value::as_str).unwrap_or("");
@@ -83,6 +106,7 @@ pub(crate) fn handle(server: &Server, message: Value) -> Option<Value> {
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            peer.log(&format!("called the tool {name}"));
             server.call_tool(name, &args, &progress)
         }
         "resources/list" => Ok(json!({ "resources": server.resource_list() })),

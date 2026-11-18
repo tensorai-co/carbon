@@ -131,6 +131,27 @@ pub struct Options {
 #[derive(Clone, Default)]
 pub struct Stop(Arc<Mutex<Option<Weak<Kernel>>>>);
 
+/// How a running machine's process 1 sees paths: through its mounts, from its root ([`Stop::with_files`]).
+pub struct Paths(fs::mount::View);
+
+impl Paths {
+    /// Its root.
+    pub fn root(&self) -> layers::Ino {
+        self.0.root
+    }
+
+    /// Follows `path` from the root, through mounts; links along the way are followed, and the last one too if
+    /// `follow`.
+    pub fn resolve(&self, disk: &Disk, path: &str, follow: bool) -> layers::Result<layers::Ino> {
+        self.0.resolve(disk, self.0.root, path, follow)
+    }
+
+    /// What's mounted over `ino`, if anything is: a step into a folder that's a mount point lands in what's mounted.
+    pub fn cover(&self, ino: layers::Ino) -> layers::Ino {
+        self.0.mounts.cover(ino)
+    }
+}
+
 impl std::fmt::Debug for Stop {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Stop")
@@ -156,6 +177,24 @@ impl Stop {
         let k = self.kernel()?;
         let mut disk = lock(&k.disk);
         Some(f(&mut disk))
+    }
+
+    /// As `with_disk`, with how the machine's process 1 sees paths: through its mounts (a tmpfs, a bind), from its
+    /// root. A file written at `/run/secrets/token` is in the tmpfs there, as a program writing it would put it, and
+    /// not in the disk's folder the tmpfs covers. None if the kernel isn't up.
+    pub fn with_files<R>(&self, f: impl FnOnce(&mut Disk, &Paths) -> R) -> Option<R> {
+        let k = self.kernel()?;
+        // Process 1's state (the machine's boot namespace until it's there), then the disk: never both locks at once.
+        let view = match k.process(1) {
+            Some(init) => {
+                let state = lock(&init.state);
+                fs::mount::View { root: state.root.0, mounts: state.ns.mnt.current(), who: None }
+            }
+            None => fs::mount::View { root: layers::ROOT, mounts: k.boot_ns.mnt.current(), who: None },
+        };
+        let paths = Paths(view);
+        let mut disk = lock(&k.disk);
+        Some(f(&mut disk, &paths))
     }
 
     /// Whether the machine's kernel is up, and hasn't ended: a process can be started in it from outside.

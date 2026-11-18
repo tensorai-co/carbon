@@ -192,6 +192,7 @@ impl MachineSpec {
     pub(crate) fn new(carbon: Carbon, name: Option<String>, source: Option<Source>) -> MachineSpec {
         let launch = Launch {
             name,
+            hostname: None,
             source,
             args: Vec::new(),
             isolation: Isolation::Auto,
@@ -228,6 +229,17 @@ impl MachineSpec {
     /// named after its image or program (`debian`, `debian-2`, ...).
     pub fn name(mut self, name: impl Into<String>) -> MachineSpec {
         self.launch.name = Some(name.into());
+        self
+    }
+
+    /// Its host name, as `uname` and its network give it (`--hostname`, as Docker's): kept, so it has it each time it
+    /// runs. Without one, its name. Letters, digits and `-`, in dot-separated labels of at most 63, 253 in all.
+    pub fn hostname(mut self, hostname: impl Into<String>) -> MachineSpec {
+        let hostname = hostname.into();
+        if !valid_hostname(&hostname) {
+            return self.invalid(Error::invalid(format!("--hostname {hostname}: letters, digits and '-', in labels of at most 63 characters, separated by '.'")));
+        }
+        self.launch.hostname = Some(hostname);
         self
     }
 
@@ -423,6 +435,13 @@ impl MachineSpec {
             return Err(error);
         }
         self.launch.args = argv.into_iter().map(Into::into).collect();
+        // A machine started again keeps the rules it was made with ([`MachineSpec::create`]), with these added.
+        if self.launch.source.is_none()
+            && let Some(record) = self.launch.name.as_deref().and_then(|n| self.carbon.0.store.record(n))
+            && !record.rules.is_empty()
+        {
+            self = self.rules(record.rules);
+        }
         Ok(self)
     }
 
@@ -454,8 +473,21 @@ impl MachineSpec {
 
     /// Makes it without running it, as `docker create`: a stopped machine (its image pulled if it isn't here), whose
     /// [`Machine::files`] can be written before it first runs, and which [`Carbon::again`] runs.
+    ///
+    /// What it's given is kept for each time it runs, as Docker keeps a container's config: its env, workdir and user
+    /// over its image's, `argv` (if any) as its command (an image's entrypoint stays), its host name, its network,
+    /// ports and mounts, and its rules.
     pub fn create(self) -> Result<Machine> {
-        let spec = self.with_args(Vec::<String>::new())?;
+        self.create_with(Vec::<String>::new())
+    }
+
+    /// As [`MachineSpec::create`], with `argv` as its command: Docker's `Cmd`.
+    pub fn create_with<I, S>(self, argv: I) -> Result<Machine>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let spec = self.with_args(argv)?;
         let launch = spec.launch;
         let store = &spec.carbon.0.store;
         let source = launch.source.as_ref().ok_or_else(|| Error::invalid("create makes a new machine: give it an image or a program"))?;
@@ -475,6 +507,22 @@ impl MachineSpec {
         if let Some(mounts) = launch.mounts {
             record.mounts = mounts;
         }
+        for var in &launch.env {
+            let key = var.split('=').next().unwrap_or("");
+            record.config.env.retain(|e| e.split('=').next() != Some(key));
+            record.config.env.push(var.clone());
+        }
+        if let Some(workdir) = &launch.workdir {
+            record.config.workdir = workdir.clone();
+        }
+        if let Some(user) = &launch.user {
+            record.config.user = user.clone();
+        }
+        if !launch.args.is_empty() && record.program.is_none() {
+            record.config.cmd = launch.args.clone();
+        }
+        record.hostname = launch.hostname.clone();
+        record.rules = spec.rules.clone();
         store.save_record(&record)?;
         let machine = Machine::new(spec.carbon.clone(), record.name.clone());
         if let (Some(bytes), Some(path)) = (program, &record.program) {
@@ -623,6 +671,16 @@ impl std::fmt::Debug for Running {
     }
 }
 
+/// Whether `name` is a host name Linux takes: dot-separated labels of letters, digits and `-`, none starting or
+/// ending with `-`, each at most 63 long, 253 in all.
+fn valid_hostname(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 253
+        && name.split('.').all(|label| {
+            !label.is_empty() && label.len() <= 63 && !label.starts_with('-') && !label.ends_with('-') && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,5 +700,15 @@ mod tests {
         assert_eq!(Display::parse("host=1024x700@2"), None);
         assert_eq!(Display::parse("host-windows"), Some(Display::HostWindows));
         assert_eq!(Display::parse("big"), None);
+    }
+
+    #[test]
+    fn host_names_as_linux_takes_them() {
+        for ok in ["sbx-8f3a", "a", "web.internal", "x1.y-2.z3"] {
+            assert!(valid_hostname(ok), "{ok}");
+        }
+        for bad in ["", "-a", "a-", "a..b", "a_b", "a b", &"x".repeat(64), &format!("{}.x", "a.".repeat(126))] {
+            assert!(!valid_hostname(bad), "{bad}");
+        }
     }
 }

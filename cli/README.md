@@ -50,6 +50,8 @@ carbon display clipboard app                # its clipboard's text (with text af
 carbon display drop app 300 200 --files 'C:\notes.txt'  # drops files there, as dragged in from the host (or text)
 carbon pull debian:13 [--platform OS/ARCH] | rmi IMAGE
 claude mcp add carbon -- carbon mcp         # an MCP server for agents: machines, exec, files, builds, screens as tools
+carbon mcp -H 127.0.0.1:8080 --engine      # the same over HTTP and WebSocket, with the Engine API for the programs running agents
+carbon mcp token --scope carbon:mcp         # a token for --token-file: the token, then its line
 carbon login -u someone                     # a login for docker.io (or `carbon login ghcr.io`), asked for unseen
 carbon push someone/app:1                   # a layer per step; a pulled base's layers taken from where they are
 carbon save -o app.tar app:1 debian:13      # images as one archive, as docker save writes it; docker load reads it
@@ -72,6 +74,7 @@ carbon atlas imports ~/installers/          # a folder of them: which load, and 
 | `-t`, `--tty` | With `-i`, this terminal is the machine's console (raw, the kernel editing lines: lambda's line discipline, atlas's conhost-like console), `TERM=xterm`; `-it` for a shell. Without `-t`, a Windows machine's standard handles are pipes, not a console. `-it` with stdin not a terminal is refused, as Docker refuses it |
 | `--isolation vm\|sandbox\|auto` | A hardware VM, the process sandbox, or the best there is (the default, which says so when it falls back) |
 | `--name NAME` | The machine's name; else one from its image or program |
+| `-h, --hostname NAME` | Its hostname; its name by default |
 | `--platform OS/ARCH` | Which build of an image to pull; Linux for this CPU by default |
 | `--display headless=WxH[@SCALE]\|host[=WxH]\|host-windows\|none` | Where its windows go: a screen in memory (`headless=1280x800` by default), the whole desktop in a window on this Mac's screen (which closing stops the machine), or each window in a Mac window of its own |
 | `--gpu auto\|host\|software\|none` | Its GPU: the host's if there is one, else the CPU device (`auto`, the default, which says so when it takes the CPU device), the host's or fail, the CPU device, or none. Linux machines reach it through lambda's Vulkan driver; Windows machines don't yet |
@@ -132,11 +135,19 @@ is found in the cache. `carbon watch build-<id>-<n>` shows a step's machine as i
 folder, exposed ports, volumes, labels, stop signal, health check, shell, `ONBUILD`), its history, and its layers'
 digests. `carbon history IMAGE` is the history as a table; `carbon tag SOURCE TARGET` names it again.
 
-`carbon mcp [options]` is an MCP server over this Carbon home, on stdin and stdout, for an agent's client to start
-([`mcp`](../mcp/README.md) has its tools). `--machine NAME` serves one machine alone; `--host-dir DIR` is a host
-folder its tools may name (for binds, copies, build contexts and archives; none by default, and then no host paths
-at all); `--deny-exec`, `--deny` and `--allow` are rules on every machine it starts, and `--network`, `--memory` and
-`--timeout` their defaults, as `carbon run` takes them; `--tools a,b` lists only those.
+`carbon mcp [options]` is Carbon's front door: an MCP server over this Carbon home, on stdin and stdout for an agent's
+client to start, or on the network with `-H` ([`mcp`](../mcp/README.md) has its tools, the Engine API and who may
+connect). `--machine NAME` serves one machine alone; `--host-dir DIR` is a host folder its tools may name (for binds,
+copies, build contexts and archives; none by default, and then no host paths at all); `--deny-exec`, `--deny` and
+`--allow` are rules on every machine it starts, and `--network`, `--memory` and `--timeout` their defaults, as `carbon
+run` takes them; `--tools a,b` lists only those.
+
+On the network: `-H ADDR` (repeatable) listens on `host:port` or a Unix socket's path, serving MCP at `POST /mcp` and
+a WebSocket carrying everything on the same address. `--engine` adds the Engine API (`engine/…` methods, and REST under
+`/v1`). `--max-sessions N` serves N sessions in all, then exits. `--tls --tlscert FILE --tlskey FILE` is TLS 1.3;
+`--token-file FILE` lists the tokens that may connect (required beyond loopback, unless `--no-auth`);
+`--allow-origin ORIGIN` lets a browser page in. `carbon mcp token [--scope SCOPES] [--name NAME]` prints a new token
+and its line for the file.
 
 `carbon login [-u USER] [--password-stdin] [REGISTRY]` checks a login with a registry (`docker.io` by default) and
 keeps it in `CARBON_HOME/auth.json`, readable by its owner alone; without `-u` and a password it asks for them, the

@@ -41,6 +41,7 @@ usage: carbon <command> ...
       --timeout DURATION                     stop it if it's still running this long after it starts: 90s, 5m, 2h
       --isolation vm|sandbox|auto            a hardware VM, the process sandbox, or the best there is (the default)
       --name NAME                            the machine's name (else one from its image or program)
+      -h, --hostname NAME                    the machine's hostname (its name by default)
       --rm                                   remove it, and its files, once it ends
       -v, --volume SOURCE:TARGET[:ro]        mount a host folder (/path, ./path, ~/path) or a volume (a name) at TARGET:
                                              each side sees the other's changes at once; a new volume is filled from
@@ -138,13 +139,27 @@ usage: carbon <command> ...
                                              each DLL and what of it isn't there; for several or a folder, what's
                                              wanted most (--all lists everything)
   pull IMAGE [--platform OS/ARCH]            pull an image
-  mcp [options]                              an MCP server for agents, on stdin and stdout (claude mcp add carbon -- carbon mcp)
+  mcp [options]                              Carbon's front door: an MCP server for agents, on stdin and stdout by
+                                             default (claude mcp add carbon -- carbon mcp), or on the network (-H)
       --machine NAME                         serve one machine alone: its tools, with no machine argument
       --host-dir DIR                         a host folder tools may name, for binds, copies and archives (as many
                                              as wanted; none by default, and then no host paths at all)
       --deny-exec, --deny, --allow           rules on every machine it starts, as carbon run's
       --network, --memory, --timeout         defaults for every machine it starts, as carbon run's
       --tools NAME,...                       list only these tools
+      -H, --host ADDR                        listen on host:port, or a Unix socket's path (no scheme), instead of
+                                             stdio: MCP at POST /mcp, and a WebSocket carrying everything, on the
+                                             same address; as many as wanted
+      --engine                               also serve the Engine API, the control plane: engine/... methods, and
+                                             REST under /v1 (off by default)
+      --max-sessions N                       serve N sessions in all, then exit (not how many at once)
+      --tls, --tlscert FILE, --tlskey FILE   TLS 1.3, with a certificate and key in PEM files
+      --token-file FILE                      tokens that may connect, a line each: SCOPES SHA256 NAME, scopes
+                                             carbon:mcp and carbon:engine (required beyond loopback)
+      --allow-origin ORIGIN                  a browser origin that may call it (none by default)
+      --no-auth                              no tokens beyond loopback: something in front of it does auth
+  mcp token [--scope SCOPES] [--name NAME]   a new token, and its line for --token-file (scopes carbon:mcp by
+                                             default; carbon:mcp,carbon:engine for both)
   push [--squash] IMAGE                      push an image to its registry, a layer per step of what made it
       --squash                               its whole disk as one layer, base included (build --squash keeps the
                                              base's layers and makes one more)
@@ -407,6 +422,10 @@ fn run(carbon: &Carbon, mut args: impl Iterator<Item = String>) -> ! {
                 options.push(Box::new(move |s| s.isolation(isolation)));
             }
             "--name" => name = Some(value("--name")),
+            "-h" | "--hostname" => {
+                let hostname = value("--hostname");
+                options.push(Box::new(move |s| s.hostname(hostname)));
+            }
             "--platform" => {
                 let text = value("--platform");
                 let platform = Platform::parse(&text).unwrap_or_else(|| fail(format!("{text} isn't a platform: linux/arm64, linux/amd64, windows/amd64")));
@@ -599,9 +618,34 @@ fn exec(carbon: &Carbon, mut args: impl Iterator<Item = String>) -> ! {
 }
 
 /// `carbon watch NAME [--exec] [--output] [--net] [--json]`: a running machine's hooked events, as they're decided.
-/// `carbon mcp [options]`: an MCP server over this Carbon home, on stdin and stdout, for an agent's client to start.
+/// `carbon mcp token [--scope SCOPES] [--name NAME]`: a new token, and the line that lets it in.
+fn mcp_token(mut args: impl Iterator<Item = String>) {
+    let (mut scopes, mut name) = (mcp::Scopes { mcp: true, engine: false }, String::from("token"));
+    while let Some(arg) = args.next() {
+        let (arg, inline) = match arg.split_once('=') {
+            Some((flag, value)) if flag.starts_with("--") => (flag.to_string(), Some(value.to_string())),
+            _ => (arg, None),
+        };
+        let mut value = |what: &str| inline.clone().or_else(|| args.next()).unwrap_or_else(|| fail(format!("{what} needs a value")));
+        match arg.as_str() {
+            "--scope" | "--scopes" => scopes = mcp::net::tokens::parse_scopes(&value("--scope")).unwrap_or_else(|e| fail(format!("--scope: {e}"))),
+            "--name" => name = value("--name"),
+            other => fail(format!("mcp token doesn't know {other}: --scope, --name")),
+        }
+    }
+    let (token, line) = mcp::net::tokens::new_token(scopes, &name).unwrap_or_else(|e| fail(e));
+    eprintln!("carbon mcp token: the token, shown once (clients send Authorization: Bearer <token>):");
+    println!("{token}");
+    eprintln!("its line, for --token-file:");
+    println!("{line}");
+}
+
+/// `carbon mcp [options]`: Carbon's front door, an MCP server over this Carbon home: on stdin and stdout, for an agent's
+/// client to start, or with `-H` on the network, and with `--engine` the Engine API too.
 fn mcp(carbon: &Carbon, mut args: impl Iterator<Item = String>) {
     let mut options = mcp::Options::default();
+    let mut net = mcp::net::NetOptions::default();
+    let (mut tls, mut tlscert, mut tlskey) = (false, None, None);
     let mut rules = Rules::new();
     while let Some(arg) = args.next() {
         let (arg, inline) = match arg.split_once('=') {
@@ -622,16 +666,49 @@ fn mcp(carbon: &Carbon, mut args: impl Iterator<Item = String>) {
             "--memory" | "-m" => options.memory = Some(value("--memory")),
             "--timeout" => options.timeout = Some(duration(&value("--timeout"))),
             "--tools" => options.tools = Some(value("--tools").split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect()),
-            "--http" => fail("carbon mcp --http isn't there yet: stdio only, as a client starts it (carbon mcp)"),
-            other => fail(format!("mcp doesn't know {other}: --machine, --host-dir, --deny-exec, --deny, --allow, --network, --memory, --timeout, --tools")),
+            "-H" | "--host" => net.hosts.push(value("--host")),
+            "--engine" => options.engine = true,
+            "--max-sessions" => {
+                let text = value("--max-sessions");
+                net.max_sessions = Some(text.parse().unwrap_or_else(|_| fail(format!("--max-sessions {text}: a number"))));
+            }
+            "--tls" => tls = true,
+            "--tlscert" => tlscert = Some(std::path::PathBuf::from(value("--tlscert"))),
+            "--tlskey" => tlskey = Some(std::path::PathBuf::from(value("--tlskey"))),
+            "--token-file" => net.token_file = Some(std::path::PathBuf::from(value("--token-file"))),
+            "--allow-origin" => net.allow_origins.push(value("--allow-origin")),
+            "--no-auth" => net.no_auth = true,
+            other => fail(format!(
+                "mcp doesn't know {other}: --machine, --host-dir, --deny-exec, --deny, --allow, --network, --memory, --timeout, --tools, \
+                 -H, --engine, --max-sessions, --tls, --tlscert, --tlskey, --token-file, --allow-origin, --no-auth"
+            )),
         }
     }
     options.rules = rules;
-    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        eprintln!("carbon mcp: an MCP server on stdin and stdout, for an MCP client to start (as `claude mcp add carbon -- carbon mcp`). Waiting for JSON-RPC.");
+    // Docker's TLS flags: --tlscert and --tlskey alone imply --tls, and --tls needs both.
+    match (tls || tlscert.is_some() || tlskey.is_some(), tlscert, tlskey) {
+        (false, ..) => {}
+        (true, Some(cert), Some(key)) => net.tls = Some((cert, key)),
+        _ => fail("--tls needs --tlscert and --tlskey"),
+    }
+    if net.hosts.is_empty() {
+        let network_only = net.tls.is_some() || net.token_file.is_some() || net.no_auth || net.max_sessions.is_some() || !net.allow_origins.is_empty();
+        if network_only {
+            fail("--tls, --token-file, --no-auth, --max-sessions and --allow-origin are for -H: on stdio, whoever started carbon mcp is its client");
+        }
+        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            eprintln!("carbon mcp: an MCP server on stdin and stdout, for an MCP client to start (as `claude mcp add carbon -- carbon mcp`). Waiting for JSON-RPC.");
+        }
+        let server = mcp::Server::new(carbon.clone(), options).unwrap_or_else(|e| fail(e));
+        server.serve_stdio().unwrap_or_else(|e| fail(format!("stdio: {e}")));
+        return;
+    }
+    // Before anything starts: who may connect where.
+    if let Err(e) = mcp::net::check(&net) {
+        fail(format!("mcp: {e}"));
     }
     let server = mcp::Server::new(carbon.clone(), options).unwrap_or_else(|e| fail(e));
-    server.serve_stdio().unwrap_or_else(|e| fail(format!("stdio: {e}")));
+    mcp::net::serve(server, net).unwrap_or_else(|e| fail(format!("mcp: {e}")));
 }
 
 fn watch(machine: &Machine, args: impl Iterator<Item = String>) {
@@ -780,6 +857,13 @@ fn main() {
     let command = args.next().unwrap_or_else(|| usage());
     if matches!(command.as_str(), "help" | "--help" | "-h") {
         print!("{USAGE}");
+        return;
+    }
+    let mut args = args.peekable();
+    // A token's made without a Carbon home.
+    if command == "mcp" && args.peek().is_some_and(|a| a == "token") {
+        args.next();
+        mcp_token(args);
         return;
     }
     let carbon = Carbon::open().unwrap_or_else(|e| fail(e));

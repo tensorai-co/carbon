@@ -34,6 +34,7 @@ carbon run --platform linux/amd64 debian:13 -- apt-get install -y curl    # x86-
 carbon run --deny 0.0.0.0/0 --allow pypi.org:443 --deny-exec 'rm -rf *' debian:13 -- ./agent-step.sh   # rules
 carbon watch web                                               # every program it starts, what it writes, where it connects
 claude mcp add carbon -- carbon mcp                            # an agent's machines, as MCP tools: run, exec, files, builds, screens
+carbon mcp -H 0.0.0.0:8080 --token-file tokens --engine        # the same over HTTP and WebSocket, and the Engine API for the programs running agents
 ```
 
 And as a Rust library, from GitHub:
@@ -74,8 +75,11 @@ let out = carbon.machine("debian:13").rm(true)
 - **Built for agents.** Because Carbon owns the kernels, a program using it sees, in real time, every program a
   machine starts, everything it writes, every connection it makes and every name it looks up, and can allow, block,
   rewrite or answer each one while the machine waits. A container runtime can't, because it doesn't own the kernel.
+- **`carbon mcp` is the front door.** Carbon is AI-first: an agent's client starts `carbon mcp` and gets machines as
+  MCP tools, and the program running the agent (a gateway, CI, an app) sets those machines up over the same server's
+  Engine API, on one connection ([below](#for-agents-carbon-mcp)).
 - **A Rust library first.** [`carbon`](carbon/README.md) is an ordinary crate, a git dependency away
-  ([below](#as-a-rust-library)); the `carbon` command is a thin layer over it.
+  ([below](#as-a-rust-library)); the `carbon` command and `carbon mcp` are thin layers over it.
 
 ## What comes with Carbon, and what comes in an image
 
@@ -215,6 +219,57 @@ for the hypervisor, as `carbon` is. It needs Rust 1.85 with `rust-src`, and LLVM
 Windows' guest code (without them, Linux machines still run). [`carbon`'s README](carbon/README.md) has every type,
 the hooks and what each kernel does with each decision, and [`examples/agent.rs`](carbon/examples/agent.rs) runs.
 
+## For agents: `carbon mcp`
+
+`carbon mcp` is an MCP server over a Carbon home. There are two planes on one server:
+
+| | MCP | The Engine API (`--engine`) |
+| --- | --- | --- |
+| For | A model | The program that runs models: a sandbox's gateway, CI, an app |
+| What it has | Task-shaped tools: `run`, `exec`, `read_file`, `edit_file`, `commit_machine`, `screenshot`, … | Machines and images with every setting: hostname, env, secrets in a tmpfs, mounts, rules, commit, push |
+| Methods | MCP's own: `tools/list`, `tools/call`, … | `engine/machines.create`, `engine/machines.exec`, `engine/files.write`, `engine/images.push`, …, never in `tools/list` |
+
+Anything relaying an agent's calls forwards MCP's methods and never `engine/…`, so an agent can't set its own keys or
+loosen its own network, even on a shared connection.
+
+```sh
+claude mcp add carbon -- carbon mcp                          # stdio: the client starts it, and is its only client
+carbon mcp -H 127.0.0.1:8080                                 # HTTP (MCP at POST /mcp) and WebSocket, this host only
+carbon mcp -H /run/carbon.sock --engine                      # a Unix socket (0600), with the Engine API
+carbon mcp -H 0.0.0.0:8443 --tls --tlscert cert.pem --tlskey key.pem --token-file tokens --engine
+carbon mcp -H 0.0.0.0:$PORT --engine --max-sessions 1 --no-auth   # one session, then exit: a sandbox host behind a gateway
+carbon mcp token --scope carbon:mcp,carbon:engine --name ci  # a new token, and its line for --token-file
+```
+
+- **One address, every protocol.** `-H` takes `host:port` or a socket's path (repeatable). `POST /mcp` is MCP's
+  Streamable HTTP; `/v1/…` is the Engine API as REST (`POST /v1/machines`, `POST /v1/machines/{name}/exec`,
+  `PUT /v1/machines/{name}/files?path=…`, …); a WebSocket carries everything on one connection. Its text messages are
+  JSON-RPC, MCP's and `engine/…` alike, and its binary messages are streams' bytes (`[stream: u32][kind: u8][bytes]`:
+  stdin, stdout, stderr, exit, data, end), so output and files never go as base64.
+- **Who may connect.** stdio and a Unix socket need no token. Loopback needs none, with a warning. Anything else needs
+  `--token-file` (lines of `SCOPES SHA256 NAME`; scopes `carbon:mcp` and `carbon:engine`), unless `--no-auth` says
+  something in front does auth. Requests with an `Origin` must come from an `--allow-origin`. TLS is 1.3.
+- **`--max-sessions N`** serves N sessions in all, then exits, so each session can get a fresh host. A session is a
+  connection that's made a request, so a health check (`GET /_ping`) or a TCP probe doesn't use one up.
+
+A session, as a gateway runs one on a WebSocket: a machine from a workspace image with its hostname, env, a tmpfs and
+rules; the session's token written into the tmpfs (a tmpfs isn't the disk, so `commit` never saves it); commands with
+their output streamed; then commit, push, close.
+
+```
+→ {"jsonrpc":"2.0","id":1,"method":"engine/machines.create","params":{"Image":"registry/ws/8f3a:latest","Name":"sbx-8f3a","Hostname":"sbx-8f3a","Env":["TURN=1"],"Cmd":["sleep","infinity"],"HostConfig":{"Tmpfs":{"/run/secrets":""}},"Rules":{"Deny":["0.0.0.0/0"],"Allow":["repo-server:443"]}}}
+→ {"jsonrpc":"2.0","id":2,"method":"engine/machines.start","params":{"Id":"sbx-8f3a"}}
+→ {"jsonrpc":"2.0","id":3,"method":"engine/files.write","params":{"Id":"sbx-8f3a","Path":"/run/secrets/token","Mode":384,"Stream":1}}
+→ [1][data] <token>   [1][end]
+→ {"jsonrpc":"2.0","id":4,"method":"engine/machines.exec","params":{"Id":"sbx-8f3a","Cmd":["bash","-lc","make test"],"Stream":7}}
+← [7][stdout] …   [7][exit] 0
+→ {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"edit_file","arguments":{…}}}     an agent's call, relayed
+→ {"jsonrpc":"2.0","id":6,"method":"engine/machines.commit","params":{"Id":"sbx-8f3a","Repo":"registry/ws/8f3a","Tag":"latest"}}
+→ {"jsonrpc":"2.0","id":7,"method":"engine/images.push","params":{"Name":"registry/ws/8f3a:latest"}}
+```
+
+[`mcp`'s README](mcp/README.md) has every tool and method, and [`openapi.yaml`](mcp/openapi.yaml) the REST paths.
+
 ## What a machine is
 
 | Part | Module | What it is | State |
@@ -237,7 +292,7 @@ Around them:
 | [`hooks`](hooks/README.md) | What hook points report and what can be decided about it: events, decisions, the `Hooks` trait, filters, and the hub every hook point asks | Built |
 | [`remote`](remote/README.md) | A machine's desktop and sound, shown and driven from another computer over QUIC | Not started |
 | [`cli`](cli/README.md) | The `carbon` command | Built, as a thin layer over `carbon` |
-| [`mcp`](mcp/README.md) | `carbon mcp`: an MCP server over the library, so agents get machines to work in | Built: stdio, both eras of the protocol, 37 tools (machines, processes, files, images, volumes, screens, events); Streamable HTTP to do |
+| [`mcp`](mcp/README.md) | `carbon mcp`: Carbon's front door, an MCP server over the library, and with `--engine` the Engine API | Built: stdio, HTTP and WebSocket (`-H`), TLS, tokens with scopes, `--max-sessions`; both eras of the protocol, 37 tools; the Engine API's machines, exec, files and images, as JSON-RPC and REST |
 
 ```
 cli ──► carbon ──► kernels ──► exec, layers, display, gpu, audio, net, host
@@ -487,9 +542,9 @@ process per machine, so one program runs several at once on macOS. (`--rm` and `
 1. The library's rest ([carbon](carbon/README.md#to-do), [the proposal](docs/carbon_lib.md)): workers, so a
    program runs several machines at once on macOS; files, process lifecycle, accepts, data and the registry hooked;
    an answered Windows exec and an answered connection; checkpoints and rollback, forks, record and
-   replay, limits; `carbon mcp` over HTTP; clients in other languages over the control protocol. (The crate `carbon`,
-   the CLI over it, hooks on programs, output, connections and lookups, rules, `carbon watch` and `carbon mcp` over
-   stdio are done.)
+   replay, limits; clients in other languages over the Engine API (carbon-go first). (The crate `carbon`, the CLI
+   over it, hooks on programs, output, connections and lookups, rules, `carbon watch`, and `carbon mcp` on stdio, HTTP
+   and WebSocket with the Engine API, are done.)
 2. Linux ARM64 hosts; ARM64 → x86-64 translation ([exec](exec/README.md#5-more-hosts-and-isas)).
 3. The macOS sandbox: shared memory, x86 programs, the rest of ARM64; the Windows sandbox hardened; winkvm's rest
    (NMIs, VPID, kernel CET, AMD SVM, signing) ([exec](exec/README.md#4-safety-and-robustness)).

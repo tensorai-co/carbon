@@ -387,14 +387,54 @@ fn info_from_json(v: &Value) -> Option<FileInfo> {
     })
 }
 
+/// How paths are followed: from the disk's root (a stopped machine's), or as a running machine's programs see them,
+/// through its mounts, so a file written into a tmpfs is in the tmpfs.
+pub(crate) trait Walk<M: Meta> {
+    fn root(&self) -> Ino {
+        ROOT
+    }
+    fn resolve(&self, disk: &Fs<M>, path: &str, follow: bool) -> layers::Result<Ino>;
+    /// What's mounted over `ino`, if anything is.
+    fn cover(&self, ino: Ino) -> Ino {
+        ino
+    }
+}
+
+/// The disk alone: no mounts.
+pub(crate) struct Plain;
+
+impl<M: Meta> Walk<M> for Plain {
+    fn resolve(&self, disk: &Fs<M>, path: &str, follow: bool) -> layers::Result<Ino> {
+        disk.resolve(ROOT, path, follow)
+    }
+}
+
+/// A running Linux machine's view, through its mounts.
+pub(crate) struct Mounted<'a>(pub &'a lambda::Paths);
+
+impl Walk<lambda::Meta> for Mounted<'_> {
+    fn root(&self) -> Ino {
+        self.0.root()
+    }
+    fn resolve(&self, disk: &Fs<lambda::Meta>, path: &str, follow: bool) -> layers::Result<Ino> {
+        self.0.resolve(disk, path, follow)
+    }
+    fn cover(&self, ino: Ino) -> Ino {
+        self.0.cover(ino)
+    }
+}
+
 /// Folders along `path`, made where they aren't there: each `mode` (or `0755`), `owner`'s.
-fn make_dirs<M: Meta>(disk: &mut Fs<M>, path: &str, meta: &M, at: u64) -> Result<Ino> {
-    let mut dir = ROOT;
+fn make_dirs<M: Meta>(disk: &mut Fs<M>, walk: &dyn Walk<M>, path: &str, meta: &M, at: u64) -> Result<Ino> {
+    let mut dir = walk.root();
+    let mut so_far = String::new();
     for name in path.split('/').filter(|n| !n.is_empty()) {
-        dir = match disk.lookup(dir, name) {
+        so_far.push('/');
+        so_far.push_str(name);
+        dir = match disk.lookup(dir, name).map(|ino| walk.cover(ino)) {
             Ok(ino) => match disk.stat(ino).map_err(|e| failed(path, e))?.kind {
                 Kind::Dir => ino,
-                Kind::Symlink => disk.resolve(dir, name, true).map_err(|e| failed(path, e))?,
+                Kind::Symlink => walk.resolve(disk, &so_far, true).map_err(|e| failed(path, e))?,
                 Kind::File => return Err(failed(path, layers::Error::NotDir)),
             },
             Err(layers::Error::NotFound) => disk.create(dir, name, New::Dir, meta.clone(), at).map_err(|e| failed(path, e))?,
@@ -416,16 +456,21 @@ fn remove_tree<M: Meta>(disk: &mut Fs<M>, dir: Ino, name: &str, path: &str, at: 
 
 /// Does `op` on `disk`: its answer's bytes (JSON, or a read's bytes). `data` is a write's.
 pub(crate) fn apply<M: Meta>(disk: &mut Fs<M>, op: &Op, data: &[u8]) -> Result<Vec<u8>> {
+    apply_with(disk, &Plain, op, data)
+}
+
+/// As [`apply`], following paths as `walk` does.
+pub(crate) fn apply_with<M: Meta>(disk: &mut Fs<M>, walk: &dyn Walk<M>, op: &Op, data: &[u8]) -> Result<Vec<u8>> {
     let at = now();
     let done = || Ok(b"{}".to_vec());
     let owner = |disk: &Fs<M>, owner: &Option<String>| owner.as_deref().map(|o| M::owner(disk, o)).transpose();
     match op {
         Op::Stat { path } => {
-            let ino = disk.resolve(ROOT, path, false).map_err(|e| failed(path, e))?;
+            let ino = walk.resolve(disk, path, false).map_err(|e| failed(path, e))?;
             Ok(info_json(&info(disk, ino).map_err(|e| failed(path, e))?).to_string().into_bytes())
         }
         Op::List { path } => {
-            let dir = disk.resolve(ROOT, path, true).map_err(|e| failed(path, e))?;
+            let dir = walk.resolve(disk, path, true).map_err(|e| failed(path, e))?;
             let mut list = Vec::new();
             for (name, ino, _) in disk.entries(dir).map_err(|e| failed(path, e))? {
                 let mut entry = info_json(&info(disk, ino).map_err(|e| failed(path, e))?);
@@ -435,7 +480,7 @@ pub(crate) fn apply<M: Meta>(disk: &mut Fs<M>, op: &Op, data: &[u8]) -> Result<V
             Ok(Value::Array(list).to_string().into_bytes())
         }
         Op::Read { path, offset, len } => {
-            let ino = disk.resolve(ROOT, path, true).map_err(|e| failed(path, e))?;
+            let ino = walk.resolve(disk, path, true).map_err(|e| failed(path, e))?;
             let stat = disk.stat(ino).map_err(|e| failed(path, e))?;
             if stat.kind == Kind::Dir {
                 return Err(failed(path, layers::Error::IsDir));
@@ -449,7 +494,7 @@ pub(crate) fn apply<M: Meta>(disk: &mut Fs<M>, op: &Op, data: &[u8]) -> Result<V
         Op::Write { path, mode, owner: who, parents, append, modified, .. } => {
             let (uid, gid) = owner(disk, who)?.unwrap_or((0, 0));
             let (parent_path, name) = split(path)?;
-            let dir = if *parents { make_dirs(disk, parent_path, &M::make(Kind::Dir, 0o755, uid, gid), at)? } else { disk.resolve(ROOT, parent_path, true).map_err(|e| failed(path, e))? };
+            let dir = if *parents { make_dirs(disk, walk, parent_path, &M::make(Kind::Dir, 0o755, uid, gid), at)? } else { walk.resolve(disk, parent_path, true).map_err(|e| failed(path, e))? };
             let ino = match disk.resolve(dir, name, true) {
                 Ok(ino) => {
                     if disk.stat(ino).map_err(|e| failed(path, e))?.kind == Kind::Dir {
@@ -481,10 +526,10 @@ pub(crate) fn apply<M: Meta>(disk: &mut Fs<M>, op: &Op, data: &[u8]) -> Result<V
             let (uid, gid) = owner(disk, who)?.unwrap_or((0, 0));
             let meta = M::make(Kind::Dir, mode.unwrap_or(0o755), uid, gid);
             let ino = if *parents {
-                make_dirs(disk, path, &meta, at)?
+                make_dirs(disk, walk, path, &meta, at)?
             } else {
                 let (parent_path, name) = split(path)?;
-                let dir = disk.resolve(ROOT, parent_path, true).map_err(|e| failed(path, e))?;
+                let dir = walk.resolve(disk, parent_path, true).map_err(|e| failed(path, e))?;
                 disk.create(dir, name, New::Dir, meta.clone(), at).map_err(|e| failed(path, e))?
             };
             // A folder there already, made by a copy: its mode and owner as asked.
@@ -499,7 +544,7 @@ pub(crate) fn apply<M: Meta>(disk: &mut Fs<M>, op: &Op, data: &[u8]) -> Result<V
         Op::Symlink { path, target, owner: who } => {
             let (uid, gid) = owner(disk, who)?.unwrap_or((0, 0));
             let (parent_path, name) = split(path)?;
-            let dir = disk.resolve(ROOT, parent_path, true).map_err(|e| failed(path, e))?;
+            let dir = walk.resolve(disk, parent_path, true).map_err(|e| failed(path, e))?;
             // What's there goes, as a copy replaces a file.
             if disk.lookup(dir, name).is_ok() {
                 remove_tree(disk, dir, name, path, at)?;
@@ -508,9 +553,9 @@ pub(crate) fn apply<M: Meta>(disk: &mut Fs<M>, op: &Op, data: &[u8]) -> Result<V
             done()
         }
         Op::Link { path, to } => {
-            let ino = disk.resolve(ROOT, to, false).map_err(|e| failed(to, e))?;
+            let ino = walk.resolve(disk, to, false).map_err(|e| failed(to, e))?;
             let (parent_path, name) = split(path)?;
-            let dir = disk.resolve(ROOT, parent_path, true).map_err(|e| failed(path, e))?;
+            let dir = walk.resolve(disk, parent_path, true).map_err(|e| failed(path, e))?;
             if disk.lookup(dir, name).is_ok_and(|there| there != ino) {
                 remove_tree(disk, dir, name, path, at)?;
             }
@@ -522,14 +567,14 @@ pub(crate) fn apply<M: Meta>(disk: &mut Fs<M>, op: &Op, data: &[u8]) -> Result<V
         Op::Rename { from, to } => {
             let (from_path, from_name) = split(from)?;
             let (to_path, to_name) = split(to)?;
-            let from_dir = disk.resolve(ROOT, from_path, true).map_err(|e| failed(from, e))?;
-            let to_dir = disk.resolve(ROOT, to_path, true).map_err(|e| failed(to, e))?;
+            let from_dir = walk.resolve(disk, from_path, true).map_err(|e| failed(from, e))?;
+            let to_dir = walk.resolve(disk, to_path, true).map_err(|e| failed(to, e))?;
             disk.rename(from_dir, from_name, to_dir, to_name, at).map_err(|e| failed(from, e))?;
             done()
         }
         Op::Remove { path, recursive } => {
             let (parent_path, name) = split(path)?;
-            let dir = disk.resolve(ROOT, parent_path, true).map_err(|e| failed(path, e))?;
+            let dir = walk.resolve(disk, parent_path, true).map_err(|e| failed(path, e))?;
             if *recursive {
                 remove_tree(disk, dir, name, path, at)?;
             } else {
