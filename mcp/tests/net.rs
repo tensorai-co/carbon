@@ -163,7 +163,7 @@ fn tokens_scopes_and_the_engine() {
     let req = ureq::get(&format!("http://{base}/v1/images/docker.io/library/nope:1")).set("Authorization", &format!("Bearer {gateway}"));
     assert_eq!(call(req, None).0, 404);
     let req = ureq::post(&format!("http://{base}/v1/machines")).set("Authorization", &format!("Bearer {gateway}"));
-    let (status, body) = call(req, Some(&json!({ "Image": "debian:13", "Labels": { "a": "b" } })));
+    let (status, body) = call(req, Some(&json!({ "Image": "debian:13", "Entrypoint": ["sh"] })));
     assert_eq!(status, 501, "{body}");
 
     let mut socket = ws(&base, Some(&gateway));

@@ -35,6 +35,7 @@ carbon run --deny-exec 'rm -rf *' --deny-exec 'shutdown *' debian:13 -- ./agent-
 carbon watch dev                            # what it does, as it does it: programs, output, connections, lookups
 carbon watch dev --exec --net --json        # as JSON lines, for a program to read
 carbon ps                                   # NAME  FROM  ISOLATION  STATUS
+carbon ps --filter label=team=infra         # only machines with that label (label=KEY for any value)
 carbon stop dev                             # SIGTERM to its first process; everything ends 10 s later
 carbon rm dev                               # a stopped machine and its files
 carbon commit dev mine:1                    # an image of a machine's disk, running or not, as docker commit
@@ -74,12 +75,15 @@ carbon atlas imports ~/installers/          # a folder of them: which load, and 
 | `-t`, `--tty` | With `-i`, this terminal is the machine's console (raw, the kernel editing lines: lambda's line discipline, atlas's conhost-like console), `TERM=xterm`; `-it` for a shell. Without `-t`, a Windows machine's standard handles are pipes, not a console. `-it` with stdin not a terminal is refused, as Docker refuses it |
 | `--isolation vm\|sandbox\|auto` | A hardware VM, the process sandbox, or the best there is (the default, which says so when it falls back) |
 | `--name NAME` | The machine's name; else one from its image or program |
-| `-h, --hostname NAME` | Its hostname; its name by default |
+| `-h, --hostname NAME` | Its hostname; its name by default. Kept for when it runs again |
+| `-l`, `--label KEY[=VALUE]`, `--label-file FILE` | Labels, as Docker's: kept in its config over its image's, and in an image committed from it. `carbon ps --filter label=KEY[=VALUE]` finds machines by them |
+| `--add-host NAME:IP` | A line for its `/etc/hosts`, after its own (`NAME=IP` too; IPv6 as it is, or in brackets). Kept for when it runs again, unless given again. Linux machines; there's no `host-gateway` yet, as a machine's gateway doesn't reach this host's services |
 | `--platform OS/ARCH` | Which build of an image to pull; Linux for this CPU by default |
 | `--display headless=WxH[@SCALE]\|host[=WxH]\|host-windows\|none` | Where its windows go: a screen in memory (`headless=1280x800` by default), the whole desktop in a window on this Mac's screen (which closing stops the machine), or each window in a Mac window of its own |
 | `--gpu auto\|host\|software\|none` | Its GPU: the host's if there is one, else the CPU device (`auto`, the default, which says so when it takes the CPU device), the host's or fail, the CPU device, or none. Linux machines reach it through lambda's Vulkan driver; Windows machines don't yet |
 | `--audio auto\|host\|none\|FILE.wav` | Where its sound goes: the host's speakers when it's on the host's screen (`auto`, the default), the host's speakers or fail, nowhere, or a WAV file of everything played |
 | `-e`, `--env NAME=VALUE` | An environment variable, over the image's |
+| `--env-file FILE` | Environment variables from a file, as Docker reads one: a `NAME=VALUE` line each, the value as written (quotes and all); `NAME` alone takes this shell's, and is left out if it has none; `#` lines are comments. `carbon exec` takes it too |
 | `-w`, `--workdir DIR` | Where its program starts; the image's working directory by default |
 | `-u`, `--user USER[:GROUP]` | Who its programs run as: a name or a number from the image's `/etc/passwd` and `/etc/group`; the image's `USER` by default, else root. Linux machines only, for now |
 | `--memory SIZE` | How much memory it may use, as `512m` or `4g` (`4g` by default, or ¾ of a container's memory limit if that's less, as on Cloud Run; only what's touched is taken) |

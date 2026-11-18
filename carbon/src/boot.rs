@@ -25,6 +25,10 @@ pub(crate) struct Launch {
     pub name: Option<String>,
     /// Its host name, as `uname` and its network give it (`--hostname`); None for what it had, or its name.
     pub hostname: Option<String>,
+    /// Labels (`--label`), over what it had and its image's.
+    pub labels: Vec<(String, String)>,
+    /// Its `/etc/hosts`' extra lines (`--add-host`); None for what it had.
+    pub extra_hosts: Option<Vec<crate::ExtraHost>>,
     /// What a new machine starts from; None starts the machine called `name` again.
     pub source: Option<Source>,
     /// The program and its arguments; empty for what the image says (its entrypoint and command).
@@ -109,6 +113,12 @@ pub(crate) fn run(store: &Store, launch: Launch, notify: &Notify, started: &mut 
     }
     if let Some(hostname) = &launch.hostname {
         record.hostname = Some(hostname.clone());
+    }
+    for (key, value) in &launch.labels {
+        record.config.labels.insert(key.clone(), value.clone());
+    }
+    if let Some(hosts) = &launch.extra_hosts {
+        record.extra_hosts = hosts.clone();
     }
     let mut ports = Vec::new();
     let exposed: Vec<String> = if launch.publish_all { record.config.exposed_ports.clone() } else { Vec::new() };
@@ -428,11 +438,15 @@ fn boot(store: &Store, record: &Record, launch: &Launch, parts: Parts, notify: &
             let mounts = crate::mounts::lambda_mounts(store.images.home(), &record.mounts, &disk, (who.user.uid, who.user.gid))?;
             let mut options = lambda::Options { stop, display: desktop.clone(), gpu, audio: Some(mixer), env, network: Some(network), hooks: hub, program, mounts, user: Some(who.user), ..lambda::Options::default() };
             options.hostname = record.host_name();
+            options.extra_hosts = record.extra_hosts.iter().map(|h| (h.name.clone(), h.ip)).collect();
             options.console = launch.tty;
             options.cwd = workdir.clone();
             lambda::boot(exec, cpu, disk, as_host, &argv, options).map(lambda::Status::code).map_err(Error::from)
         }
         Kernel::Atlas => {
+            if !record.extra_hosts.is_empty() {
+                return Err(Error::unsupported("--add-host in a Windows machine isn't there yet: Linux machines have it"));
+            }
             if !record.mounts.is_empty() {
                 return Err(Error::unsupported("mounts in a Windows machine aren't there yet: Linux machines have them"));
             }

@@ -135,7 +135,7 @@ pub fn call(server: &Server, peer: &Arc<Peer>, method: &str, params: &Value) -> 
         "machines.wait" => wait(server, &p),
         "machines.remove" => remove(server, &p),
         "machines.inspect" => inspect(server, &p),
-        "machines.list" => Ok(Value::Array(server.carbon().machines().iter().map(machine_row).collect())),
+        "machines.list" => list_machines(server, &p),
         "machines.logs" => logs(server, &p),
         "machines.commit" => commit(server, &p),
         "machines.exec" => exec(server, peer, &p),
@@ -194,7 +194,7 @@ fn rules(v: &Value) -> Result<Rules, EngineError> {
 
 fn create(server: &Server, p: &P) -> R {
     let image = p.str("Image")?;
-    for unsupported in ["Entrypoint", "Labels", "ExposedPorts", "Healthcheck", "StopSignal"] {
+    for unsupported in ["Entrypoint", "ExposedPorts", "Healthcheck", "StopSignal"] {
         if p.0.get(unsupported).is_some_and(|v| !v.is_null()) {
             return Err(EngineError::new("unsupported", format!("{unsupported} isn't supported by machines.create yet")));
         }
@@ -205,6 +205,12 @@ fn create(server: &Server, p: &P) -> R {
     }
     if let Some(h) = p.opt_str("Hostname") {
         spec = spec.hostname(h);
+    }
+    if let Some(labels) = p.object("Labels") {
+        for (key, value) in labels {
+            let value = value.as_str().ok_or_else(|| EngineError::invalid(format!("Labels.{key} must be a string")))?;
+            spec = spec.label(key.clone(), value);
+        }
     }
     if let Some(text) = p.opt_str("Platform") {
         spec = spec.platform(carbon::Platform::parse(&text).ok_or_else(|| EngineError::invalid(format!("Platform {text}: linux/arm64, linux/amd64, windows/amd64…")))?);
@@ -238,6 +244,10 @@ fn create(server: &Server, p: &P) -> R {
                 spec = spec.memory(m);
             }
         }
+    }
+    for text in host.strings("ExtraHosts")? {
+        let extra = carbon::ExtraHost::parse(&text)?;
+        spec = spec.add_host(extra.name, extra.ip);
     }
     if let Some(tmpfs) = host.object("Tmpfs") {
         for target in tmpfs.keys() {
@@ -327,6 +337,20 @@ fn remove(server: &Server, p: &P) -> R {
     Ok(json!({}))
 }
 
+/// Every machine, or with `Label` (`KEY` or `KEY=VALUE`, one or a list) those with every one of them.
+fn list_machines(server: &Server, p: &P) -> R {
+    let wanted: Vec<(String, Option<String>)> = p
+        .strings("Label")?
+        .into_iter()
+        .map(|l| match l.split_once('=') {
+            Some((k, v)) => (k.to_string(), Some(v.to_string())),
+            None => (l, None),
+        })
+        .collect();
+    let has = |m: &carbon::MachineInfo| wanted.iter().all(|(k, v)| m.config.labels.get(k).is_some_and(|have| v.as_ref().is_none_or(|v| v == have)));
+    Ok(Value::Array(server.carbon().machines().iter().filter(|m| has(m)).map(machine_row).collect()))
+}
+
 fn machine_row(info: &carbon::MachineInfo) -> Value {
     let state = if info.running { "running" } else if info.exit.is_some() { "exited" } else { "created" };
     json!({
@@ -336,6 +360,7 @@ fn machine_row(info: &carbon::MachineInfo) -> Value {
         "Created": rfc3339(info.created),
         "State": state,
         "Platform": info.platform.to_string(),
+        "Labels": info.config.labels,
     })
 }
 
@@ -349,7 +374,14 @@ fn inspect(server: &Server, p: &P) -> R {
         "Platform": info.platform.to_string(),
         "Created": rfc3339(info.created),
         "State": { "Status": status, "Running": info.running, "ExitCode": info.exit.unwrap_or(0), "Pid": info.pid.unwrap_or(0) },
-        "HostConfig": { "NetworkMode": carbon::network_name(info.network) },
+        "Config": {
+            "Hostname": info.hostname, "Env": info.config.env, "Cmd": info.config.cmd, "Entrypoint": info.config.entrypoint,
+            "WorkingDir": info.config.workdir, "User": info.config.user, "Labels": info.config.labels,
+        },
+        "HostConfig": {
+            "NetworkMode": carbon::network_name(info.network),
+            "ExtraHosts": info.extra_hosts.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        },
         "NetworkSettings": { "Ports": info.ports.iter().map(|port| json!(format!("{port:?}"))).collect::<Vec<_>>() },
         "Backend": info.backend,
     }))

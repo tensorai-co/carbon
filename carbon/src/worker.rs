@@ -111,6 +111,8 @@ fn spec_json(home: &Path, launch: &Launch, rules: &Rules, link: Option<(&Path, I
         "home": home,
         "name": launch.name,
         "hostname": launch.hostname,
+        "labels": launch.labels.iter().map(|(k, v)| json!([k, v])).collect::<Vec<_>>(),
+        "extra_hosts": launch.extra_hosts.as_ref().map(|h| h.iter().map(ToString::to_string).collect::<Vec<_>>()),
         "source": match &launch.source {
             Some(Source::Image(image)) => json!({ "image": image }),
             Some(Source::Program(path)) => json!({ "program": path }),
@@ -172,6 +174,13 @@ fn spec_from_json(v: &Value) -> Result<(PathBuf, Launch, Rules, Option<(PathBuf,
     let launch = Launch {
         name: s("name"),
         hostname: s("hostname"),
+        labels: v.get("labels").and_then(Value::as_array).map(|l| {
+            l.iter().filter_map(|p| Some((p.get(0)?.as_str()?.to_string(), p.get(1)?.as_str()?.to_string()))).collect()
+        }).unwrap_or_default(),
+        extra_hosts: match list("extra_hosts") {
+            Some(hosts) => Some(hosts.iter().map(|h| crate::ExtraHost::parse(h)).collect::<crate::Result<Vec<_>>>().map_err(|_| bad("extra_hosts"))?),
+            None => None,
+        },
         source,
         args: list("args").unwrap_or_default(),
         isolation: match s("isolation").as_deref() {
@@ -567,6 +576,8 @@ mod tests {
         let launch = Launch {
             name: Some("dev".into()),
             hostname: Some("sbx-8f3a".into()),
+            labels: vec![("team".into(), "infra".into())],
+            extra_hosts: Some(vec![crate::ExtraHost::parse("db:10.0.0.5").unwrap()]),
             source: Some(Source::Image("debian:13".into())),
             args: vec!["sleep".into(), "infinity".into()],
             isolation: Isolation::Sandbox,
@@ -601,6 +612,8 @@ mod tests {
         assert_eq!((back.display, back.audio, back.memory), (launch.display, launch.audio, launch.memory));
         assert_eq!((back.network, back.publish, back.remove, back.timeout, back.publish_all), (launch.network, launch.publish, true, launch.timeout, true));
         assert_eq!(back.hostname.as_deref(), Some("sbx-8f3a"));
+        assert_eq!(back.labels, [("team".to_string(), "infra".to_string())]);
+        assert_eq!(back.extra_hosts.as_ref().map(|h| h[0].to_string()), Some("db:10.0.0.5".to_string()));
         assert_eq!(rules_back, rules);
         assert_eq!(link, Some((PathBuf::from("/tmp/link.sock"), Interest::exec() | Interest::lookup())));
     }

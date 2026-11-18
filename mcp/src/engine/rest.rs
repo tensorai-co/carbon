@@ -51,6 +51,7 @@ fn param_name(query_name: &str) -> String {
         "parents" => "Parents".into(),
         "timeout" | "t" => "Timeout".into(),
         "to" => "To".into(),
+        "label" => "Label".into(),
         other => other.into(),
     }
 }

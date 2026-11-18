@@ -135,9 +135,9 @@ path's and query's parts join the JSON body as params.
 | Method | Params | Answer |
 | --- | --- | --- |
 | `system.version`, `system.ping` | | `{Version, ApiVersion, Os, Arch}`; `"OK"` |
-| `machines.create` | `Image`, `Name`, `Hostname`, `Platform`, `Env` (`NAME=VALUE`s), `Cmd`, `WorkingDir`, `User`, `HostConfig` (`NetworkMode`: `nat`/`bridge`, `none`, `host`; `Memory` in bytes; `Tmpfs`: `{target: ""}`; `Binds`: `SOURCE:TARGET[:ro]`; `Mounts`: `{Type, Source, Target, ReadOnly}`), and `Rules`: `{Deny, Allow, DenyExec}` | `{Id}` |
+| `machines.create` | `Image`, `Name`, `Hostname`, `Platform`, `Env` (`NAME=VALUE`s), `Cmd`, `WorkingDir`, `User`, `Labels` (`{key: value}`), `HostConfig` (`ExtraHosts`: `NAME:IP`s; `NetworkMode`: `nat`/`bridge`, `none`, `host`; `Memory` in bytes; `Tmpfs`: `{target: ""}`; `Binds`: `SOURCE:TARGET[:ro]`; `Mounts`: `{Type, Source, Target, ReadOnly}`), and `Rules`: `{Deny, Allow, DenyExec}` | `{Id}` |
 | `machines.start`, `.stop` (`Timeout` s, 10 by default, then killed; answered once stopped), `.kill`, `.wait` (`Timeout`), `.remove` (`Force`) | `Id` | `{}`; `.wait`: `{StatusCode, Ended}` |
-| `machines.inspect`, `.list`, `.logs` (`Tail`) | `Id` | the machine; rows `{Id, Name, Image, Created, State, Platform}`; lines |
+| `machines.inspect`, `.list` (`Label`: `KEY` or `KEY=VALUE`, one or a list, all matching), `.logs` (`Tail`) | `Id` | the machine, with `Config` (`Hostname`, `Env`, `Cmd`, `WorkingDir`, `User`, `Labels`) and `HostConfig.ExtraHosts`; rows `{Id, Name, Image, Created, State, Platform, Labels}`; lines |
 | `machines.exec` | `Id`, `Cmd`, `Env`, `WorkingDir`, `User`, `Timeout`, `Stream` | without `Stream`: `{ExitCode, Stdout, Stderr, TimedOut}`. With one, on a WebSocket: stdin from the client's `stdin` frames until `end`, output as `stdout` and `stderr` frames, then an `exit` frame, and `{ExitCode}` |
 | `machines.commit` | `Id`, `Repo`, `Tag`, `Comment`, `Changes` (Dockerfile instructions) | `{Id}`: the image, running or stopped |
 | `files.stat`, `.list`, `.remove` (`Recursive`) | `Id`, `Path` | `{Kind, Size, Mode, Uid, Gid, Modified, Link}`; entries with `Name` |
@@ -202,8 +202,6 @@ The same with REST over a Unix socket with curl.
 
 ## To do
 
-- [ ] `machines.create`'s `Labels` and `HostConfig.ExtraHosts` (the library has neither yet), and `--env-file` for
-      `carbon run`.
 - [ ] The rest of the Engine API: `machines.events` and `watch` as streams, `images.build`, `.save`, `.load`,
       `.history`, `volumes.*`, `display.*`, `rules` on a running machine.
 - [ ] REST streams: exec, logs and events upgrading to a WebSocket at their own paths.

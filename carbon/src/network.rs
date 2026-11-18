@@ -9,6 +9,45 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use hooks::{Connect, Decision, Hub, Kind, Lookup, Proto};
 use net::{Host, HostDatagram, HostListener, HostStream, Ready, Result, Shutdown, Waker};
 
+/// A line a machine's `/etc/hosts` gets (`--add-host`, Docker's `ExtraHosts`): a name, and its address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtraHost {
+    pub name: String,
+    pub ip: IpAddr,
+}
+
+impl ExtraHost {
+    pub fn new(name: impl Into<String>, ip: IpAddr) -> crate::Result<ExtraHost> {
+        let name = name.into();
+        if !crate::spec::valid_hostname(&name) {
+            return Err(crate::Error::invalid(format!("--add-host {name}: a host name is letters, digits and '-', in labels separated by '.'")));
+        }
+        Ok(ExtraHost { name, ip })
+    }
+
+    /// `NAME:IP` or `NAME=IP`, as `--add-host` takes it; an IPv6 address as it is, or in brackets
+    /// (`db:fd00::5`, `db=[fd00::5]`).
+    pub fn parse(text: &str) -> crate::Result<ExtraHost> {
+        let Some(at) = text.find([':', '=']) else {
+            return Err(crate::Error::invalid(format!("--add-host {text}: NAME:IP")));
+        };
+        let (name, ip) = (&text[..at], text[at + 1..].trim_start_matches('[').trim_end_matches(']'));
+        if ip == "host-gateway" {
+            return Err(crate::Error::unsupported(format!(
+                "--add-host {text}: a machine's gateway doesn't reach this host's own services, so there's no host-gateway yet"
+            )));
+        }
+        let ip: IpAddr = ip.parse().map_err(|_| crate::Error::invalid(format!("--add-host {text}: {ip:?} isn't an IP address")))?;
+        ExtraHost::new(name, ip)
+    }
+}
+
+impl std::fmt::Display for ExtraHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.name, self.ip)
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
@@ -197,6 +236,19 @@ impl HostDatagram for HookedDatagram {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extra_hosts_as_add_host_takes_them() {
+        for (text, shown) in [("db:10.0.0.5", "db:10.0.0.5"), ("db=10.0.0.5", "db:10.0.0.5"), ("v6:fd00::5", "v6:fd00::5"), ("v6=[fd00::5]", "v6:fd00::5"), ("repo-server.internal:10.8.0.2", "repo-server.internal:10.8.0.2")] {
+            let host = ExtraHost::parse(text).unwrap();
+            assert_eq!(host.to_string(), shown);
+            assert_eq!(ExtraHost::parse(&host.to_string()).unwrap(), host);
+        }
+        for bad in ["db", "db:", "db:nope", ":10.0.0.5", "bad name:10.0.0.5", "-db:10.0.0.5"] {
+            assert!(ExtraHost::parse(bad).is_err(), "{bad}");
+        }
+        assert!(ExtraHost::parse("host.docker.internal:host-gateway").unwrap_err().to_string().contains("host-gateway"));
+    }
 
     #[test]
     fn refused_connections_and_unknown_names() {

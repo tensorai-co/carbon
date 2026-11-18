@@ -90,7 +90,8 @@ fn a_gateway_s_session() {
         "engine/machines.create",
         json!({
             "Image": "debian:latest", "Name": name, "Hostname": "sbx-8f3a", "Env": ["TURN=1"], "Cmd": ["sleep", "infinity"],
-            "HostConfig": { "Tmpfs": { "/run/secrets": "" } },
+            "Labels": { "session": "8f3a", "tier": "sandbox" },
+            "HostConfig": { "Tmpfs": { "/run/secrets": "" }, "ExtraHosts": ["repo-server.internal:10.8.0.2", "mirror=10.8.0.3"] },
             "Rules": { "Deny": ["0.0.0.0/0"] },
         }),
     );
@@ -123,6 +124,21 @@ fn a_gateway_s_session() {
     assert_eq!(reply["result"]["ExitCode"], 0, "{reply}");
     assert_eq!(joined(&frames, 1), "hello there");
 
+    // --add-host's lines, after the machine's own.
+    let r = s.ok("engine/machines.exec", json!({ "Id": id, "Cmd": ["sh", "-c", "getent hosts repo-server.internal mirror; tail -2 /etc/hosts"] }));
+    let out = r["Stdout"].as_str().unwrap();
+    assert!(out.contains("10.8.0.2        repo-server.internal") || out.contains("10.8.0.2\trepo-server.internal") || out.lines().any(|l| l.split_whitespace().collect::<Vec<_>>() == ["10.8.0.2", "repo-server.internal"]), "{out}");
+    assert!(out.lines().any(|l| l.split_whitespace().collect::<Vec<_>>() == ["10.8.0.3", "mirror"]), "{out}");
+
+    // Labels: found by them, and shown.
+    let found = s.ok("engine/machines.list", json!({ "Label": ["session=8f3a", "tier"] }));
+    assert_eq!(found.as_array().unwrap().iter().map(|m| m["Id"].as_str().unwrap()).collect::<Vec<_>>(), [id.as_str()]);
+    assert_eq!(s.ok("engine/machines.list", json!({ "Label": "session=other" })), json!([]));
+    let inspect = s.ok("engine/machines.inspect", json!({ "Id": id }));
+    assert_eq!(inspect["Config"]["Labels"]["tier"], "sandbox", "{inspect}");
+    assert_eq!(inspect["Config"]["Hostname"], "sbx-8f3a");
+    assert_eq!(inspect["HostConfig"]["ExtraHosts"], json!(["repo-server.internal:10.8.0.2", "mirror:10.8.0.3"]));
+
     // Without a stream, the output's in the answer.
     let r = s.ok("engine/machines.exec", json!({ "Id": id, "Cmd": ["sh", "-c", "echo plain"] }));
     assert_eq!(r["Stdout"].as_str().unwrap().trim(), "plain");
@@ -148,6 +164,8 @@ fn a_gateway_s_session() {
 
     let again = s.ok("engine/machines.create", json!({ "Image": format!("{repo}:t1"), "Name": format!("{name}-2") }));
     let again = again["Id"].as_str().unwrap().to_string();
+    let image = s.ok("engine/images.inspect", json!({ "Name": format!("{repo}:t1") }));
+    assert_eq!(image["Config"]["Labels"]["session"], "8f3a", "the labels are in the image: {image}");
     let r = s.ok("engine/files.stat", json!({ "Id": again, "Path": "/root/work.txt" }));
     assert_eq!(r["Size"], 4);
     let (reply, _) = s.call("engine/files.stat", json!({ "Id": again, "Path": "/run/secrets/token" }), &[]);

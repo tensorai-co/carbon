@@ -12,10 +12,17 @@ pub(crate) fn etc_file(k: &Kernel, path: &str) -> Option<Vec<u8>> {
     let hostname = &k.options.hostname;
     let text = match path {
         "/etc/resolv.conf" => format!("# The machine's DNS server, which is Carbon's.\nnameserver {}\n", k.net.gateway()),
-        "/etc/hosts" => format!(
-            "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\nfe00::0\tip6-localnet\nff00::0\tip6-mcastprefix\nff02::1\tip6-allnodes\nff02::2\tip6-allrouters\n{}\t{hostname}\n",
-            k.net.address()
-        ),
+        "/etc/hosts" => {
+            let mut text = format!(
+                "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\nfe00::0\tip6-localnet\nff00::0\tip6-mcastprefix\nff02::1\tip6-allnodes\nff02::2\tip6-allrouters\n{}\t{hostname}\n",
+                k.net.address()
+            );
+            // `--add-host`'s, after the machine's own, as Docker writes them.
+            for (name, ip) in &k.options.extra_hosts {
+                text.push_str(&format!("{ip}\t{name}\n"));
+            }
+            text
+        }
         "/etc/hostname" => format!("{hostname}\n"),
         _ => return None,
     };

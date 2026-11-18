@@ -47,6 +47,11 @@ paths:
     get:
       tags: [machines]
       operationId: machines.list
+      parameters:
+        - name: label
+          in: query
+          schema: { type: string }
+          description: "Only machines with this label: `KEY`, or `KEY=VALUE`."
       responses:
         "200":
           description: Every machine.
@@ -427,11 +432,20 @@ components:
           description: What it runs; the image's command when absent. A machine for exec is given one that waits, `["sleep", "infinity"]`.
         WorkingDir: { type: string }
         User: { type: string }
+        Labels:
+          type: object
+          additionalProperties: { type: string }
+          description: Kept in its config over its image's labels, and so in an image committed from it.
         HostConfig:
           type: object
           properties:
             NetworkMode: { type: string, enum: [nat, bridge, default, none, host] }
             Memory: { type: integer, description: Bytes. }
+            ExtraHosts:
+              type: array
+              items: { type: string }
+              description: "Lines for its /etc/hosts: `NAME:IP` (or `NAME=IP`). Linux machines."
+              examples: [["repo-server.internal:10.8.0.2"]]
             Tmpfs:
               type: object
               additionalProperties: { type: string }
@@ -463,6 +477,7 @@ components:
         Created: { type: string, format: date-time }
         State: { type: string, enum: [created, running, exited] }
         Platform: { type: string }
+        Labels: { type: object, additionalProperties: { type: string } }
     FileInfo:
       type: object
       properties:

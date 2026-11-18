@@ -59,12 +59,22 @@ pub struct MachineInfo {
     pub ports: Vec<Port>,
     /// How its first process ended, the last time it ran (None while it runs, or if it never ended).
     pub exit: Option<i32>,
+    /// Its host name: its own (`--hostname`), or its name.
+    pub hostname: String,
+    /// Its config: its image's, and what it was given (env, command, working folder, user, labels).
+    pub config: images::Config,
+    /// Its `/etc/hosts`' extra lines (`--add-host`).
+    pub extra_hosts: Vec<crate::ExtraHost>,
 }
 
 impl MachineInfo {
     pub(crate) fn of(record: Record) -> MachineInfo {
         let running = record.running();
+        let hostname = record.host_name();
         MachineInfo {
+            hostname,
+            config: record.config,
+            extra_hosts: record.extra_hosts,
             running,
             pid: record.pid.filter(|_| running),
             ports: if running { record.ports.iter().filter_map(|p| Port::parse(p)).collect() } else { Vec::new() },

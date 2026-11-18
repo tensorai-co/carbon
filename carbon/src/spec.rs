@@ -193,6 +193,8 @@ impl MachineSpec {
         let launch = Launch {
             name,
             hostname: None,
+            labels: Vec::new(),
+            extra_hosts: None,
             source,
             args: Vec::new(),
             isolation: Isolation::Auto,
@@ -241,6 +243,29 @@ impl MachineSpec {
         }
         self.launch.hostname = Some(hostname);
         self
+    }
+
+    /// A label, as Docker's (`--label`): kept in its config, over its image's own, and so in an image committed
+    /// from it.
+    pub fn label(mut self, key: impl Into<String>, value: impl Into<String>) -> MachineSpec {
+        let key = key.into();
+        if key.is_empty() || key.contains(char::is_whitespace) {
+            return self.invalid(Error::invalid(format!("--label {key:?}: a label's key is one word")));
+        }
+        self.launch.labels.push((key, value.into()));
+        self
+    }
+
+    /// A line its `/etc/hosts` gets (`--add-host`): `name` at `ip`. Kept, as its hostname is; a run that gives any
+    /// replaces what it had.
+    pub fn add_host(mut self, name: impl Into<String>, ip: std::net::IpAddr) -> MachineSpec {
+        match crate::ExtraHost::new(name, ip) {
+            Ok(host) => {
+                self.launch.extra_hosts.get_or_insert_with(Vec::new).push(host);
+                self
+            }
+            Err(e) => self.invalid(e),
+        }
     }
 
     /// A hardware VM ([`Isolation::Vm`]), the process sandbox, or the best there is ([`Isolation::Auto`], the
@@ -522,6 +547,12 @@ impl MachineSpec {
             record.config.cmd = launch.args.clone();
         }
         record.hostname = launch.hostname.clone();
+        for (key, value) in &launch.labels {
+            record.config.labels.insert(key.clone(), value.clone());
+        }
+        if let Some(hosts) = &launch.extra_hosts {
+            record.extra_hosts = hosts.clone();
+        }
         record.rules = spec.rules.clone();
         store.save_record(&record)?;
         let machine = Machine::new(spec.carbon.clone(), record.name.clone());
@@ -673,7 +704,7 @@ impl std::fmt::Debug for Running {
 
 /// Whether `name` is a host name Linux takes: dot-separated labels of letters, digits and `-`, none starting or
 /// ending with `-`, each at most 63 long, 253 in all.
-fn valid_hostname(name: &str) -> bool {
+pub(crate) fn valid_hostname(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 253
         && name.split('.').all(|label| {

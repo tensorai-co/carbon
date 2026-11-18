@@ -94,6 +94,8 @@ pub type Disk = layers::Fs<Meta>;
 #[derive(Debug, Clone)]
 pub struct Options {
     pub hostname: String,
+    /// More lines for its `/etc/hosts` (`--add-host`): a name, and its address.
+    pub extra_hosts: Vec<(String, std::net::IpAddr)>,
     /// The first program's environment.
     pub env: Vec<String>,
     /// The first program's working directory (an image's `WORKDIR`, or `--workdir`): `/` if None.
@@ -214,6 +216,7 @@ impl Default for Options {
     fn default() -> Options {
         Options {
             hostname: "carbon".to_string(),
+            extra_hosts: Vec::new(),
             env: vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(), "HOME=/root".to_string()],
             cwd: None,
             trace: std::env::var_os("CARBON_TRACE").is_some(),

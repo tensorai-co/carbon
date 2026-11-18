@@ -104,6 +104,7 @@ pub use machine::{Button, ExecSpec, Commit, Machine, MachineInfo, Port, Process,
 pub use files::{Copy, DirEntry, FileInfo, FileKind, Files, MOST_READ, Remove, Write};
 pub use logs::{LogLine, LogReader, LogStream, Logs};
 pub use mounts::{Mount, MountKind, Volume, VolumeInfo};
+pub use network::ExtraHost;
 pub use rules::Rules;
 pub use spec::{Audio, Display, Exit, MachineSpec, MemorySize, Output, Running, parse_size};
 pub use stdio::{Chunks, Stdin, Stdio};

@@ -42,6 +42,10 @@ usage: carbon <command> ...
       --isolation vm|sandbox|auto            a hardware VM, the process sandbox, or the best there is (the default)
       --name NAME                            the machine's name (else one from its image or program)
       -h, --hostname NAME                    the machine's hostname (its name by default)
+      -l, --label KEY[=VALUE]                a label, kept with it over its image's (and in an image committed from
+                                             it); carbon ps --filter label=KEY finds it
+      --label-file FILE                      labels from a file, a KEY[=VALUE] line each
+      --add-host NAME:IP                     a line for its /etc/hosts (NAME=IP too; IPv6 as it is, or in brackets)
       --rm                                   remove it, and its files, once it ends
       -v, --volume SOURCE:TARGET[:ro]        mount a host folder (/path, ./path, ~/path) or a volume (a name) at TARGET:
                                              each side sees the other's changes at once; a new volume is filled from
@@ -61,6 +65,8 @@ usage: carbon <command> ...
                                              screen (auto, the default), the host's speakers or fail, nowhere, or a
                                              WAV file of everything played
       -e, --env NAME=VALUE                   an environment variable, over the image's
+      --env-file FILE                        environment variables from a file, as Docker reads one: a NAME=VALUE
+                                             line each (NAME alone takes this one's), # for comments
       -w, --workdir DIR                      where its program starts (the image's working directory by default)
       -u, --user USER[:GROUP]                who it runs as, by name or number from the image's /etc/passwd (the
                                              image's USER by default, else root)
@@ -85,6 +91,7 @@ usage: carbon <command> ...
       -t, --tty                              a terminal of its own, this one (-it for a shell)
       -d, --detach                           start it and leave it running
       -e, --env NAME=VALUE                   an environment variable, over the machine's
+      --env-file FILE                        environment variables from a file, a NAME=VALUE line each
       -w, --workdir DIR                      where it starts (the image's working directory by default)
       -u, --user USER[:GROUP]                who it runs as (the machine's first program's user by default)
       --timeout DURATION                     kill it if it hasn't ended this long after it starts (exit 124)
@@ -109,7 +116,8 @@ usage: carbon <command> ...
                                              what a running machine does, as it does it: the programs it starts,
                                              what they write, its connections and lookups, and what its rules and
                                              hooks decided (everything unless some are named; --json: a line each)
-  ps                                         the machines, and which are running (ls too)
+  ps [--filter label=KEY[=VALUE]]            the machines, and which are running (ls too); with a filter, only
+                                             those with that label (as many filters as wanted, all of them)
   port NAME [PORT[/tcp|udp]]                 what a running machine publishes: 22/tcp -> 0.0.0.0:2222
   gpu                                        the devices a machine's GPU can be: this host's, and the CPU device
   stop NAME                                  stop a running machine (SIGTERM, then everything after 10s)
@@ -213,6 +221,44 @@ fn usage() -> ! {
 }
 
 /// A length of time as `--timeout` takes it: `90` or `90s`, `500ms`, `5m`, `2h`.
+/// `--env-file`, as Docker reads one: a `NAME=VALUE` line each, the value as it is (quotes and all); `NAME` alone takes
+/// this process's, and is left out if it has none; blank lines and `#` lines skipped.
+fn env_file(path: &str) -> Vec<(String, String)> {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| fail(format!("--env-file {path}: {e}")));
+    let mut vars = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, value) = match line.split_once('=') {
+            Some((key, value)) => (key, Some(value.to_string())),
+            None => (line.trim_end(), None),
+        };
+        if key.is_empty() || key.contains(char::is_whitespace) {
+            fail(format!("--env-file {path}: line {}: {key:?} isn't a variable's name", i + 1));
+        }
+        match value.or_else(|| std::env::var(key).ok()) {
+            Some(value) => vars.push((key.to_string(), value)),
+            None => continue,
+        }
+    }
+    vars
+}
+
+/// `--label-file`: a `KEY[=VALUE]` line each, blank lines and `#` lines skipped.
+fn label_file(path: &str) -> Vec<(String, String)> {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| fail(format!("--label-file {path}: {e}")));
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| {
+            let (k, v) = l.split_once('=').unwrap_or((l, ""));
+            (k.to_string(), v.to_string())
+        })
+        .collect()
+}
+
 fn duration(text: &str) -> std::time::Duration {
     let (number, unit) = text.find(|c: char| !c.is_ascii_digit()).map_or((text, ""), |at| text.split_at(at));
     let n: u64 = number.parse().unwrap_or_else(|_| fail(format!("{text} isn't a length of time: 90, 90s, 500ms, 5m, 2h")));
@@ -426,6 +472,27 @@ fn run(carbon: &Carbon, mut args: impl Iterator<Item = String>) -> ! {
                 let hostname = value("--hostname");
                 options.push(Box::new(move |s| s.hostname(hostname)));
             }
+            "-l" | "--label" | "--label-file" => {
+                let text = value(&arg);
+                let labels = if arg == "--label-file" {
+                    label_file(&text)
+                } else {
+                    let (k, v) = text.split_once('=').unwrap_or((&text, ""));
+                    vec![(k.to_string(), v.to_string())]
+                };
+                for (k, v) in labels {
+                    options.push(Box::new(move |s| s.label(k, v)));
+                }
+            }
+            "--add-host" => {
+                let host = carbon::ExtraHost::parse(&value("--add-host")).unwrap_or_else(|e| fail(e));
+                options.push(Box::new(move |s| s.add_host(host.name, host.ip)));
+            }
+            "--env-file" => {
+                for (key, val) in env_file(&value("--env-file")) {
+                    options.push(Box::new(move |s| s.env(&key, &val)));
+                }
+            }
             "--platform" => {
                 let text = value("--platform");
                 let platform = Platform::parse(&text).unwrap_or_else(|| fail(format!("{text} isn't a platform: linux/arm64, linux/amd64, windows/amd64")));
@@ -556,6 +623,7 @@ fn exec(carbon: &Carbon, mut args: impl Iterator<Item = String>) -> ! {
                 let Some((key, val)) = var.split_once('=') else { fail(format!("{var}: an environment variable is NAME=VALUE")) };
                 env.push((key.to_string(), val.to_string()));
             }
+            "--env-file" => env.extend(env_file(&value("--env-file"))),
             "-w" | "--workdir" => workdir = Some(value("--workdir")),
             "-u" | "--user" => user = Some(value("--user")),
             "--timeout" => timeout = Some(duration(&value("--timeout"))),
@@ -787,10 +855,32 @@ fn logs(carbon: &Carbon, args: impl Iterator<Item = String>) {
     }
 }
 
-fn ls(carbon: &Carbon) {
+fn ls(carbon: &Carbon, mut args: impl Iterator<Item = String>) {
+    // Docker's `--filter label=KEY` and `label=KEY=VALUE`: every one must match.
+    let mut labels: Vec<(String, Option<String>)> = Vec::new();
+    while let Some(arg) = args.next() {
+        let (flag, inline) = match arg.split_once('=') {
+            Some((f, v)) if f == "--filter" => (f.to_string(), Some(v.to_string())),
+            _ => (arg, None),
+        };
+        match flag.as_str() {
+            "-f" | "--filter" => {
+                let text = inline.or_else(|| args.next()).unwrap_or_else(|| fail("--filter needs a value: label=KEY[=VALUE]"));
+                let Some(label) = text.strip_prefix("label=") else { fail(format!("--filter {text}: label=KEY[=VALUE] is the filter there is")) };
+                let (k, v) = match label.split_once('=') {
+                    Some((k, v)) => (k.to_string(), Some(v.to_string())),
+                    None => (label.to_string(), None),
+                };
+                labels.push((k, v));
+            }
+            "-a" | "--all" => {}
+            other => fail(format!("ps doesn't know {other}: --filter label=KEY[=VALUE]")),
+        }
+    }
     let rows: Vec<[String; 5]> = carbon
         .machines()
         .into_iter()
+        .filter(|m| labels.iter().all(|(k, v)| m.config.labels.get(k).is_some_and(|have| v.as_ref().is_none_or(|v| v == have))))
         .map(|m| {
             let status = match (m.running, m.exit) {
                 (true, _) => format!("running ({})", m.pid.unwrap_or(0)),
@@ -877,7 +967,7 @@ fn main() {
             let name = one("a machine's name");
             watch(&machine(&name), args);
         }
-        "ls" | "ps" => ls(&carbon),
+        "ls" | "ps" => ls(&carbon, args),
         "port" => {
             let name = one("a machine's name");
             port(&carbon, &name, args.next().as_deref());
@@ -1232,5 +1322,29 @@ fn main() {
         }
         "rmi" => carbon.remove_image(&one("an image")).unwrap_or_else(|e| fail(e)),
         other => fail(format!("{other} isn't a command: carbon help")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_and_label_files_as_docker_reads_them() {
+        let dir = std::env::temp_dir().join(format!("carbon-cli-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("env");
+        // SAFETY: a variable only this test reads.
+        unsafe { std::env::set_var("CARBON_TEST_FROM_HOST", "hosts") };
+        std::fs::write(&file, "# a comment\n\nA=1\n  B=two words\nC=\"quoted\"\nD=x=y\nCARBON_TEST_FROM_HOST\nCARBON_TEST_UNSET_ANYWHERE\n").unwrap();
+        let vars = env_file(file.to_str().unwrap());
+        let want: Vec<(String, String)> = [("A", "1"), ("B", "two words"), ("C", "\"quoted\""), ("D", "x=y"), ("CARBON_TEST_FROM_HOST", "hosts")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        assert_eq!(vars, want);
+        std::fs::write(&file, "team=infra\n# no\ntier\n").unwrap();
+        assert_eq!(label_file(file.to_str().unwrap()), [("team".to_string(), "infra".to_string()), ("tier".to_string(), String::new())]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

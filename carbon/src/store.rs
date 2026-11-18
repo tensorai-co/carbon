@@ -89,6 +89,8 @@ pub(crate) struct Record {
     pub mounts: Vec<crate::Mount>,
     /// Its host name (`--hostname`); None for its name.
     pub hostname: Option<String>,
+    /// Its `/etc/hosts`' extra lines (`--add-host`).
+    pub extra_hosts: Vec<crate::ExtraHost>,
     /// Rules it was made with ([`crate::MachineSpec::create`]), added to any it's started with.
     pub rules: crate::Rules,
 }
@@ -112,6 +114,7 @@ impl Record {
             "exit": self.exit,
             "mounts": crate::mounts::mounts_json(&self.mounts),
             "hostname": self.hostname,
+            "extra_hosts": self.extra_hosts.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "rules": if self.rules.is_empty() { Value::Null } else { self.rules.to_json() },
         })
     }
@@ -148,6 +151,7 @@ impl Record {
             exit: v.get("exit").and_then(Value::as_i64).map(|c| c as i32),
             mounts: crate::mounts::mounts_from_json(v.get("mounts")),
             hostname: s("hostname"),
+            extra_hosts: list(Some(v), "extra_hosts").iter().filter_map(|h| crate::ExtraHost::parse(h).ok()).collect(),
             rules: v.get("rules").filter(|r| !r.is_null()).and_then(|r| crate::Rules::from_json(r).ok()).unwrap_or_default(),
         })
     }
@@ -538,6 +542,7 @@ impl Store {
             exit: None,
             mounts: Vec::new(),
             hostname: None,
+            extra_hosts: Vec::new(),
             rules: crate::Rules::new(),
         };
         match source {
@@ -658,6 +663,7 @@ mod tests {
             exit: Some(3),
             mounts: vec![crate::Mount::volume("data", "/data"), crate::Mount::tmpfs("/tmp").read_only()],
             hostname: Some("sbx-8f3a".into()),
+            extra_hosts: vec![crate::ExtraHost::parse("repo-server:10.8.0.5").unwrap(), crate::ExtraHost::parse("v6=[fd00::5]").unwrap()],
             rules: crate::Rules::new().deny("0.0.0.0/0").unwrap().allow("pypi.org:443").unwrap(),
         };
         assert_eq!(Record::from_json(&record.to_json()), Some(record));
