@@ -86,7 +86,7 @@ libraries.
 | [`Logs`, `LogLine`](src/logs.rs) | What a launched machine wrote, as lines on its stream: `tail(n)`, `follow()` |
 | [`Image`, `ImageConfig`, `History`](../images/src/config.rs) | An image: its whole OCI config (exposed ports, volumes, labels, stop signal, health check, shell, `ONBUILD`), each step that made it, and its [`Lineage`](../images/src/lib.rs): the repository and [`Layer`](../images/src/lib.rs)s its first disk was pulled as, and each [`Disk`](../images/src/lib.rs) it was made through |
 | [`Push`, `Pushed`, `PushProgress`](src/lib.rs) | How to push (as another name, squashed), what a push did (the name, the manifest's digest, layers sent), and where one is |
-| [`ExecSpec`, `Process`](src/machine.rs) | A process in a running machine, as `docker exec`: `user`, `env`, `workdir`, `tty`, `timeout` (killed after it, exit 124); then `spawn` (stdin, output as it comes, `resize`, `signal`, `wait`), `output`, `detach`, or `attach` to this terminal |
+| [`ExecSpec`, `Process`, `ProcessHandle`](src/machine.rs) | A process in a running machine, as `docker exec`: `user`, `env`, `workdir`, `tty`, `timeout` (killed after it, exit 124); then `spawn` (stdin, output as it comes, `resize`, `signal`, `wait`), `output`, `detach`, or `attach` to this terminal; `handle` for a `ProcessHandle` that writes its stdin and signals it from another thread while one reads it |
 | [`Screen`](src/machine.rs) | A running machine's desktop, for computer use: `screenshot` (PNG), `windows`, `click`, `drag`, `scroll`, `type_text`, `key`, `resize`, `clipboard`, `drop_text`, `drop_files` |
 | [`hooks`](../hooks/README.md) | Events, decisions, the `Hooks` trait, filters, and the `Hub` each machine's hook points ask, with observers and subscriptions |
 | [`Rules`](src/rules.rs) | Decisions with no code: programs that may not start (`deny_exec("rm -rf *")`), where the network may and may not go (`deny("0.0.0.0/0")`, `allow("pypi.org:443")`) |
@@ -308,7 +308,7 @@ In [the proposal](../docs/carbon_lib.md)'s order:
       difference from the step before, as a tar with whiteouts), `--squash` for one; `build --output type=docker|oci`.
 - [ ] **The rest of registries:** Windows images pushed and saved; several platforms pushed as one index;
       `build --output type=tar` (the files alone); `carbon export` of a machine's disk as a tar.
-- [ ] **Policy and budget** (step 11), held by every build too; **checkpoints** of a running machine (step 12).
+- [ ] **Checkpoints** of a running machine (step 11): an image of its disk while it runs, as `docker commit` makes one.
 - [ ] **Windows images built**: `FROM atlas`, `RUN` by `cmd.exe` and `powershell`, `COPY` into `C:\`.
 - [ ] **The rest of building**: `ADD` of a URL (`--checksum`) or a git repository, and a tar or git URL as the
       context; `COPY --parents`; symbolic `--chmod`; bzip2, xz and zstd archives; stages that don't need each
@@ -325,9 +325,9 @@ In [the proposal](../docs/carbon_lib.md)'s order:
       published ports, connection data, the registry, desktop dialogs, time and randomness.
 - [ ] **Answers**: a Windows program's start answered (a process that ends at once with the answer's output); a
       connection answered by a peer in memory.
-- [ ] **A rules file** (`--policy`) and read-only paths (`--read-only`), once files are hooked.
+- [x] **`carbon mcp`** over stdio ([`mcp`](../mcp/README.md)), every tool a call into this crate.
 - [ ] **For agents**: checkpoints and rollback of a running machine's disk, forks, record and replay, limits,
-      virtual time, and `carbon mcp`.
+      virtual time.
 - [ ] **Async**: `Subscription` and `Process` as streams, behind a feature, so no runtime is chosen for its users.
 - [ ] **Windows hosts**: the control socket (exec, watch, stop from another process) is Unix-only today.
 - [ ] **Other languages**, as clients of [the control protocol](src/wire.rs).

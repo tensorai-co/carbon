@@ -181,7 +181,7 @@ Limits that come with where the hooks are, found as they were built:
 
 ### In Rust
 
-A policy as a type:
+A program's own decisions, as a type:
 
 ```rust
 use carbon::hooks::{Connect, Decision, Exec, Hooks, Interest, Lookup, Output, Reply};
@@ -269,7 +269,7 @@ let rules = Rules::new().deny_exec("rm -rf *").deny("0.0.0.0/0")?.allow("pypi.or
 
 An `--allow` beats a `--deny`; a host takes its subdomains and matches the name the machine looked up; an exec
 pattern's first word is the program's name and each after it one argument, with `*` and `?`, and a last `*` takes
-the rest. A rules file (`--policy`) and read-only paths come with file hooks.
+the rest.
 
 ## Machines in processes of their own
 
@@ -300,8 +300,7 @@ package is a thin layer over the socket, not a second implementation.
 | `carbon ls`, `port`, `stop`, `rm`, `freeze`, `cp`, `display ...` | `Carbon::machines`; `Machine::ports`, `stop`, `remove`, `freeze`, `copy_in`, `copy_out`; `Screen` |
 | `carbon watch NAME [--exec] [--output] [--net] [--json]` | `Machine::watch` |
 | `carbon run --deny-exec`, `--allow`, `--deny` | `Rules` |
-| `carbon run --policy FILE`, `--read-only` | rules, with file hooks (to do) |
-| `carbon mcp` | an MCP server over the library (to do) |
+| `carbon mcp` | an MCP server over the library ([`mcp`](../mcp/README.md)): stdio built, HTTP to do |
 
 ## For agents, beyond hooks
 
@@ -324,10 +323,9 @@ What the parts already make cheap, which the library should name (step 6):
 2. **`hooks`, and the first hook points:** exec in both kernels, output, connect and lookup, in the same process; and
    `carbon watch`. *Done:* a program using the library blocks a command, rewrites one, answers one, redacts output
    and refuses a connection; tested in each kernel.
-3. **Rules:** network allow and deny, exec patterns. *Done*, as `Rules`, `--deny-exec`, `--allow` and `--deny`. A
-   rules file and read-only paths wait for file hooks.
+3. **Rules:** network allow and deny, exec patterns. *Done*, as `Rules`, `--deny-exec`, `--allow` and `--deny`.
 4. **Workers**, and hook frames over the socket; several machines at once from one program on macOS.
-5. **The other hook points:** files (then `--policy` and `--read-only`), process lifecycle and signals, input,
+5. **The other hook points:** files, process lifecycle and signals, input,
    accepts, data, the registry, desktop dialogs, time. And the answers not there yet: a Windows exec, a connection.
 6. **For agents:** checkpoints and rollback, `carbon mcp`, record and replay, limits, virtual time.
 7. **Other languages**, over the wire protocol; async streams for `Subscription` and `Process`, behind a feature.

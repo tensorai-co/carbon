@@ -188,15 +188,22 @@ impl Surface {
         }
     }
 
-    /// As a PNG: 8-bit RGB, deflated as stored blocks.
+    /// As a PNG: 8-bit RGB, each row filtered against the one above (PNG's "up"), deflated. A desktop's flat colours
+    /// and repeated rows come to a small fraction of the pixels, so a screenshot is cheap to send.
     pub fn png(&self) -> Vec<u8> {
+        let stride = (self.width * 3) as usize;
         let mut raw = Vec::with_capacity((self.width * self.height * 3 + self.height) as usize);
+        let mut above = vec![0u8; stride];
+        let mut row = vec![0u8; stride];
         for y in 0..self.height {
-            raw.push(0);
             for x in 0..self.width {
                 let p = self.pixels[(y * self.width + x) as usize];
-                raw.extend([(p >> 16) as u8, (p >> 8) as u8, p as u8]);
+                let at = (x * 3) as usize;
+                row[at..at + 3].copy_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, p as u8]);
             }
+            raw.push(2);
+            raw.extend(row.iter().zip(&above).map(|(b, a)| b.wrapping_sub(*a)));
+            std::mem::swap(&mut row, &mut above);
         }
         let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
         let mut header = Vec::new();
@@ -204,7 +211,7 @@ impl Surface {
         header.extend((self.height as u32).to_be_bytes());
         header.extend([8, 2, 0, 0, 0]);
         chunk(&mut out, b"IHDR", &header);
-        chunk(&mut out, b"IDAT", &zlib_stored(&raw));
+        chunk(&mut out, b"IDAT", &zlib(&raw));
         chunk(&mut out, b"IEND", &[]);
         out
     }
@@ -231,23 +238,12 @@ fn crc32(data: &[u8]) -> u32 {
 }
 
 /// A zlib stream of stored (uncompressed) deflate blocks.
-fn zlib_stored(data: &[u8]) -> Vec<u8> {
-    let mut out = vec![0x78, 0x01];
-    let chunks: Vec<&[u8]> = if data.is_empty() { vec![&[]] } else { data.chunks(65535).collect() };
-    for (i, block) in chunks.iter().enumerate() {
-        out.push(u8::from(i + 1 == chunks.len()));
-        let len = block.len() as u16;
-        out.extend(len.to_le_bytes());
-        out.extend((!len).to_le_bytes());
-        out.extend(*block);
-    }
-    let (mut a, mut b) = (1u32, 0u32);
-    for &byte in data {
-        a = (a + u32::from(byte)) % 65521;
-        b = (b + a) % 65521;
-    }
-    out.extend((b << 16 | a).to_be_bytes());
-    out
+fn zlib(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut e = flate2::write::ZlibEncoder::new(Vec::with_capacity(data.len() / 8), flate2::Compression::fast());
+    // Writing to memory can't fail.
+    let _ = e.write_all(data);
+    e.finish().unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -287,5 +283,36 @@ mod tests {
         assert_eq!(&png[12..16], b"IHDR");
         assert_eq!(crc32(b"IEND"), 0xae42_6082);
         assert!(png.ends_with(&[0xae, 0x42, 0x60, 0x82]));
+    }
+
+    #[test]
+    fn png_pixels_come_back_and_a_flat_screen_is_small() {
+        use std::io::Read;
+        let mut s = Surface::new(40, 30, 0x204060);
+        for i in 0..s.pixels.len() {
+            if i % 7 == 0 {
+                s.pixels[i] = (i as u32).wrapping_mul(2_654_435_761) & 0xff_ffff;
+            }
+        }
+        let png = s.png();
+        // Its IDAT, inflated and unfiltered, is the pixels.
+        let len = u32::from_be_bytes(png[33..37].try_into().unwrap()) as usize;
+        assert_eq!(&png[37..41], b"IDAT");
+        let mut raw = Vec::new();
+        flate2::read::ZlibDecoder::new(&png[41..41 + len]).read_to_end(&mut raw).unwrap();
+        let stride = 40 * 3;
+        let mut above = vec![0u8; stride];
+        for y in 0..30 {
+            let line = &raw[y * (stride + 1)..(y + 1) * (stride + 1)];
+            assert_eq!(line[0], 2, "up-filtered");
+            let row: Vec<u8> = line[1..].iter().zip(&above).map(|(d, a)| d.wrapping_add(*a)).collect();
+            for x in 0..40 {
+                let p = s.pixels[y * 40 + x];
+                assert_eq!(&row[x * 3..x * 3 + 3], &[(p >> 16) as u8, (p >> 8) as u8, p as u8]);
+            }
+            above = row;
+        }
+        let flat = Surface::new(1280, 800, 0x336699).png();
+        assert!(flat.len() < 20_000, "a flat 1280x800 screen is {} bytes", flat.len());
     }
 }

@@ -49,6 +49,7 @@ carbon display resize app 1600x900@2        # its screen's size and scale, chang
 carbon display clipboard app                # its clipboard's text (with text after: set, as copied on the host)
 carbon display drop app 300 200 --files 'C:\notes.txt'  # drops files there, as dragged in from the host (or text)
 carbon pull debian:13 [--platform OS/ARCH] | rmi IMAGE
+claude mcp add carbon -- carbon mcp         # an MCP server for agents: machines, exec, files, builds, screens as tools
 carbon login -u someone                     # a login for docker.io (or `carbon login ghcr.io`), asked for unseen
 carbon push someone/app:1                   # a layer per step; a pulled base's layers taken from where they are
 carbon save -o app.tar app:1 debian:13      # images as one archive, as docker save writes it; docker load reads it
@@ -130,6 +131,12 @@ is found in the cache. `carbon watch build-<id>-<n>` shows a step's machine as i
 folder, exposed ports, volumes, labels, stop signal, health check, shell, `ONBUILD`), its history, and its layers'
 digests. `carbon history IMAGE` is the history as a table; `carbon tag SOURCE TARGET` names it again.
 
+`carbon mcp [options]` is an MCP server over this Carbon home, on stdin and stdout, for an agent's client to start
+([`mcp`](../mcp/README.md) has its tools). `--machine NAME` serves one machine alone; `--host-dir DIR` is a host
+folder its tools may name (for binds, copies, build contexts and archives; none by default, and then no host paths
+at all); `--deny-exec`, `--deny` and `--allow` are rules on every machine it starts, and `--network`, `--memory` and
+`--timeout` their defaults, as `carbon run` takes them; `--tools a,b` lists only those.
+
 `carbon login [-u USER] [--password-stdin] [REGISTRY]` checks a login with a registry (`docker.io` by default) and
 keeps it in `CARBON_HOME/auth.json`, readable by its owner alone; without `-u` and a password it asks for them, the
 password unseen. A registry Carbon has no login for is looked for in Docker's (`~/.docker/config.json` and its
@@ -179,8 +186,6 @@ carbon connect box.example.com/app [--windows] [--view-only] [--headless out/]
 
 # machines, and agents
 carbon fork dev dev-2
-carbon run --policy agent.toml --read-only /etc debian:13 -- bash
-carbon mcp                                    # an MCP server over the library, for agents that speak MCP
 ```
 
 ## To do

@@ -96,6 +96,7 @@ name = "cli"
 version = "0.2.0"
 dependencies = [
  "carbon",
+ "mcp",
 ]
 
 [[package]]
@@ -139,6 +140,9 @@ dependencies = [
 [[package]]
 name = "display"
 version = "0.2.0"
+dependencies = [
+ "flate2",
+]
 
 [[package]]
 name = "display-macos"
@@ -481,6 +485,14 @@ name = "log"
 version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
+
+[[package]]
+name = "mcp"
+version = "0.2.0"
+dependencies = [
+ "carbon",
+ "serde_json",
+]
 
 [[package]]
 name = "memchr"

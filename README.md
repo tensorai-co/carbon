@@ -33,6 +33,7 @@ carbon run --isolation vm debian:13 -- ./untrusted.sh          # a hardware VM, 
 carbon run --platform linux/amd64 debian:13 -- apt-get install -y curl    # x86-64, translated on Apple silicon
 carbon run --deny 0.0.0.0/0 --allow pypi.org:443 --deny-exec 'rm -rf *' debian:13 -- ./agent-step.sh   # rules
 carbon watch web                                               # every program it starts, what it writes, where it connects
+claude mcp add carbon -- carbon mcp                            # an agent's machines, as MCP tools: run, exec, files, builds, screens
 ```
 
 And as a Rust library, from GitHub:
@@ -236,6 +237,7 @@ Around them:
 | [`hooks`](hooks/README.md) | What hook points report and what can be decided about it: events, decisions, the `Hooks` trait, filters, and the hub every hook point asks | Built |
 | [`remote`](remote/README.md) | A machine's desktop and sound, shown and driven from another computer over QUIC | Not started |
 | [`cli`](cli/README.md) | The `carbon` command | Built, as a thin layer over `carbon` |
+| [`mcp`](mcp/README.md) | `carbon mcp`: an MCP server over the library, so agents get machines to work in | Built: stdio, both eras of the protocol, 37 tools (machines, processes, files, images, volumes, screens, events); Streamable HTTP to do |
 
 ```
 cli ──► carbon ──► kernels ──► exec, layers, display, gpu, audio, net, host
@@ -463,7 +465,7 @@ process per machine, so one program runs several at once on macOS. (`--rm` and `
 
 **6. Networks** ([net](net/README.md#to-do))
 
-1. Policy's rest: a rules file, `--dns`. (`--allow`, `--deny` and their log, `carbon watch`, are done as rules on
+1. `--dns`. (`--allow`, `--deny` and their log, `carbon watch`, are done as rules on
    `carbon`'s hooks; `--publish`, `--network none` and `host`, and `carbon port`, for lambda and atlas.)
 2. Between machines: named networks, names in DNS, `carbon net`.
 3. ICMP echo, IPv6 end to end, broadcast and multicast, as programs ask.
@@ -484,9 +486,10 @@ process per machine, so one program runs several at once on macOS. (`--rm` and `
 
 1. The library's rest ([carbon](carbon/README.md#to-do), [the proposal](docs/carbon_lib.md)): workers, so a
    program runs several machines at once on macOS; files, process lifecycle, accepts, data and the registry hooked;
-   an answered Windows exec and an answered connection; a rules file; checkpoints and rollback, forks, record and
-   replay, limits; `carbon mcp`; clients in other languages over the control protocol. (The crate `carbon`, the CLI
-   over it, hooks on programs, output, connections and lookups, rules and `carbon watch` are done.)
+   an answered Windows exec and an answered connection; checkpoints and rollback, forks, record and
+   replay, limits; `carbon mcp` over HTTP; clients in other languages over the control protocol. (The crate `carbon`,
+   the CLI over it, hooks on programs, output, connections and lookups, rules, `carbon watch` and `carbon mcp` over
+   stdio are done.)
 2. Linux ARM64 hosts; ARM64 → x86-64 translation ([exec](exec/README.md#5-more-hosts-and-isas)).
 3. The macOS sandbox: shared memory, x86 programs, the rest of ARM64; the Windows sandbox hardened; winkvm's rest
    (NMIs, VPID, kernel CET, AMD SVM, signing) ([exec](exec/README.md#4-safety-and-robustness)).

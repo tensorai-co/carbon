@@ -133,6 +133,13 @@ usage: carbon <command> ...
                                              each DLL and what of it isn't there; for several or a folder, what's
                                              wanted most (--all lists everything)
   pull IMAGE [--platform OS/ARCH]            pull an image
+  mcp [options]                              an MCP server for agents, on stdin and stdout (claude mcp add carbon -- carbon mcp)
+      --machine NAME                         serve one machine alone: its tools, with no machine argument
+      --host-dir DIR                         a host folder tools may name, for binds, copies and archives (as many
+                                             as wanted; none by default, and then no host paths at all)
+      --deny-exec, --deny, --allow           rules on every machine it starts, as carbon run's
+      --network, --memory, --timeout         defaults for every machine it starts, as carbon run's
+      --tools NAME,...                       list only these tools
   push [--squash] IMAGE                      push an image to its registry, a layer per step of what made it
       --squash                               its whole disk as one layer
   login [options] [REGISTRY]                 log in to a registry (docker.io by default), for pushes and private pulls
@@ -584,6 +591,41 @@ fn exec(carbon: &Carbon, mut args: impl Iterator<Item = String>) -> ! {
 }
 
 /// `carbon watch NAME [--exec] [--output] [--net] [--json]`: a running machine's hooked events, as they're decided.
+/// `carbon mcp [options]`: an MCP server over this Carbon home, on stdin and stdout, for an agent's client to start.
+fn mcp(carbon: &Carbon, mut args: impl Iterator<Item = String>) {
+    let mut options = mcp::Options::default();
+    let mut rules = Rules::new();
+    while let Some(arg) = args.next() {
+        let (arg, inline) = match arg.split_once('=') {
+            Some((flag, value)) if flag.starts_with("--") => (flag.to_string(), Some(value.to_string())),
+            _ => (arg, None),
+        };
+        let mut value = |what: &str| inline.clone().or_else(|| args.next()).unwrap_or_else(|| fail(format!("{what} needs a value")));
+        match arg.as_str() {
+            "--machine" => options.machine = Some(value("--machine")),
+            "--host-dir" => options.host_dirs.push(std::path::PathBuf::from(value("--host-dir"))),
+            "--deny-exec" => rules = rules.deny_exec(&value("--deny-exec")),
+            "--deny" => rules = rules.deny(&value("--deny")).unwrap_or_else(|e| fail(format!("--deny {e}"))),
+            "--allow" => rules = rules.allow(&value("--allow")).unwrap_or_else(|e| fail(format!("--allow {e}"))),
+            "--network" => {
+                let text = value("--network");
+                options.network = Some(carbon::parse_network(&text).unwrap_or_else(|| fail(format!("--network {text}: nat, none or host"))));
+            }
+            "--memory" | "-m" => options.memory = Some(value("--memory")),
+            "--timeout" => options.timeout = Some(duration(&value("--timeout"))),
+            "--tools" => options.tools = Some(value("--tools").split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect()),
+            "--http" => fail("carbon mcp --http isn't there yet: stdio only, as a client starts it (carbon mcp)"),
+            other => fail(format!("mcp doesn't know {other}: --machine, --host-dir, --deny-exec, --deny, --allow, --network, --memory, --timeout, --tools")),
+        }
+    }
+    options.rules = rules;
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        eprintln!("carbon mcp: an MCP server on stdin and stdout, for an MCP client to start (as `claude mcp add carbon -- carbon mcp`). Waiting for JSON-RPC.");
+    }
+    let server = mcp::Server::new(carbon.clone(), options).unwrap_or_else(|e| fail(e));
+    server.serve_stdio().unwrap_or_else(|e| fail(format!("stdio: {e}")));
+}
+
 fn watch(machine: &Machine, args: impl Iterator<Item = String>) {
     let mut interest = Interest::none();
     let mut json = false;
@@ -738,6 +780,7 @@ fn main() {
     match command.as_str() {
         "run" => run(&carbon, args),
         "exec" => exec(&carbon, args),
+        "mcp" => mcp(&carbon, args),
         "watch" => {
             let name = one("a machine's name");
             watch(&machine(&name), args);

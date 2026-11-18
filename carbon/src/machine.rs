@@ -472,6 +472,18 @@ impl Process {
         self.send(3, &signal.to_le_bytes())
     }
 
+    /// A handle to write its stdin and signal it from another thread, while this one reads what it writes
+    /// ([`Process::next_event`] waits, and needs it alone).
+    pub fn handle(&self) -> Result<ProcessHandle> {
+        #[cfg(unix)]
+        {
+            let stream = self.stream.try_clone().map_err(|e| Error::io(format!("the process's machine: {e}")))?;
+            Ok(ProcessHandle { stream: std::sync::Arc::new(stream) })
+        }
+        #[cfg(not(unix))]
+        Err(Error::unsupported("exec isn't there yet on Windows hosts"))
+    }
+
     /// What it writes, in order, as it writes it, then its exit code; None after that.
     pub fn next_event(&mut self) -> Option<ProcessEvent> {
         if self.exited.is_some() {
@@ -526,6 +538,48 @@ impl Iterator for Process {
     type Item = ProcessEvent;
     fn next(&mut self) -> Option<ProcessEvent> {
         self.next_event()
+    }
+}
+
+/// A [`Process`]'s stdin and signals, apart from what it writes: [`Process::handle`]. Clones share the process.
+#[derive(Debug, Clone)]
+pub struct ProcessHandle {
+    #[cfg(unix)]
+    stream: std::sync::Arc<std::os::unix::net::UnixStream>,
+}
+
+impl ProcessHandle {
+    #[cfg(unix)]
+    fn send(&self, kind: u8, data: &[u8]) -> Result<()> {
+        use std::io::Write;
+        (&*self.stream).write_all(&wire::frame(kind, data)).map_err(|e| Error::io(format!("the process's machine: {e}")))
+    }
+
+    #[cfg(not(unix))]
+    fn send(&self, _kind: u8, _data: &[u8]) -> Result<()> {
+        Err(Error::unsupported("exec isn't there yet on Windows hosts"))
+    }
+
+    /// Writes to its stdin.
+    pub fn write_stdin(&self, data: &[u8]) -> Result<()> {
+        self.send(0, data)
+    }
+
+    /// Ends its stdin.
+    pub fn close_stdin(&self) {
+        let _ = self.send(1, &[]);
+    }
+
+    /// Its terminal's new size, if it has one.
+    pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
+        let mut d = rows.to_le_bytes().to_vec();
+        d.extend(cols.to_le_bytes());
+        self.send(2, &d)
+    }
+
+    /// Sends it a signal (in a Windows machine, any signal ends it).
+    pub fn signal(&self, signal: i32) -> Result<()> {
+        self.send(3, &signal.to_le_bytes())
     }
 }
 

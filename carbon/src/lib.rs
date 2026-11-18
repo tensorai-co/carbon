@@ -100,7 +100,7 @@ use std::sync::{Arc, RwLock};
 pub use hooks;
 
 pub use error::{Error, ErrorKind, Result};
-pub use machine::{Button, ExecSpec, Freeze, Machine, MachineInfo, Port, Process, ProcessEvent, Screen, Window};
+pub use machine::{Button, ExecSpec, Freeze, Machine, MachineInfo, Port, Process, ProcessEvent, ProcessHandle, Screen, Window};
 pub use files::{Copy, DirEntry, FileInfo, FileKind, Files, MOST_READ, Remove, Write};
 pub use logs::{LogLine, LogReader, LogStream, Logs};
 pub use mounts::{Mount, MountKind, Volume, VolumeInfo};

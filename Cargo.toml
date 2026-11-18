@@ -12,6 +12,7 @@ members = [
     "hooks",
     "carbon",
     "cli",
+    "mcp",
     "display",
     "display/macos",
     "audio",
@@ -50,6 +51,7 @@ layers = { path = "layers" }
 images = { path = "images" }
 hooks = { path = "hooks" }
 carbon = { path = "carbon" }
+mcp = { path = "mcp" }
 display = { path = "display" }
 display-macos = { path = "display/macos" }
 audio = { path = "audio" }

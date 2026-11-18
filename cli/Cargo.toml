@@ -17,3 +17,4 @@ workspace = true
 
 [dependencies]
 carbon.workspace = true
+mcp.workspace = true
