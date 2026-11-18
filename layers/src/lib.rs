@@ -472,6 +472,25 @@ impl<M: Clone> Fs<M> {
         Ok(Stat { ino, kind, size, links: node.links, modified: node.modified, generation: node.generation })
     }
 
+    /// A file's chunks by their names in the store (None for a hole), when every one is in the store: so two files
+    /// with the same names hold the same bytes, which is found without reading them. None for a file with any chunk in
+    /// memory (a small one, kept in the index, or one changed since it was saved), or for anything not a file.
+    pub fn chunk_names(&self, ino: Ino) -> Result<Option<Vec<Option<Hash>>>> {
+        if self.ext_file(ino).is_some() {
+            return Ok(None);
+        }
+        let Data::File(file) = &self.node(ino)?.data else { return Ok(None) };
+        let mut names = Vec::with_capacity(file.chunks.len());
+        for chunk in &file.chunks {
+            names.push(match chunk {
+                Chunk::Hole => None,
+                Chunk::Stored(hash) => Some(*hash),
+                Chunk::Bytes(..) => return Ok(None),
+            });
+        }
+        Ok(Some(names))
+    }
+
     /// A file's `M`.
     pub fn meta(&self, ino: Ino) -> Result<M> {
         if let Some((root, path)) = self.ext_file(ino) {

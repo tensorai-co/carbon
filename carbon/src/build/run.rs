@@ -354,7 +354,7 @@ impl Run<'_> {
         }
         let images = &self.build.carbon.0.store.images;
         let index = images.index(&state.image).map_err(crate::error::image)?;
-        images.save_unnamed(&index, &state.platform, &state.config, &state.history, &state.image.layers, "built").map_err(crate::error::image)
+        images.save_unnamed(&index, &state.platform, &state.config, &state.history, &state.image.lineage, "built").map_err(crate::error::image)
     }
 
     /// An empty disk, for `FROM scratch`.
@@ -367,7 +367,7 @@ impl Run<'_> {
             layers::Fs::building(lambda::Meta::dir(0o755), false, store).freeze()
         }
         .map_err(|e| Error::io(format!("an empty disk: {e}")))?;
-        images.save_unnamed(&index, platform, &Config::default(), &[], &[], "scratch").map_err(crate::error::image)
+        images.save_unnamed(&index, platform, &Config::default(), &[], &images::Lineage::default(), "scratch").map_err(crate::error::image)
     }
 
     fn stage(&mut self, index: usize) -> Result<()> {

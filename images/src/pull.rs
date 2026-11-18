@@ -7,12 +7,9 @@ use std::io::Read;
 use flate2::read::GzDecoder;
 use layers::Persist;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
-use crate::{Config, Entry, Image, Images, Platform, full_name, store};
-
-const ACCEPT: &str = "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, \
-                      application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json";
+use crate::registry::{Client, Reference, scope};
+use crate::{Config, Entry, Image, Images, Platform, full_name};
 
 /// What a pull is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,131 +59,6 @@ impl std::fmt::Display for Progress {
     }
 }
 
-/// How often a download reports itself: after this many bytes, at most.
-const REPORT_EVERY: u64 = 256 << 10;
-
-/// Where an image is: its registry's host, its repository there, and its tag or digest.
-#[derive(Debug, PartialEq, Eq)]
-struct Reference {
-    host: String,
-    repository: String,
-    tag: String,
-}
-
-fn reference(name: &str) -> Reference {
-    let full = full_name(name);
-    let (registry, rest) = full.split_once('/').unwrap_or(("docker.io", &full));
-    let (repository, tag) = rest.rsplit_once(':').unwrap_or((rest, "latest"));
-    // Docker Hub's API is on another host than its name.
-    let host = if registry == "docker.io" { "registry-1.docker.io" } else { registry };
-    Reference { host: host.into(), repository: repository.into(), tag: tag.into() }
-}
-
-/// A connection to one repository, with the token it asked for, if it did.
-struct Client {
-    agent: ureq::Agent,
-    base: String,
-    token: Option<String>,
-}
-
-/// A field of a `WWW-Authenticate` challenge: `realm="…"`.
-fn field(header: &str, name: &str) -> Option<String> {
-    let start = header.find(&format!("{name}=\""))? + name.len() + 2;
-    let rest = header.get(start..)?;
-    Some(rest.get(..rest.find('"')?)?.to_string())
-}
-
-impl Client {
-    fn connect(reference: &Reference) -> Result<Client, String> {
-        let agent = ureq::AgentBuilder::new().tls_config(crate::tls::client_config()?).build();
-        let base = format!("https://{}/v2/{}", reference.host, reference.repository);
-        let mut client = Client { agent, base, token: None };
-        // A registry says how to get a token by refusing without one.
-        match client.agent.get(&format!("https://{}/v2/", reference.host)).call() {
-            Ok(_) => {}
-            Err(ureq::Error::Status(401, response)) => {
-                let header = response.header("www-authenticate").unwrap_or("").to_string();
-                let realm = field(&header, "realm").ok_or("the registry wants a login this doesn't understand")?;
-                let service = field(&header, "service").unwrap_or_default();
-                let scope = format!("repository:{}:pull", reference.repository);
-                let body: Value = client
-                    .agent
-                    .get(&realm)
-                    .query("service", &service)
-                    .query("scope", &scope)
-                    .call()
-                    .map_err(|e| format!("getting a token: {e}"))?
-                    .into_string()
-                    .ok()
-                    .and_then(|text| serde_json::from_str(&text).ok())
-                    .ok_or("getting a token: the answer wasn't JSON")?;
-                client.token = body.get("token").or(body.get("access_token")).and_then(Value::as_str).map(String::from);
-            }
-            Err(e) => return Err(format!("reaching {}: {e}", reference.host)),
-        }
-        Ok(client)
-    }
-
-    fn get(&self, url: &str) -> Result<ureq::Response, String> {
-        let mut request = self.agent.get(url).set("Accept", ACCEPT);
-        if let Some(token) = &self.token {
-            request = request.set("Authorization", &format!("Bearer {token}"));
-        }
-        request.call().map_err(|e| match e {
-            ureq::Error::Status(404, _) => "not found".to_string(),
-            other => other.to_string(),
-        })
-    }
-
-    fn manifest(&self, reference: &str) -> Result<Value, String> {
-        let text = self.get(&format!("{}/manifests/{reference}", self.base))?.into_string().map_err(|e| format!("reading a manifest: {e}"))?;
-        serde_json::from_str(&text).map_err(|e| format!("reading a manifest: {e}"))
-    }
-
-    /// A blob, all of it, checked against its digest.
-    fn blob(&self, digest: &str) -> Result<Vec<u8>, String> {
-        self.blob_reporting(digest, 0, &mut |_| {})
-    }
-
-    /// A blob, read a piece at a time and hashed as it comes, telling `arrived` how many bytes are here so far (at
-    /// most every [`REPORT_EVERY`], and at the end); then checked against its digest. `expected` sizes the buffer.
-    fn blob_reporting(&self, digest: &str, expected: u64, arrived: &mut dyn FnMut(u64)) -> Result<Vec<u8>, String> {
-        let mut reader = self.get(&format!("{}/blobs/{digest}", self.base))?.into_reader();
-        let mut bytes = Vec::with_capacity(usize::try_from(expected).unwrap_or(0).min(1 << 30));
-        let mut hash = Sha256::new();
-        let mut piece = vec![0u8; 64 << 10];
-        let mut told = 0u64;
-        loop {
-            let n = reader.read(&mut piece).map_err(|e| format!("downloading {digest}: {e}"))?;
-            if n == 0 {
-                break;
-            }
-            hash.update(&piece[..n]);
-            bytes.extend_from_slice(&piece[..n]);
-            if bytes.len() as u64 - told >= REPORT_EVERY {
-                told = bytes.len() as u64;
-                arrived(told);
-            }
-        }
-        arrived(bytes.len() as u64);
-        check_hash(digest, &store::hex(&hash.finalize()))?;
-        Ok(bytes)
-    }
-}
-
-#[cfg(test)]
-fn check_digest(digest: &str, bytes: &[u8]) -> Result<(), String> {
-    check_hash(digest, &store::hex(&Sha256::digest(bytes)))
-}
-
-fn check_hash(digest: &str, actual: &str) -> Result<(), String> {
-    match digest.strip_prefix("sha256:") {
-        Some(expected) if expected == actual => Ok(()),
-        Some(expected) => Err(format!("a download doesn't match its digest: expected {expected}, got {actual}")),
-        None => Err(format!("{digest} isn't a digest this understands")),
-    }
-}
-
 /// The manifest for `platform` from an index, by its digest.
 fn choose(index: &[Value], platform: &Platform) -> Option<String> {
     index
@@ -203,9 +75,10 @@ fn choose(index: &[Value], platform: &Platform) -> Option<String> {
 
 pub fn pull<M: Persist>(images: &Images, name: &str, platform: &Platform, mut meta: impl FnMut(Entry) -> M, root: M, progress: &mut dyn FnMut(&Progress)) -> Result<Image, String> {
     let full = full_name(name);
-    let reference = reference(name);
+    let reference = Reference::parse(name);
     progress(&Progress { stage: Stage::Resolving, layer: 0, layers: 0, done: 0, total: 0 });
-    let client = Client::connect(&reference)?;
+    let login = crate::auth::credentials(images.home(), &reference.registry);
+    let client = Client::connect(&reference, &[scope(&reference.repository, "pull")], login.as_ref())?;
     let mut manifest = client.manifest(&reference.tag).map_err(|e| format!("{full}: {e}"))?;
     if let Some(list) = manifest.get("manifests").and_then(Value::as_array) {
         let chosen = choose(list, platform).ok_or_else(|| format!("{full} isn't built for {platform}"))?;
@@ -232,7 +105,8 @@ pub fn pull<M: Persist>(images: &Images, name: &str, platform: &Platform, mut me
         let size = layer.get("size").and_then(Value::as_u64).unwrap_or(0);
         let at = |stage, done| Progress { stage, layer: i + 1, layers: count, done, total: total.max(done) };
         progress(&at(Stage::Downloading, before));
-        let blob = client.blob_reporting(digest, size, &mut |here| progress(&at(Stage::Downloading, before + here)))?;
+        let mut blob = Vec::with_capacity(usize::try_from(size).unwrap_or(0).min(1 << 30));
+        client.blob_into(digest, &mut blob, &mut |here| progress(&at(Stage::Downloading, before + here)))?;
         before += blob.len() as u64;
         progress(&at(Stage::Unpacking, before));
         let tar = if media.contains("zstd") {
@@ -248,8 +122,20 @@ pub fn pull<M: Persist>(images: &Images, name: &str, platform: &Platform, mut me
     }
     progress(&Progress { stage: Stage::Indexing, layer: count, layers: count, done: before, total: total.max(before) });
     let index = disk.freeze().map_err(|e| format!("writing the index: {e}"))?;
-    let digests: Vec<String> = layers.iter().filter_map(|l| l.get("digest").and_then(Value::as_str).map(String::from)).collect();
-    images.save_with(name, &index, platform, &image_config, &history, &digests, &format!("pulled from {}", reference.host))
+    // Its layers as the registry has them, with what each holds, so a push of an image made from it sends them as they are.
+    let diff_ids: Vec<&str> = config.get("rootfs").and_then(|r| r.get("diff_ids")).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+    let kept: Vec<crate::Layer> = layers
+        .iter()
+        .enumerate()
+        .map(|(i, l)| crate::Layer {
+            digest: l.get("digest").and_then(Value::as_str).unwrap_or_default().into(),
+            size: l.get("size").and_then(Value::as_u64).unwrap_or(0),
+            media_type: l.get("mediaType").and_then(Value::as_str).unwrap_or_default().into(),
+            diff_id: diff_ids.get(i).copied().unwrap_or_default().into(),
+        })
+        .collect();
+    let lineage = crate::Lineage { repository: reference.full_repository(), layers: kept, disks: Vec::new() };
+    images.save_with(name, &index, platform, &image_config, &history, &lineage, &format!("pulled from {}", reference.host))
 }
 
 #[cfg(test)]
@@ -278,17 +164,7 @@ mod tests {
     }
 
     #[test]
-    fn references() {
-        assert_eq!(reference("debian:13"), Reference { host: "registry-1.docker.io".into(), repository: "library/debian".into(), tag: "13".into() });
-        assert_eq!(reference("ghcr.io/org/app:1.0"), Reference { host: "ghcr.io".into(), repository: "org/app".into(), tag: "1.0".into() });
-        assert_eq!(reference("localhost:5000/app").host, "localhost:5000");
-    }
-
-    #[test]
     fn digests_and_platforms() {
-        assert!(check_digest("sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824", b"hello").is_ok());
-        assert!(check_digest("sha256:00", b"hello").is_err());
-        assert!(check_digest("md5:00", b"hello").is_err());
         let index: Vec<Value> = serde_json::from_str(
             r#"[{"digest":"sha256:a","platform":{"os":"linux","architecture":"amd64"}},
                 {"digest":"sha256:b","platform":{"os":"linux","architecture":"arm64","variant":"v8"}}]"#,

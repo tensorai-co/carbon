@@ -12,9 +12,14 @@
 //! `<home>` is `CARBON_HOME`, or `.carbon` in the user's home folder. Nothing here knows a kernel: a kernel's `M` is made
 //! from each tar entry by the caller.
 
+pub mod archive;
+pub mod auth;
 mod config;
 mod pull;
+pub mod push;
+mod registry;
 pub use pull::{Progress as PullProgress, Stage as PullStage};
+pub use push::{Progress as PushProgress, Pushed, Stage as PushStage};
 pub mod store;
 mod tls;
 
@@ -78,9 +83,112 @@ pub struct Image {
     pub source: String,
     /// Each step that made it, oldest first.
     pub history: Vec<History>,
-    /// A pulled image's layers, as its registry named them (`sha256:...`), so a push of an image built on it sends only
-    /// what's new. Empty for one made here.
-    pub layers: Vec<String>,
+    /// What it was made from: the registry its first disk came from and that disk's layers there, and each disk it
+    /// was made through since. So a push sends a layer per step, and only what's new.
+    pub lineage: Lineage,
+}
+
+/// A layer as a registry has it, kept from a pull.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Layer {
+    /// Its blob's digest, `sha256:…`, as compressed.
+    pub digest: String,
+    /// Its blob's size, as compressed.
+    pub size: u64,
+    pub media_type: String,
+    /// The digest of the tar inside, as the image's config lists it (`rootfs.diff_ids`).
+    pub diff_id: String,
+}
+
+impl Layer {
+    /// Whether it says all a push needs to send it again: its digest, size and what's in it.
+    pub fn complete(&self) -> bool {
+        !self.digest.is_empty() && self.size > 0 && !self.diff_id.is_empty() && !self.media_type.is_empty()
+    }
+
+    fn to_json(&self) -> Value {
+        json!({ "digest": self.digest, "size": self.size, "media_type": self.media_type, "diff_id": self.diff_id })
+    }
+
+    fn from_json(v: &Value) -> Layer {
+        let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+        // A record from before layers were kept whole has only their digests.
+        match v.as_str() {
+            Some(digest) => Layer { digest: digest.into(), ..Layer::default() },
+            None => Layer { digest: s("digest"), size: v.get("size").and_then(Value::as_u64).unwrap_or(0), media_type: s("media_type"), diff_id: s("diff_id") },
+        }
+    }
+}
+
+/// A disk an image was made through: its index, and how many of the image's history entries made it, so the entries
+/// after them are what made the next disk.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Disk {
+    /// Its index's SHA-256, in hex.
+    pub index: String,
+    pub history: usize,
+}
+
+/// Where an image's disk came from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Lineage {
+    /// The repository its first disk was pulled from, in full (`docker.io/library/debian`); empty for one that began
+    /// here (imported, loaded, from `scratch`).
+    pub repository: String,
+    /// That first disk's layers in the repository, oldest first.
+    pub layers: Vec<Layer>,
+    /// Each disk it was made through before its own, oldest first: the first is the one pulled or begun here.
+    pub disks: Vec<Disk>,
+}
+
+impl Lineage {
+    /// An image made from `base` by a step: `base`'s lineage, then `base`'s disk, made by its history up to the last
+    /// entry that changed files. The entries after that changed only its config, so they're as much the next step's:
+    /// a build's `WORKDIR` is said to change files only once the step after it makes its folder.
+    pub fn after(base: &Image) -> Lineage {
+        let mut lineage = base.lineage.clone();
+        let made_by = base.history.iter().rposition(|h| !h.empty_layer).map_or(0, |i| i + 1);
+        let made_by = made_by.max(lineage.disks.last().map_or(0, |d| d.history));
+        lineage.disks.push(Disk { index: base.index.clone(), history: made_by });
+        lineage
+    }
+
+    /// Whether its first disk can be sent as the registry's own layers, as they are.
+    pub fn pulled(&self) -> bool {
+        !self.repository.is_empty() && !self.layers.is_empty() && self.layers.iter().all(Layer::complete)
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "repository": self.repository,
+            "layers": self.layers.iter().map(Layer::to_json).collect::<Vec<_>>(),
+            "disks": self.disks.iter().map(|d| json!({ "index": d.index, "history": d.history })).collect::<Vec<_>>(),
+        })
+    }
+
+    fn from_record(v: &Value) -> Lineage {
+        match v.get("lineage") {
+            Some(l) => Lineage {
+                repository: l.get("repository").and_then(Value::as_str).unwrap_or_default().to_string(),
+                layers: l.get("layers").and_then(Value::as_array).map(|a| a.iter().map(Layer::from_json).collect()).unwrap_or_default(),
+                disks: l
+                    .get("disks")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .map(|d| Disk { index: d.get("index").and_then(Value::as_str).unwrap_or_default().to_string(), history: d.get("history").and_then(Value::as_u64).unwrap_or(0) as usize })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            },
+            // Older records: a pulled image's layers' digests alone.
+            None => Lineage { layers: v.get("layers").and_then(Value::as_array).map(|a| a.iter().map(Layer::from_json).collect()).unwrap_or_default(), ..Lineage::default() },
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.repository.is_empty() && self.layers.is_empty() && self.disks.is_empty()
+    }
 }
 
 impl Image {
@@ -96,6 +204,23 @@ pub fn gunzip(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     flate2::read::GzDecoder::new(bytes).read_to_end(&mut out).map_err(|e| format!("unpacking gzip: {e}"))?;
     Ok(out)
+}
+
+/// Seconds since 1970 as RFC 3339, as OCI writes a time: `2026-11-17T20:22:00Z`.
+pub fn rfc3339(secs: u64) -> String {
+    let days = secs / 86_400;
+    let (h, m, s) = (secs % 86_400 / 3600, secs % 3600 / 60, secs % 60);
+    // Civil from days (Howard Hinnant's algorithm).
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(mo <= 2);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
 /// A name in full: `debian` is `docker.io/library/debian:latest`, `ghcr.io/org/app:1` is itself.
@@ -119,10 +244,6 @@ const UNNAMED: &str = ".unnamed";
 /// An unnamed image's id, from its name `sha256:<64 hex digits>`.
 fn unnamed_id(name: &str) -> Option<&str> {
     name.strip_prefix("sha256:").filter(|id| id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()))
-}
-
-fn strings(value: Option<&Value>) -> Vec<String> {
-    value.and_then(Value::as_array).map(|list| list.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default()
 }
 
 fn now() -> u64 {
@@ -198,7 +319,7 @@ impl Images {
     /// build's steps are kept: found again by [`Images::image`] with its name, `sha256:<id>`, and never listed by
     /// [`Images::images`]. Saving the same image again gives the same one, and marks it used.
     #[allow(clippy::too_many_arguments)]
-    pub fn save_unnamed(&self, index: &[u8], platform: &Platform, config: &Config, history: &[History], layers: &[String], source: &str) -> Result<Image, String> {
+    pub fn save_unnamed(&self, index: &[u8], platform: &Platform, config: &Config, history: &[History], lineage: &Lineage, source: &str) -> Result<Image, String> {
         let hash = self.store()?.put(index).map_err(|_| "putting the index in the store".to_string())?;
         let what = json!({
             "index": store::hex(&hash),
@@ -211,7 +332,7 @@ impl Images {
             self.touch_unnamed(&image.name);
             return Ok(image);
         }
-        let image = Image { name: format!("sha256:{id}"), index: store::hex(&hash), platform: platform.clone(), config: config.clone(), created: now(), source: source.into(), history: history.to_vec(), layers: layers.to_vec() };
+        let image = Image { name: format!("sha256:{id}"), index: store::hex(&hash), platform: platform.clone(), config: config.clone(), created: now(), source: source.into(), history: history.to_vec(), lineage: lineage.clone() };
         self.write_record(&image)?;
         Ok(image)
     }
@@ -254,7 +375,7 @@ impl Images {
             created: v.get("created").and_then(Value::as_u64).unwrap_or(0),
             source: s("source"),
             history: v.get("history").and_then(Value::as_array).map(|h| h.iter().map(History::from_json).collect()).unwrap_or_default(),
-            layers: strings(v.get("layers")),
+            lineage: Lineage::from_record(&v),
         })
     }
 
@@ -289,20 +410,25 @@ impl Images {
 
     /// An image's index, from the store.
     pub fn index(&self, image: &Image) -> Result<Vec<u8>, String> {
-        let hash = store::parse_hash(&image.index).ok_or_else(|| format!("{}'s record is corrupt", image.name))?;
-        self.store()?.get(&hash).map_err(|_| format!("{}'s index is missing from the store", image.name))
+        self.index_named(&image.index).map_err(|e| format!("{}: {e}", image.name))
+    }
+
+    /// An index by its SHA-256, in hex, from the store.
+    pub fn index_named(&self, hex: &str) -> Result<Vec<u8>, String> {
+        let hash = store::parse_hash(hex).ok_or_else(|| format!("{hex} isn't an index's name"))?;
+        self.store()?.get(&hash).map_err(|_| format!("the index {hex} is missing from the store"))
     }
 
     /// Names an index: puts it in the store and writes the image's record. The name's only taken once it's all there.
     pub fn save(&self, name: &str, index: &[u8], platform: &Platform, config: &Config, source: &str) -> Result<Image, String> {
-        self.save_with(name, index, platform, config, &[], &[], source)
+        self.save_with(name, index, platform, config, &[], &Lineage::default(), source)
     }
 
-    /// As [`Images::save`], with its history and (for a pulled image) its registry's layers.
+    /// As [`Images::save`], with its history and what it was made from.
     #[allow(clippy::too_many_arguments)]
-    pub fn save_with(&self, name: &str, index: &[u8], platform: &Platform, config: &Config, history: &[History], layers: &[String], source: &str) -> Result<Image, String> {
+    pub fn save_with(&self, name: &str, index: &[u8], platform: &Platform, config: &Config, history: &[History], lineage: &Lineage, source: &str) -> Result<Image, String> {
         let hash = self.store()?.put(index).map_err(|_| "putting the index in the store".to_string())?;
-        let image = Image { name: full_name(name), index: store::hex(&hash), platform: platform.clone(), config: config.clone(), created: now(), source: source.into(), history: history.to_vec(), layers: layers.to_vec() };
+        let image = Image { name: full_name(name), index: store::hex(&hash), platform: platform.clone(), config: config.clone(), created: now(), source: source.into(), history: history.to_vec(), lineage: lineage.clone() };
         self.write_record(&image)?;
         Ok(image)
     }
@@ -327,8 +453,8 @@ impl Images {
         if !image.history.is_empty() {
             record["history"] = json!(image.history.iter().map(History::to_json).collect::<Vec<_>>());
         }
-        if !image.layers.is_empty() {
-            record["layers"] = json!(image.layers);
+        if !image.lineage.is_empty() {
+            record["lineage"] = image.lineage.to_json();
         }
         let path = match unnamed_id(&image.name) {
             Some(id) => self.unnamed_path(id),
@@ -348,6 +474,25 @@ impl Images {
         layers::tar::import(&mut disk, tar, meta).map_err(|e| format!("reading the tar: {e}"))?;
         let index = disk.freeze().map_err(|e| format!("writing the index: {e}"))?;
         self.save(name, &index, platform, config, "imported")
+    }
+
+    /// Pushes an image to `target` (a name in its registry; the image's own, as `docker push` takes it, or another), a
+    /// layer per step unless `squash`: each file's `M` told as a tar entry by `entry`, and `root` the root's for
+    /// reading its disks. With the login `auth` keeps for that registry, if there is one.
+    pub fn push<M: Persist>(&self, image: &Image, target: &str, squash: bool, entry: impl FnMut(&M) -> Entry, root: M, progress: &mut dyn FnMut(&PushProgress)) -> Result<Pushed, String> {
+        push::push(self, image, target, squash, entry, root, progress)
+    }
+
+    /// Checks a login with its registry, and keeps it if it's let in.
+    pub fn login(&self, registry: &str, credentials: &auth::Credentials) -> Result<(), String> {
+        let reference = registry::Reference::parse(&format!("{}/x", auth::registry_key(registry)));
+        registry::Client::check_login(&reference, credentials)?;
+        auth::store(&self.home, registry, credentials)
+    }
+
+    /// Forgets the login Carbon keeps for a registry; whether it had one.
+    pub fn logout(&self, registry: &str) -> Result<bool, String> {
+        auth::forget(&self.home, registry)
     }
 
     /// Pulls an image from its registry for `platform`, merges its layers into an index, and names it. Each tar
@@ -408,16 +553,65 @@ mod tests {
         assert_eq!(disk.contents(file).unwrap(), b"box\n\0");
         assert_eq!(disk.meta(file).unwrap(), 0o644);
         // Unnamed: found by id, the same image saved twice is one, never listed, removable.
-        let unnamed = images.save_unnamed(&index, &found.platform, &config, &[], &[], "a build").unwrap();
+        let unnamed = images.save_unnamed(&index, &found.platform, &config, &[], &Lineage::after(&found), "a build").unwrap();
         assert!(unnamed.name.starts_with("sha256:"));
         assert_eq!(images.image(&unnamed.name), Some(unnamed.clone()));
-        assert_eq!(images.save_unnamed(&index, &found.platform, &config, &[], &[], "again").unwrap().name, unnamed.name);
+        assert_eq!(unnamed.lineage.disks, vec![Disk { index: found.index.clone(), history: 0 }], "its lineage is kept");
+        assert_eq!(images.save_unnamed(&index, &found.platform, &config, &[], &Lineage::default(), "again").unwrap().name, unnamed.name);
         assert_eq!(images.images().len(), 1);
         assert_eq!(images.unnamed().len(), 1);
         images.remove_unnamed(&unnamed.name).unwrap();
         assert!(images.image(&unnamed.name).is_none());
         images.remove("box:1").unwrap();
         assert!(images.image("box:1").is_none());
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    /// A one-file tar: `name`, holding `body`.
+    fn tar_of(name: &str, body: &[u8]) -> Vec<u8> {
+        let mut tar = layers::tar::file_header(name, body.len() as u64);
+        tar.extend_from_slice(body);
+        tar.resize(tar.len().next_multiple_of(512) + 1024, 0);
+        tar
+    }
+
+    #[test]
+    fn saved_a_layer_per_step_and_loaded_back() {
+        let home = std::env::temp_dir().join(format!("carbon-images-save-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        let images = Images::open(Some(&home)).unwrap();
+        let base = images.import("base:1", &tar_of("etc/hostname", b"box\n"), &Platform::linux_here(), &Config::default(), |e| e.mode, 0o755u32).unwrap();
+        // A step on it: a file added, as a machine frozen after a RUN would be.
+        let mut disk: layers::Fs<u32> = layers::Fs::open(Some(&images.index(&base).unwrap()), Box::new(images.machine_store("step").unwrap()), 0o755, false).unwrap();
+        let f = disk.create(layers::ROOT, "made", layers::New::File, 0o644, 1_000_000_000).unwrap();
+        disk.write(f, 0, b"by a step", 1_000_000_000).unwrap();
+        let index = disk.freeze().unwrap();
+        let history = vec![History { created_by: "RUN make".into(), ..History::default() }, History { created_by: "CMD x".into(), empty_layer: true, ..History::default() }];
+        let app = images.save_with("app:1", &index, &Platform::linux_here(), &Config { cmd: vec!["x".into()], ..Config::default() }, &history, &Lineage::after(&base), "built").unwrap();
+        let path = home.join("saved.tar");
+        let mut out = fs::File::create(&path).unwrap();
+        let entry = |m: &u32| Entry { mode: *m, uid: 0, gid: 0, rdev: 0 };
+        archive::save(&images, &[(app.clone(), vec!["app:1".into(), "app:latest".into()])], &mut out, entry, 0o755u32, &mut |_| {}).unwrap();
+        drop(out);
+        let (archive, found) = archive::Archive::open(&path, &home.join("tmp")).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].names, ["app:1", "app:latest"]);
+        images.remove("app:1").unwrap();
+        let loaded = archive::load(&images, &archive, &found[0], |e| e.mode, 0o755u32).unwrap();
+        assert_eq!(loaded.len(), 2);
+        let back = images.image("app:1").unwrap();
+        assert_eq!(back.config.cmd, ["x"]);
+        assert_eq!(back.history.iter().filter(|h| !h.empty_layer).count(), 2, "a layer for the base, one for the step");
+        assert_eq!(back.lineage.disks.len(), 1, "the disk after its first layer, kept");
+        // Saved again, it's the same two layers.
+        let again = home.join("again.tar");
+        archive::save(&images, &[(back.clone(), vec!["app:1".into()])], &mut fs::File::create(&again).unwrap(), entry, 0o755u32, &mut |_| {}).unwrap();
+        let blobs = |p: &Path| archive::Archive::open(p, &home.join("tmp")).unwrap().1[0].layer_count();
+        assert_eq!((blobs(&path), blobs(&again)), (2, 2));
+        let disk: layers::Fs<u32> = layers::Fs::open(Some(&images.index(&back).unwrap()), Box::new(images.store().unwrap()), 0, false).unwrap();
+        let made = disk.resolve(layers::ROOT, "/made", true).unwrap();
+        assert_eq!(disk.contents(made).unwrap(), b"by a step");
+        assert_eq!(disk.contents(disk.resolve(layers::ROOT, "/etc/hostname", true).unwrap()).unwrap(), b"box\n");
         fs::remove_dir_all(&home).unwrap();
     }
 }

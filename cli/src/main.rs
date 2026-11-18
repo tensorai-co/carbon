@@ -97,6 +97,7 @@ usage: carbon <command> ...
       --secret id=ID,src=FILE|env=VAR        a secret for RUN --mount=type=secret,id=ID: at /run/secrets/ID for
                                              that step only, never in the image
       -o, --output DIR                       also copy what's built to this folder
+      --output type=docker|oci,dest=FILE     also write the image as an archive, as carbon save does
       --isolation, --network, --memory, --timeout, --deny, --allow, --deny-exec
                                              as run's, for every RUN
       -q, --quiet                            print only the image's name
@@ -132,6 +133,15 @@ usage: carbon <command> ...
                                              each DLL and what of it isn't there; for several or a folder, what's
                                              wanted most (--all lists everything)
   pull IMAGE [--platform OS/ARCH]            pull an image
+  push [--squash] IMAGE                      push an image to its registry, a layer per step of what made it
+      --squash                               its whole disk as one layer
+  login [options] [REGISTRY]                 log in to a registry (docker.io by default), for pushes and private pulls
+      -u, --username USER                    who to be (asked for if not given)
+      --password-stdin                       the password or token on stdin (else asked for, unseen)
+  logout [REGISTRY]                          forget the login for a registry
+  save [-o FILE] IMAGE...                    images as one archive, as docker save writes it (to stdout without -o)
+  load [-i FILE]                             the images an archive has, docker save's or an OCI layout's (stdin
+                                             without -i)
   import [options] FILE|- [NAME]             an image from a tar of a root file system, as docker import
       --platform OS/ARCH                     its platform (a tar of C:\\ for Windows, as atlas-base's, is found)
       -c, --change INSTRUCTION               its config: CMD, ENTRYPOINT, ENV, WORKDIR or USER, as a Dockerfile
@@ -145,6 +155,27 @@ usage: carbon <command> ...
 fn fail(message: impl std::fmt::Display) -> ! {
     eprintln!("carbon: {message}");
     exit(1)
+}
+
+/// Asks on the terminal, and reads a line: seen as it's typed, or not (a password: the terminal's echo off meanwhile).
+fn ask(prompt: &str, seen: bool) -> String {
+    use std::io::Write;
+    eprint!("{prompt}");
+    let _ = std::io::stderr().flush();
+    let stty = |arg: &str| {
+        let _ = std::process::Command::new("stty").arg(arg).stdin(std::process::Stdio::inherit()).status();
+    };
+    if !seen && cfg!(unix) {
+        stty("-echo");
+    }
+    let mut line = String::new();
+    let read = std::io::stdin().read_line(&mut line);
+    if !seen && cfg!(unix) {
+        stty("echo");
+        eprintln!();
+    }
+    read.unwrap_or_else(|e| fail(format!("reading the terminal: {e}")));
+    line.trim_end_matches(['\r', '\n']).to_string()
 }
 
 fn usage() -> ! {
@@ -168,6 +199,8 @@ fn duration(text: &str) -> std::time::Duration {
 /// `carbon build`: its arguments made into a `Build`, and its steps printed.
 fn build(carbon: &Carbon, mut args: impl Iterator<Item = String>) {
     let (mut context, mut file, mut tags, mut quiet) = (None, None, Vec::new(), false);
+    // `--output type=docker|oci,dest=FILE`: the image, as an archive, once it's built.
+    let mut archive: Option<String> = None;
     let mut rules = Rules::new();
     let mut options: Vec<Box<dyn FnOnce(carbon::build::Build) -> carbon::build::Build>> = Vec::new();
     while let Some(arg) = args.next() {
@@ -239,8 +272,17 @@ fn build(carbon: &Carbon, mut args: impl Iterator<Item = String>) {
             }
             "-o" | "--output" => {
                 let text = value("--output");
-                let dir = text.strip_prefix("type=local,dest=").or_else(|| text.strip_prefix("dest=")).unwrap_or(&text).to_string();
-                options.push(Box::new(move |b| b.output(dir)));
+                let fields: Vec<(&str, &str)> = text.split(',').filter_map(|f| f.split_once('=')).collect();
+                let get = |k: &str| fields.iter().find(|(key, _)| *key == k).map(|(_, v)| v.to_string());
+                match (get("type").as_deref(), get("dest")) {
+                    (Some("docker" | "oci" | "image-archive"), Some(dest)) => archive = Some(dest),
+                    (Some("docker" | "oci" | "image-archive"), None) => fail(format!("--output {text}: dest=FILE")),
+                    (Some("local") | None, dest) => {
+                        let dir = dest.unwrap_or_else(|| text.clone());
+                        options.push(Box::new(move |b| b.output(dir)));
+                    }
+                    (Some(other), _) => fail(format!("--output type={other} isn't there: local, docker or oci")),
+                }
             }
             // Accepted as Docker's: one line a step is all there is.
             "--progress" => {
@@ -290,6 +332,11 @@ fn build(carbon: &Carbon, mut args: impl Iterator<Item = String>) {
         .unwrap_or_else(|e| fail(e));
     if !quiet {
         eprintln!("built in {:.1}s: {} ran, {} cached", built.took.as_secs_f64(), built.ran, built.cached);
+    }
+    if let Some(dest) = archive {
+        let names: Vec<&str> = if tags.is_empty() { vec![built.image.name.as_str()] } else { tags.iter().map(String::as_str).collect() };
+        let out = std::fs::File::create(&dest).unwrap_or_else(|e| fail(format!("{dest}: {e}")));
+        carbon.save(&names, std::io::BufWriter::with_capacity(1 << 20, out)).unwrap_or_else(|e| fail(e));
     }
     println!("{}", built.image.short_name());
 }
@@ -853,6 +900,144 @@ fn main() {
                 eprint!("\r\x1b[K");
             }
             println!("{} ({})", image.short_name(), image.platform);
+        }
+        "push" => {
+            let (mut squash, mut name) = (false, None);
+            for arg in args.by_ref() {
+                match arg.as_str() {
+                    "--squash" => squash = true,
+                    _ if name.is_none() && !arg.starts_with('-') => name = Some(arg),
+                    _ => usage(),
+                }
+            }
+            let name = name.unwrap_or_else(|| fail("push needs an image: carbon push someone/app:1"));
+            let live = std::io::IsTerminal::is_terminal(&std::io::stderr());
+            let pushed = carbon
+                .push_with(&name, &carbon::Push::new().squash(squash), |p| {
+                    if live {
+                        eprint!("\r\x1b[K{name}: {p}");
+                    } else if p.stage != carbon::PushStage::Sending || p.done == 0 {
+                        eprintln!("{name}: {p}");
+                    }
+                })
+                .unwrap_or_else(|e| {
+                    if live {
+                        eprintln!();
+                    }
+                    fail(e)
+                });
+            if live {
+                eprint!("\r\x1b[K");
+            }
+            eprintln!("{} layers, {} sent, {} already there", pushed.layers, pushed.sent, pushed.layers - pushed.sent);
+            println!("{}@{}", pushed.name, pushed.digest);
+        }
+        "login" => {
+            let (mut user, mut from_stdin, mut password, mut registry) = (None, false, None, None);
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "-u" | "--username" => user = Some(args.next().unwrap_or_else(|| fail("--username needs a value"))),
+                    "--password-stdin" => from_stdin = true,
+                    "-p" | "--password" => {
+                        eprintln!("carbon: a password on the command line is seen by others on this host: use --password-stdin");
+                        password = Some(args.next().unwrap_or_else(|| fail("--password needs a value")));
+                    }
+                    _ if registry.is_none() && !arg.starts_with('-') => registry = Some(arg),
+                    _ => usage(),
+                }
+            }
+            let registry = registry.unwrap_or_else(|| "docker.io".into());
+            let terminal = std::io::IsTerminal::is_terminal(&std::io::stdin());
+            let user = user.unwrap_or_else(|| {
+                if from_stdin || !terminal {
+                    fail("login needs a username: -u USER");
+                }
+                ask("Username: ", true)
+            });
+            let password = match password {
+                Some(p) => p,
+                None if from_stdin => {
+                    let mut text = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut text).unwrap_or_else(|e| fail(format!("reading stdin: {e}")));
+                    text.trim_end_matches(['\r', '\n']).to_string()
+                }
+                None if terminal => ask("Password: ", false),
+                None => fail("login needs a password: --password-stdin"),
+            };
+            if password.is_empty() {
+                fail("login needs a password");
+            }
+            carbon.login(&registry, &user, &password).unwrap_or_else(|e| fail(e));
+            println!("Logged in to {registry} as {user}");
+        }
+        "logout" => {
+            let registry = args.next().unwrap_or_else(|| "docker.io".into());
+            match carbon.logout(&registry).unwrap_or_else(|e| fail(e)) {
+                true => println!("Logged out of {registry}"),
+                false => println!("Not logged in to {registry}"),
+            }
+        }
+        "save" => {
+            let (mut output, mut names) = (None, Vec::new());
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "-o" | "--output" => output = Some(args.next().unwrap_or_else(|| fail("--output needs a file"))),
+                    _ if arg.starts_with("--output=") => output = Some(arg["--output=".len()..].to_string()),
+                    _ if !arg.starts_with('-') => names.push(arg),
+                    _ => usage(),
+                }
+            }
+            if names.is_empty() {
+                fail("save needs an image: carbon save -o app.tar app:1");
+            }
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            match output {
+                Some(path) => {
+                    // Written beside where it goes, then moved there, so a failed save leaves nothing half written.
+                    let partial = format!("{path}.partial");
+                    let file = std::fs::File::create(&partial).unwrap_or_else(|e| fail(format!("{partial}: {e}")));
+                    let saved = carbon.save(&names, std::io::BufWriter::with_capacity(1 << 20, file));
+                    if let Err(e) = saved {
+                        let _ = std::fs::remove_file(&partial);
+                        fail(e);
+                    }
+                    std::fs::rename(&partial, &path).unwrap_or_else(|e| fail(format!("{path}: {e}")));
+                }
+                None => {
+                    if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+                        fail("an archive isn't for a terminal: -o FILE, or send stdout elsewhere");
+                    }
+                    carbon.save(&names, std::io::BufWriter::with_capacity(1 << 20, std::io::stdout().lock())).unwrap_or_else(|e| fail(e));
+                }
+            }
+        }
+        "load" => {
+            let input = match (args.next().as_deref(), args.next()) {
+                (Some("-i" | "--input"), Some(file)) => Some(file),
+                (None, _) => None,
+                _ => usage(),
+            };
+            let loaded = match input {
+                Some(file) => carbon.load(&file),
+                None => {
+                    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                        fail("load needs an archive: -i FILE, or one on stdin");
+                    }
+                    // Kept as a file first, as an archive is read in the order its index says, not as it comes.
+                    let dir = carbon.home().join("tmp");
+                    let _ = std::fs::create_dir_all(&dir);
+                    let path = dir.join(format!("stdin-{}.tar", std::process::id()));
+                    let mut file = std::fs::File::create(&path).unwrap_or_else(|e| fail(format!("{}: {e}", path.display())));
+                    let copied = std::io::copy(&mut std::io::stdin().lock(), &mut file);
+                    drop(file);
+                    let loaded = copied.map_err(|e| format!("reading stdin: {e}")).and_then(|_| carbon.load(&path).map_err(|e| e.to_string()));
+                    let _ = std::fs::remove_file(&path);
+                    loaded.map_err(|e| fail(e))
+                }
+            };
+            for image in loaded.unwrap_or_else(|e| fail(e)) {
+                println!("Loaded image: {} ({})", image.short_name(), image.platform);
+            }
         }
         "import" => {
             let (mut platform, mut changes, mut rest) = (None, Vec::new(), Vec::new());

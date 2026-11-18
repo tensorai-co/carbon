@@ -118,9 +118,34 @@ pub use exec::Isa;
 /// Which GPU a machine gets: the host's, the CPU device, the host's if there is one (the default), or none.
 pub use gpu_api::Choice as Gpu;
 /// An image on the host's disk, and the OS and CPU it's for.
-pub use images::{Config as ImageConfig, Healthcheck, History, Image, Platform};
+pub use images::{Config as ImageConfig, Disk, Healthcheck, History, Image, Layer, Lineage, Platform, PushProgress, PushStage, Pushed};
 /// What a machine's network reaches, and a port it publishes on the host's.
 pub use net::{Mode as Network, Publish};
+
+/// How to push an image: as another name than its own, or squashed into one layer.
+#[derive(Debug, Clone, Default)]
+pub struct Push {
+    to: Option<String>,
+    squash: bool,
+}
+
+impl Push {
+    pub fn new() -> Push {
+        Push::default()
+    }
+
+    /// Pushes it as `name` (`registry.example.com/team/app:2`), as if it were tagged so first.
+    pub fn to(mut self, name: impl Into<String>) -> Push {
+        self.to = Some(name.into());
+        self
+    }
+
+    /// Its whole disk as one layer, not a layer per step.
+    pub fn squash(mut self, squash: bool) -> Push {
+        self.squash = squash;
+        self
+    }
+}
 
 /// An image as JSON, as `carbon inspect` prints it: its name, index, platform, config, history and layers.
 pub fn image_json(image: &Image) -> String {
@@ -132,7 +157,9 @@ pub fn image_json(image: &Image) -> String {
         "source": image.source,
         "config": image.config.to_json(),
         "history": image.history.iter().map(History::to_json).collect::<Vec<_>>(),
-        "layers": image.layers,
+        "layers": image.lineage.layers.iter().map(|l| &l.digest).collect::<Vec<_>>(),
+        "repository": image.lineage.repository,
+        "disks": image.lineage.disks.len(),
     });
     serde_json::to_string_pretty(&v).unwrap_or_default()
 }
@@ -312,6 +339,45 @@ impl Carbon {
     /// Another name for an image (`app:2` as `registry.example.com/team/app:2`): the same disk and config.
     pub fn tag(&self, source: &str, target: &str) -> Result<Image> {
         self.0.store.images.tag(source, target).map_err(error::image)
+    }
+
+    /// Pushes an image to its registry, as `docker push` does: a layer per step of what made it (a pulled base's
+    /// layers as the registry has them, taken from their own repository when they're on the same registry), with the
+    /// login [`Carbon::login`] keeps for that registry, or Docker's. Its progress goes to [`Carbon::on_notice`];
+    /// [`Carbon::push_with`] has it as it happens, and pushes as another name or squashed.
+    pub fn push(&self, name: &str) -> Result<Pushed> {
+        let notify = self.notify();
+        self.0.store.push(name, None, false, &mut |p| notify(Notice::progress(p.to_string())))
+    }
+
+    /// Pushes an image as [`Push`] says, telling `progress` where it is as each layer is made and sent.
+    pub fn push_with(&self, name: &str, how: &Push, mut progress: impl FnMut(&PushProgress)) -> Result<Pushed> {
+        self.0.store.push(name, how.to.as_deref(), how.squash, &mut progress)
+    }
+
+    /// Checks a login with a registry (`docker.io`, `ghcr.io`, `localhost:5000`), and keeps it for its pulls and
+    /// pushes, in `<home>/auth.json`, readable by its owner alone. A registry Carbon has no login for is looked for in
+    /// Docker's own (`~/.docker/config.json` and its credential helpers).
+    pub fn login(&self, registry: &str, user: &str, secret: &str) -> Result<()> {
+        let credentials = images::auth::Credentials { user: user.into(), secret: secret.into() };
+        self.0.store.images.login(registry, &credentials).map_err(|e| Error::new(ErrorKind::Denied, e))
+    }
+
+    /// Forgets the login Carbon keeps for a registry; whether it had one (Docker's own are left alone).
+    pub fn logout(&self, registry: &str) -> Result<bool> {
+        self.0.store.images.logout(registry).map_err(error::image)
+    }
+
+    /// Writes images to `out` as one archive, as `docker save` does, that `docker load` and [`Carbon::load`] read: an
+    /// OCI image layout with Docker's `manifest.json`, a layer per step.
+    pub fn save(&self, names: &[&str], mut out: impl std::io::Write) -> Result<()> {
+        self.0.store.save(names, &mut out, &mut |_| {})
+    }
+
+    /// Loads the images an archive has (`docker save`'s or [`Carbon::save`]'s, or an OCI layout as a tar; gzipped or
+    /// not), named as they were saved, or by their ids. What it loaded.
+    pub fn load(&self, path: impl AsRef<Path>) -> Result<Vec<Image>> {
+        self.0.store.load(path.as_ref())
     }
 
     /// Forgets an image.

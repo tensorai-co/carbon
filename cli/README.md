@@ -49,6 +49,10 @@ carbon display resize app 1600x900@2        # its screen's size and scale, chang
 carbon display clipboard app                # its clipboard's text (with text after: set, as copied on the host)
 carbon display drop app 300 200 --files 'C:\notes.txt'  # drops files there, as dragged in from the host (or text)
 carbon pull debian:13 [--platform OS/ARCH] | rmi IMAGE
+carbon login -u someone                     # a login for docker.io (or `carbon login ghcr.io`), asked for unseen
+carbon push someone/app:1                   # a layer per step; a pulled base's layers taken from where they are
+carbon save -o app.tar app:1 debian:13      # images as one archive, as docker save writes it; docker load reads it
+carbon load -i app.tar                      # docker save's archives, or an OCI layout, gzipped or not
 carbon images                               # KERNEL  IMAGE  PLATFORM  FROM: atlas for a Windows image, lambda for a Linux one
 carbon inspect nginx:alpine                 # an image as JSON: its whole config (ports, stop signal, labels…), history, layers
 carbon history nginx:alpine                 # CREATED  CHANGED  CREATED BY: each step that made it
@@ -125,6 +129,22 @@ is found in the cache. `carbon watch build-<id>-<n>` shows a step's machine as i
 `carbon inspect IMAGE` prints an image as JSON: OCI's whole config (environment, entrypoint, command, user, working
 folder, exposed ports, volumes, labels, stop signal, health check, shell, `ONBUILD`), its history, and its layers'
 digests. `carbon history IMAGE` is the history as a table; `carbon tag SOURCE TARGET` names it again.
+
+`carbon login [-u USER] [--password-stdin] [REGISTRY]` checks a login with a registry (`docker.io` by default) and
+keeps it in `CARBON_HOME/auth.json`, readable by its owner alone; without `-u` and a password it asks for them, the
+password unseen. A registry Carbon has no login for is looked for in Docker's (`~/.docker/config.json` and its
+credential helper), so `docker login` is enough. `carbon logout [REGISTRY]` forgets Carbon's.
+
+`carbon push [--squash] IMAGE` pushes an image to its registry, as `docker push` does, and prints `NAME@DIGEST`. Each
+step that made it is a layer: the layers of a base it was built on, pulled from the same registry, are taken from the
+base's repository with nothing sent; from another registry, they're fetched from there and sent. A step that changed
+no files makes no layer. A second push of the same image sends nothing and gets the same digest. `--squash` pushes
+it as one layer. Tag an image first to push it somewhere else (`carbon tag app:1 ghcr.io/team/app:1`).
+
+`carbon save [-o FILE] IMAGE...` writes images as one archive (to stdout without `-o`): an OCI image layout with
+Docker's `manifest.json`, as Docker 25 and later write, a layer per step, which `docker load` reads. `carbon load
+[-i FILE]` loads one (from stdin without `-i`): Docker's, an OCI layout, or Docker's older kind, gzipped or not.
+`carbon build --output type=docker,dest=FILE` (or `type=oci`) also writes the built image so.
 
 `carbon import [--platform OS/ARCH] [-c INSTRUCTION]... FILE|- [NAME]` makes an image from a tar of a root file
 system, as `docker import` does. `-c` sets its config with a Dockerfile instruction: `CMD`, `ENTRYPOINT`, `ENV`,

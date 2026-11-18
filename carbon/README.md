@@ -77,14 +77,15 @@ libraries.
 
 | Type | What it is |
 | --- | --- |
-| [`Carbon`](src/lib.rs) | Carbon on this host: its folder of machines and images. `machine(image)`, `program(path)`, `again(name)` make a `MachineSpec`; `build(context)` a [`Build`](#building); `get(name)`, `machines()`, `images()`, `image(name)` (or an unnamed one's `sha256:…`), `pull`, `import`, `tag`, `remove_image`, `prune`; `on_notice` for what machines fall back to |
+| [`Carbon`](src/lib.rs) | Carbon on this host: its folder of machines and images. `machine(image)`, `program(path)`, `again(name)` make a `MachineSpec`; `build(context)` a [`Build`](#building); `get(name)`, `machines()`, `images()`, `image(name)` (or an unnamed one's `sha256:…`), `pull`, `push`, `push_with` ([`Push`](#registries)), `login`, `logout`, `save`, `load`, `import`, `tag`, `remove_image`, `prune`; `on_notice` for what machines fall back to |
 | [`MachineSpec`](src/spec.rs) | A builder: `name`, `isolation`, `platform`, `user`, `env`, `workdir`, `memory`, `network`, `publish`, `display`, `gpu`, `audio`, `stdin`/`stdout`/`stderr` ([`Stdio`](src/stdio.rs): inherit, null, piped), `tty`, `relay_signals`, `rm`, `publish_all`, `timeout`, `mount`, and `hooks`, `rules`, `on_exec`, `on_output`, `on_connect`, `on_lookup`. Then `run(argv)` on this thread, `output(argv)` to its end with what it wrote, `start(argv)` on a thread of its own, `launch(argv)` in a process of its own ([workers](#workers)), or `create()` to make it without running it, as `docker create` |
 | [`Running`](src/spec.rs) | A machine this process runs: `take_stdin`, `take_stdout`, `take_stderr` ([`Chunks`](src/stdio.rs), also an `io::Read`), `hooks()`, `machine()`, `stop`, `kill`, `wait` |
 | [`Machine`](src/machine.rs) | A machine by name, in this process or another: `info`, `exec(argv)`, `stop`, `kill`, `wait`, `ports`, `screen`, `watch`, `logs`, `files`, `copy_in`, `copy_out`, `freeze`, `freeze_with` ([`Freeze`](src/machine.rs): its name or none, config, step, history), `remove` |
 | [`Files`](src/files.rs) | A machine's files, running or stopped: `stat`, `list`, `read`, `read_to_string`, `write` ([`Write`](src/files.rs): mode, owner, parents, append, time), `mkdir`, `symlink`, `rename`, `remove`, and `copy_in`, `copy_out`, `copy_from` (another machine's disk) ([`Copy`](src/files.rs): `chown`, `chmod`, `exclude` with an ignore file's patterns), which keep kinds, modes, owners, times and links |
 | [`Mount`, `Volume`](src/mounts.rs) | A host's folder (or one file) seen live in a machine (`Mount::bind`), a volume (`Mount::volume`: a folder Carbon keeps that outlives its machines, its files' owners kept), a tmpfs; `read_only`; `Mount::parse` takes Docker's `-v` and `--mount`. `Carbon::volume(name)`: `create`, `path`, `info`; `volumes()`, `remove_volume` |
 | [`Logs`, `LogLine`](src/logs.rs) | What a launched machine wrote, as lines on its stream: `tail(n)`, `follow()` |
-| [`Image`, `ImageConfig`, `History`](../images/src/config.rs) | An image: its whole OCI config (exposed ports, volumes, labels, stop signal, health check, shell, `ONBUILD`), each step that made it, its layers' digests |
+| [`Image`, `ImageConfig`, `History`](../images/src/config.rs) | An image: its whole OCI config (exposed ports, volumes, labels, stop signal, health check, shell, `ONBUILD`), each step that made it, and its [`Lineage`](../images/src/lib.rs): the repository and [`Layer`](../images/src/lib.rs)s its first disk was pulled as, and each [`Disk`](../images/src/lib.rs) it was made through |
+| [`Push`, `Pushed`, `PushProgress`](src/lib.rs) | How to push (as another name, squashed), what a push did (the name, the manifest's digest, layers sent), and where one is |
 | [`ExecSpec`, `Process`](src/machine.rs) | A process in a running machine, as `docker exec`: `user`, `env`, `workdir`, `tty`, `timeout` (killed after it, exit 124); then `spawn` (stdin, output as it comes, `resize`, `signal`, `wait`), `output`, `detach`, or `attach` to this terminal |
 | [`Screen`](src/machine.rs) | A running machine's desktop, for computer use: `screenshot` (PNG), `windows`, `click`, `drag`, `scroll`, `type_text`, `key`, `resize`, `clipboard`, `drop_text`, `drop_files` |
 | [`hooks`](../hooks/README.md) | Events, decisions, the `Hooks` trait, filters, and the `Hub` each machine's hook points ask, with observers and subscriptions |
@@ -225,6 +226,30 @@ for nothing but running a file with no execute bit, so it pays nothing. A bound 
 machine's user, so whoever it runs as can use them, as on Docker Desktop; a volume's keep their own owners.
 Windows machines don't take a user yet.
 
+## Registries
+
+```rust
+carbon.login("docker.io", "someone", &token)?;                    // checked, and kept in <home>/auth.json (mode 600)
+let pushed = carbon.push("someone/app:1")?;                       // a layer per step
+println!("{}@{}", pushed.name, pushed.digest);
+carbon.push_with("app:1", &Push::new().to("ghcr.io/team/app:1").squash(true), |p| eprintln!("{p}"))?;
+carbon.save(&["app:1", "debian:13"], std::fs::File::create("images.tar")?)?;   // as docker save writes
+let loaded = carbon.load("images.tar")?;                          // docker save's, or an OCI layout
+```
+
+An image keeps its **lineage**: the layers a pulled base came as, and each disk a step made since (a build's every
+`RUN`, `COPY` and `ADD`, a `carbon freeze`). A push sends a layer per disk: the base's layers as the registry has
+them (taken from the base's own repository on the same registry with nothing sent, or fetched from another), then a
+layer of what each step changed, with whiteouts for what it removed, made from the two disks as it's sent. A step
+that changed nothing makes no layer, and the image's history says which steps made one, as OCI's config wants. The
+same disks make the same bytes, so a second push sends nothing and gets the same digest; `squash` sends one layer.
+Logins are Carbon's own, else Docker's (`docker login`, and its credential helpers). Prune keeps the disks a named
+image was made through, so it can still be pushed a layer per step.
+
+`save` writes the same layers, as plain tars, into an OCI image layout with Docker's `manifest.json` (as Docker 25
+and later write: `docker load` reads it); `load` reads that, an OCI layout alone, or Docker's older archive, gzipped
+or not, and keeps each layer's disk as the image's lineage. Windows images don't push or save yet.
+
 ## Workers
 
 `launch` runs a machine in a **worker**: this program's own binary, run again, which `carbon::init()` takes over. It
@@ -251,7 +276,7 @@ launched with `-P`: port 80 published from its config, its page served, its logs
 A host folder bound into a machine: written, linked, renamed and removed on both sides, each seen by the other at
 once while it ran; read-only refusing writes (EROFS); `npm install` of Express into a bound project (67 packages and
 their links, on the host). A volume's file chowned to 999 and chmod 600, the same for the next machine; a new volume
-filled from the image's `/etc/apt`. As users: `-u node` refused `/root`, `/etc/shadow` and `/usr/local` and given its own home; an image's `USER` taken by default and by `exec`; `exec -u nobody` and `-u 1234:1234`; a setuid root copy of `id` (`euid=0`) and a setgid one; `/tmp`'s sticky bit refusing another user's `rm`; `chown` refused to a user; `su` as root, and refused without a password; nginx's workers as `nginx`; a build that `useradd`s, then `USER app`, `COPY --chown` and a `RUN` as `app`. A build with every `RUN --mount`: `pip`'s cache reused by the next build, a bound
+filled from the image's `/etc/apt`. As users: `-u node` refused `/root`, `/etc/shadow` and `/usr/local` and given its own home; an image's `USER` taken by default and by `exec`; `exec -u nobody` and `-u 1234:1234`; a setuid root copy of `id` (`euid=0`) and a setgid one; `/tmp`'s sticky bit refusing another user's `rm`; `chown` refused to a user; `su` as root, and refused without a password; nginx's workers as `nginx`; a build that `useradd`s, then `USER app`, `COPY --chown` and a `RUN` as `app`. With Docker Hub: a login refused and one kept; an image built on `alpine:3.20` pushed with alpine's layer mounted from `library/alpine` and two step layers sent (its `RUN`'s removed `/etc/motd` a whiteout), pulled into an empty home and run as it was built, its history as built; pushed again with nothing sent and the same digest; pushed squashed; `quay.io`'s alpine pushed to Docker Hub, its layer fetched and sent; a push without a login refused with what to do. Two images saved as one archive and loaded into an empty home, plain, gzipped from stdin, and as an OCI layout alone; `debian` saved (139 MB) and loaded with its setuid, setgid, sticky bits, groups and hard links as they were; a loaded image pushed as the three layers it came as; `build --output type=oci`. A build with every `RUN --mount`: `pip`'s cache reused by the next build, a bound
 `requirements.txt`, a secret as a file and as a variable, a tmpfs, and none of it in the image. From the CLI: `--deny-exec` in a Linux machine (EACCES,
 126) and a Windows one (`where` refused when cmd starts it), a refused first program, `--deny` with `--allow`, and
 `carbon watch` showing another process's `carbon exec`, its output, its lookups and its refusals. A program outside
@@ -279,9 +304,10 @@ In [the proposal](../docs/carbon_lib.md)'s order:
       files' permissions, setuid and setgid against them.
 - [ ] **The rest of users:** in Windows machines (refused today); `--group-add`; `user` in a `Files` operation (they
       are root's); file capabilities (`security.capability`) at `execve`.
-- [ ] **Registries** (step 10): `login`, `push`, `save`, `load`; a built image pushed a layer per step (each its
-      index's difference from the step before, as a tar with whiteouts), `--squash` for one; `build --output
-      type=tar|oci`.
+- [x] **Registries**: `login`, `push`, `save`, `load`; a built image pushed a layer per step (each its disk's
+      difference from the step before, as a tar with whiteouts), `--squash` for one; `build --output type=docker|oci`.
+- [ ] **The rest of registries:** Windows images pushed and saved; several platforms pushed as one index;
+      `build --output type=tar` (the files alone); `carbon export` of a machine's disk as a tar.
 - [ ] **Policy and budget** (step 11), held by every build too; **checkpoints** of a running machine (step 12).
 - [ ] **Windows images built**: `FROM atlas`, `RUN` by `cmd.exe` and `powershell`, `COPY` into `C:\`.
 - [ ] **The rest of building**: `ADD` of a URL (`--checksum`) or a git repository, and a tar or git URL as the

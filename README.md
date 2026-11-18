@@ -167,6 +167,7 @@ carbon inspect nginx:alpine                          # an image's whole config a
 carbon build -t app:1 .                              # an image from a Carbonfile, which is any Dockerfile, exactly
 carbon run -v ~/work:/work -v data:/data debian:13   # a host folder seen live, and a volume that outlives the machine
 carbon pull debian:13 | import TAR NAME | images | rmi IMAGE | rm NAME
+carbon login -u someone && carbon push someone/app:1   # a layer per step; carbon save | carbon load, as Docker's
 ```
 
 Everything is kept in `CARBON_HOME`, or `~/.carbon`. [`cli`](cli/README.md) has every option, and what's coming.
@@ -361,7 +362,8 @@ programs and how to build them are in [lambda's](kernels/lambda/README.md#runnin
   a running machine, for both kernels (a pty in lambda, a console of its own in atlas). `carbon run -it debian:13 bash`
   works on all three hosts, from an image pulled over HTTPS (trusting what the host trusts), with machines kept by
   name, stopped, frozen and started again, or imported from a tar (`carbon import`); `carbon run -it atlas` is a
-  Windows prompt.
+  Windows prompt. Images are built from a Carbonfile, pushed to any registry a layer per step (`carbon login`,
+  `carbon push`), and saved and loaded as `docker save` and `docker load` have them.
 - **net** gives each machine its own network over the host's sockets: `apt-get update` and `curl https://` work in
   `debian:13` on all three hosts, and published ports reach programs in both kernels (`ssh -p 2222` into `sshd`, a
   Windows server's TCP and UDP ports), with the client's own address seen inside.
@@ -408,8 +410,8 @@ blocks real work, it moves up. Each item's detail is in the README it links to.
 
 **2. A machine you can run** ([layers](layers/README.md#to-do), [images](images/README.md#to-do), [carbon](carbon/README.md#to-do))
 
-`carbon run -it debian:13 bash` and `carbon exec` work. Left: compacting a running machine's log; zstd layers, registry
-logins, streaming layers, clearing unused chunks; atlas-base on Docker Hub as `tensoraico/atlas` (one multi-ISA
+`carbon run -it debian:13 bash` and `carbon exec` work. Left: compacting a running machine's log; zstd layers, streaming
+pulled layers; atlas-base on Docker Hub as `tensoraico/atlas` (one multi-ISA
 image), and Windows machines from it by default; `-d`'s logs; stopping, screenshots and `exec` from another process on Windows hosts; a worker
 process per machine, so one program runs several at once on macOS. (`--rm` and `-w` are done.)
 

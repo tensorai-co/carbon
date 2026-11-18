@@ -18,7 +18,10 @@ kernel (owner and mode to lambda, attributes to atlas) is that kernel's `M`, kep
   `FlushFileBuffers`, every 16 MiB written, and when the machine ends. A record is length-prefixed and checksummed, so
   a crash leaves the disk as it was at the last whole record.
 - **`freeze`** writes the whole tree as a new index: that's how a machine becomes an image.
-- **Tar** (`tar.rs`): a disk filled from a tar, with hard links, long names and OCI whiteouts.
+- **Tar** (`tar.rs`), both ways: a disk filled from a tar, with hard links, long names, PAX numbers and OCI
+  whiteouts; and a disk written as one (`export`), whole or as what differs from another disk (a layer, with
+  whiteouts for what's gone). Two files are compared by their chunks' names when both are in the store, so an
+  unchanged file is never read; each folder's names go in their order, so the same disks always make the same bytes.
 - **Case.** A directory can fold case, as Windows' do: names that differ only in case are one name, and keep the case
   they were given.
 - **Open files.** A file held open (`hold`) outlives its name, as programs' nameless temporary files need; the last
@@ -49,7 +52,9 @@ cargo test -p layers
 Extended attributes set, replaced, removed and replayed from the log; a volatile tree never reaching the log, nothing crossing out of it, and a file held open outliving it; an observer
 told of each change in order, with the tree as it is after; writing and removing, folding case (and keeping it through an index), an open file outliving its name; a disk that
 keeps its files when reopened, what wasn't synced lost cleanly after a crash, holes, files cut then grown, ranges zeroed in place (`fallocate`'s punched holes), freezing and
-reopening, and a bad index refused.
+reopening, and a bad index refused. A tree written as a tar and read back is the same tree (hard links, devices, FIFOs,
+long paths and big owners through PAX); a layer of what changed, applied to its base, makes the new tree, and a tree
+differs from itself in nothing.
 
 ## To do
 
@@ -57,4 +62,5 @@ reopening, and a bad index refused.
       a machine on the new image). Compacting it while the machine runs would need its files' numbers kept.
 - [ ] **Sharing a running machine's disk**, for forking a machine (`sdk`'s `fork`): a second machine on the same
       index and a copy of the log.
-- [ ] Files' permissions are kept in each kernel's `M` and not checked yet: that's lambda's to do, with credentials.
+- [x] Files' permissions are kept in each kernel's `M`; lambda checks them.
+- [ ] Extended attributes in a frozen index, and so in an exported layer (`security.capability`, ACLs).

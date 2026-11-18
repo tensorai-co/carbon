@@ -157,21 +157,11 @@ pub(crate) fn alive(pid: u32) -> bool {
     pid == std::process::id()
 }
 
-/// Seconds since 1970 as RFC 3339, as OCI writes a time: `2026-11-17T20:22:00Z`.
-pub(crate) fn rfc3339(secs: u64) -> String {
-    let days = secs / 86_400;
-    let (h, m, s) = (secs % 86_400 / 3600, secs % 3600 / 60, secs % 60);
-    // Civil from days (Howard Hinnant's algorithm).
-    let z = days as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(mo <= 2);
-    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+pub(crate) use images::rfc3339;
+
+/// A Linux file's `Meta` as a tar entry has it, for a layer made from a disk.
+fn lambda_entry(m: &lambda::Meta) -> layers::tar::Entry {
+    layers::tar::Entry { mode: m.mode, uid: m.uid, gid: m.gid, rdev: m.rdev }
 }
 
 pub(crate) fn now() -> u64 {
@@ -314,6 +304,13 @@ impl Store {
         for image in kept {
             let hash = images::store::parse_hash(&image.index).ok_or_else(|| Error::io(format!("{}'s record is corrupt; nothing pruned", image.name)))?;
             keep_index(hash, &mut store, &mut live)?;
+            // The disks it was made through, so it can still be pushed and saved a layer per step. One already gone
+            // only means it's pushed squashed, so it's no reason to prune nothing.
+            for disk in &image.lineage.disks {
+                if let Some(hash) = images::store::parse_hash(&disk.index) {
+                    let _ = keep_index(hash, &mut store, &mut live);
+                }
+            }
         }
         for record in &records {
             if let Some(index) = record.index.as_deref() {
@@ -410,6 +407,59 @@ impl Store {
         .map_err(error::image)
     }
 
+    /// An image by name, or why there isn't one, for what's done to it.
+    fn image_named(&self, name: &str) -> Result<Image> {
+        self.images.image(name).ok_or_else(|| Error::not_found(format!("there's no image {}", images::full_name(name))))
+    }
+
+    /// Pushes an image to `target` (else its own name), a layer per step unless `squash`.
+    pub fn push(&self, name: &str, target: Option<&str>, squash: bool, progress: &mut dyn FnMut(&images::PushProgress)) -> Result<images::Pushed> {
+        let image = self.image_named(name)?;
+        if image.platform.os == "windows" {
+            return Err(Error::unsupported("pushing a Windows image isn't there yet: Linux images push"));
+        }
+        let target = match target {
+            Some(t) => t.to_string(),
+            None if image.name.starts_with("sha256:") => return Err(Error::invalid(format!("{name} has no name to push it as: tag it first (carbon tag {name} REGISTRY/REPOSITORY:TAG)"))),
+            None => image.name.clone(),
+        };
+        self.images.push(&image, &target, squash, lambda_entry, lambda::Meta::dir(0o755), progress).map_err(error::image)
+    }
+
+    /// Writes images to `out` as one archive, as `docker save` does: each named as asked (`debian:13`), or an unnamed
+    /// one by its id.
+    pub fn save(&self, names: &[&str], out: &mut dyn std::io::Write, progress: &mut dyn FnMut(&images::PushProgress)) -> Result<()> {
+        let mut saving: Vec<(Image, Vec<String>)> = Vec::new();
+        for name in names {
+            let image = self.image_named(name)?;
+            if image.platform.os == "windows" {
+                return Err(Error::unsupported("saving a Windows image isn't there yet: Linux images save"));
+            }
+            let as_named = if image.name.starts_with("sha256:") { None } else { Some(image.name.clone()) };
+            // The same image under two names is saved once, with both.
+            match saving.iter_mut().find(|(i, _)| i.index == image.index && i.config == image.config && i.history == image.history && i.lineage == image.lineage) {
+                Some((_, also)) => also.extend(as_named),
+                None => saving.push((image, as_named.into_iter().collect())),
+            }
+        }
+        images::archive::save(&self.images, &saving, out, lambda_entry, lambda::Meta::dir(0o755), progress).map_err(error::image)
+    }
+
+    /// Loads every image an archive has (`docker save`'s, or an OCI layout's, gzipped or not), named as it was saved.
+    pub fn load(&self, path: &Path) -> Result<Vec<Image>> {
+        let (archive, found) = images::archive::Archive::open(path, &self.images.home().join("tmp")).map_err(error::image)?;
+        let mut loaded = Vec::new();
+        for image in &found {
+            let made = if image.platform.os == "windows" {
+                images::archive::load(&self.images, &archive, image, |_| atlas::Meta::default(), atlas::Meta { attributes: 0x10 })
+            } else {
+                images::archive::load(&self.images, &archive, image, lambda::Meta::from, lambda::Meta::dir(0o755))
+            };
+            loaded.extend(made.map_err(error::image)?);
+        }
+        Ok(loaded)
+    }
+
     /// Pulls an image for `platform` (Linux for this host's CPU, if not said).
     pub fn pull(&self, name: &str, platform: &Platform, progress: &mut dyn FnMut(&images::PullProgress)) -> Result<Image> {
         if platform.os == "windows" {
@@ -439,12 +489,12 @@ impl Store {
                 history.push(images::History { created: rfc3339(now()), created_by, empty_layer: false, comment: how.comment.clone() });
             }
         }
-        let layers = base.map(|b| b.layers).unwrap_or_default();
+        let lineage = base.as_ref().map(images::Lineage::after).unwrap_or_default();
         let config = how.config.as_ref().unwrap_or(&record.config);
         let source = how.source.clone().unwrap_or_else(|| format!("frozen from machine {name}"));
         match &how.name {
-            Some(image) => self.images.save_with(image, &index, &record.platform, config, &history, &layers, &source),
-            None => self.images.save_unnamed(&index, &record.platform, config, &history, &layers, &source),
+            Some(image) => self.images.save_with(image, &index, &record.platform, config, &history, &lineage, &source),
+            None => self.images.save_unnamed(&index, &record.platform, config, &history, &lineage, &source),
         }
         .map_err(error::image)
     }
@@ -598,6 +648,11 @@ mod tests {
         };
         image("kept:1", 1);
         image("gone:1", 2);
+        // An image made from one no longer named: the disk it was made through is its lineage's, and stays.
+        let earlier = image("earlier:1", 5);
+        let index = store.images.index(&store.images.image("kept:1").unwrap()).unwrap();
+        store.images.save_with("later:1", &index, &Platform::linux_here(), &Config::default(), &[], &images::Lineage::after(&earlier), "test").unwrap();
+        store.images.remove("earlier:1").unwrap();
         let machine = |name: &str, byte: u8| {
             let (record, _) = store.create(Some(name), None, &Source::Image("kept:1".into()), &|_| {}).unwrap();
             store.save_record(&record).unwrap();
@@ -625,6 +680,7 @@ mod tests {
         let has = |bytes: &[u8]| images::store::DiskStore::chunks(home.join("chunks")).unwrap().has(&images::store::sha256(bytes));
         let chunk = |byte: u8| vec![byte; layers::CHUNK as usize];
         assert!(has(&chunk(1)) && has(&chunk(3)), "the kept image's and the kept machine's chunks stay");
+        assert!(has(&chunk(5)), "a kept image's lineage's disk stays, for pushing it a layer per step");
         assert!(!has(&chunk(2)) && !has(&chunk(4)), "the removed image's and the removed machine's chunks go");
         let disk = store.disk::<lambda::Meta>(&kept, dir, false).unwrap();
         assert_eq!(disk.contents(disk.resolve(layers::ROOT, "/written.bin", false).unwrap()).unwrap(), contents(3));
