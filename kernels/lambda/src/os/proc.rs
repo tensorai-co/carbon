@@ -57,7 +57,7 @@ pub(crate) const PROCESS: [(&str, u8); 17] = [
 ];
 
 /// What's in `/proc/<pid>/task/<tid>`: the files a thread has that tools read.
-pub(crate) const THREAD: [(&str, u8); 6] = [("cmdline", DT_REG), ("comm", DT_REG), ("environ", DT_REG), ("stat", DT_REG), ("statm", DT_REG), ("status", DT_REG)];
+pub(crate) const THREAD: [(&str, u8); 7] = [("cmdline", DT_REG), ("comm", DT_REG), ("environ", DT_REG), ("stat", DT_REG), ("statm", DT_REG), ("status", DT_REG), ("syscall", DT_REG)];
 
 /// The names of the files a process has, for `parse` and `stat`.
 pub(crate) fn is_process_file(name: &str) -> bool {

@@ -133,13 +133,20 @@ pub fn with_faults<R>(
     mut copy: impl FnMut(&mut Turn<'_>) -> Result<R>,
 ) -> Result<R> {
     let access = if write { Prot::W } else { Prot::R };
+    // The same page can fault again after it's been filled: between the fill (one turn) and the copy (the next),
+    // another thread may take it away again, as a `fork` does to every page of the process (read-only, to share). So
+    // it's filled and tried again while filling works, as a kernel does; only a page faulting this many times in a row
+    // is given up on, so a fill that never takes can't loop for ever.
+    const MOST_IN_A_ROW: u32 = 64;
     let mut last = None;
+    let mut again = 0;
     loop {
         match cx.turn(&mut copy) {
             Ok(result) => return Ok(result),
             Err(Fault(addr)) => {
                 let page = addr & !(PAGE - 1);
-                if last == Some(page) || !fill(cx, addr, access) {
+                again = if last == Some(page) { again + 1 } else { 0 };
+                if again >= MOST_IN_A_ROW || !fill(cx, addr, access) {
                     return Err(Fault(addr));
                 }
                 last = Some(page);

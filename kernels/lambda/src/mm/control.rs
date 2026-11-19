@@ -74,7 +74,18 @@ impl Task {
         if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0 || (flags & MS_ASYNC != 0 && flags & MS_SYNC != 0) {
             return Err(EINVAL);
         }
-        self.mapped_pages(addr, len)?;
+        let range = self.mapped_pages(addr, len)?;
+        // A file's shared pages in the range, written back to it.
+        let areas: Vec<(std::ops::Range<u64>, Backing)> = {
+            let state = lock(&self.process.state);
+            state.regions.iter().filter(|(r, _)| r.start < range.end && range.start < r.end).map(|(r, a)| (r, a.backing.clone())).collect()
+        };
+        for (r, backing) in areas {
+            if let Backing::Shared { mem, offset, private: false } = backing {
+                let (start, end) = (r.start.max(range.start), r.end.min(range.end));
+                mem.sync((offset + start - r.start) / PAGE, (end - start) / PAGE);
+            }
+        }
         Ok(0)
     }
 

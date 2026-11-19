@@ -132,8 +132,46 @@ pub(crate) enum Report {
 }
 
 /// A running thread, as its process knows it.
+/// The system call a thread is in now, if it's in one: `/proc/<pid>/task/<tid>/syscall`.
+pub(crate) struct InSyscall {
+    nr: std::sync::atomic::AtomicI64,
+    args: [AtomicU64; 6],
+}
+
+impl Default for InSyscall {
+    fn default() -> InSyscall {
+        InSyscall { nr: std::sync::atomic::AtomicI64::new(-1), args: Default::default() }
+    }
+}
+
+impl InSyscall {
+        fn enter(&self, nr: u64, args: &[u64; 6]) {
+        for (slot, arg) in self.args.iter().zip(args) {
+            slot.store(*arg, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.nr.store(nr as i64, std::sync::atomic::Ordering::Release);
+    }
+
+    fn leave(&self) {
+        self.nr.store(-1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// As Linux writes it: the number and its six arguments (then the stack pointer and pc, which aren't kept: 0), or
+    /// `running`.
+    pub(crate) fn text(&self) -> String {
+        let nr = self.nr.load(std::sync::atomic::Ordering::Acquire);
+        if nr < 0 {
+            return "running\n".to_string();
+        }
+        let args: Vec<String> = self.args.iter().map(|a| format!("{:#x}", a.load(std::sync::atomic::Ordering::Relaxed))).collect();
+        format!("{nr} {} 0x0 0x0\n", args.join(" "))
+    }
+}
+
 pub(crate) struct Live {
     pub handle: Handle,
+    /// The system call it's in.
+    pub now: Arc<InSyscall>,
     pub waiter: Arc<Waiter>,
     pub signals: Arc<ThreadSignals>,
     /// Its CPU time so far.
@@ -211,6 +249,8 @@ pub(crate) struct Task {
     pub robust: Arc<AtomicU64>,
     /// Whether, and by whom, it's traced (`ptrace`).
     pub trace: Arc<ptrace::Trace>,
+    /// The system call it's in now.
+    pub now: Arc<InSyscall>,
     /// What `exit` gave, for its tracer to hear when it ends.
     exit_code: i32,
     /// Where its backend's jump gate is, if it has one, once asked (`mm::patch`).
@@ -245,6 +285,7 @@ impl Task {
             wall,
             robust: Arc::default(),
             trace: Arc::default(),
+            now: Arc::default(),
             exit_code: 0,
             jump_gate: None,
             forked: None,
@@ -253,7 +294,7 @@ impl Task {
 
     /// How its process sees it, running on `handle`.
     pub fn live(&self, handle: Handle) -> Live {
-        Live { handle, waiter: self.waiter.clone(), signals: self.signals.clone(), times: self.times.clone(), robust: self.robust.clone(), trace: self.trace.clone() }
+        Live { handle, now: self.now.clone(), waiter: self.waiter.clone(), signals: self.signals.clone(), times: self.times.clone(), robust: self.robust.clone(), trace: self.trace.clone() }
     }
 }
 
@@ -387,15 +428,15 @@ impl Task {
     /// A futex's key: its address in this process's space; or, unless it's `private`, its place in the shared
     /// memory it's in, so processes sharing that memory wait and wake on the same futex (a process-shared mutex, a
     /// POSIX semaphore).
-    pub fn futex_key(&self, addr: u64, private: bool) -> u64 {
+    pub fn futex_key(&self, addr: u64, private: bool) -> u128 {
         let state = lock(&self.process.state);
         if !private
             && let Some((range, area)) = state.regions.find(addr)
             && let crate::mm::Backing::Shared { mem, offset, private: false } = &area.backing
         {
-            return 1 << 63 | mem.ino << 40 ^ (offset + addr - range.start);
+            return kernels_core::wait::shared_key(mem.ino, offset + addr - range.start);
         }
-        state.space.0 << 48 ^ addr
+        kernels_core::wait::private_key(state.space.0, addr)
     }
 
     /// The process `id` names: one with that pid, or one with a thread of that ID.
@@ -523,6 +564,7 @@ impl Task {
             return Err(ENOSYS).into();
         };
         let a = call.args;
+        self.now.enter(nr, &args);
         let outcome = match call.sys {
             Sys::Exit => {
                 self.exit_code = a[0] as i32 & 0xff;
@@ -557,6 +599,7 @@ impl Task {
             },
             sys => self.call(cx, sys, a).into(),
         };
+        self.now.leave();
         // `restart_syscall`'s own EINTR is its answer, not a call to restart.
         if matches!(outcome, Outcome::Return(EINTR_RETURN)) && call.sys != Sys::RestartSyscall {
             self.interrupted = Some(Interrupted { sys: call.sys, nr, args });

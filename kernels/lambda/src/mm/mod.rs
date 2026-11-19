@@ -155,6 +155,24 @@ pub(crate) fn fill(k: &crate::Kernel, state: &crate::process::ProcState, cx: &mu
     }
 }
 
+impl crate::Kernel {
+    /// A file's shared mapping, if it has one: what it holds, written back, so the disk has it.
+    pub(crate) fn sync_file_maps(&self, ino: layers::Ino) {
+        let mem = lock(&self.file_maps).get(&ino).and_then(std::sync::Weak::upgrade);
+        if let Some(mem) = mem {
+            mem.sync(0, u64::MAX);
+        }
+    }
+
+    /// A `write` to a file went to the disk: its shared mapping, if it has one, takes it too.
+    pub(crate) fn file_written(&self, ino: layers::Ino, offset: u64, data: &[u8]) {
+        let mem = lock(&self.file_maps).get(&ino).and_then(std::sync::Weak::upgrade);
+        if let Some(mem) = mem {
+            mem.written(offset, data);
+        }
+    }
+}
+
 impl Task {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn mmap(&mut self, cx: &mut Cx<'_>, addr: u64, len: u64, prot: u64, flags: u64, fd: i32, offset: u64) -> Result<u64, Errno> {
@@ -168,6 +186,11 @@ impl Task {
         } else {
             let open = self.file(fd)?;
             match &open.node {
+                // Shared, and opened to write: the file's shared pages, written back to it. (Opened only to read, a
+                // shared mapping can never be written, and reads the page cache as a private one does.)
+                Node::File(ino) if shared && *lock(&open.flags) & O_ACCMODE == O_RDWR => {
+                    (Backing::Shared { mem: self.file_shared(*ino)?, offset, private: false }, open.path.clone())
+                }
                 Node::File(ino) => (Backing::File { ino: *ino, offset }, open.path.clone()),
                 Node::Zero | Node::Null if shared => (self.shared_anon(len), "/dev/zero (deleted)".to_string()),
                 Node::Zero | Node::Null => (Backing::Anon, String::new()),
@@ -185,6 +208,19 @@ impl Task {
             }
         };
         self.place(cx, addr, len, Area::new(prot_from(prot), backing, name), flags)
+    }
+
+    /// A file's pages for its shared mappings: the ones its mappings have now, or new ones.
+    fn file_shared(&self, ino: layers::Ino) -> Result<Arc<shared::SharedMem>, Errno> {
+        let mut maps = lock(&self.k.file_maps);
+        if let Some(mem) = maps.get(&ino).and_then(std::sync::Weak::upgrade) {
+            return Ok(mem);
+        }
+        let size = lock(&self.k.disk).stat(ino).map(|s| s.size).map_err(|_| EIO)?;
+        let mem = shared::SharedMem::for_file(&self.k, ino, size);
+        maps.retain(|_, m| m.strong_count() > 0);
+        maps.insert(ino, Arc::downgrade(&mem));
+        Ok(mem)
     }
 
     /// Puts `area` in the address space, `len` bytes of it: at `addr` with `MAP_FIXED` (replacing what's there) or

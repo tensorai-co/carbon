@@ -380,6 +380,7 @@ pub fn boot(mut exec: Exec, cpu: Cpu, disk: Disk, host: Arc<dyn Host>, argv: &[&
         host,
         disk: Mutex::new(disk),
         cache: Mutex::new(PageCache::default()),
+        file_maps: Mutex::new(std::collections::HashMap::new()),
         futexes: Futexes::default(),
         processes: Mutex::new(BTreeMap::new()),
         next_id: AtomicI32::new(1),
@@ -518,6 +519,8 @@ pub(crate) struct Kernel {
     host: Arc<dyn Host>,
     disk: Mutex<Disk>,
     cache: Mutex<PageCache>,
+    /// Each file's pages for its shared mappings, while it has any (`mm::shared`).
+    file_maps: Mutex<std::collections::HashMap<layers::Ino, std::sync::Weak<mm::shared::SharedMem>>>,
     futexes: Futexes,
     processes: Mutex<BTreeMap<i32, Arc<Process>>>,
     /// Process and thread IDs share one count, as on Linux.

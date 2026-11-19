@@ -107,6 +107,11 @@ impl Waiter {
     }
 }
 
+fn watching() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CARBON_EXEC_WATCH").is_some())
+}
+
 /// Something to tell when something it watches may have changed.
 pub trait Wake: Send + Sync {
     fn wake(&self);
@@ -144,10 +149,25 @@ impl Watchers {
     }
 }
 
+/// A futex's key for an address in a process's own memory: its space and the address, whole. (A key that squeezed
+/// both into 64 bits once kept only 4 bits of the space, and processes running the same program, whose futexes are at
+/// the same addresses, woke each other's waiters and lost their own wakes.) The address's top byte, a pointer tag, is
+/// dropped, as Linux's futexes drop it.
+pub fn private_key(space: u64, addr: u64) -> u128 {
+    u128::from(space) << 64 | u128::from(addr & 0x00ff_ffff_ffff_ffff)
+}
+
+/// A futex's key for a place in shared memory, as every process that maps it sees it: the memory, and the offset.
+pub fn shared_key(memory: u64, offset: u64) -> u128 {
+    1 << 127 | u128::from(memory) << 64 | u128::from(offset)
+}
+
 /// Waits keyed by an address: Linux's futexes, Windows' `WaitOnAddress` and keyed events.
 #[derive(Default)]
 pub struct Futexes {
-    waiting: Mutex<HashMap<u64, Vec<Arc<Waiter>>>>,
+    waiting: Mutex<HashMap<u128, Vec<Arc<Waiter>>>>,
+    /// `CARBON_EXEC_WATCH`: each key's last wake, when, by which thread, and how many it woke.
+    last_wake: Mutex<HashMap<u128, (Instant, String, usize)>>,
 }
 
 /// The value wasn't what the waiter expected, so it didn't wait.
@@ -157,7 +177,7 @@ pub struct Changed;
 impl Futexes {
     /// Waits on `key`, if `still()` says to. `still` runs with this table locked (it may take a turn to read the
     /// program's memory), so no wake can come between it and the wait.
-    pub fn wait(&self, key: u64, me: &Arc<Waiter>, still: impl FnOnce() -> bool, deadline: Option<Instant>) -> Result<Woke, Changed> {
+    pub fn wait(&self, key: u128, me: &Arc<Waiter>, still: impl FnOnce() -> bool, deadline: Option<Instant>) -> Result<Woke, Changed> {
         {
             let mut waiting = lock(&self.waiting);
             if !still() {
@@ -181,7 +201,7 @@ impl Futexes {
 
     /// Waits on every one of `keys` at once (`futex_waitv`), if `still()` says to, as `wait` does. Gives how the wait
     /// ended and, if a wake ended it, the first of `keys` it was woken by.
-    pub fn wait_any(&self, keys: &[u64], me: &Arc<Waiter>, still: impl FnOnce() -> bool, deadline: Option<Instant>) -> Result<(Woke, Option<usize>), Changed> {
+    pub fn wait_any(&self, keys: &[u128], me: &Arc<Waiter>, still: impl FnOnce() -> bool, deadline: Option<Instant>) -> Result<(Woke, Option<usize>), Changed> {
         {
             let mut waiting = lock(&self.waiting);
             if !still() {
@@ -215,11 +235,30 @@ impl Futexes {
         Ok((woke, if woke == Woke::Woken { by } else { None }))
     }
 
+    /// `CARBON_EXEC_WATCH`: what's known of `key`'s last wake: how long ago, by which thread, how many it woke.
+    pub fn last_wake(&self, key: u128) -> Option<(std::time::Duration, String, usize)> {
+        lock(&self.last_wake).get(&key).map(|(at, who, n)| (at.elapsed(), who.clone(), *n))
+    }
+
+    /// Whether `waiter` is on `key`'s queue now.
+    pub fn queued(&self, key: u128, waiter: &Arc<Waiter>) -> bool {
+        lock(&self.waiting).get(&key).is_some_and(|q| q.iter().any(|w| Arc::ptr_eq(w, waiter)))
+    }
+
     /// Wakes up to `count` threads waiting on `key`, first come first woken, giving how many.
-    pub fn wake(&self, key: u64, count: usize) -> usize {
+    pub fn wake(&self, key: u128, count: usize) -> usize {
         let mut waiting = lock(&self.waiting);
-        let Some(queue) = waiting.get_mut(&key) else { return 0 };
+        let watching = watching();
+        let Some(queue) = waiting.get_mut(&key) else {
+            if watching {
+                lock(&self.last_wake).insert(key, (Instant::now(), std::thread::current().name().unwrap_or("?").to_string(), 0));
+            }
+            return 0;
+        };
         let n = count.min(queue.len());
+        if watching {
+            lock(&self.last_wake).insert(key, (Instant::now(), std::thread::current().name().unwrap_or("?").to_string(), n));
+        }
         for waiter in queue.drain(..n) {
             waiter.wake();
         }
@@ -230,7 +269,7 @@ impl Futexes {
     }
 
     /// Moves up to `count` waiters from `from` to `to`, without waking them (`FUTEX_REQUEUE`).
-    pub fn requeue(&self, from: u64, to: u64, count: usize) -> usize {
+    pub fn requeue(&self, from: u128, to: u128, count: usize) -> usize {
         let mut waiting = lock(&self.waiting);
         let Some(queue) = waiting.get_mut(&from) else { return 0 };
         let n = count.min(queue.len());
@@ -302,5 +341,23 @@ mod tests {
         // A watcher that's gone is skipped.
         drop(a);
         watchers.notify();
+    }
+
+    #[test]
+    fn keys_tell_processes_apart() {
+        // Two spaces whose roots share bits 12-15, and one address: the old key, `root << 48 ^ addr`, was the same for
+        // both, so one process's wake went to the other's waiter.
+        let (a, b, addr) = (0x8000_1000u64, 0x8011_1000u64, 0x0000_4000_0008_0148u64);
+        assert_eq!(a << 48 ^ addr, b << 48 ^ addr, "the old key collides");
+        assert_ne!(super::private_key(a, addr), super::private_key(b, addr));
+        // A tagged pointer is the same futex as the untagged one.
+        assert_eq!(super::private_key(a, 0x5a00_4000_0008_0148), super::private_key(a, addr));
+        // Shared memory's keys never meet a private one.
+        assert_ne!(super::shared_key(7, 0x148), super::private_key(7, 0x148));
+        // A wake on one process's key leaves the other's waiter be.
+        let futexes = Futexes::default();
+        let me = Waiter::new();
+        assert_eq!(futexes.wake(super::private_key(a, addr), 1), 0);
+        assert_eq!(futexes.wait(super::private_key(b, addr), &me, || true, Some(Instant::now() + Duration::from_millis(5))), Ok(Woke::TimedOut));
     }
 }

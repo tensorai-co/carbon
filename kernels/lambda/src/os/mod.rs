@@ -59,6 +59,8 @@ enum Proc<'p> {
     Fds(Arc<Process>),
     /// `/proc/<pid>/task`: its threads, by their IDs.
     Tasks(Arc<Process>),
+    /// `/proc/<pid>/task/<tid>/syscall`: the system call the thread is in.
+    Syscall(Arc<Process>, i32),
     Maps(Arc<Process>),
     Global(&'p str),
     /// A process's mounts: `mountinfo`, or `mounts`.
@@ -98,6 +100,11 @@ fn ns_kind(leaf: &str) -> Option<crate::ns::NsKind> {
     crate::ns::NsKind::ALL.into_iter().find(|k| k.name() == leaf)
 }
 
+/// The thread a `/proc/<pid>/task/<tid>/...` path (past `/proc/`) names, or 0.
+fn what_tid(rest: &str) -> i32 {
+    rest.split('/').nth(2).filter(|_| rest.split('/').nth(1) == Some("task")).and_then(|t| t.parse().ok()).unwrap_or(0)
+}
+
 fn parse<'p>(task: &Task, path: &'p str) -> Option<Proc<'p>> {
     if path == "/proc" || path == "/proc/" {
         return Some(Proc::Root);
@@ -113,9 +120,11 @@ fn parse<'p>(task: &Task, path: &'p str) -> Option<Proc<'p>> {
         Some((tid, inner)) if tid.parse::<i32>().is_ok() && process.as_ref().is_some_and(|p| lock(&p.state).threads.contains_key(&tid.parse().unwrap_or(0))) => (inner.trim_end_matches('/'), true),
         _ => (what.trim_end_matches('/'), false),
     };
+    let tid: i32 = what_tid(rest);
     if thread {
         let p = process?;
         return match what {
+            "syscall" => Some(Proc::Syscall(p, tid)),
             "" => Some(Proc::ThreadDir),
             "comm" => Some(Proc::Comm(p)),
             "status" => Some(Proc::Memory(p, Memory::Status)),
@@ -331,6 +340,7 @@ pub(crate) fn open(task: &Task, path: &str) -> Option<Result<Arc<Open>, Errno>> 
         Proc::ThreadDir => Some(Ok(Open::new(Node::Listing(proc::entries(&proc::THREAD)), O_DIRECTORY, path))),
         Proc::Namespaces => Some(Ok(Open::new(Node::Listing(proc::namespaces()), O_DIRECTORY, path))),
         Proc::Comm(p) => made(format!("{}\n", Task::comm(&lock(&p.state)))),
+        Proc::Syscall(p, tid) => made(lock(&p.state).threads.get(&tid).map_or_else(|| "running\n".to_string(), |live| live.now.text())),
         // Its memory is read where a thread can reach it: `Task::open_proc_memory`, which every open goes through
         // first. Here (`stat` of an open file, say), it's an empty file.
         Proc::Memory(p, Memory::Status) => made(status(task, &p, None)),

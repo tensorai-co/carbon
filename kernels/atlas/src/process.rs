@@ -356,7 +356,8 @@ impl Task {
             }
             call::WAKE_ADDRESS => {
                 let a = self.args(cx, 2);
-                self.k.futexes.wake(a[0], if a[1] != 0 { usize::MAX } else { 1 });
+                let key = self.address_key(cx, a[0]);
+                self.k.futexes.wake(key, if a[1] != 0 { usize::MAX } else { 1 });
                 self.answer(cx, 0)
             }
             call::UPCALL_RETURN => self.die(status::INVALID_PARAMETER, "returned to an upcall that isn't waiting"),
@@ -508,6 +509,13 @@ impl Task {
         if self.ending() { Flow::End } else { Flow::Run }
     }
 
+    /// What `WAIT_ADDRESS` and `WAKE_ADDRESS` wait and wake on: the address in this process's space, so processes
+    /// running the same program (at the same addresses) don't wake each other.
+    fn address_key(&mut self, cx: &mut Cx<'_>, addr: u64) -> u128 {
+        let space = cx.turn(|t| t.space().id().0);
+        kernels_core::wait::private_key(space, addr)
+    }
+
     /// `WAIT_ADDRESS`: waits while the `size` bytes at `addr` are what's at `compare`, up to `timeout_ms`. 0 when
     /// woken (or it had changed), STATUS_TIMEOUT when the time's up.
     fn wait_address(&mut self, cx: &mut Cx<'_>, addr: u64, compare: u64, size: u64, timeout_ms: u64) -> Result<u32, Reply> {
@@ -517,8 +525,9 @@ impl Task {
         let deadline = (timeout_ms as u32 != u32::MAX).then(|| std::time::Instant::now() + std::time::Duration::from_millis(u64::from(timeout_ms as u32)));
         let waiter = self.waiter.clone();
         let k = self.k.clone();
+        let key = self.address_key(cx, addr);
         let still = || self.mem(cx, false, |t| user::read_vec(&t.space(), addr, size)).is_ok_and(|now| now == expected);
-        match k.futexes.wait(addr, &waiter, still, deadline) {
+        match k.futexes.wait(key, &waiter, still, deadline) {
             Err(kernels_core::wait::Changed) | Ok(kernels_core::wait::Woke::Woken) => Ok(0),
             Ok(kernels_core::wait::Woke::TimedOut) => Ok(0x102),
             Ok(kernels_core::wait::Woke::Interrupted) if self.ending() => Err(Reply::Ended),

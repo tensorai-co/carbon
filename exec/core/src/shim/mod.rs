@@ -32,8 +32,9 @@ pub trait Shim: Send + Sync + Sized + 'static {
     /// What goes in cr3 or TTBR0 for a space, or for none (0).
     fn root_register(&self, root: u64) -> u64;
 
-    /// Just before running: if `flush`, go back to the program by way of a TLB flush.
-    fn before_run(&self, regs: &mut Self::Regs, flush: bool);
+    /// Just before running: if `flush`, go back to the program by way of a TLB flush. Whether the flush is arranged:
+    /// false if the CPU isn't where it can go that way, so it's still to do.
+    fn before_run(&self, regs: &mut Self::Regs, flush: bool) -> bool;
     /// The shim stopped the CPU at `at`. Leaves it ready to go back to the program.
     fn trap(&self, mmu: &Mmu<Native>, cpu: &Self::CpuData, regs: &mut Self::Regs, at: u64) -> Stop;
     /// It was preempted, wherever it was. Leaves it ready to go back to the program.

@@ -5,12 +5,17 @@
 //! page faulted later maps the same frame, so parent and child go on sharing. A memfd's `read` and `write` go to the
 //! same frames, so what's written either way is seen both ways.
 //!
-//! Not yet: `MAP_SHARED` of a file on the disk still acts as a private mapping (see `Backing::File`). And the
-//! translator doesn't see x86-64 code written through another mapping of a shared page (exec's to-do list).
+//! `MAP_SHARED` of a file on the disk, opened to write, is one too ([`SharedMem::for_file`]): one for each file,
+//! however many mappings it has in however many processes, its pages read from the file as they're first touched, and
+//! written back to it on `msync` and once the last mapping goes (`munmap`, `exec`, exit). So what a program writes
+//! through the mapping is in the file for whatever reads it next: Go's linker writes its output that way, and the
+//! binary is run straight after. Not yet: a `read` or `write` of the file while it's mapped shared goes to the disk,
+//! and doesn't see what's in the mapping until it's written back (nor the mapping what's written). And the translator
+//! doesn't see x86-64 code written through another mapping of a shared page (exec's to-do list).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use exec::{Frame, PAGE, Prot};
 use kernels_core::lock;
@@ -40,6 +45,44 @@ pub(crate) struct SharedMem {
     exec: SharedExec,
     inner: Mutex<Inner>,
     pub ino: u64,
+    /// The file on the disk it's a shared mapping of, if it's one.
+    file: Option<FileBacked>,
+}
+
+/// A file a shared mapping writes back to.
+struct FileBacked {
+    ino: layers::Ino,
+    k: Weak<crate::Kernel>,
+}
+
+impl FileBacked {
+    /// Page `index` of the file, as it is on the disk: zeroes past its end.
+    fn read_page(&self, index: u64) -> Vec<u8> {
+        let mut page = vec![0; PAGE as usize];
+        if let Some(k) = self.k.upgrade() {
+            let _ = lock(&k.disk).read(self.ino, index * PAGE, &mut page);
+        }
+        page
+    }
+
+    /// Writes pages back to the file, as far as its size goes now: a mapping doesn't grow its file.
+    fn write_back(&self, pages: Vec<(u64, Vec<u8>)>) {
+        let Some(k) = self.k.upgrade() else { return };
+        if pages.is_empty() {
+            return;
+        }
+        let now = k.now();
+        let mut disk = lock(&k.disk);
+        let Ok(size) = disk.stat(self.ino).map(|s| s.size) else { return };
+        for (index, bytes) in pages {
+            let at = index * PAGE;
+            if at >= size {
+                continue;
+            }
+            let n = (size - at).min(PAGE) as usize;
+            let _ = disk.write(self.ino, at, &bytes[..n], now);
+        }
+    }
 }
 
 struct Inner {
@@ -56,22 +99,82 @@ impl std::fmt::Debug for SharedMem {
 }
 
 impl Drop for SharedMem {
+    /// Its last mapping's gone: a file's pages are written back to it (read out under exec's lock, written with the
+    /// disk's, never both at once), and its frames go.
     fn drop(&mut self) {
         let inner = self.inner.get_mut().unwrap_or_else(|p| p.into_inner());
         if inner.frames.is_empty() {
             return;
         }
-        let mut exec = lock(&self.exec);
-        let mut memory = exec.memory();
-        for frame in std::mem::take(&mut inner.frames).into_values() {
-            memory.free_frame(frame);
+        let mut pages = Vec::new();
+        {
+            let mut exec = lock(&self.exec);
+            let mut memory = exec.memory();
+            for (index, frame) in std::mem::take(&mut inner.frames) {
+                if self.file.is_some() {
+                    let mut bytes = vec![0; PAGE as usize];
+                    memory.frame_read(frame, 0, &mut bytes);
+                    pages.push((index, bytes));
+                }
+                memory.free_frame(frame);
+            }
+        }
+        if let Some(file) = &self.file {
+            file.write_back(pages);
         }
     }
 }
 
 impl SharedMem {
     pub fn new(exec: SharedExec, size: u64, seals: u32) -> Arc<SharedMem> {
-        Arc::new(SharedMem { exec, inner: Mutex::new(Inner { frames: BTreeMap::new(), size, seals }), ino: NEXT_INO.fetch_add(1, Ordering::Relaxed) })
+        Arc::new(SharedMem { exec, inner: Mutex::new(Inner { frames: BTreeMap::new(), size, seals }), ino: NEXT_INO.fetch_add(1, Ordering::Relaxed), file: None })
+    }
+
+    /// The pages of a file on the disk, `size` bytes of it now, for its shared mappings.
+    pub fn for_file(k: &Arc<crate::Kernel>, ino: layers::Ino, size: u64) -> Arc<SharedMem> {
+        Arc::new(SharedMem {
+            exec: k.exec.clone(),
+            inner: Mutex::new(Inner { frames: BTreeMap::new(), size, seals: 0 }),
+            ino: NEXT_INO.fetch_add(1, Ordering::Relaxed),
+            file: Some(FileBacked { ino, k: Arc::downgrade(k) }),
+        })
+    }
+
+    /// A `write` to its file: the pages it has there take the bytes too.
+    pub fn written(&self, offset: u64, data: &[u8]) {
+        let inner = lock(&self.inner);
+        let mut exec = lock(&self.exec);
+        let mut memory = exec.memory();
+        let mut done = 0;
+        while done < data.len() {
+            let at = offset + done as u64;
+            let (page, within) = (at / PAGE, (at % PAGE) as usize);
+            let part = (data.len() - done).min(PAGE as usize - within);
+            if let Some(frame) = inner.frames.get(&page) {
+                memory.frame_write(*frame, within, &data[done..done + part]);
+            }
+            done += part;
+        }
+    }
+
+    /// `msync`: writes pages `first..first + count` back to the file, if it's a file's.
+    pub fn sync(&self, first: u64, count: u64) {
+        let Some(file) = &self.file else { return };
+        let pages: Vec<(u64, Vec<u8>)> = {
+            let inner = lock(&self.inner);
+            let mut exec = lock(&self.exec);
+            let memory = exec.memory();
+            inner
+                .frames
+                .range(first..first.saturating_add(count))
+                .map(|(index, frame)| {
+                    let mut bytes = vec![0; PAGE as usize];
+                    memory.frame_read(*frame, 0, &mut bytes);
+                    (*index, bytes)
+                })
+                .collect()
+        };
+        file.write_back(pages);
     }
 
     pub fn size(&self) -> u64 {
@@ -200,11 +303,21 @@ impl SharedMem {
 pub(crate) fn fault_shared(cx: &mut Cx<'_>, mem: &SharedMem, index: u64, page: u64, prot: Prot, private: bool, write: bool) -> Result<(), exec::Error> {
     // Its lock first, then exec's, as `read` and `write` take them.
     let mut inner = lock(&mem.inner);
+    // A file's page, the first time: what the file has there, read before exec's lock is taken (the disk's comes
+    // first, where both are).
+    let fill = match (&mem.file, inner.frames.contains_key(&index)) {
+        (Some(file), false) => Some(file.read_page(index)),
+        _ => None,
+    };
     cx.turn(|t| {
         let frame = match inner.frames.get(&index) {
             Some(frame) => *frame,
             None => {
-                let frame = t.memory().new_frame()?;
+                let mut memory = t.memory();
+                let frame = memory.new_frame()?;
+                if let Some(bytes) = &fill {
+                    memory.frame_write(frame, 0, bytes);
+                }
                 inner.frames.insert(index, frame);
                 frame
             }

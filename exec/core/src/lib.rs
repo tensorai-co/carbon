@@ -17,6 +17,7 @@ mod ticker;
 mod translated;
 mod tuning;
 mod turn;
+mod watch;
 mod types;
 mod unavailable;
 

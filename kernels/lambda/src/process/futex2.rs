@@ -123,7 +123,7 @@ impl Task {
         for f in &futexes {
             self.mem(cx, false, |t| user::read_u32(&t.space(), f.addr))?;
         }
-        let keys: Vec<u64> = futexes.iter().map(|f| self.futex_key(f.addr, f.private)).collect();
+        let keys: Vec<u128> = futexes.iter().map(|f| self.futex_key(f.addr, f.private)).collect();
         let waiter = self.waiter.clone();
         loop {
             let still = || cx.turn(|t| futexes.iter().all(|f| user::read_u32(&t.space(), f.addr) == Ok(f.val)));

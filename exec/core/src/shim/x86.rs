@@ -282,10 +282,12 @@ impl Shim for X86Shim {
         root
     }
 
-    fn before_run(&self, regs: &mut X86VcpuRegs, flush: bool) {
+    fn before_run(&self, regs: &mut X86VcpuRegs, flush: bool) -> bool {
         if flush && regs.rip == IRET_STUB {
             regs.rip = FLUSH_STUB;
+            return true;
         }
+        regs.rip == FLUSH_STUB
     }
 
     fn trap(&self, mmu: &Mmu<Native>, cpu: &X86Cpu, regs: &mut X86VcpuRegs, at: u64) -> Stop {

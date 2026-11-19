@@ -132,7 +132,10 @@ impl<V: Vm, S: Sandbox> Core<V, S> {
             chains: Vec::new(),
             resume: Vec::new(),
             setups: Vec::new(),
-            ticker: Ticker::start(cpus.clone(), options.tuning.time_slice),
+            ticker: {
+                crate::watch::start(cpus.clone());
+                Ticker::start(cpus.clone(), options.tuning.time_slice)
+            },
             cpus,
             generation: Arc::new(AtomicU64::new(0)),
             paused: Arc::new(AtomicBool::new(false)),
@@ -218,6 +221,9 @@ impl<V: Vm, S: Sandbox> Core<V, S> {
             // Behind, so it flushes before it first runs.
             flushed: AtomicU64::new(u64::MAX),
             gone: AtomicBool::new(false),
+            entered: AtomicU64::new(0),
+            thread: std::sync::OnceLock::new(),
+            progress: std::sync::Mutex::new(crate::watch::Progress::default()),
             preempt,
         });
         if free.is_some() {
@@ -332,19 +338,27 @@ impl<V: Vm, S: Sandbox> Core<V, S> {
     /// for, so nothing can use a page that's gone once this returns.
     fn flush_others(&mut self, me: usize) {
         self.generation.fetch_add(1, Ordering::SeqCst);
-        self.stop_running_others(me, false);
+        self.stop_running_others(me);
     }
 
     /// Stops every other CPU from running in its program until the returned guard drops, so an emulated atomic can
     /// read and write memory across a 16-byte boundary or page boundary atomically with respect to other CPUs.
     pub(crate) fn pause_others(&self, me: usize) -> PauseGuard<'_> {
         self.paused.store(true, Ordering::SeqCst);
-        self.stop_running_others(me, true);
+        self.stop_running_others(me);
         std::sync::atomic::fence(Ordering::SeqCst);
         PauseGuard(&self.paused)
     }
 
-    fn stop_running_others(&self, me: usize, renotify: bool) {
+    /// Kicks every other CPU that's running out of its program, and waits until each has left it.
+    ///
+    /// A kick can be lost: a CPU marks itself running, checks for a stop, and only then goes into its program (hvf's
+    /// `hv_vcpu_run`), and a kick that lands between the two finds no program to leave, which hvf doesn't remember.
+    /// Once in, a program that spins without trapping (a Go thread waiting on the very CPU flushing, say) never comes
+    /// out by itself, and this would wait for ever, the kernel's lock held. So the kick is sent again every so often
+    /// while waiting: it costs nothing when the first one lands, and catches the CPU once it's in its program when
+    /// it didn't.
+    fn stop_running_others(&self, me: usize) {
         let cpus = self.cpus.lock().unwrap_or_else(PoisonError::into_inner).clone();
         for (index, cpu) in cpus.iter().enumerate() {
             if index == me || cpu.gone.load(Ordering::Acquire) || !cpu.running.load(Ordering::SeqCst) {
@@ -354,7 +368,7 @@ impl<V: Vm, S: Sandbox> Core<V, S> {
             let mut spins = 0u32;
             while cpu.running.load(Ordering::SeqCst) && !cpu.gone.load(Ordering::Acquire) {
                 spins = spins.wrapping_add(1);
-                if renotify && (spins & 1023) == 0 {
+                if (spins & 1023) == 0 {
                     (cpu.preempt)();
                     std::thread::yield_now();
                 } else {

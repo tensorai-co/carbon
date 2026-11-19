@@ -384,6 +384,8 @@ impl Task {
             }
             Node::Stdout | Node::Stderr => Err(EBADF),
             Node::File(ino) => {
+                // What a shared mapping of it holds first, so a read sees it.
+                self.k.sync_file_maps(*ino);
                 let buffer = {
                     let mut offset = lock(&open.offset);
                     let start = at.unwrap_or(*offset);
@@ -611,6 +613,9 @@ impl Task {
                 if at.is_none() {
                     *offset = start + n as u64;
                 }
+                drop(disk);
+                // And into a shared mapping of it, so it sees the write, and doesn't write its old pages back over it.
+                self.k.file_written(*ino, start, &data[..n]);
                 Ok(n)
             }
             Node::Memfd(_, true) => Err(EINVAL),

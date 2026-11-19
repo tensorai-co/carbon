@@ -148,10 +148,12 @@ impl Shim for Arm64Shim {
         if root == 0 { self.empty_root } else { root }
     }
 
-    fn before_run(&self, regs: &mut Arm64VcpuRegs, flush: bool) {
+    fn before_run(&self, regs: &mut Arm64VcpuRegs, flush: bool) -> bool {
         if flush && regs.pc == ERET_AT {
             regs.pc = FLUSH_AT;
+            return true;
         }
+        (FLUSH_AT..FLUSH_AT + 16).contains(&regs.pc)
     }
 
     fn trap(&self, _mmu: &Mmu<Native>, _cpu: &(), regs: &mut Arm64VcpuRegs, at: u64) -> Stop {

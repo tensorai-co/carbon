@@ -20,6 +20,13 @@ pub(crate) struct CpuShared {
     pub flushed: AtomicU64,
     /// Its thread has finished with it.
     pub gone: AtomicBool,
+    /// When it last went into its program ([`crate::watch::now`]), for `CARBON_EXEC_WATCH`; 0 while it's out.
+    pub entered: AtomicU64,
+    /// The name of the thread that runs it, for the watch's reports.
+    pub thread: std::sync::OnceLock<String>,
+    /// For the watch: when it last came out for something other than a kick (a trap, a fault), the runs since, those
+    /// that didn't go in at all, and when it last reported.
+    pub progress: std::sync::Mutex<crate::watch::Progress>,
     pub preempt: RawPreempt,
 }
 
@@ -81,6 +88,9 @@ impl<V: Vm, S: Sandbox> Cpu<V, S> {
     /// Runs the program until it needs its kernel. The one call made without the kernel's lock.
     pub fn run(&mut self) -> Exit {
         if self.shared.pending.swap(false, Ordering::SeqCst) || self.paused.load(Ordering::SeqCst) {
+            if crate::watch::on() {
+                crate::watch::kicked(&self.shared, self.index, true, String::new);
+            }
             return Exit(RawExit::Preempted);
         }
         self.shared.ran.store(true, Ordering::SeqCst);
@@ -94,10 +104,16 @@ impl<V: Vm, S: Sandbox> Cpu<V, S> {
         }
         let generation = self.generation.load(Ordering::SeqCst);
         let flush = self.shared.flushed.load(Ordering::Acquire) != generation;
+        let watching = crate::watch::on();
+        if watching {
+            self.shared.thread.get_or_init(|| std::thread::current().name().unwrap_or("?").to_string());
+            self.shared.entered.store(crate::watch::now(), Ordering::Release);
+        }
         let raw = match &mut self.inner {
             CpuInner::Vm { cpu, shim, .. } => {
-                shim.before_run(cpu.regs(), flush);
-                if flush {
+                // Caught up only once the flush is really on its way: a CPU that isn't where it can go back by way of
+                // one stays behind, and flushes next time.
+                if shim.before_run(cpu.regs(), flush) && flush {
                     self.shared.flushed.store(generation, Ordering::Release);
                 }
                 RawExit::Vm(cpu.run())
@@ -105,6 +121,32 @@ impl<V: Vm, S: Sandbox> Cpu<V, S> {
             CpuInner::Sandbox { cpu } => RawExit::Sandbox(cpu.resume()),
         };
         self.shared.running.store(false, Ordering::SeqCst);
+        if watching {
+            let kicked = matches!(raw, RawExit::Preempted | RawExit::Vm(VmExit::Preempted) | RawExit::Sandbox(SandboxExit::Preempted));
+            if kicked {
+                let inner = &mut self.inner;
+                crate::watch::kicked(&self.shared, self.index, false, || match inner {
+                    CpuInner::Vm { cpu, .. } => format!("{:x?}", cpu.regs()),
+                    CpuInner::Sandbox { cpu } => format!("{:x?}", cpu.regs()),
+                });
+            } else {
+                crate::watch::progressed(&self.shared);
+            }
+            let entered = self.shared.entered.swap(0, Ordering::AcqRel);
+            let stayed = crate::watch::now().saturating_sub(entered);
+            if stayed >= crate::watch::LONG {
+                let regs = match &mut self.inner {
+                    CpuInner::Vm { cpu, .. } => format!("{:x?}", cpu.regs()),
+                    CpuInner::Sandbox { cpu } => format!("{:x?}", cpu.regs()),
+                };
+                eprintln!(
+                    "exec watch: cpu {} ({}) came out after {:.1}s in its program: {raw:x?}; {regs}",
+                    self.index,
+                    self.shared.thread.get().map_or("?", String::as_str),
+                    stayed as f64 / 1e9
+                );
+            }
+        }
         Exit(raw)
     }
 

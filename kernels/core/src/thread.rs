@@ -291,6 +291,8 @@ impl Seat {
 /// A CPU for this thread, waiting for one to be free if `share` and there's none: threads blocked with one are asked to
 /// give theirs up meanwhile.
 fn take_cpu(exec: &SharedExec, share: bool) -> Result<Cpu, exec::Error> {
+    let started = Instant::now();
+    let mut reported = 0u64;
     loop {
         let seen = *lock(&SEATS.freed);
         match lock(exec).add_cpu() {
@@ -300,6 +302,17 @@ fn take_cpu(exec: &SharedExec, share: bool) -> Result<Cpu, exec::Error> {
         }
         SEATS.wanted.fetch_add(1, Ordering::SeqCst);
         let asked = SEATS.ask_one();
+        // `CARBON_EXEC_WATCH`: a thread that's waited long for a CPU, said once every few seconds.
+        let waited = started.elapsed().as_secs();
+        if waited >= 3 && waited / 3 > reported && std::env::var_os("CARBON_EXEC_WATCH").is_some() {
+            reported = waited / 3;
+            let blocked = lock(&SEATS.list).iter().filter_map(Weak::upgrade).filter(|seat| lock(&seat.blocked).is_some()).count();
+            eprintln!(
+                "exec watch: {} has waited {waited}s for a CPU ({} waiting, {blocked} blocked with one; asked one: {asked})",
+                std::thread::current().name().unwrap_or("?"),
+                SEATS.wanted.load(Ordering::SeqCst)
+            );
+        }
         trace(if asked { "waits for a CPU, having asked a blocked thread for one" } else { "waits for a CPU, with no blocked thread to ask" });
         let freed = lock(&SEATS.freed);
         if *freed == seen {

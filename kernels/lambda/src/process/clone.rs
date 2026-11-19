@@ -429,12 +429,41 @@ impl Task {
                     })
                 };
                 let waiter = self.waiter.clone();
-                let still = || cx.turn(|t| user::read_u32(&t.space(), addr)) == Ok(val as u32);
-                match self.k.futexes.wait(key, &waiter, still, deadline) {
-                    Err(Changed) => Err(EAGAIN),
-                    Ok(Woke::Woken) => Ok(0),
-                    Ok(Woke::Interrupted) => Err(EINTR),
-                    Ok(Woke::TimedOut) => Err(ETIMEDOUT),
+                // `CARBON_EXEC_WATCH`: a wait with no end looks again each second, and one whose word has changed
+                // under it (a wake that never came) says so and ends, as a spurious wake would.
+                let watching = deadline.is_none() && std::env::var_os("CARBON_EXEC_WATCH").is_some();
+                let started = std::time::Instant::now();
+                loop {
+                    let step = if watching { Some(Instant::now() + Duration::from_secs(1)) } else { deadline };
+                    let still = || cx.turn(|t| user::read_u32(&t.space(), addr)) == Ok(val as u32);
+                    let woke = self.k.futexes.wait(key, &waiter, still, step);
+                    if watching && woke == Ok(Woke::TimedOut) {
+                        let now = cx.turn(|t| user::read_u32(&t.space(), addr));
+                        if now != Ok(val as u32) {
+                            let last = self.k.futexes.last_wake(key);
+                            eprintln!(
+                                "exec watch: [{}] last wake on {addr:#x}: {}",
+                                self.tid,
+                                match last {
+                                    Some((ago, who, n)) => format!("{:.3}s ago by {who}, woke {n} (this wait began {:.3}s ago)", ago.as_secs_f64(), started.elapsed().as_secs_f64()),
+                                    None => "none ever".to_string(),
+                                }
+                            );
+                            eprintln!(
+                                "exec watch: [{}] futex {addr:#x} (key {key:#x}) still waited on for {val:#x} after {:.1}s, but it holds {now:x?}: a wake was lost",
+                                self.tid,
+                                started.elapsed().as_secs_f64()
+                            );
+                            return Ok(0);
+                        }
+                        continue;
+                    }
+                    return match woke {
+                        Err(Changed) => Err(EAGAIN),
+                        Ok(Woke::Woken) => Ok(0),
+                        Ok(Woke::Interrupted) => Err(EINTR),
+                        Ok(Woke::TimedOut) => Err(ETIMEDOUT),
+                    };
                 }
             }
             FUTEX_WAKE | FUTEX_WAKE_BITSET => Ok(self.k.futexes.wake(key, val as usize) as u64),
