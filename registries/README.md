@@ -39,13 +39,14 @@ bearer. An answer is JSON, bytes (with `Carbon-Size`, and `Carbon-Digest` when i
 | [`registries-pypi`](pypi/src/lib.rs) | PyPI's simple index (and so pip's and uv's) as `project` and `file` calls; each file's URL pointed back at the registry with its SHA-256 in it, and each file checked against it as it streams |
 | [`registries-crates`](crates/src/lib.rs) | Cargo's sparse index as `index` and `crate` calls; `config.json` answered here, its downloads pointed back at the registry with each one's SHA-256 in its URL; `/.cargo/config.toml` in a tmpfs, replacing crates.io's source |
 | [`registries-go`](go/src/lib.rs) | Go's module proxy protocol as `list`, `latest`, `info`, `mod` and `zip` calls, and its checksum database as `lookup`, `tile` and `head`; `GOPROXY` pointing here, with no `direct`, and `GOSUMDB` kept at `sum.golang.org`, so go checks every module against its signed log itself |
+| [`registries-maven`](maven/src/lib.rs) | A Maven repository's layout as `metadata` and `file` calls: a folder's `maven-metadata.xml` (and its checksums, of what the server rebuilt), a version's files (each its own, by name), and the plugin repository under `-plugins/`, whose calls say `for: plugins`; Maven's settings in a tmpfs, named by `MAVEN_ARGS` |
 | [`registries-git`](git/src/lib.rs) | git's smart HTTP (v0/v1) as `refs`, `fetch` and `push` calls: every pkt-line read and checked, the ref advertisement written by Carbon, gzip'd and chunked bodies, `insteadOf` for each host the server names |
 | [`registries-npm`](npm/src/lib.rs) | npm's registry protocol (and so yarn's, pnpm's and bun's) as `packument` and `tarball` calls; each packument's tarball URLs pointed back at the registry, and each tarball checked against its `integrity` as it streams |
 
 `carbon` joins them to a machine ([`carbon/src/registries.rs`](../carbon/src/registries.rs)). With `--registries`,
 its network's DNS answers `registry.carbon` with the gateway's address, and a connection to the gateway's port 80 is
 an in-memory pipe whose other end a `Server` thread serves. Each adapter is a Cargo feature of `carbon` (`apt`, `npm`,
-`pypi`, `crates`, `go` and `git`, all on by default), and says what its tool needs in the machine: environment (over the
+`pypi`, `crates`, `go`, `maven` and `git`, all on by default), and says what its tool needs in the machine: environment (over the
 image's, under `-e`), and files where no variable will do (cargo's source replacement), each in a read-only tmpfs at its
 folder. A run gets them; the machine's record and its committed images never do.
 
@@ -121,6 +122,21 @@ carbon ──► registries-core ──► hooks
   emptied. go checks the database's signed log with the key it was built with, so a module the log doesn't have
   can't be handed to it. A zip has no hash Carbon could check as it streams (its `h1:` is over the files in it), so
   the server checks it whole before sending it, and go checks it again.
+- **Maven**, end to end: a stock `mvn package` (Maven 3.10, its default plugins) of a project using
+  `commons-lang3` in `maven:3-eclipse-temurin-21` under `--deny 0.0.0.0/0`.
+
+  | Maven asks for | The call |
+  | --- | --- |
+  | `/{folder}/maven-metadata.xml`, and its `.sha1` (`.md5`, `.sha256`, `.sha512`) | `metadata {path}`, `metadata {path, checksum}` |
+  | `/{group…}/{artifact}/{version}/{artifact}-{version}[-{classifier}].{ext}` | `file {group, artifact, version, file}` |
+  | `/-plugins/…`, the same paths | the same calls, with `for: plugins` |
+
+  Maven reads repositories only from its settings, so the machine gets `/etc/carbon/maven/settings.xml` in a tmpfs,
+  and `MAVEN_ARGS` names it as Maven's global settings. Its profile, always active, makes `central` this registry,
+  with its plugin repository under `-plugins/`, so a server can hold what Maven fetches to run plugins to a rule of
+  its own; its mirror sends every other repository a build names here too. `MAVEN_ARGS` also picks Maven's wagon
+  transport: the JDK's, Maven's default since 3.9, drops a refusal's reason, so Maven would say only "HTTP Status:
+  403", not why.
 - **git**, end to end: clone (empty, full and shallow), push, racing pushes, and a public GitHub repo, in `debian:13`
   under `--deny 0.0.0.0/0`, through a package server.
 
@@ -147,7 +163,7 @@ carbon ──► registries-core ──► hooks
 ## Testing
 
 ```sh
-cargo test -p registries-core -p registries-apt -p registries-npm -p registries-pypi -p registries-crates -p registries-go -p registries-git
+cargo test -p registries-core -p registries-apt -p registries-npm -p registries-pypi -p registries-crates -p registries-go -p registries-maven -p registries-git
 cargo test -p carbon --lib registries   # the pipe between the machine and a server thread
 cargo test -p net gateway               # the gateway's port and names
 ```
