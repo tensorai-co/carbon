@@ -1,0 +1,14 @@
+[package]
+name = "registries-pypi"
+description = "PyPI's simple index, as registries' calls: a project's page, a file"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+registries-core.workspace = true
+serde_json.workspace = true

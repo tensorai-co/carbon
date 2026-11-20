@@ -140,6 +140,7 @@ dependencies = [
  "registries-apt",
  "registries-core",
  "registries-npm",
+ "registries-pypi",
  "serde_json",
 ]
 
@@ -870,6 +871,14 @@ dependencies = [
 
 [[package]]
 name = "registries-npm"
+version = "0.2.0"
+dependencies = [
+ "registries-core",
+ "serde_json",
+]
+
+[[package]]
+name = "registries-pypi"
 version = "0.2.0"
 dependencies = [
  "registries-core",
