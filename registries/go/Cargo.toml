@@ -1,0 +1,14 @@
+[package]
+name = "registries-go"
+description = "Go's module proxy protocol and checksum database, as registries' calls: a module's versions, info, go.mod, zip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+registries-core.workspace = true
+serde_json.workspace = true

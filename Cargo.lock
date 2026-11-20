@@ -141,6 +141,7 @@ dependencies = [
  "registries-core",
  "registries-crates",
  "registries-git",
+ "registries-go",
  "registries-npm",
  "registries-pypi",
  "serde_json",
@@ -884,6 +885,14 @@ name = "registries-git"
 version = "0.2.0"
 dependencies = [
  "flate2",
+ "registries-core",
+ "serde_json",
+]
+
+[[package]]
+name = "registries-go"
+version = "0.2.0"
+dependencies = [
  "registries-core",
  "serde_json",
 ]

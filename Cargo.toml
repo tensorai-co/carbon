@@ -25,6 +25,7 @@ members = [
     "registries/pypi",
     "registries/git",
     "registries/crates",
+    "registries/go",
     "gpu",
     "gpu/ir",
     "gpu/frontend",
@@ -70,6 +71,7 @@ registries-npm = { path = "registries/npm" }
 registries-pypi = { path = "registries/pypi" }
 registries-git = { path = "registries/git" }
 registries-crates = { path = "registries/crates" }
+registries-go = { path = "registries/go" }
 gpu = { path = "gpu" }
 gpu-ir = { path = "gpu/ir" }
 gpu-frontend = { path = "gpu/frontend" }

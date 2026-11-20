@@ -37,6 +37,8 @@ pub fn adapters() -> Vec<Arc<dyn Adapter>> {
     all.push(registries_git::Git::adapter());
     #[cfg(feature = "crates")]
     all.push(registries_crates::Crates::adapter());
+    #[cfg(feature = "go")]
+    all.push(registries_go::Go::adapter());
     all
 }
 
