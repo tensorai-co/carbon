@@ -1,5 +1,7 @@
 //! Mounts and volumes: a host's folder seen live in a machine ([`Mount::bind`]), a volume, a folder Carbon keeps
-//! that outlives the machines that mount it ([`Mount::volume`], [`Volume`]), and a tmpfs ([`Mount::tmpfs`]).
+//! that outlives the machines that mount it ([`Mount::volume`], [`Volume`]), and a tmpfs ([`Mount::tmpfs`]), which
+//! may start with files in it ([`Mount::with_file`]): in memory only, so never on the machine's disk or in an image
+//! committed from it.
 //!
 //! A bound folder and a volume are both host folders (`host::folder`), attached to the machine's disk as an external
 //! tree (`layers::External`) and mounted where the machine wants them: every call a program makes on a file there is
@@ -21,8 +23,17 @@ pub enum MountKind {
     Bind(PathBuf),
     /// A volume, by its name: made if it isn't there.
     Volume(String),
-    /// Memory only, gone when the machine is.
-    Tmpfs,
+    /// Memory only, gone when the machine is, starting with these files.
+    Tmpfs(Vec<TmpfsFile>),
+}
+
+/// A file a tmpfs starts with: its path under the tmpfs (`config.toml`, `a/b.txt`), its bytes and its mode, owned by
+/// root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmpfsFile {
+    pub path: String,
+    pub data: Vec<u8>,
+    pub mode: u32,
 }
 
 /// A folder mounted in a machine: [`crate::MachineSpec::mount`].
@@ -50,7 +61,22 @@ impl Mount {
 
     /// A tmpfs at `target`: memory only, never on the disk.
     pub fn tmpfs(target: impl Into<String>) -> Mount {
-        Mount { kind: MountKind::Tmpfs, target: target.into(), read_only: false }
+        Mount { kind: MountKind::Tmpfs(Vec::new()), target: target.into(), read_only: false }
+    }
+
+    /// This tmpfs, starting with `data` at `path` under it (`config.toml`, `a/b.txt`; its folders are made), mode
+    /// 0644. A tmpfs is memory only, so the file is never on the machine's disk, or in an image committed from it.
+    /// Only a tmpfs has files: on any other mount, this does nothing.
+    pub fn with_file(self, path: impl Into<String>, data: impl Into<Vec<u8>>) -> Mount {
+        self.with_file_mode(path, data, 0o644)
+    }
+
+    /// [`Mount::with_file`], with its mode.
+    pub fn with_file_mode(mut self, path: impl Into<String>, data: impl Into<Vec<u8>>, mode: u32) -> Mount {
+        if let MountKind::Tmpfs(files) = &mut self.kind {
+            files.push(TmpfsFile { path: path.into(), data: data.into(), mode });
+        }
+        self
     }
 
     /// Nothing in it can be changed from the machine.
@@ -113,9 +139,22 @@ impl Mount {
         let (kind, source) = match &self.kind {
             MountKind::Bind(p) => ("bind", Some(p.to_string_lossy().into_owned())),
             MountKind::Volume(n) => ("volume", Some(n.clone())),
-            MountKind::Tmpfs => ("tmpfs", None),
+            MountKind::Tmpfs(_) => ("tmpfs", None),
         };
-        json!({ "type": kind, "source": source, "target": self.target, "read_only": self.read_only })
+        let mut v = json!({ "type": kind, "source": source, "target": self.target, "read_only": self.read_only });
+        if let MountKind::Tmpfs(files) = &self.kind
+            && !files.is_empty()
+        {
+            // Text as it is; anything else as hex.
+            v["files"] = files
+                .iter()
+                .map(|f| match std::str::from_utf8(&f.data) {
+                    Ok(text) => json!({ "path": f.path, "mode": f.mode, "text": text }),
+                    Err(_) => json!({ "path": f.path, "mode": f.mode, "hex": f.data.iter().map(|b| format!("{b:02x}")).collect::<String>() }),
+                })
+                .collect();
+        }
+        v
     }
 
     pub(crate) fn from_json(v: &Value) -> Option<Mount> {
@@ -123,7 +162,23 @@ impl Mount {
         let kind = match v.get("type")?.as_str()? {
             "bind" => MountKind::Bind(PathBuf::from(source?)),
             "volume" => MountKind::Volume(source?.to_string()),
-            "tmpfs" => MountKind::Tmpfs,
+            "tmpfs" => MountKind::Tmpfs(
+                v.get("files")
+                    .and_then(Value::as_array)
+                    .map(|l| {
+                        l.iter()
+                            .filter_map(|f| {
+                                let data = match (f.get("text").and_then(Value::as_str), f.get("hex").and_then(Value::as_str)) {
+                                    (Some(t), _) => t.as_bytes().to_vec(),
+                                    (None, Some(h)) => (0..h.len() / 2).map(|i| u8::from_str_radix(h.get(2 * i..2 * i + 2)?, 16).ok()).collect::<Option<Vec<u8>>>()?,
+                                    _ => return None,
+                                };
+                                Some(TmpfsFile { path: f.get("path")?.as_str()?.to_string(), data, mode: f.get("mode").and_then(Value::as_u64).unwrap_or(0o644) as u32 })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            ),
             _ => return None,
         };
         Some(Mount { kind, target: v.get("target")?.as_str()?.to_string(), read_only: v.get("read_only").and_then(Value::as_bool).unwrap_or(false) })
@@ -134,7 +189,7 @@ impl Mount {
         let source = match &self.kind {
             MountKind::Bind(p) => p.to_string_lossy().into_owned(),
             MountKind::Volume(n) => n.clone(),
-            MountKind::Tmpfs => "tmpfs".to_string(),
+            MountKind::Tmpfs(_) => "tmpfs".to_string(),
         };
         format!("{source}:{}{}", self.target, if self.read_only { ":ro" } else { "" })
     }
@@ -339,7 +394,7 @@ pub(crate) fn lambda_mounts(home: &Path, mounts: &[Mount], disk: &lambda::Disk, 
                 }
                 lambda::MountSource::Folder(lambda::Folder::new(Box::new(HostTree(folder, owner))), name.clone())
             }
-            MountKind::Tmpfs => lambda::MountSource::Tmpfs,
+            MountKind::Tmpfs(files) => lambda::MountSource::Tmpfs(files.iter().map(|f| lambda::TmpfsFile { path: f.path.clone(), data: f.data.clone(), mode: f.mode }).collect()),
         };
         out.push(lambda::Mount { target: m.target.clone(), source, read_only: m.read_only });
     }
@@ -444,7 +499,12 @@ mod tests {
         let m = Mount::parse("/srv/data:/data:ro").unwrap();
         assert_eq!((m.kind, m.target.as_str(), m.read_only), (MountKind::Bind("/srv/data".into()), "/data", true));
         assert_eq!(Mount::parse("pgdata:/var/lib/postgresql/data").unwrap().kind, MountKind::Volume("pgdata".into()));
-        assert_eq!(Mount::parse("type=tmpfs,target=/scratch").unwrap().kind, MountKind::Tmpfs);
+        assert_eq!(Mount::parse("type=tmpfs,target=/scratch").unwrap().kind, MountKind::Tmpfs(Vec::new()));
+        // A tmpfs's files go to the worker and back, text as text and anything else as hex.
+        let seeded = Mount::tmpfs("/.cargo").with_file("config.toml", "[source.crates-io]\n").with_file_mode("bin/x", vec![0u8, 255, 7], 0o755);
+        assert_eq!(Mount::from_json(&seeded.to_json()), Some(seeded.clone()));
+        assert_eq!(seeded.to_json()["files"][0]["text"], "[source.crates-io]\n");
+        assert_eq!(Mount::volume("v", "/v").with_file("x", "y"), Mount::volume("v", "/v"));
         let m = Mount::parse("type=bind,src=/a,dst=/b,readonly").unwrap();
         assert_eq!((m.kind, m.target.as_str(), m.read_only), (MountKind::Bind("/a".into()), "/b", true));
         assert!(Mount::parse("x:relative").is_err());

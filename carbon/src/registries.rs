@@ -22,6 +22,8 @@ pub const NAME: &str = "registry.carbon";
 pub const PORT: u16 = 80;
 
 /// The registries this Carbon has.
+// Each is its own Cargo feature, so the list is pushed to one at a time.
+#[allow(clippy::vec_init_then_push)]
 pub fn adapters() -> Vec<Arc<dyn Adapter>> {
     #[allow(unused_mut)]
     let mut all: Vec<Arc<dyn Adapter>> = Vec::new();
@@ -33,6 +35,8 @@ pub fn adapters() -> Vec<Arc<dyn Adapter>> {
     all.push(registries_pypi::Pypi::adapter());
     #[cfg(feature = "git")]
     all.push(registries_git::Git::adapter());
+    #[cfg(feature = "crates")]
+    all.push(registries_crates::Crates::adapter());
     all
 }
 

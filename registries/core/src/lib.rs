@@ -43,6 +43,12 @@ pub trait Adapter: Send + Sync {
     fn env(&self, _base: &str, _details: &serde_json::Value) -> Vec<(String, String)> {
         Vec::new()
     }
+    /// Files the machine's tool needs to use the registry at `base`, where no environment variable will do (cargo's
+    /// source replacement): absolute paths and their bytes. Carbon puts each in a tmpfs at its folder, for the run
+    /// only, so it's never on the machine's disk or in an image committed from it. None by default.
+    fn files(&self, _base: &str, _details: &serde_json::Value) -> Vec<(String, Vec<u8>)> {
+        Vec::new()
+    }
 }
 
 /// One connection's requests and answers, for one service.
@@ -106,6 +112,11 @@ impl Server {
             .flat_map(|((a, _), details)| a.env(&format!("http://{host}/{}/", a.service()), details))
             .map(|(k, v)| format!("{k}={v}"))
             .collect()
+    }
+
+    /// The files its tools need, with the registries at `http://{host}/`: absolute paths and their bytes.
+    pub fn files(&self, host: &str) -> Vec<(String, Vec<u8>)> {
+        self.adapters.iter().zip(&self.details).flat_map(|((a, _), details)| a.files(&format!("http://{host}/{}/", a.service()), details)).collect()
     }
 
     /// Answers one connection's requests until it ends, on this thread.

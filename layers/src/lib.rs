@@ -1130,7 +1130,20 @@ impl<M: Clone> Fs<M> {
 
     /// Builds: puts `data` at the absolute `path`, making directories on the way with `dir_meta`.
     pub fn put(&mut self, path: &str, new: New, data: &[u8], meta: M, dir_meta: M) -> Result<Ino> {
-        let mut at = ROOT;
+        self.put_from(ROOT, path, new, data, meta, dir_meta)
+    }
+
+    /// [`Fs::put`], from `root` (a volatile tree's, say) rather than the disk's: `path` is under it, and may not
+    /// climb out of it with `..`.
+    pub fn put_in(&mut self, root: Ino, path: &str, new: New, data: &[u8], meta: M, dir_meta: M) -> Result<Ino> {
+        if path.split('/').any(|part| part == "." || part == "..") {
+            return Err(Error::BadName);
+        }
+        self.put_from(root, path, new, data, meta, dir_meta)
+    }
+
+    fn put_from(&mut self, root: Ino, path: &str, new: New, data: &[u8], meta: M, dir_meta: M) -> Result<Ino> {
+        let mut at = root;
         let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
         let Some((last, dirs)) = parts.split_last() else { return Err(Error::BadName) };
         for part in dirs {

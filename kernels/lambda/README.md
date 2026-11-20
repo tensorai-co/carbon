@@ -335,7 +335,7 @@ curl -sLO https://raw.githubusercontent.com/torvalds/linux/master/arch/x86/entry
 
 ### The kernel
 
-- **Processes:** `execve` with other threads running (end them first); a `vfork` that shares memory; process groups
+- **Processes:** a `vfork` that shares memory; process groups
   and sessions as job control needs them; SIGTTOU, the FP state in the signal frame itself, and core dumps;
   x86-64's `MAP_32BIT`; i386 programs (`sys/i386.rs`, with exec's 32-bit translation).
 - **Memory:** `MAP_SHARED` of a file on the disk written back and kept in step with `read` and `write` (anonymous

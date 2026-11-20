@@ -110,11 +110,11 @@ impl Task {
             Err(Ok(reply)) => return self.answer_exec(reply),
             Err(Err(e)) => return Err(e).into(),
         };
-        let mut state = lock(&self.process.state);
-        if state.threads.len() > 1 {
-            // Ending the other threads first isn't done yet.
-            return Err(EAGAIN).into();
+        if lock(&self.process.state).threads.len() > 1 && !self.dethread() {
+            // The process is ending, or another of its threads is execing: this one ends with it.
+            return Outcome::End;
         }
+        let mut state = lock(&self.process.state);
         match exec_into(&self.k, cx, &mut state, &path, argv, env) {
             Ok(()) => {
                 crate::timer::on_exec(&self.k, &mut state);
@@ -146,6 +146,52 @@ impl Task {
 
 /// What to run: a program's path, its arguments and its environment.
 type Run = (String, Vec<String>, Vec<String>);
+
+impl Task {
+    /// Linux's de-thread, before an `execve` with other threads running: they all end (each as it would at its
+    /// process's end: robust futexes let go, its tid cleared), this one waits until they have, and then it's the
+    /// process's only thread, with the pid as its tid if it wasn't the first. False if the process is ending
+    /// meanwhile, or another thread got to `execve` first: this thread ends then, with the rest.
+    fn dethread(&mut self) -> bool {
+        {
+            let mut state = lock(&self.process.state);
+            if state.exiting.is_some() || state.dethread.is_some_and(|t| t != self.tid) {
+                return false;
+            }
+            state.dethread = Some(self.tid);
+            for (tid, live) in &state.threads {
+                if *tid != self.tid {
+                    live.waiter.interrupt();
+                    live.handle.preempt();
+                }
+            }
+        }
+        loop {
+            {
+                let mut state = lock(&self.process.state);
+                if state.exiting.is_some() {
+                    state.dethread = None;
+                    return false;
+                }
+                if state.threads.len() <= 1 {
+                    state.dethread = None;
+                    let pid = self.process.pid;
+                    if self.tid != pid
+                        && let Some(live) = state.threads.remove(&self.tid)
+                    {
+                        state.threads.insert(pid, live);
+                        self.tid = pid;
+                    }
+                    return true;
+                }
+            }
+            // The others end on their own threads; look again shortly.
+            self.waiter.reset();
+            self.waiter.wait(Some(std::time::Instant::now() + std::time::Duration::from_millis(2)));
+            self.waiter.clear_interrupt();
+        }
+    }
+}
 
 impl Task {
     /// What the machine's hooks make of an `execve`: what to run (as asked, or rewritten), an answer to give instead of

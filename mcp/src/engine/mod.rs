@@ -309,7 +309,20 @@ fn create(server: &Server, p: &P) -> R {
             let mount = match m.opt_str("Type").as_deref().unwrap_or("volume") {
                 "bind" => Mount::bind(server.host_path(&m.str("Source")?, true).map_err(EngineError::invalid)?, target),
                 "volume" => Mount::volume(m.str("Source")?, target),
-                "tmpfs" => Mount::tmpfs(target),
+                "tmpfs" => {
+                    // Files it starts with: {"Path": "config.toml", "Content": "…", "Mode": 420}. In memory only, so
+                    // never on the machine's disk or in an image committed from it (a secret, a tool's config).
+                    let mut tmpfs = Mount::tmpfs(target.clone());
+                    for f in m.0.get("Files").and_then(Value::as_array).into_iter().flatten() {
+                        let f = P(f);
+                        let path = f.str("Path")?;
+                        if path.is_empty() || path.starts_with('/') || path.split('/').any(|p| p == ".." || p == ".") {
+                            return Err(EngineError::invalid(format!("HostConfig.Mounts {target} Files Path {path}: a path under the tmpfs")));
+                        }
+                        tmpfs = tmpfs.with_file_mode(path, f.str("Content")?.into_bytes(), f.u64("Mode").unwrap_or(0o644) as u32);
+                    }
+                    tmpfs
+                }
                 other => return Err(EngineError::invalid(format!("HostConfig.Mounts Type {other}: bind, volume or tmpfs"))),
             };
             spec = spec.mount(if m.bool("ReadOnly") { mount.read_only() } else { mount });

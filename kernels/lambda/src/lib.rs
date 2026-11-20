@@ -266,8 +266,18 @@ pub enum MountSource {
     Folder(Folder, String),
     /// One file of a folder from elsewhere, by its name in it: a single file bound over a file, as Linux allows.
     File(Folder, String, String),
-    /// Memory only, gone when the machine is.
-    Tmpfs,
+    /// Memory only, gone when the machine is: what's made in it is never on the disk, and never committed. It starts
+    /// with these files (none, for an empty one).
+    Tmpfs(Vec<TmpfsFile>),
+}
+
+/// A file a tmpfs starts with: its path under the tmpfs (`config.toml`, `a/b.txt`), its bytes, and its mode. Owned by
+/// root, its folders made as it needs them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmpfsFile {
+    pub path: String,
+    pub data: Vec<u8>,
+    pub mode: u32,
 }
 
 /// A mount a machine boots with.
@@ -316,8 +326,14 @@ fn boot_mounts(disk: &mut Disk, mounts: &[Mount]) -> Result<Vec<fs::mount::BootM
                 let root = disk.lookup(top, name).map_err(|e| format!("{source}: {e}"))?;
                 (root, fs::mount::What::Host, source.clone(), None)
             }
-            MountSource::Tmpfs => {
+            MountSource::Tmpfs(files) => {
                 let tree = disk.volatile_root(Meta::dir(0o755), 0);
+                for f in files {
+                    if f.path.is_empty() || f.path.starts_with('/') {
+                        return Err(format!("{}: a tmpfs's file is a path under it, not {:?}", m.target, f.path));
+                    }
+                    disk.put_in(tree, &f.path, layers::New::File, &f.data, Meta::file(f.mode & 0o7777), Meta::dir(0o755)).map_err(|e| format!("{}/{}: {e}", m.target, f.path))?;
+                }
                 (tree, fs::mount::What::Tmpfs, "tmpfs".to_string(), Some(tree))
             }
         };

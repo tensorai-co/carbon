@@ -98,6 +98,9 @@ pub(crate) struct ProcState {
     pub threads: BTreeMap<i32, Live>,
     /// Set once, when the process starts to end; every thread ends at its next chance.
     pub exiting: Option<Status>,
+    /// The thread `execve`ing while others run: every other thread ends at its next chance, as Linux's de-thread
+    /// ends them, and it waits until they have.
+    pub dethread: Option<i32>,
     /// Set when its last thread has ended, until its parent collects it.
     pub zombie: Option<Status>,
     pub children: Vec<i32>,
@@ -421,8 +424,10 @@ impl Task {
         Ok(kernels_core::user::with_faults(cx, write, |cx, addr, access| self.fault(cx, addr, access).is_ok(), copy)?)
     }
 
+    /// Whether this thread is to end: its process is ending, or another of its threads is `execve`ing.
     pub fn ending(&self) -> bool {
-        lock(&self.process.state).exiting.is_some()
+        let state = lock(&self.process.state);
+        state.exiting.is_some() || state.dethread.is_some_and(|t| t != self.tid)
     }
 
     /// A futex's key: its address in this process's space; or, unless it's `private`, its place in the shared
@@ -1200,6 +1205,7 @@ fn start(k: &Arc<Kernel>, cx: &mut Cx<'_>, pid: i32, path: &str, argv: &[String]
         exe: String::new(),
         threads: BTreeMap::new(),
         exiting: None,
+        dethread: None,
         zombie: None,
         children: Vec::new(),
         tracees: Vec::new(),

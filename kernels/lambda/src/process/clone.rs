@@ -115,6 +115,7 @@ impl Task {
                 exe: state.exe.clone(),
                 threads: Default::default(),
                 exiting: None,
+                dethread: None,
                 zombie: None,
                 children: Vec::new(),
                 tracees: Vec::new(),

@@ -1,0 +1,14 @@
+[package]
+name = "registries-crates"
+description = "Cargo's sparse index, as registries' calls: a crate's index file, a .crate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+registries-core.workspace = true
+serde_json.workspace = true

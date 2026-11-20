@@ -37,14 +37,16 @@ bearer. An answer is JSON, bytes (with `Carbon-Size`, and `Carbon-Digest` when i
 | [`registries-core`](core/src/lib.rs) | `Registries` (what a machine gets: services, servers, token, meta), `Call` and op schemas, `Adapter` and `Conversation`, the HTTP/1.1 a tool is answered with, the upstream client, and `Server`, which ties them together |
 | [`registries-apt`](apt/src/lib.rs) | apt's paths as `release`, `index` and `deb` calls, and the answers back as apt reads them |
 | [`registries-pypi`](pypi/src/lib.rs) | PyPI's simple index (and so pip's and uv's) as `project` and `file` calls; each file's URL pointed back at the registry with its SHA-256 in it, and each file checked against it as it streams |
+| [`registries-crates`](crates/src/lib.rs) | Cargo's sparse index as `index` and `crate` calls; `config.json` answered here, its downloads pointed back at the registry with each one's SHA-256 in its URL; `/.cargo/config.toml` in a tmpfs, replacing crates.io's source |
 | [`registries-git`](git/src/lib.rs) | git's smart HTTP (v0/v1) as `refs`, `fetch` and `push` calls: every pkt-line read and checked, the ref advertisement written by Carbon, gzip'd and chunked bodies, `insteadOf` for each host the server names |
 | [`registries-npm`](npm/src/lib.rs) | npm's registry protocol (and so yarn's, pnpm's and bun's) as `packument` and `tarball` calls; each packument's tarball URLs pointed back at the registry, and each tarball checked against its `integrity` as it streams |
 
 `carbon` joins them to a machine ([`carbon/src/registries.rs`](../carbon/src/registries.rs)). With `--registries`,
 its network's DNS answers `registry.carbon` with the gateway's address, and a connection to the gateway's port 80 is
 an in-memory pipe whose other end a `Server` thread serves. Each adapter is a Cargo feature of `carbon` (`apt`, `npm`,
-`pypi` and `git`, all on by default), and says what its tool needs in the machine's environment, which each run gets (over the
-image's, under `-e`) and never keeps.
+`pypi`, `crates` and `git`, all on by default), and says what its tool needs in the machine: environment (over the
+image's, under `-e`), and files where no variable will do (cargo's source replacement), each in a read-only tmpfs at its
+folder. A run gets them; the machine's record and its committed images never do.
 
 ```
 carbon ──► registries-core ──► hooks
@@ -90,6 +92,18 @@ carbon ──► registries-core ──► hooks
   and uv's `UV_DEFAULT_INDEX`, with pip's version check off. A page is PEP 691's JSON, or PEP 503's HTML for a tool
   that doesn't ask for JSON. Each file's URL carries its SHA-256, so the adapter keeps nothing, and every file's call
   expects its hash.
+- **crates.io**, end to end: `cargo run` of a project depending on `itoa` and `serde` with `derive` (so `syn`,
+  `quote`, `proc-macro2` and the rest) in `rust:1-slim` under `--deny 0.0.0.0/0`.
+
+  | cargo asks for | The call |
+  | --- | --- |
+  | `/config.json` | None: answered here, `dl` pointing at `/crates/dl/{crate}/{version}/{sha256-checksum}` |
+  | `/1/{n}`, `/2/{n}`, `/3/{c}/{n}`, `/{ab}/{cd}/{n}` | `index {name}` |
+  | `/dl/{crate}/{version}/{sha256}` | `crate {name, version, sha256}` |
+
+  No environment variable can point cargo at another index, so the machine gets `/.cargo/config.toml`, which cargo
+  reads for every project from the filesystem's root, replacing crates.io's source with `sparse+http://registry.carbon/crates/`.
+  It's in a tmpfs, never on the disk.
 - **git**, end to end: clone (empty, full and shallow), push, racing pushes, and a public GitHub repo, in `debian:13`
   under `--deny 0.0.0.0/0`, through a package server.
 
@@ -116,7 +130,7 @@ carbon ──► registries-core ──► hooks
 ## Testing
 
 ```sh
-cargo test -p registries-core -p registries-apt -p registries-npm -p registries-pypi -p registries-git
+cargo test -p registries-core -p registries-apt -p registries-npm -p registries-pypi -p registries-crates -p registries-git
 cargo test -p carbon --lib registries   # the pipe between the machine and a server thread
 cargo test -p net gateway               # the gateway's port and names
 ```

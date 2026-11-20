@@ -104,7 +104,7 @@ pub use error::{Error, ErrorKind, Result};
 pub use machine::{Button, ExecSpec, Commit, Machine, MachineInfo, Port, Process, ProcessEvent, ProcessHandle, Screen, Window};
 pub use files::{Copy, DirEntry, FileInfo, FileKind, Files, MOST_READ, Remove, Write};
 pub use logs::{LogLine, LogReader, LogStream, Logs};
-pub use mounts::{Mount, MountKind, Volume, VolumeInfo};
+pub use mounts::{Mount, MountKind, TmpfsFile, Volume, VolumeInfo};
 pub use network::ExtraHost;
 pub use registries::Registries;
 pub use rules::Rules;
