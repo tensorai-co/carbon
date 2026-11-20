@@ -33,9 +33,14 @@ pub trait Adapter: Send + Sync {
     fn ops(&self) -> &'static [Op];
     /// A conversation for one connection, where an adapter keeps what it needs between requests.
     fn conversation(&self) -> Box<dyn Conversation>;
+    /// The most a request's body may be: package managers' reads have none, so 1 MiB; git's pushes are packs.
+    fn most_body(&self) -> u64 {
+        1 << 20
+    }
     /// What the machine's environment needs for its tool to use the registry at `base`
-    /// (`http://registry.carbon/npm/`): `NPM_CONFIG_REGISTRY`, say. None by default: apt reads only files.
-    fn env(&self, _base: &str) -> Vec<(String, String)> {
+    /// (`http://registry.carbon/npm/`): `NPM_CONFIG_REGISTRY`, say. `details` is what the server's discovery says under
+    /// the service's name, if anything (git's hosts). None by default: apt reads only files.
+    fn env(&self, _base: &str, _details: &serde_json::Value) -> Vec<(String, String)> {
         Vec::new()
     }
 }
@@ -51,8 +56,12 @@ pub trait Conversation: Send {
 /// A machine's registries, answering its connections to the gateway.
 pub struct Server {
     adapters: Vec<(Arc<dyn Adapter>, String)>,
+    /// What each server's discovery said of each service, for its env.
+    details: Vec<serde_json::Value>,
     upstream: Upstream,
     hub: hooks::Hub,
+    /// The most a request's body may be, for the adapters it has.
+    most_body: u64,
 }
 
 impl Server {
@@ -63,7 +72,8 @@ impl Server {
         settings.check(&known)?;
         let upstream = Upstream::new(tls, settings.token.clone(), settings.meta.clone());
         let mut chosen = Vec::new();
-        let mut asked: Vec<(String, upstream::Served)> = Vec::new();
+        let mut details = Vec::new();
+        let mut asked: Vec<(String, (upstream::Served, serde_json::Value))> = Vec::new();
         for service in &settings.services {
             let adapter = adapters.iter().find(|a| a.service() == service).cloned().ok_or_else(|| format!("no registry {service}"))?;
             let base = settings.upstream_for(service).unwrap_or_default().to_string();
@@ -71,14 +81,16 @@ impl Server {
                 let served = upstream.discover(&base).map_err(|e| format!("--registries {service}: {e}"))?;
                 asked.push((base.clone(), served));
             }
-            let served = &asked.iter().find(|(b, _)| *b == base).map(|(_, s)| s).cloned().unwrap_or_default();
+            let (served, whole) = asked.iter().find(|(b, _)| *b == base).map(|(_, s)| s.clone()).unwrap_or_default();
             let ops = served.iter().find(|(s, _)| s == service).map(|(_, ops)| ops).ok_or_else(|| format!("--registries {service}: {base} doesn't serve {service}"))?;
             if let Some(missing) = adapter.ops().iter().find(|op| !ops.iter().any(|o| o == op.name)) {
                 return Err(format!("--registries {service}: {base} doesn't answer {service} {}", missing.name));
             }
+            details.push(whole.get(service.as_str()).cloned().unwrap_or(serde_json::Value::Null));
             chosen.push((adapter, base));
         }
-        Ok(Server { adapters: chosen, upstream, hub })
+        let most_body = chosen.iter().map(|(a, _)| a.most_body()).max().unwrap_or(1 << 20);
+        Ok(Server { adapters: chosen, details, upstream, hub, most_body })
     }
 
     /// The services it answers.
@@ -88,7 +100,12 @@ impl Server {
 
     /// The environment its tools need, with the registries at `http://{host}/`: `NAME=value`s.
     pub fn env(&self, host: &str) -> Vec<String> {
-        self.adapters.iter().flat_map(|(a, _)| a.env(&format!("http://{host}/{}/", a.service()))).map(|(k, v)| format!("{k}={v}")).collect()
+        self.adapters
+            .iter()
+            .zip(&self.details)
+            .flat_map(|((a, _), details)| a.env(&format!("http://{host}/{}/", a.service()), details))
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect()
     }
 
     /// Answers one connection's requests until it ends, on this thread.
@@ -96,7 +113,7 @@ impl Server {
         let mut conn = BufReader::new(conn);
         let mut conversations: Vec<(&'static str, Box<dyn Conversation>)> = Vec::new();
         loop {
-            let req = match http::read_request(&mut conn) {
+            let req = match http::read_request(&mut conn, self.most_body) {
                 Ok(Some(req)) => req,
                 Ok(None) => return,
                 Err(e) => {

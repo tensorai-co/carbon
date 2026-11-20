@@ -23,6 +23,7 @@ members = [
     "registries/apt",
     "registries/npm",
     "registries/pypi",
+    "registries/git",
     "gpu",
     "gpu/ir",
     "gpu/frontend",
@@ -66,6 +67,7 @@ registries-core = { path = "registries/core" }
 registries-apt = { path = "registries/apt" }
 registries-npm = { path = "registries/npm" }
 registries-pypi = { path = "registries/pypi" }
+registries-git = { path = "registries/git" }
 gpu = { path = "gpu" }
 gpu-ir = { path = "gpu/ir" }
 gpu-frontend = { path = "gpu/frontend" }

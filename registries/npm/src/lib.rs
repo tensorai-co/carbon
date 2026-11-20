@@ -82,7 +82,7 @@ impl Adapter for Npm {
     fn conversation(&self) -> Box<dyn Conversation> {
         Box::new(NpmConversation { integrity: self.integrity.clone(), host: "registry.carbon".into() })
     }
-    fn env(&self, base: &str) -> Vec<(String, String)> {
+    fn env(&self, base: &str, _details: &Value) -> Vec<(String, String)> {
         let host = base.trim_start_matches("http://").split('/').next().unwrap_or_default().to_string();
         vec![
             ("NPM_CONFIG_REGISTRY".into(), base.into()),
@@ -271,7 +271,7 @@ mod tests {
     fn packuments_point_at_this_registry_and_tarballs_expect_their_integrity() {
         let npm = Npm { integrity: Arc::default() };
         let mut conv = npm.conversation();
-        let req = Request { method: "GET".into(), path: "/npm/left-pad".into(), headers: vec![("Host".into(), "registry.carbon".into())], body: Vec::new(), keep_alive: true };
+        let req = Request { method: "GET".into(), path: "/npm/left-pad".into(), query: String::new(), headers: vec![("Host".into(), "registry.carbon".into())], body: Vec::new(), keep_alive: true };
         let call = conv.parse(&req, "/left-pad").unwrap();
         let sum = [7u8; 64];
         let b64 = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBw==";
@@ -297,7 +297,7 @@ mod tests {
         let registries_core::Body::Bytes(body) = n.body else { panic!() };
         assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["error"], "fresh has no version published before 2025-11-20");
         let npm = Npm { integrity: Arc::default() };
-        let env = npm.env("http://registry.carbon/npm/");
+        let env = npm.env("http://registry.carbon/npm/", &Value::Null);
         assert!(env.contains(&("NPM_CONFIG_REGISTRY".into(), "http://registry.carbon/npm/".into())));
         assert!(env.contains(&("YARN_UNSAFE_HTTP_WHITELIST".into(), "registry.carbon".into())));
     }

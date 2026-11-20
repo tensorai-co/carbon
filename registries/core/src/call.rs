@@ -4,20 +4,27 @@ use serde_json::{Map, Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// One of an op's fields: its name, whether it must be there, and what its value must look like.
+/// One of an op's fields: its name, whether it must be there, and what its value must look like. A list field's
+/// value is a list of items, each checked, at most `most` of them.
 #[derive(Clone, Copy)]
 pub struct Field {
     pub name: &'static str,
     pub required: bool,
     pub check: fn(&str) -> bool,
+    pub list: bool,
+    pub most: usize,
 }
 
 impl Field {
     pub const fn required(name: &'static str, check: fn(&str) -> bool) -> Field {
-        Field { name, required: true, check }
+        Field { name, required: true, check, list: false, most: 1 }
     }
     pub const fn optional(name: &'static str, check: fn(&str) -> bool) -> Field {
-        Field { name, required: false, check }
+        Field { name, required: false, check, list: false, most: 1 }
+    }
+    /// A list of at most `most` items, each passing `check`; a required one has at least one.
+    pub const fn list(name: &'static str, required: bool, most: usize, check: fn(&str) -> bool) -> Field {
+        Field { name, required, check, list: true, most }
     }
 }
 
@@ -36,19 +43,36 @@ pub struct Expect {
     pub size: Option<u64>,
 }
 
-/// A call, before it's sent: `apt deb {archive: debian, name: jq, …}`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A call, before it's sent: `apt deb {archive: debian, name: jq, …}`. A list field's items are kept as one value,
+/// separated by spaces (no item has one), so hooks and rules see them as text; they're sent as a JSON list.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Call {
     pub service: &'static str,
     pub op: &'static str,
     pub params: Vec<(&'static str, String)>,
+    /// Which params are lists.
+    pub lists: Vec<&'static str>,
     pub expect: Option<Expect>,
     pub offset: u64,
+    /// What's sent after the call's JSON, for an op that sends data (git's push: its pack).
+    pub data: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for Call {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Call")
+            .field("service", &self.service)
+            .field("op", &self.op)
+            .field("params", &self.params)
+            .field("expect", &self.expect)
+            .field("data", &self.data.as_ref().map(Vec::len))
+            .finish()
+    }
 }
 
 impl Call {
     pub fn new(service: &'static str, op: &'static str) -> Call {
-        Call { service, op, params: Vec::new(), expect: None, offset: 0 }
+        Call { service, op, params: Vec::new(), lists: Vec::new(), expect: None, offset: 0, data: None }
     }
 
     /// This, with a field.
@@ -57,8 +81,31 @@ impl Call {
         self
     }
 
+    /// This, with a list field.
+    pub fn with_list<I, S>(mut self, name: &'static str, items: I) -> Call
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let joined: Vec<String> = items.into_iter().map(|s| s.as_ref().to_string()).collect();
+        self.params.push((name, joined.join(" ")));
+        self.lists.push(name);
+        self
+    }
+
+    /// This, with data after its JSON.
+    pub fn with_data(mut self, data: Vec<u8>) -> Call {
+        self.data = Some(data);
+        self
+    }
+
     pub fn param(&self, name: &str) -> Option<&str> {
         self.params.iter().find(|(n, _)| *n == name).map(|(_, v)| v.as_str())
+    }
+
+    /// A list field's items; none if it isn't there.
+    pub fn items(&self, name: &str) -> Vec<&str> {
+        self.param(name).map(|v| v.split(' ').filter(|s| !s.is_empty()).collect()).unwrap_or_default()
     }
 
     /// Checks it against `ops`, its service's schema: the op is one of them, every field is one of the op's and
@@ -70,7 +117,21 @@ impl Call {
             if self.params[..i].iter().any(|(n, _)| n == name) {
                 return Err(format!("{name} is given twice"));
             }
-            if !(field.check)(value) {
+            if field.list != self.lists.contains(name) {
+                return Err(format!("{name} is {}a list", if field.list { "" } else { "not " }));
+            }
+            if field.list {
+                let items = self.items(name);
+                if items.len() > field.most {
+                    return Err(format!("{name} has {} items; {} {} takes at most {}", items.len(), self.service, self.op, field.most));
+                }
+                if field.required && items.is_empty() {
+                    return Err(format!("{} {} needs at least one {name}", self.service, self.op));
+                }
+                if let Some(bad) = items.iter().find(|item| !(field.check)(item)) {
+                    return Err(format!("{name} has {bad:?}, which isn't one {} {} takes", self.service, self.op));
+                }
+            } else if !(field.check)(value) {
                 return Err(format!("{name} {value:?} isn't one {} {} takes", self.service, self.op));
             }
         }
@@ -87,7 +148,14 @@ impl Call {
 
     /// The body that's sent: `{"id", "params", "expect", "offset", "meta"}`.
     pub fn body(&self, meta: &[(String, String)]) -> Value {
-        let params: Map<String, Value> = self.params.iter().map(|(n, v)| (n.to_string(), Value::String(v.clone()))).collect();
+        let params: Map<String, Value> = self
+            .params
+            .iter()
+            .map(|(n, v)| {
+                let value = if self.lists.contains(n) { Value::from(self.items(n)) } else { Value::String(v.clone()) };
+                (n.to_string(), value)
+            })
+            .collect();
         let mut body = json!({ "id": new_id(), "params": params });
         if let Some(e) = &self.expect {
             let mut expect = Map::new();
@@ -157,6 +225,23 @@ mod tests {
             Call::new("apt", "deb").with("name", "jq").with("arch", "riscv64"),
         ] {
             assert!(bad.check(OPS).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn list_fields() {
+        const LISTS: &[Op] = &[Op { name: "fetch", fields: &[Field::list("wants", true, 2, |s| check::hex(s, 4)), Field::list("haves", false, 10, |s| check::hex(s, 4))] }];
+        let ok = Call::new("git", "fetch").with_list("wants", ["abcd", "0123"]).with_list("haves", Vec::<String>::new());
+        assert_eq!(ok.check(LISTS), Ok(()));
+        assert_eq!(ok.body(&[])["params"], json!({ "wants": ["abcd", "0123"], "haves": [] }));
+        for bad in [
+            Call::new("git", "fetch").with_list("wants", Vec::<String>::new()),
+            Call::new("git", "fetch").with_list("wants", ["abcd", "0123", "4567"]),
+            Call::new("git", "fetch").with_list("wants", ["abcd", "xyz!"]),
+            Call::new("git", "fetch").with("wants", "abcd"),
+            Call::new("git", "fetch").with_list("wants", ["ab cd"]),
+        ] {
+            assert!(bad.check(LISTS).is_err(), "{bad:?}");
         }
     }
 

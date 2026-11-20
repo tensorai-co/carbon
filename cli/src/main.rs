@@ -87,11 +87,12 @@ usage: carbon <command> ...
       --deny HOST|ADDRESS|NETWORK[:PORT]     refuse connections there: 0.0.0.0/0 and ::/0 for everything
       --allow HOST|ADDRESS|NETWORK[:PORT]    let connections there through, whatever --deny says: pypi.org:443
                                              (a host takes its subdomains), 10.0.0.0/8, [::1]:53
-      --registries apt,npm,pypi              its package managers answered by Carbon at registry.carbon, and each
+      --registries apt,npm,pypi,git          its package managers and git answered by Carbon at registry.carbon, and each
                                              request sent to --upstream as one checked call (POST /v1/apt/deb, …);
                                              nothing the machine sends goes anywhere, and it works under --deny
-                                             0.0.0.0/0 and --network none (npm's NPM_CONFIG_REGISTRY and pip's
-                                             PIP_INDEX_URL are set)
+                                             0.0.0.0/0 and --network none (npm's NPM_CONFIG_REGISTRY, pip's
+                                             PIP_INDEX_URL and git's insteadOf, for each host the server names,
+                                             are set)
       --upstream URL|SERVICE=URL             the package server: https://…, or http:// to this host's loopback
       --upstream-token-file FILE             the token sent with every call (as a bearer), never in the machine
       --registry-meta KEY=VALUE              a field of meta on every call, for the server: sid=8f3a
@@ -832,7 +833,7 @@ fn registry_flag(r: &mut carbon::Registries, flag: &str, value: &mut dyn FnMut(&
 fn registries_given(r: carbon::Registries) -> Option<carbon::Registries> {
     if r.is_empty() {
         if r != carbon::Registries::default() {
-            fail("--upstream, --upstream-token-file and --registry-meta are for --registries: which ones (apt, npm, pypi)?");
+            fail("--upstream, --upstream-token-file and --registry-meta are for --registries: which ones (apt, npm, pypi, git)?");
         }
         return None;
     }

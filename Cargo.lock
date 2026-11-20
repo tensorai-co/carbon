@@ -139,6 +139,7 @@ dependencies = [
  "net",
  "registries-apt",
  "registries-core",
+ "registries-git",
  "registries-npm",
  "registries-pypi",
  "serde_json",
@@ -867,6 +868,15 @@ dependencies = [
  "serde_json",
  "sha2",
  "ureq",
+]
+
+[[package]]
+name = "registries-git"
+version = "0.2.0"
+dependencies = [
+ "flate2",
+ "registries-core",
+ "serde_json",
 ]
 
 [[package]]

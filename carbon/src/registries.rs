@@ -31,6 +31,8 @@ pub fn adapters() -> Vec<Arc<dyn Adapter>> {
     all.push(registries_npm::Npm::adapter());
     #[cfg(feature = "pypi")]
     all.push(registries_pypi::Pypi::adapter());
+    #[cfg(feature = "git")]
+    all.push(registries_git::Git::adapter());
     all
 }
 

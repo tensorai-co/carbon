@@ -65,19 +65,31 @@ impl Upstream {
         }
     }
 
-    /// What `base` serves: each service and its ops.
-    pub fn discover(&self, base: &str) -> Result<Served, String> {
+    /// What `base` serves: each service and its ops, and the whole answer, for what a service says of itself there
+    /// (git's hosts).
+    pub fn discover(&self, base: &str) -> Result<(Served, Value), String> {
         let response = self.auth(self.agent.get(&format!("{base}/v1/"))).call().map_err(|e| format!("{base}: {}", describe(e)))?;
         let v: Value = json(response, 1 << 20).map_err(|e| format!("{base}/v1/: {e}"))?;
         let services = v.get("services").and_then(Value::as_object).ok_or_else(|| format!("{base}/v1/ doesn't list its services"))?;
-        Ok(services.iter().map(|(s, ops)| (s.clone(), ops.as_array().map(|l| l.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default())).collect())
+        let served = services.iter().map(|(s, ops)| (s.clone(), ops.as_array().map(|l| l.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default())).collect();
+        Ok((served, v))
     }
 
     /// Sends `call` to `base`, and gives what it answered. A server that can't be reached is a refusal, `unavailable`.
     pub fn send(&self, base: &str, call: &Call) -> Answer {
         let url = format!("{base}/v1/{}/{}", call.service, call.op);
         let body = call.body(&self.meta).to_string();
-        let sent = self.auth(self.agent.post(&url)).set("Content-Type", "application/json").send_string(&body);
+        let sent = match &call.data {
+            // The call's JSON on one line, then its data.
+            Some(data) => {
+                let mut wire = Vec::with_capacity(body.len() + 1 + data.len());
+                wire.extend_from_slice(body.as_bytes());
+                wire.push(b'\n');
+                wire.extend_from_slice(data);
+                self.auth(self.agent.post(&url)).set("Content-Type", "application/vnd.carbon.stream").send_bytes(&wire)
+            }
+            None => self.auth(self.agent.post(&url)).set("Content-Type", "application/json").send_string(&body),
+        };
         let response = match sent {
             Ok(r) => r,
             Err(ureq::Error::Status(_, r)) => return refusal(r),

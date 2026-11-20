@@ -5,8 +5,6 @@ use std::io::{self, BufRead, Read, Write};
 
 /// The most a request's line and headers may be.
 const MOST_HEAD: usize = 32 << 10;
-/// The most a request's body may be: package managers' reads have none.
-const MOST_BODY: u64 = 1 << 20;
 
 /// A request, as the tool sent it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,6 +12,8 @@ pub struct Request {
     pub method: String,
     /// The path, without the query, as it was sent (still percent-encoded).
     pub path: String,
+    /// The query, without its `?`, as it was sent.
+    pub query: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     /// The connection stays open after the answer.
@@ -77,8 +77,9 @@ pub fn clean(text: &str) -> String {
     out
 }
 
-/// The next request, None at the connection's end. An error is a request that can't be read, and ends the connection.
-pub fn read_request(r: &mut impl BufRead) -> io::Result<Option<Request>> {
+/// The next request, None at the connection's end, its body at most `most_body` bytes, sent with a length or
+/// chunked. An error is a request that can't be read, and ends the connection.
+pub fn read_request(r: &mut impl BufRead, most_body: u64) -> io::Result<Option<Request>> {
     let mut head = Vec::new();
     loop {
         let start = head.len();
@@ -118,15 +119,21 @@ pub fn read_request(r: &mut impl BufRead) -> io::Result<Option<Request>> {
             return Err(bad("too many headers"));
         }
     }
-    let mut req = Request { method: method.to_string(), path: target.split(['?', '#']).next().unwrap_or("/").to_string(), headers, body: Vec::new(), keep_alive: false };
+    let target = target.split('#').next().unwrap_or("/");
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let mut req = Request { method: method.to_string(), path: path.to_string(), query: query.to_string(), headers, body: Vec::new(), keep_alive: false };
     let connection = req.header("Connection").unwrap_or("").to_ascii_lowercase();
     req.keep_alive = if version == "HTTP/1.0" { connection.contains("keep-alive") } else { !connection.contains("close") };
-    if req.header("Transfer-Encoding").is_some() {
-        return Err(bad("a request body sent chunked"));
+    if let Some(te) = req.header("Transfer-Encoding") {
+        if !te.eq_ignore_ascii_case("chunked") {
+            return Err(bad("a request body sent with a transfer encoding other than chunked"));
+        }
+        req.body = read_chunked(r, most_body)?;
+        return Ok(Some(req));
     }
     if let Some(len) = req.header("Content-Length") {
         let len: u64 = len.parse().map_err(|_| bad("a bad Content-Length"))?;
-        if len > MOST_BODY {
+        if len > most_body {
             return Err(bad("a request body too big"));
         }
         r.by_ref().take(len).read_to_end(&mut req.body)?;
@@ -135,6 +142,40 @@ pub fn read_request(r: &mut impl BufRead) -> io::Result<Option<Request>> {
         }
     }
     Ok(Some(req))
+}
+
+/// A chunked body, whole, if it's at most `most` bytes.
+fn read_chunked(r: &mut impl BufRead, most: u64) -> io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    loop {
+        let mut line = Vec::new();
+        r.by_ref().take(1024).read_until(b'\n', &mut line)?;
+        let text = std::str::from_utf8(&line).map_err(|_| bad("a bad chunk size"))?.trim();
+        let size = u64::from_str_radix(text.split(';').next().unwrap_or("").trim(), 16).map_err(|_| bad("a bad chunk size"))?;
+        if size == 0 {
+            // Trailers, if any, to the blank line.
+            loop {
+                let mut trailer = Vec::new();
+                let n = r.by_ref().take(8192).read_until(b'\n', &mut trailer)?;
+                if n == 0 || trailer == b"\r\n" || trailer == b"\n" {
+                    return Ok(body);
+                }
+            }
+        }
+        if body.len() as u64 + size > most {
+            return Err(bad("a request body too big"));
+        }
+        let start = body.len();
+        r.by_ref().take(size).read_to_end(&mut body)?;
+        if (body.len() - start) as u64 != size {
+            return Err(bad("the connection ended in a chunk"));
+        }
+        let mut end = [0u8; 2];
+        r.read_exact(&mut end)?;
+        if &end != b"\r\n" {
+            return Err(bad("a chunk without its CRLF"));
+        }
+    }
 }
 
 /// Writes `answer`. An error reading its body ends the connection with the answer cut short, so the tool sees a
@@ -216,17 +257,23 @@ mod tests {
     fn pipelined_requests_are_read_one_by_one() {
         let wire = b"GET /apt/debian/dists/trixie/InRelease HTTP/1.1\r\nHost: registry.carbon\r\nUser-Agent: Debian APT-HTTP/1.3\r\n\r\nGET /a?b=c HTTP/1.1\r\nConnection: close\r\n\r\n";
         let mut r = BufReader::new(&wire[..]);
-        let first = read_request(&mut r).unwrap().unwrap();
+        let first = read_request(&mut r, 1 << 20).unwrap().unwrap();
         assert_eq!((first.method.as_str(), first.path.as_str(), first.keep_alive), ("GET", "/apt/debian/dists/trixie/InRelease", true));
         assert_eq!(first.header("user-agent"), Some("Debian APT-HTTP/1.3"));
-        let second = read_request(&mut r).unwrap().unwrap();
-        assert_eq!((second.path.as_str(), second.keep_alive), ("/a", false));
-        assert!(read_request(&mut r).unwrap().is_none());
-        for bad in [&b"GET http://x/ HTTP/1.1\r\n\r\n"[..], b"GET / SPDY\r\n\r\n", b"GET /\r\n\r\n", b"GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n", b"GET / HTTP/1.1\r\nHost"] {
-            assert!(read_request(&mut BufReader::new(bad)).is_err(), "{:?}", String::from_utf8_lossy(bad));
+        let second = read_request(&mut r, 1 << 20).unwrap().unwrap();
+        assert_eq!((second.path.as_str(), second.query.as_str(), second.keep_alive), ("/a", "b=c", false));
+        assert!(read_request(&mut r, 1 << 20).unwrap().is_none());
+        for bad in [&b"GET http://x/ HTTP/1.1\r\n\r\n"[..], b"GET / SPDY\r\n\r\n", b"GET /\r\n\r\n", b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n", b"GET / HTTP/1.1\r\nHost"] {
+            assert!(read_request(&mut BufReader::new(bad), 1 << 20).is_err(), "{:?}", String::from_utf8_lossy(bad));
         }
         let huge = format!("GET / HTTP/1.1\r\nX: {}\r\n\r\n", "a".repeat(MOST_HEAD));
-        assert!(read_request(&mut BufReader::new(huge.as_bytes())).is_err());
+        assert!(read_request(&mut BufReader::new(huge.as_bytes()), 1 << 20).is_err());
+        // A chunked body, as git sends a big one, with its trailers; and one over the limit.
+        let chunked = b"POST /git/a/b/git-receive-pack HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6;x=y\r\n world\r\n0\r\nX-T: 1\r\n\r\nGET / HTTP/1.1\r\n\r\n";
+        let mut r = BufReader::new(&chunked[..]);
+        assert_eq!(read_request(&mut r, 1 << 20).unwrap().unwrap().body, b"hello world");
+        assert_eq!(read_request(&mut r, 1 << 20).unwrap().unwrap().path, "/");
+        assert!(read_request(&mut BufReader::new(&chunked[..]), 8).is_err());
     }
 
     #[test]

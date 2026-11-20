@@ -28,14 +28,16 @@ registries-core.workspace = true
 registries-apt = { workspace = true, optional = true }
 registries-npm = { workspace = true, optional = true }
 registries-pypi = { workspace = true, optional = true }
+registries-git = { workspace = true, optional = true }
 serde_json.workspace = true
 
 [features]
-default = ["apt", "npm", "pypi"]
+default = ["apt", "npm", "pypi", "git"]
 # Each registry a machine can be given with --registries.
 apt = ["dep:registries-apt"]
 npm = ["dep:registries-npm"]
 pypi = ["dep:registries-pypi"]
+git = ["dep:registries-git"]
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

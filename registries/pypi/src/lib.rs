@@ -71,7 +71,7 @@ impl Adapter for Pypi {
     fn conversation(&self) -> Box<dyn Conversation> {
         Box::new(PypiConversation { host: "registry.carbon".into(), json: true })
     }
-    fn env(&self, base: &str) -> Vec<(String, String)> {
+    fn env(&self, base: &str, _details: &Value) -> Vec<(String, String)> {
         let host = base.trim_start_matches("http://").split('/').next().unwrap_or_default().to_string();
         let index = format!("{base}simple/");
         vec![
@@ -224,7 +224,7 @@ mod tests {
     #[test]
     fn pages_point_at_this_registry_and_files_expect_their_hash() {
         let sum = "b".repeat(64);
-        let req = Request { method: "GET".into(), path: "/pypi/simple/requests/".into(), headers: vec![("Host".into(), "registry.carbon".into()), ("Accept".into(), "application/vnd.pypi.simple.v1+json, text/html;q=0.01".into())], body: Vec::new(), keep_alive: true };
+        let req = Request { method: "GET".into(), path: "/pypi/simple/requests/".into(), query: String::new(), headers: vec![("Host".into(), "registry.carbon".into()), ("Accept".into(), "application/vnd.pypi.simple.v1+json, text/html;q=0.01".into())], body: Vec::new(), keep_alive: true };
         let mut conv = Pypi.conversation();
         let call = conv.parse(&req, "/simple/requests/").unwrap();
         let page = json!({ "meta": {"api-version": "1.1"}, "name": "requests", "files": [
@@ -244,6 +244,6 @@ mod tests {
         let registries_core::Body::Bytes(body) = conv.reply(&call, Answer::Json(page)).body else { panic!() };
         let text = String::from_utf8(body).unwrap();
         assert!(text.contains(&format!("/pypi/files/requests/{sum}/requests-2.31.0-py3-none-any.whl#sha256={sum}\" data-requires-python=\"&gt;=3.7\"")), "{text}");
-        assert!(Pypi.env("http://registry.carbon/pypi/").contains(&("PIP_INDEX_URL".into(), "http://registry.carbon/pypi/simple/".into())));
+        assert!(Pypi.env("http://registry.carbon/pypi/", &Value::Null).contains(&("PIP_INDEX_URL".into(), "http://registry.carbon/pypi/simple/".into())));
     }
 }
