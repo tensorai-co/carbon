@@ -92,8 +92,9 @@ usage: carbon <command> ...
                                              request sent to --upstream as one checked call (POST /v1/apt/deb, …);
                                              nothing the machine sends goes anywhere, and it works under --deny
                                              0.0.0.0/0 and --network none (npm's NPM_CONFIG_REGISTRY, pip's
-                                             PIP_INDEX_URL, go's GOPROXY, Maven's MAVEN_ARGS and git's insteadOf are
-                                             set, and cargo's and Maven's settings are in tmpfs, for this run only)
+                                             PIP_INDEX_URL, go's GOPROXY, Maven's MAVEN_ARGS, sbt's SBT_OPTS and git's
+                                             insteadOf are set, and cargo's, Maven's, Gradle's and sbt's settings are
+                                             in tmpfs, for this run only)
       --upstream URL|SERVICE=URL             the package server: https://…, or http:// to this host's loopback
       --upstream-token-file FILE             the token sent with every call (as a bearer), never in the machine
       --registry-meta KEY=VALUE              a field of meta on every call, for the server: sid=8f3a

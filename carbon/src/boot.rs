@@ -285,10 +285,15 @@ struct Parts {
     registry_files: Vec<(String, Vec<u8>)>,
 }
 
-/// Registries' files as tmpfs mounts, one for each folder they're in, for this run only: never in its record.
-fn registry_mounts(files: &[(String, Vec<u8>)]) -> Result<Vec<crate::Mount>> {
+/// Registries' files as tmpfs mounts, one for each folder they're in, for this run only: never in its record. A
+/// path under `~/` is under `home`, the home of the user the machine runs as.
+fn registry_mounts(files: &[(String, Vec<u8>)], home: &str) -> Result<Vec<crate::Mount>> {
     let mut mounts: Vec<crate::Mount> = Vec::new();
     for (path, data) in files {
+        let path = match path.strip_prefix("~/") {
+            Some(rest) => format!("{}/{rest}", home.trim_end_matches('/')),
+            None => path.clone(),
+        };
         let (dir, name) = path.rsplit_once('/').filter(|(d, n)| d.starts_with('/') && !n.is_empty()).ok_or_else(|| Error::invalid(format!("a registry's file must be in a folder, not {path}")))?;
         match mounts.iter().position(|m| m.target == dir) {
             Some(i) => {
@@ -490,7 +495,7 @@ fn boot(store: &Store, record: &Record, launch: &Launch, parts: Parts, notify: &
             let (mixer, _audio) = open_audio(&launch.audio, launch.display, notify)?;
             // Its mounts: host folders and volumes attached to its disk, and tmpfs; and its registries' files.
             let mut all = record.mounts.clone();
-            all.extend(registry_mounts(&registry_files)?);
+            all.extend(registry_mounts(&registry_files, &who.home)?);
             let mounts = crate::mounts::lambda_mounts(store.images.home(), &all, &disk, (who.user.uid, who.user.gid))?;
             let mut options = lambda::Options { stop, display: desktop.clone(), gpu, audio: Some(mixer), env, network: Some(network), hooks: hub, program, mounts, user: Some(who.user), ..lambda::Options::default() };
             options.hostname = record.host_name();

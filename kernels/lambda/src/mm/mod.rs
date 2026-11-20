@@ -7,7 +7,7 @@ mod control;
 pub(crate) mod patch;
 pub(crate) mod shared;
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use exec::{PAGE, Prot};
 use kernels_core::cache::Key;
@@ -53,9 +53,9 @@ impl Area {
 pub(crate) enum Backing {
     /// Zeros until written. Also an ELF image's pages, which are mapped when it's loaded.
     Anon,
-    /// A file's pages from `offset`. Shared mappings of a file on the disk aren't written back yet, so for now they
-    /// act as private ones.
-    File { ino: layers::Ino, offset: u64 },
+    /// A file's pages from `offset`, the file kept while it's mapped. Shared mappings of a file on the disk aren't
+    /// written back yet, so for now they act as private ones.
+    File { ino: layers::Ino, offset: u64, kept: Arc<Kept> },
     /// Shared memory's pages from `offset`: its frames themselves, or with `private` copy-on-write views of them.
     Shared { mem: Arc<shared::SharedMem>, offset: u64, private: bool },
     /// Never the program's: what the backend keeps for itself.
@@ -65,11 +65,40 @@ pub(crate) enum Backing {
 impl Region for Area {
     fn advanced(&self, by: u64) -> Area {
         let backing = match &self.backing {
-            Backing::File { ino, offset } => Backing::File { ino: *ino, offset: offset + by },
+            Backing::File { ino, offset, kept } => Backing::File { ino: *ino, offset: offset + by, kept: kept.clone() },
             Backing::Shared { mem, offset, private } => Backing::Shared { mem: mem.clone(), offset: offset + by, private: *private },
             other => other.clone(),
         };
         Area { prot: self.prot, backing, name: self.name.clone(), sealed: self.sealed }
+    }
+}
+
+/// A file on the disk kept while it's mapped, as Unix keeps it: once a file is mapped, its descriptor may be closed and
+/// its last name removed (the dynamic loader closes a library's, and JNA then removes the library it unpacked), and
+/// the pages not yet touched must still be its own. Every piece of a mapping shares one.
+pub(crate) struct Kept {
+    k: Weak<crate::Kernel>,
+    ino: layers::Ino,
+}
+
+impl Kept {
+    pub(crate) fn new(k: &Arc<crate::Kernel>, ino: layers::Ino) -> Arc<Kept> {
+        lock(&k.disk).hold(ino);
+        Arc::new(Kept { k: Arc::downgrade(k), ino })
+    }
+}
+
+impl Drop for Kept {
+    fn drop(&mut self) {
+        if let Some(k) = self.k.upgrade() {
+            lock(&k.disk).release(self.ino);
+        }
+    }
+}
+
+impl std::fmt::Debug for Kept {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Kept({})", self.ino)
     }
 }
 
@@ -106,7 +135,7 @@ pub(crate) fn fill(k: &crate::Kernel, state: &crate::process::ProcState, cx: &mu
         let file = match area.backing {
             Backing::Reserved => return Err(()),
             Backing::Anon => None,
-            Backing::File { ino, offset } => Some((ino, offset + (page - range.start))),
+            Backing::File { ino, offset, .. } => Some((ino, offset + (page - range.start))),
             Backing::Shared { ref mem, offset, private } => {
                 let index = (offset + (page - range.start)) / PAGE;
                 let mem = mem.clone();
@@ -191,7 +220,7 @@ impl Task {
                 Node::File(ino) if shared && *lock(&open.flags) & O_ACCMODE == O_RDWR => {
                     (Backing::Shared { mem: self.file_shared(*ino)?, offset, private: false }, open.path.clone())
                 }
-                Node::File(ino) => (Backing::File { ino: *ino, offset }, open.path.clone()),
+                Node::File(ino) => (Backing::File { ino: *ino, offset, kept: Kept::new(&self.k, *ino) }, open.path.clone()),
                 Node::Zero | Node::Null if shared => (self.shared_anon(len), "/dev/zero (deleted)".to_string()),
                 Node::Zero | Node::Null => (Backing::Anon, String::new()),
                 Node::Memfd(mem, secret) => {

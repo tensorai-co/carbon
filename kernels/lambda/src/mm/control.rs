@@ -394,7 +394,7 @@ impl Task {
             }
             let mut area = area.clone();
             area.backing = match area.backing {
-                Backing::File { ino, .. } => Backing::File { ino, offset },
+                Backing::File { ino, kept, .. } => Backing::File { ino, offset, kept },
                 Backing::Shared { mem, private: false, .. } => Backing::Shared { mem, offset, private: false },
                 _ => return Err(EINVAL),
             };

@@ -225,7 +225,9 @@ The root is the image's layers (Debian's, say) plus `os/`'s file systems. lambda
   foreground groups, controlling terminals, `TIOCGPTN`, `TIOCSPTLCK`, `TIOCGPTPEER`; SIGTTIN for background reads;
   SIGHUP when a session leader leaves.
 - **Memory** (`mm/`): `mmap` (anonymous and file-backed through the page cache), `munmap`, `mprotect`, `mremap`,
-  `madvise`, `brk`. Mapping only makes a region; pages are filled when the program faults on them. Shared memory
+  `madvise`, `brk`. Mapping only makes a region; pages are filled when the program faults on them. A file stays while
+  it's mapped, as on Linux: its descriptor closed and its last name removed (the dynamic loader closes a library's,
+  and JNA removes the library it unpacked), its pages not yet touched are still its own. Shared memory
   (`mm/shared.rs`) is frames lambda owns, made on first touch, that every mapping of it maps: `MAP_SHARED`
   anonymous memory and `/dev/zero`, memfds (with seals) and SysV segments, shared across fork. `mm/control.rs` has
   `msync`, `mincore`, the `mlock` family, `mseal`, NUMA on one node, and `process_madvise`.
@@ -253,7 +255,8 @@ The root is the image's layers (Debian's, say) plus `os/`'s file systems. lambda
   never logged or saved, sized by `size=` for `statfs`), proc, devpts and mqueue; `umount2`, lazily too;
   `pivot_root`. `/proc/<pid>/mounts`, `mountinfo` and `/proc/mounts` list them; `statfs` gives each mount's type and
   flags. The table is a mount namespace's, held by each process: there's one today. A machine boots with the mounts
-  `Options::mounts` gives (`carbon run -v`): a host folder or a volume attached to the disk as an external tree and
+  `Options::mounts` gives (`carbon run -v`), each at where the links on the way to its target lead, as Docker has it
+  (`/root/.gradle/init.d`, with `/root/.gradle` a link to `/home/gradle/.gradle`): a host folder or a volume attached to the disk as an external tree and
   mounted over its target (`fuse.carbon` in `mountinfo`, FUSE's magic for `statfs`, a device of its own), one file of
   a folder bound over a file, or a tmpfs; each target made on the disk if it isn't there.
 - **Extended attributes** (`fs/xattr.rs`): the twelve `*xattr` calls and the four `*xattrat` forms, over attributes

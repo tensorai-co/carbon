@@ -25,6 +25,10 @@ use serde_json::Value;
 const SERVICE: &str = "maven";
 /// Where the machine's Maven settings are, in a tmpfs.
 pub const SETTINGS: &str = "/etc/carbon/maven/settings.xml";
+/// Gradle's init script, in the user's Gradle home, which Gradle runs before every build.
+pub const GRADLE_INIT: &str = "~/.gradle/init.d/carbon-registries.gradle";
+/// sbt's repositories, which `SBT_OPTS` names.
+pub const SBT_REPOSITORIES: &str = "/etc/carbon/sbt/repositories";
 
 fn segment(s: &str) -> bool {
     !s.is_empty() && s.len() <= 128 && (s.as_bytes()[0].is_ascii_alphanumeric() || s.as_bytes()[0] == b'_') && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)) && !s.contains("..")
@@ -68,13 +72,17 @@ fn is_rest(rest: &str) -> bool {
 
 /// A call for Maven's plugins: what it fetches through its plugin repository.
 const FOR: Field = Field::optional("for", |s| s == "plugins");
+/// A call for Gradle's plugins, whose repositories are Maven Central and the Gradle Plugin Portal.
+const REPO: Field = Field::optional("repo", |s| s == "gradle-plugins");
 
 /// The prefix of Maven's plugin repository's paths.
 const PLUGINS: &str = "-plugins";
+/// The prefix of Gradle's plugin repository's paths: Maven Central, then the Gradle Plugin Portal.
+const GRADLE_PLUGINS: &str = "-gradle-plugins";
 
 static OPS: &[Op] = &[
-    Op { name: "metadata", fields: &[Field::required("path", is_path), Field::optional("checksum", |s| matches!(s, "sha1" | "md5" | "sha256" | "sha512")), FOR] },
-    Op { name: "file", fields: &[Field::required("group", is_group), Field::required("artifact", is_artifact), Field::required("version", is_version), Field::required("file", is_file), FOR] },
+    Op { name: "metadata", fields: &[Field::required("path", is_path), Field::optional("checksum", |s| matches!(s, "sha1" | "md5" | "sha256" | "sha512")), FOR, REPO] },
+    Op { name: "file", fields: &[Field::required("group", is_group), Field::required("artifact", is_artifact), Field::required("version", is_version), Field::required("file", is_file), FOR, REPO] },
 ];
 
 /// Maven's adapter. It keeps nothing.
@@ -98,8 +106,12 @@ impl Adapter for Maven {
     }
     /// Maven reads the settings below as its global settings. Its wagon transport, because the JDK's (Maven's
     /// default since 3.9) drops a refusal's reason, so Maven would say only "HTTP Status: 403", not why.
+    /// sbt reads only the repositories below, for itself and every build.
     fn env(&self, _base: &str, _details: &Value) -> Vec<(String, String)> {
-        vec![("MAVEN_ARGS".into(), format!("--global-settings {SETTINGS} -Dmaven.resolver.transport=wagon"))]
+        vec![
+            ("MAVEN_ARGS".into(), format!("--global-settings {SETTINGS} -Dmaven.resolver.transport=wagon")),
+            ("SBT_OPTS".into(), format!("-Dsbt.override.build.repos=true -Dsbt.repository.config={SBT_REPOSITORIES}")),
+        ]
     }
     /// `central` is this registry, its plugin repository under `-plugins`, and every other repository a build names
     /// is mirrored here: nothing comes from anywhere else.
@@ -142,7 +154,38 @@ impl Adapter for Maven {
 </settings>
 "#
         );
-        vec![(SETTINGS.into(), settings.into_bytes())]
+        // Every Maven repository a Gradle build declares, pointed here by what it's for: a project's dependencies, or
+        // its build's plugins and build logic (`pluginManagement`, `buildscript`), whose Gradle Plugin Portal is the
+        // registry's too. The Portal is added to `pluginManagement` before the settings script runs, as Gradle's own
+        // default would be.
+        let gradle = format!(
+            r#"// Carbon's registries: every Maven repository Gradle is given, through this machine's own registry.
+def carbonDependencies = '{url}'
+def carbonPlugins = '{url}/{PLUGINS}'
+def carbonPortal = '{url}/{GRADLE_PLUGINS}'
+def carbonPoint = {{ repos, boolean build ->
+    repos.configureEach {{ r ->
+        if (r instanceof MavenArtifactRepository) {{
+            r.url = r.url.toString().contains('plugins.gradle.org') ? carbonPortal : (build ? carbonPlugins : carbonDependencies)
+            r.allowInsecureProtocol = true
+        }}
+    }}
+}}
+gradle.beforeSettings {{ settings ->
+    settings.pluginManagement.repositories.gradlePluginPortal()
+    carbonPoint(settings.pluginManagement.repositories, true)
+    carbonPoint(settings.buildscript.repositories, true)
+    carbonPoint(settings.dependencyResolutionManagement.repositories, false)
+}}
+gradle.allprojects {{ p ->
+    carbonPoint(p.buildscript.repositories, true)
+    carbonPoint(p.repositories, false)
+}}
+"#
+        );
+        // sbt refuses a plain-HTTP repository unless it says so.
+        let sbt = format!("[repositories]\n  local\n  carbon: {url}/, allowInsecureProtocol\n");
+        vec![(SETTINGS.into(), settings.into_bytes()), (GRADLE_INIT.into(), gradle.into_bytes()), (SBT_REPOSITORIES.into(), sbt.into_bytes())]
     }
 }
 
@@ -153,12 +196,16 @@ const METADATA: &str = "maven-metadata.xml";
 fn parse_path(path: &str) -> Option<Call> {
     let segments: Vec<String> = path.strip_prefix('/')?.split('/').map(decode_segment).collect::<Option<_>>()?;
     let mut s: Vec<&str> = segments.iter().map(String::as_str).collect();
-    let plugins = s.first() == Some(&PLUGINS);
-    if plugins {
+    let prefix = s.first().copied().filter(|p| *p == PLUGINS || *p == GRADLE_PLUGINS);
+    if prefix.is_some() {
         s.remove(0);
     }
     let call = parse_folders(&s)?;
-    Some(if plugins { call.with("for", "plugins") } else { call })
+    Some(match prefix {
+        Some(PLUGINS) => call.with("for", "plugins"),
+        Some(_) => call.with("repo", "gradle-plugins"),
+        None => call,
+    })
 }
 
 fn parse_folders(s: &[&str]) -> Option<Call> {
@@ -241,6 +288,9 @@ mod tests {
         plugin.1.push(p("for", "plugins"));
         assert_eq!(call("/-plugins/org/apache/maven/plugins/maven-jar-plugin/3.4.1/maven-jar-plugin-3.4.1.jar"), Some(plugin));
         assert_eq!(call("/-plugins/org/apache/maven/plugins/maven-metadata.xml"), Some(("metadata", vec![p("path", "org/apache/maven/plugins"), p("for", "plugins")])));
+        let mut marker = file("org.example.greet", "org.example.greet.gradle.plugin", "1.0", "org.example.greet.gradle.plugin-1.0.pom").unwrap();
+        marker.1.push(p("repo", "gradle-plugins"));
+        assert_eq!(call("/-gradle-plugins/org/example/greet/org.example.greet.gradle.plugin/1.0/org.example.greet.gradle.plugin-1.0.pom"), Some(marker));
     }
 
     #[test]
@@ -257,6 +307,7 @@ mod tests {
             "/.hidden/maven-metadata.xml",
             "/org/x/lib/1.0/lib-1.0..jar",
             "/-plugins/-plugins/org/x/lib/1.0/lib-1.0.jar",
+            "/-gradle-plugins/-plugins/org/x/lib/1.0/lib-1.0.jar",
             "/",
         ] {
             assert!(call(path).is_none(), "{path}");
@@ -270,7 +321,13 @@ mod tests {
         let text = String::from_utf8(files[0].1.clone()).unwrap();
         assert!(text.contains("<url>http://registry.carbon/maven</url>") && text.contains("<url>http://registry.carbon/maven/-plugins</url>"));
         assert!(text.contains("<mirrorOf>*,!central</mirrorOf>") && text.contains("<activeProfile>carbon</activeProfile>"));
-        assert_eq!(Maven.env("http://registry.carbon/maven/", &Value::Null), vec![("MAVEN_ARGS".to_string(), format!("--global-settings {SETTINGS} -Dmaven.resolver.transport=wagon"))]);
+        let gradle = String::from_utf8(files[1].1.clone()).unwrap();
+        assert_eq!(files[1].0, GRADLE_INIT);
+        assert!(gradle.contains("'http://registry.carbon/maven/-gradle-plugins'") && gradle.contains("allowInsecureProtocol = true"));
+        assert_eq!((files[2].0.as_str(), String::from_utf8(files[2].1.clone()).unwrap()), (SBT_REPOSITORIES, "[repositories]\n  local\n  carbon: http://registry.carbon/maven/, allowInsecureProtocol\n".to_string()));
+        let env = Maven.env("http://registry.carbon/maven/", &Value::Null);
+        assert_eq!(env[0], ("MAVEN_ARGS".to_string(), format!("--global-settings {SETTINGS} -Dmaven.resolver.transport=wagon")));
+        assert!(env[1].1.contains(&format!("-Dsbt.repository.config={SBT_REPOSITORIES}")));
         assert!(is_version("4.1.100.Final") && is_version("1.0-rc1+build") && !is_version("1.0-SNAPSHOT") && is_group("org.apache") && !is_group("org..apache"));
     }
 }

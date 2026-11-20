@@ -44,7 +44,7 @@ pub trait Adapter: Send + Sync {
         Vec::new()
     }
     /// Files the machine's tool needs to use the registry at `base`, where no environment variable will do (cargo's
-    /// source replacement): absolute paths and their bytes. Carbon puts each in a tmpfs at its folder, for the run
+    /// source replacement): absolute paths, or under `~/` (the home of the user the machine runs as), and their bytes. Carbon puts each in a tmpfs at its folder, for the run
     /// only, so it's never on the machine's disk or in an image committed from it. None by default.
     fn files(&self, _base: &str, _details: &serde_json::Value) -> Vec<(String, Vec<u8>)> {
         Vec::new()

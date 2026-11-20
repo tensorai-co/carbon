@@ -39,7 +39,7 @@ bearer. An answer is JSON, bytes (with `Carbon-Size`, and `Carbon-Digest` when i
 | [`registries-pypi`](pypi/src/lib.rs) | PyPI's simple index (and so pip's and uv's) as `project` and `file` calls; each file's URL pointed back at the registry with its SHA-256 in it, and each file checked against it as it streams |
 | [`registries-crates`](crates/src/lib.rs) | Cargo's sparse index as `index` and `crate` calls; `config.json` answered here, its downloads pointed back at the registry with each one's SHA-256 in its URL; `/.cargo/config.toml` in a tmpfs, replacing crates.io's source |
 | [`registries-go`](go/src/lib.rs) | Go's module proxy protocol as `list`, `latest`, `info`, `mod` and `zip` calls, and its checksum database as `lookup`, `tile` and `head`; `GOPROXY` pointing here, with no `direct`, and `GOSUMDB` kept at `sum.golang.org`, so go checks every module against its signed log itself |
-| [`registries-maven`](maven/src/lib.rs) | A Maven repository's layout as `metadata` and `file` calls: a folder's `maven-metadata.xml` (and its checksums, of what the server rebuilt), a version's files (each its own, by name), and the plugin repository under `-plugins/`, whose calls say `for: plugins`; Maven's settings in a tmpfs, named by `MAVEN_ARGS` |
+| [`registries-maven`](maven/src/lib.rs) | A Maven repository's layout as `metadata` and `file` calls, for Maven, Gradle and sbt: a folder's `maven-metadata.xml` (and its checksums, of what the server rebuilt), a version's files (each its own, by name), Maven's plugin repository under `-plugins/` (`for: plugins`) and Gradle's under `-gradle-plugins/` (`repo: gradle-plugins`); Maven's settings, Gradle's init script and sbt's repositories in tmpfs |
 | [`registries-git`](git/src/lib.rs) | git's smart HTTP (v0/v1) as `refs`, `fetch` and `push` calls: every pkt-line read and checked, the ref advertisement written by Carbon, gzip'd and chunked bodies, `insteadOf` for each host the server names |
 | [`registries-npm`](npm/src/lib.rs) | npm's registry protocol (and so yarn's, pnpm's and bun's) as `packument` and `tarball` calls; each packument's tarball URLs pointed back at the registry, and each tarball checked against its `integrity` as it streams |
 
@@ -137,6 +137,18 @@ carbon ──► registries-core ──► hooks
   its own; its mirror sends every other repository a build names here too. `MAVEN_ARGS` also picks Maven's wagon
   transport: the JDK's, Maven's default since 3.9, drops a refusal's reason, so Maven would say only "HTTP Status:
   403", not why.
+- **Gradle**, end to end: a stock build (Gradle 9.9) of a project using `commons-lang3`, with a settings plugin from
+  the Gradle Plugin Portal, in `gradle:jdk21` under `--deny 0.0.0.0/0`. Gradle reads no settings file for its
+  repositories, so the machine gets an init script, `~/.gradle/init.d/carbon-registries.gradle` (in the home of the
+  user it runs as), that points every Maven repository a build declares here, by what it's for: a project's
+  dependencies at `/maven/`, its plugins and build logic (`pluginManagement`, `buildscript`) at `/maven/-plugins/`,
+  and the Gradle Plugin Portal at `/maven/-gradle-plugins/`, whose calls say `repo: gradle-plugins`. The Portal is
+  added to `pluginManagement` before the settings script runs, as Gradle's own default would be.
+- **sbt**, end to end: `sbt run` of a Scala 3 project using `commons-lang3`, sbt 1.10.7 and Scala themselves fetched
+  through the registry, in an sbt image under `--deny 0.0.0.0/0`. The machine gets `/etc/carbon/sbt/repositories`,
+  this registry alone, and `SBT_OPTS` makes sbt use it for itself and every build
+  (`-Dsbt.override.build.repos=true -Dsbt.repository.config=…`). sbt's resolver shows a refusal as "forbidden" and
+  its URL, without the server's reason.
 - **git**, end to end: clone (empty, full and shallow), push, racing pushes, and a public GitHub repo, in `debian:13`
   under `--deny 0.0.0.0/0`, through a package server.
 

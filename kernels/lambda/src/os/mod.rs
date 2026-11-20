@@ -467,7 +467,7 @@ fn maps(process: &Process) -> String {
         }
         let p = area.prot;
         let (offset, ino, shared) = match area.backing {
-            Backing::File { ino, offset } => (offset, ino, false),
+            Backing::File { ino, offset, .. } => (offset, ino, false),
             Backing::Shared { ref mem, offset, private } => (offset, mem.ino, !private),
             _ => (0, 0, false),
         };

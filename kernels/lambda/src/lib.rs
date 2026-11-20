@@ -303,13 +303,55 @@ fn host_meta(st: &layers::ExtStat) -> Meta {
     Meta { mode: kind | st.mode & 0o7777, uid: st.uid, gid: st.gid, ..Meta::default() }
 }
 
-/// Attaches the folders a machine boots with, and makes tmpfs trees, each with its folder made on the disk.
+/// `target` with the symbolic links on its way followed on the disk, as Docker follows them in a container's own
+/// files: a mount at `/root/.gradle/init.d`, where `/root/.gradle` links to `/home/gradle/.gradle`, is at
+/// `/home/gradle/.gradle/init.d`. The walk ends at the first part that isn't there: the rest is made as folders.
+fn real_path(disk: &Disk, target: &str) -> String {
+    let mut done: Vec<String> = Vec::new();
+    let mut todo: std::collections::VecDeque<String> = target.split('/').filter(|p| !p.is_empty()).map(String::from).collect();
+    let mut links = 0;
+    while let Some(part) = todo.pop_front() {
+        match part.as_str() {
+            "." => continue,
+            ".." => {
+                done.pop();
+                continue;
+            }
+            _ => {}
+        }
+        let here = format!("/{}", done.iter().chain(std::iter::once(&part)).cloned().collect::<Vec<_>>().join("/"));
+        let link = disk.resolve(layers::ROOT, &here, false).ok().filter(|&ino| disk.stat(ino).is_ok_and(|st| st.kind == layers::Kind::Symlink));
+        match link.and_then(|ino| disk.read_link(ino).ok()) {
+            Some(to) if links < 40 => {
+                links += 1;
+                if to.starts_with('/') {
+                    done.clear();
+                }
+                for p in to.split('/').filter(|p| !p.is_empty()).rev() {
+                    todo.push_front(p.to_string());
+                }
+            }
+            _ => {
+                let missing = disk.resolve(layers::ROOT, &here, false).is_err();
+                done.push(part);
+                if missing {
+                    done.extend(todo.drain(..));
+                }
+            }
+        }
+    }
+    format!("/{}", done.join("/"))
+}
+
+/// Attaches the folders a machine boots with, and makes tmpfs trees, each with its folder made on the disk, where
+/// the links on the way to it lead.
 fn boot_mounts(disk: &mut Disk, mounts: &[Mount]) -> Result<Vec<fs::mount::BootMount>, String> {
     let mut out = Vec::new();
     for m in mounts {
         if !m.target.starts_with('/') || m.target.split('/').any(|p| p == "..") {
             return Err(format!("a mount's target must be an absolute path: {}", m.target));
         }
+        let m = &Mount { target: real_path(disk, &m.target), ..m.clone() };
         // What it covers: a folder, or for a single file, a file.
         let point = if matches!(m.source, MountSource::File(..)) { layers::New::File } else { layers::New::Dir };
         disk.put(&m.target, point, &[], Meta::file(0o644), Meta::dir(0o755)).map_err(|e| format!("making {} for its mount: {e}", m.target))?;
@@ -638,6 +680,21 @@ mod tests {
 
     fn env(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_mounts_folder_is_where_the_links_on_its_way_lead() {
+        use super::{Disk, Meta, real_path};
+        let mut disk = Disk::new(Meta::dir(0o755), false);
+        disk.put("/home/gradle/.gradle/caches", layers::New::Dir, &[], Meta::file(0o644), Meta::dir(0o755)).unwrap();
+        disk.put("/root/.gradle", layers::New::Symlink("/home/gradle/.gradle".into()), &[], Meta::file(0o777), Meta::dir(0o755)).unwrap();
+        disk.put("/opt/tools", layers::New::Symlink("../home/gradle".into()), &[], Meta::file(0o777), Meta::dir(0o755)).unwrap();
+        disk.put("/loop", layers::New::Symlink("/loop".into()), &[], Meta::file(0o777), Meta::dir(0o755)).unwrap();
+        assert_eq!(real_path(&disk, "/root/.gradle/init.d"), "/home/gradle/.gradle/init.d");
+        assert_eq!(real_path(&disk, "/opt/tools/.gradle/x/y"), "/home/gradle/.gradle/x/y");
+        assert_eq!(real_path(&disk, "/etc/carbon/maven"), "/etc/carbon/maven");
+        assert_eq!(real_path(&disk, "/home/gradle/.gradle/caches"), "/home/gradle/.gradle/caches");
+        assert_eq!(real_path(&disk, "/loop/x"), "/loop/x");
     }
 
     #[test]
