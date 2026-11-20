@@ -63,6 +63,8 @@ pub(crate) struct Launch {
     pub mounts: Option<Vec<crate::Mount>>,
     /// Who its first program runs as (`name[:group]`, `uid[:gid]`); None for the image's `USER`, else root.
     pub user: Option<String>,
+    /// Its registries (`--registries`): not kept, so each run says again, as its rules do.
+    pub registries: Option<crate::Registries>,
     pub hub: Hub,
 }
 
@@ -166,6 +168,12 @@ pub(crate) fn run(store: &Store, launch: Launch, notify: &Notify, started: &mut 
         });
     }
 
+    // Its registries' servers are asked what they serve before anything runs: one that can't be had stops it here.
+    let registries = match launch.registries.as_ref().filter(|r| !r.is_empty()) {
+        Some(settings) => Some(crate::registries::open(settings, &launch.hub)?),
+        None => None,
+    };
+
     // x86 of either width on Apple silicon wants the CPU's own x86 memory ordering.
     let tso = matches!(record.platform.arch.as_str(), "amd64" | "386") && cfg!(target_arch = "aarch64");
     // Opens exec and boots the kernel on this thread, which its CPUs belong to.
@@ -173,8 +181,10 @@ pub(crate) fn run(store: &Store, launch: Launch, notify: &Notify, started: &mut 
         let (exec, cpu) = open_exec(launch.isolation, tso, launch.memory, notify)?;
         // Its network, with its ports published on the host's before anything runs: a host port that's taken stops
         // it here, saying which. Its connections and lookups go through its hooks.
-        let config = net::Config { hostname: record.host_name(), mode: record.network, ..net::Config::default() };
-        let network = net::Network::new(config, Arc::new(crate::network::HookedNet::new(launch.hub.clone())));
+        let gateway_names = if registries.is_some() { vec![crate::registries::NAME.to_string()] } else { Vec::new() };
+        let config = net::Config { hostname: record.host_name(), mode: record.network, gateway_names, ..net::Config::default() };
+        let hooked = crate::network::HookedNet::new(launch.hub.clone()).with_registries(registries.clone());
+        let network = net::Network::new(config, Arc::new(hooked));
         let mut published = Vec::new();
         for (text, ports) in &ports {
             published.push(network.publish(ports).map_err(|e| match e {

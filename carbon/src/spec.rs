@@ -217,6 +217,7 @@ impl MachineSpec {
             timeout: None,
             mounts: None,
             user: None,
+            registries: None,
             hub: Hub::new(),
         };
         MachineSpec { carbon, launch, invalid: None, rules: Rules::new(), code_hooks: std::cell::Cell::new(false) }
@@ -442,6 +443,25 @@ impl MachineSpec {
     pub fn on_lookup(self, filter: Filter, f: impl Fn(&Lookup) -> Decision<Lookup> + Send + Sync + 'static) -> MachineSpec {
         self.launch.hub.on_lookup(filter, f);
         self.code_hooks.set(true);
+        self
+    }
+
+    /// Decides the calls its package managers make to its registries ([`MachineSpec::registries`]).
+    pub fn on_registry(self, filter: Filter, f: impl Fn(&hooks::Registry) -> Decision<hooks::Registry> + Send + Sync + 'static) -> MachineSpec {
+        self.launch.hub.on_registry(filter, f);
+        self.code_hooks.set(true);
+        self
+    }
+
+    /// Its registries (`--registries`): its package managers answered at `registry.carbon` by Carbon, and each request
+    /// sent to `registries`' servers as one checked call, with their token, which never goes in the machine. The
+    /// servers are asked what they serve when it starts, and a service one doesn't have stops it there. Only for this
+    /// run, as its rules are.
+    pub fn registries(mut self, registries: crate::Registries) -> MachineSpec {
+        if let Err(e) = registries.check(&crate::registries::known()) {
+            return self.invalid(Error::invalid(e));
+        }
+        self.launch.registries = Some(registries);
         self
     }
 

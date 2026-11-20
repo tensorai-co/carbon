@@ -32,6 +32,7 @@ carbon exec -it web bash                                       # from another te
 carbon run --isolation vm debian:13 -- ./untrusted.sh          # a hardware VM, or fail
 carbon run --platform linux/amd64 debian:13 -- apt-get install -y curl    # x86-64, translated on Apple silicon
 carbon run --deny 0.0.0.0/0 --allow pypi.org:443 --deny-exec 'rm -rf *' debian:13 -- ./agent-step.sh   # rules
+carbon run --deny 0.0.0.0/0 --registries apt --upstream https://pkg.example.com debian:13 -- apt-get install -y jq   # packages, with no network out
 carbon watch web                                               # every program it starts, what it writes, where it connects
 claude mcp add carbon -- carbon mcp                            # an agent's machines, as MCP tools: run, exec, files, builds, screens
 carbon mcp -H 0.0.0.0:8080 --token-file tokens --engine        # the same over HTTP and WebSocket, and the Engine API for the programs running agents
@@ -73,8 +74,8 @@ let out = carbon.machine("debian:13").rm(true)
 - **Screens for computer use.** One desktop both kernels' windows go on, headless or in the host's own windows (on
   macOS today), with screenshots, clicks and keys from the command line, and later remote viewers over QUIC.
 - **Built for agents.** Because Carbon owns the kernels, a program using it sees, in real time, every program a
-  machine starts, everything it writes, every connection it makes and every name it looks up, and can allow, block,
-  rewrite or answer each one while the machine waits. A container runtime can't, because it doesn't own the kernel.
+  machine starts, everything it writes, every connection it makes, every name it looks up and every package it asks
+  for, and can allow, block, rewrite or answer each one while the machine waits. A container runtime can't, because it doesn't own the kernel.
 - **`carbon mcp` is the front door.** Carbon is AI-first: an agent's client starts `carbon mcp` and gets machines as
   MCP tools, and the program running the agent (a gateway, CI, an app) sets those machines up over the same server's
   Engine API, on one connection ([below](#for-agents-carbon-mcp)).
@@ -257,7 +258,7 @@ rules; the session's token written into the tmpfs (a tmpfs isn't the disk, so `c
 their output streamed; then commit, push, close.
 
 ```
-→ {"jsonrpc":"2.0","id":1,"method":"engine/machines.create","params":{"Image":"registry/ws/8f3a:latest","Name":"sbx-8f3a","Hostname":"sbx-8f3a","Env":["TURN=1"],"Cmd":["sleep","infinity"],"HostConfig":{"Tmpfs":{"/run/secrets":""}},"Rules":{"Deny":["0.0.0.0/0"],"Allow":["repo-server:443"]}}}
+→ {"jsonrpc":"2.0","id":1,"method":"engine/machines.create","params":{"Image":"registry/ws/8f3a:latest","Name":"sbx-8f3a","Hostname":"sbx-8f3a","Env":["TURN=1"],"Cmd":["sleep","infinity"],"HostConfig":{"Tmpfs":{"/run/secrets":""}},"Rules":{"Deny":["0.0.0.0/0"],"Allow":["git.internal:443"]}}}
 → {"jsonrpc":"2.0","id":2,"method":"engine/machines.start","params":{"Id":"sbx-8f3a"}}
 → {"jsonrpc":"2.0","id":3,"method":"engine/files.write","params":{"Id":"sbx-8f3a","Path":"/run/secrets/token","Mode":384,"Stream":1}}
 → [1][data] <token>   [1][end]
@@ -290,6 +291,7 @@ Around them:
 | [`images`](images/README.md) | What machines start from, on the host's disk: pulled OCI images, imports, committed machines | Built |
 | [`carbon`](carbon/README.md) | Carbon as a library: puts machines together and owns their lives (run, `exec`, stop, commit, ports, screens, the control socket), and their hooks and rules | Built: everything the CLI does; machines in processes of their own, their logs and files; building images from a Carbonfile (any Dockerfile); host folders, volumes and tmpfs mounted; hooks for programs started, output, connections and lookups; users and more hook points to do |
 | [`hooks`](hooks/README.md) | What hook points report and what can be decided about it: events, decisions, the `Hooks` trait, filters, and the hub every hook point asks | Built |
+| [`registries`](registries/README.md) | A machine's package managers answered in Carbon (`--registries`), each request sent upstream as one checked call (`POST /v1/apt/deb`), never as itself, with a token the machine never has | apt built; npm and git to do |
 | [`remote`](remote/README.md) | A machine's desktop and sound, shown and driven from another computer over QUIC | Not started |
 | [`cli`](cli/README.md) | The `carbon` command | Built, as a thin layer over `carbon` |
 | [`mcp`](mcp/README.md) | `carbon mcp`: Carbon's front door, an MCP server over the library, and with `--engine` the Engine API | Built: stdio, HTTP and WebSocket (`-H`), TLS, tokens with scopes, `--max-sessions`; both eras of the protocol, 37 tools; the Engine API's machines, exec, files and images, as JSON-RPC and REST |
@@ -298,6 +300,7 @@ Around them:
 cli ──► carbon ──► kernels ──► exec, layers, display, gpu, audio, net, host
            │       (core ◄── lambda, atlas)
            ├─────► images ──► layers
+           ├─────► registries ──► hooks
            └─────► remote ──► display, audio
 hooks ◄── carbon, lambda, atlas
 ```

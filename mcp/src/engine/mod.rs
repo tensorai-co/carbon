@@ -189,7 +189,31 @@ fn rules(v: &Value) -> Result<Rules, EngineError> {
     for pattern in p.strings("DenyExec")? {
         rules = rules.deny_exec(&pattern);
     }
+    for pattern in p.strings("DenyRegistry")? {
+        rules = rules.deny_registry(&pattern).map_err(|e| EngineError::invalid(format!("Rules.DenyRegistry {pattern}: {e}")))?;
+    }
     Ok(rules)
+}
+
+/// A machine's registries, as `machines.create` takes them.
+fn registries(p: &P) -> Result<carbon::Registries, EngineError> {
+    let bad = |e: String| EngineError::invalid(format!("Registries: {e}"));
+    let mut r = carbon::Registries::new(p.strings("Services")?);
+    if let Some(url) = p.opt_str("Upstream") {
+        r = r.upstream(&url).map_err(bad)?;
+    }
+    for (service, url) in p.object("Upstreams").into_iter().flatten() {
+        let url = url.as_str().ok_or_else(|| EngineError::invalid(format!("Registries.Upstreams.{service} must be a string")))?;
+        r = r.upstream_for_service(service, url).map_err(bad)?;
+    }
+    if let Some(token) = p.opt_str("Token") {
+        r = r.token(token);
+    }
+    for (key, value) in p.object("Meta").into_iter().flatten() {
+        let value = value.as_str().ok_or_else(|| EngineError::invalid(format!("Registries.Meta.{key} must be a string")))?;
+        r = r.meta(key.clone(), value);
+    }
+    Ok(r)
 }
 
 fn create(server: &Server, p: &P) -> R {
@@ -242,6 +266,15 @@ fn create(server: &Server, p: &P) -> R {
         _ => {
             if let Some(m) = server.options().memory.clone() {
                 spec = spec.memory(m);
+            }
+        }
+    }
+    // `Registries`: {"Services": ["apt"], "Upstream": URL, "Upstreams": {"npm": URL}, "Token": T, "Meta": {"sid": …}}.
+    match p.0.get("Registries").filter(|r| !r.is_null()) {
+        Some(r) => spec = spec.registries(registries(&P(r))?),
+        None => {
+            if let Some(r) = &server.options().registries {
+                spec = spec.registries(r.clone());
             }
         }
     }

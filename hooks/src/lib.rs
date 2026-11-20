@@ -1,7 +1,8 @@
 //! `hooks`: what a machine does, as it does it, and what can be decided about it.
 //!
 //! Carbon owns the whole kernel, so every program a machine starts, everything it writes to its terminal, every
-//! connection it makes and every name it looks up passes through Carbon's own code. Each of those places is a **hook
+//! connection it makes, every name it looks up and every package it asks a registry for passes through Carbon's own
+//! code. Each of those places is a **hook
 //! point**: it makes an [`Event`] (who's asking, and for what) and asks the machine's [`Hub`] **on the thread that
 //! asked**, which waits for the answer. So a decision really decides: nothing has happened yet.
 //!
@@ -63,10 +64,12 @@ pub enum Kind {
     Connect,
     /// A name the machine looks up.
     Lookup,
+    /// A call a machine's package manager makes to a registry (apt, npm, git), as Carbon checked it.
+    Registry,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 4] = [Kind::Exec, Kind::Output, Kind::Connect, Kind::Lookup];
+    pub const ALL: [Kind; 5] = [Kind::Exec, Kind::Output, Kind::Connect, Kind::Lookup, Kind::Registry];
 
     fn bit(self) -> u32 {
         match self {
@@ -74,6 +77,7 @@ impl Kind {
             Kind::Output => 2,
             Kind::Connect => 4,
             Kind::Lookup => 8,
+            Kind::Registry => 16,
         }
     }
 
@@ -83,6 +87,7 @@ impl Kind {
             Kind::Output => "output",
             Kind::Connect => "connect",
             Kind::Lookup => "lookup",
+            Kind::Registry => "registry",
         }
     }
 
@@ -112,7 +117,7 @@ impl Interest {
         Interest(0)
     }
     pub fn all() -> Interest {
-        Interest(15)
+        Interest(31)
     }
     pub fn exec() -> Interest {
         Interest(Kind::Exec.bit())
@@ -125,6 +130,9 @@ impl Interest {
     }
     pub fn lookup() -> Interest {
         Interest(Kind::Lookup.bit())
+    }
+    pub fn registry() -> Interest {
+        Interest(Kind::Registry.bit())
     }
     /// Connections and lookups.
     pub fn network() -> Interest {
@@ -360,6 +368,40 @@ impl Lookup {
     }
 }
 
+/// A call a machine's package manager makes to a registry, after Carbon read it from the tool's own request and
+/// checked it: `apt deb {name: jq, version: 1.7.1-6, …}`. What's decided is whether it's sent at all; nothing of the
+/// tool's request goes anywhere either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Registry {
+    /// `apt`, `npm`, `git`, …
+    pub service: String,
+    /// One of the service's ops: `release`, `index`, `deb`, …
+    pub op: String,
+    /// The op's fields, as they'll be sent.
+    pub params: Vec<(String, String)>,
+}
+
+impl Registry {
+    pub fn new(service: impl Into<String>, op: impl Into<String>) -> Registry {
+        Registry { service: service.into(), op: op.into(), params: Vec::new() }
+    }
+    /// This, with a field.
+    pub fn with(mut self, name: impl Into<String>, value: impl Into<String>) -> Registry {
+        self.params.push((name.into(), value.into()));
+        self
+    }
+    pub fn service(&self) -> &str {
+        &self.service
+    }
+    pub fn op(&self) -> &str {
+        &self.op
+    }
+    /// A field's value, or "" if it hasn't one.
+    pub fn param(&self, name: &str) -> &str {
+        self.params.iter().find(|(n, _)| n == name).map_or("", |(_, v)| v.as_str())
+    }
+}
+
 /// Any event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -367,6 +409,7 @@ pub enum Event {
     Output(Output),
     Connect(Connect),
     Lookup(Lookup),
+    Registry(Registry),
 }
 
 impl Event {
@@ -376,6 +419,7 @@ impl Event {
             Event::Output(_) => Kind::Output,
             Event::Connect(_) => Kind::Connect,
             Event::Lookup(_) => Kind::Lookup,
+            Event::Registry(_) => Kind::Registry,
         }
     }
 
@@ -395,6 +439,10 @@ impl Event {
                 }
             }
             Event::Lookup(l) => format!("lookup {}", l.name),
+            Event::Registry(r) => {
+                let params: Vec<String> = r.params.iter().map(|(n, v)| format!("{n}={v}")).collect();
+                format!("registry {} {} {}", r.service, r.op, params.join(" ")).trim_end().to_string()
+            }
         }
     }
 }
@@ -444,7 +492,7 @@ mod sealed {
     pub trait Sealed {}
 }
 
-/// One of the events a hook point makes: [`Exec`], [`Output`], [`Connect`] or [`Lookup`].
+/// One of the events a hook point makes: [`Exec`], [`Output`], [`Connect`], [`Lookup`] or [`Registry`].
 pub trait Hooked: sealed::Sealed + Clone + fmt::Debug + Send + Sync + 'static {
     /// What answering it gives: [`Reply`] for an exec, addresses for a lookup, [`Never`] where there's no answer.
     type Answer: Clone + fmt::Debug + Send + Sync + 'static;
@@ -492,6 +540,7 @@ hooked!(Lookup, Vec<IpAddr>, Lookup, |a| Some(Answer::Lookup(a)), |b| match b {
     Answer::Lookup(ips) => Some(ips),
     _ => None,
 });
+hooked!(Registry, Never, Registry, |a| match a {}, |_b| None);
 
 /// What a hook decides about an event.
 #[derive(Debug, Clone)]
@@ -603,6 +652,9 @@ pub trait Hooks: Send + Sync + 'static {
     fn lookup(&self, _event: &Lookup) -> Decision<Lookup> {
         Decision::Pass
     }
+    fn registry(&self, _event: &Registry) -> Decision<Registry> {
+        Decision::Pass
+    }
     /// The kinds of event this wants to be asked about.
     fn interest(&self) -> Interest {
         Interest::all()
@@ -621,6 +673,9 @@ impl<H: Hooks + ?Sized> Hooks for Arc<H> {
     }
     fn lookup(&self, e: &Lookup) -> Decision<Lookup> {
         (**self).lookup(e)
+    }
+    fn registry(&self, e: &Registry) -> Decision<Registry> {
+        (**self).registry(e)
     }
     fn interest(&self) -> Interest {
         (**self).interest()
@@ -641,6 +696,8 @@ pub enum Filter {
     Host(String),
     /// Output on this stream.
     Stream(Stream),
+    /// A registry call to this service (`apt`), or to this op of it (`apt:deb`).
+    Service(String),
 }
 
 impl Filter {
@@ -659,6 +716,9 @@ impl Filter {
     pub fn stream(stream: Stream) -> Filter {
         Filter::Stream(stream)
     }
+    pub fn service(service: impl Into<String>) -> Filter {
+        Filter::Service(service.into())
+    }
 
     /// Whether `name` is `host` or under it.
     pub fn name_matches(host: &str, name: &str) -> bool {
@@ -674,6 +734,10 @@ impl Filter {
             (Filter::Host(h), Event::Connect(c)) => c.name().is_some_and(|n| Filter::name_matches(h, n)) || h.parse::<IpAddr>().is_ok_and(|ip| ip == c.ip()),
             (Filter::Host(h), Event::Lookup(l)) => Filter::name_matches(h, &l.name),
             (Filter::Stream(s), Event::Output(o)) => o.stream == *s,
+            (Filter::Service(s), Event::Registry(r)) => match s.split_once(':') {
+                Some((service, op)) => r.service == service && r.op == op,
+                None => r.service == *s,
+            },
             _ => false,
         }
     }
@@ -687,6 +751,7 @@ enum Entry {
     Output(Filter, Closure<Output>),
     Connect(Filter, Closure<Connect>),
     Lookup(Filter, Closure<Lookup>),
+    Registry(Filter, Closure<Registry>),
 }
 
 impl Entry {
@@ -697,6 +762,7 @@ impl Entry {
             Entry::Output(..) => Interest::output(),
             Entry::Connect(..) => Interest::connect(),
             Entry::Lookup(..) => Interest::lookup(),
+            Entry::Registry(..) => Interest::registry(),
         }
     }
 }
@@ -939,6 +1005,9 @@ impl Hub {
     pub fn on_lookup(&self, filter: Filter, f: impl Fn(&Lookup) -> Decision<Lookup> + Send + Sync + 'static) {
         self.push(Entry::Lookup(filter, Box::new(f)));
     }
+    pub fn on_registry(&self, filter: Filter, f: impl Fn(&Registry) -> Decision<Registry> + Send + Sync + 'static) {
+        self.push(Entry::Registry(filter, Box::new(f)));
+    }
 
     /// A stream of what happens, for the kinds in `interest`, holding up to `capacity` events not yet taken.
     pub fn observe(&self, interest: Interest, capacity: usize) -> Observer {
@@ -987,6 +1056,14 @@ impl Hub {
         self.decide(event, |entry, e| match entry {
             Entry::Hooks(h, i) if i.has(Kind::Lookup) => h.lookup(e),
             Entry::Lookup(filter, f) if filter.matches(&Event::Lookup(e.clone())) => f(e),
+            _ => Decision::Pass,
+        })
+    }
+
+    pub fn registry(&self, event: Registry) -> Decision<Registry> {
+        self.decide(event, |entry, e| match entry {
+            Entry::Hooks(h, i) if i.has(Kind::Registry) => h.registry(e),
+            Entry::Registry(filter, f) if filter.matches(&Event::Registry(e.clone())) => f(e),
             _ => Decision::Pass,
         })
     }
@@ -1112,6 +1189,20 @@ mod tests {
         assert!(!Filter::host("example.com").matches(&Event::Connect(connect("badexample.com", 443))));
         assert!(Filter::host("93.184.216.34").matches(&Event::Connect(connect("x", 80))));
         assert!(Filter::port(443).matches(&Event::Connect(connect("x", 443))));
+    }
+
+    #[test]
+    fn registry_calls_are_decided_by_service_and_op() {
+        let hub = Hub::new();
+        hub.on_registry(Filter::service("apt:deb"), |r| if r.param("name") == "nmap" { Decision::deny() } else { Decision::pass() });
+        hub.on_registry(Filter::service("npm"), |_| Decision::deny());
+        let deb = |name: &str| Registry::new("apt", "deb").with("name", name);
+        assert!(matches!(hub.registry(deb("nmap")), Decision::Deny));
+        assert!(matches!(hub.registry(deb("jq")), Decision::Allow));
+        assert!(matches!(hub.registry(Registry::new("apt", "release").with("name", "nmap")), Decision::Allow));
+        assert!(matches!(hub.registry(Registry::new("npm", "tarball")), Decision::Deny));
+        assert_eq!(Event::Registry(deb("jq")).describe(), "registry apt deb name=jq");
+        assert!(hub.wants(Kind::Registry) && Interest::all().has(Kind::Registry));
     }
 
     #[test]

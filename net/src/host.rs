@@ -35,6 +35,13 @@ pub trait Host: Send + Sync + 'static {
     fn udp_at(&self, _at: SocketAddr, _wake: Waker) -> Result<Box<dyn HostDatagram>> {
         Err(crate::Error::NotSupported)
     }
+
+    /// A TCP connection to the gateway's `port`, answered in this process: a service of the host program's own (a
+    /// registry, say), never a host socket. None if nothing's there, and the connection is refused. `wake` is as for
+    /// [`Host::connect`]. It's asked whatever the network's mode, since it never leaves the host.
+    fn gateway(&self, _port: u16, _wake: Waker) -> Option<Box<dyn HostStream>> {
+        None
+    }
 }
 
 /// A host's listening TCP socket, for a published port. Every call returns at once.

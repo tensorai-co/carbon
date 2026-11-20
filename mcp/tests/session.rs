@@ -1,4 +1,4 @@
-//! A session as sandbox-gateway runs one, on one WebSocket, against real machines: create from an image with a
+//! A session as a gateway runs one, on one WebSocket, against real machines: create from an image with a
 //! hostname, env, rules and a tmpfs; start; write a token into the tmpfs with frames; exec with streams (output, and
 //! stdin); read the file back as frames; commit, and the token isn't in the image; clean up.
 //!
@@ -91,7 +91,7 @@ fn a_gateway_s_session() {
         json!({
             "Image": "debian:latest", "Name": name, "Hostname": "sbx-8f3a", "Env": ["TURN=1"], "Cmd": ["sleep", "infinity"],
             "Labels": { "session": "8f3a", "tier": "sandbox" },
-            "HostConfig": { "Tmpfs": { "/run/secrets": "" }, "ExtraHosts": ["repo-server.internal:10.8.0.2", "mirror=10.8.0.3"] },
+            "HostConfig": { "Tmpfs": { "/run/secrets": "" }, "ExtraHosts": ["git.internal:10.8.0.2", "mirror=10.8.0.3"] },
             "Rules": { "Deny": ["0.0.0.0/0"] },
         }),
     );
@@ -125,9 +125,9 @@ fn a_gateway_s_session() {
     assert_eq!(joined(&frames, 1), "hello there");
 
     // --add-host's lines, after the machine's own.
-    let r = s.ok("engine/machines.exec", json!({ "Id": id, "Cmd": ["sh", "-c", "getent hosts repo-server.internal mirror; tail -2 /etc/hosts"] }));
+    let r = s.ok("engine/machines.exec", json!({ "Id": id, "Cmd": ["sh", "-c", "getent hosts git.internal mirror; tail -2 /etc/hosts"] }));
     let out = r["Stdout"].as_str().unwrap();
-    assert!(out.contains("10.8.0.2        repo-server.internal") || out.contains("10.8.0.2\trepo-server.internal") || out.lines().any(|l| l.split_whitespace().collect::<Vec<_>>() == ["10.8.0.2", "repo-server.internal"]), "{out}");
+    assert!(out.contains("10.8.0.2        git.internal") || out.contains("10.8.0.2\tgit.internal") || out.lines().any(|l| l.split_whitespace().collect::<Vec<_>>() == ["10.8.0.2", "git.internal"]), "{out}");
     assert!(out.lines().any(|l| l.split_whitespace().collect::<Vec<_>>() == ["10.8.0.3", "mirror"]), "{out}");
 
     // Labels: found by them, and shown.
@@ -137,7 +137,7 @@ fn a_gateway_s_session() {
     let inspect = s.ok("engine/machines.inspect", json!({ "Id": id }));
     assert_eq!(inspect["Config"]["Labels"]["tier"], "sandbox", "{inspect}");
     assert_eq!(inspect["Config"]["Hostname"], "sbx-8f3a");
-    assert_eq!(inspect["HostConfig"]["ExtraHosts"], json!(["repo-server.internal:10.8.0.2", "mirror:10.8.0.3"]));
+    assert_eq!(inspect["HostConfig"]["ExtraHosts"], json!(["git.internal:10.8.0.2", "mirror:10.8.0.3"]));
 
     // Without a stream, the output's in the answer.
     let r = s.ok("engine/machines.exec", json!({ "Id": id, "Cmd": ["sh", "-c", "echo plain"] }));

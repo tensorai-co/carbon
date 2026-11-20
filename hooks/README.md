@@ -10,6 +10,7 @@ on it; [`carbon`](../carbon/README.md) re-exports it as `carbon::hooks`.
 | `Output` | `stream` (`Stdout`, `Stderr`), `source` (`Machine`, `Exec(id)`), `bytes` | none |
 | `Connect` | `proto` (`Tcp`, `Udp`), `to`, `name` (the name a lookup gave that address) | none (yet) |
 | `Lookup` | `name` | addresses |
+| `Registry` | `service` (`apt`, …), `op` (`deb`, …), `params` (the call's fields, as they'll be sent) | none |
 
 A [`Decision<E>`](src/lib.rs) is `Pass`, `Allow`, `Deny`, `Rewrite(E)` or `Answer(E::Answer)`, typed by its event, so
 an answer that doesn't fit doesn't compile. A [`Verdict`](src/lib.rs) is the same without the type, for observers and

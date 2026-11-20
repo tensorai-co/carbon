@@ -84,6 +84,8 @@ pub(crate) fn respond(net: &Shared, query: &[u8], question: &Question) -> Vec<u8
         Some(vec![IpAddr::V4(net.address)])
     } else if question.name == "localhost" {
         Some(vec![IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)])
+    } else if net.is_gateway_name(&question.name) {
+        Some(vec![IpAddr::V4(net.gateway)])
     } else {
         None
     };

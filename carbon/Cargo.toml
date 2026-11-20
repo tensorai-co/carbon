@@ -24,7 +24,14 @@ gpu-api.workspace = true
 lambda.workspace = true
 atlas.workspace = true
 hooks.workspace = true
+registries-core.workspace = true
+registries-apt = { workspace = true, optional = true }
 serde_json.workspace = true
+
+[features]
+default = ["apt"]
+# Each registry a machine can be given with --registries.
+apt = ["dep:registries-apt"]
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

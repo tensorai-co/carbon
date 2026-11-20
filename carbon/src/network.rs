@@ -81,11 +81,19 @@ pub(crate) struct HookedNet {
     inner: net::System,
     hub: Hub,
     names: Arc<Names>,
+    /// Its registries, answering at the gateway, if it has any.
+    registries: Option<Arc<registries_core::Server>>,
 }
 
 impl HookedNet {
     pub fn new(hub: Hub) -> HookedNet {
-        HookedNet { inner: net::System, hub, names: Arc::default() }
+        HookedNet { inner: net::System, hub, names: Arc::default(), registries: None }
+    }
+
+    /// With `registries` answering the gateway's port 80.
+    pub fn with_registries(mut self, registries: Option<Arc<registries_core::Server>>) -> HookedNet {
+        self.registries = registries;
+        self
     }
 }
 
@@ -163,6 +171,13 @@ impl Host for HookedNet {
     fn udp_at(&self, at: SocketAddr, wake: Waker) -> Result<Box<dyn HostDatagram>> {
         self.inner.udp_at(at, wake)
     }
+
+    fn gateway(&self, port: u16, wake: Waker) -> Option<Box<dyn HostStream>> {
+        match &self.registries {
+            Some(server) if port == crate::registries::PORT => Some(crate::registries::connect(server, wake)),
+            _ => None,
+        }
+    }
 }
 
 /// What's been decided for each destination a UDP socket sends to: allowed, refused, or sent somewhere else.
@@ -239,7 +254,7 @@ mod tests {
 
     #[test]
     fn extra_hosts_as_add_host_takes_them() {
-        for (text, shown) in [("db:10.0.0.5", "db:10.0.0.5"), ("db=10.0.0.5", "db:10.0.0.5"), ("v6:fd00::5", "v6:fd00::5"), ("v6=[fd00::5]", "v6:fd00::5"), ("repo-server.internal:10.8.0.2", "repo-server.internal:10.8.0.2")] {
+        for (text, shown) in [("db:10.0.0.5", "db:10.0.0.5"), ("db=10.0.0.5", "db:10.0.0.5"), ("v6:fd00::5", "v6:fd00::5"), ("v6=[fd00::5]", "v6:fd00::5"), ("git.internal:10.8.0.2", "git.internal:10.8.0.2")] {
             let host = ExtraHost::parse(text).unwrap();
             assert_eq!(host.to_string(), shown);
             assert_eq!(ExtraHost::parse(&host.to_string()).unwrap(), host);

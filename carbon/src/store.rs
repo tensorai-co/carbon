@@ -663,7 +663,7 @@ mod tests {
             exit: Some(3),
             mounts: vec![crate::Mount::volume("data", "/data"), crate::Mount::tmpfs("/tmp").read_only()],
             hostname: Some("sbx-8f3a".into()),
-            extra_hosts: vec![crate::ExtraHost::parse("repo-server:10.8.0.5").unwrap(), crate::ExtraHost::parse("v6=[fd00::5]").unwrap()],
+            extra_hosts: vec![crate::ExtraHost::parse("git:10.8.0.5").unwrap(), crate::ExtraHost::parse("v6=[fd00::5]").unwrap()],
             rules: crate::Rules::new().deny("0.0.0.0/0").unwrap().allow("pypi.org:443").unwrap(),
         };
         assert_eq!(Record::from_json(&record.to_json()), Some(record));

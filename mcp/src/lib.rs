@@ -49,6 +49,9 @@ pub struct Options {
     pub network: Option<Network>,
     pub memory: Option<String>,
     pub timeout: Option<Duration>,
+    /// Registries for every machine it starts (`--registries`): an agent's calls can't change them, and the Engine
+    /// API's `Registries` replaces them for the machine it makes.
+    pub registries: Option<carbon::Registries>,
     /// List only these tools.
     pub tools: Option<Vec<String>>,
     /// Also serve the Engine API (`--engine`).

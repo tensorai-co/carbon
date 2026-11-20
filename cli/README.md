@@ -97,6 +97,11 @@ carbon atlas imports ~/installers/          # a folder of them: which load, and 
 | `--deny-exec PATTERN` | Refuses to start programs whose arguments match: the first word is a program's name (`rm`, not `/bin/rm`), each after it one argument, with `*` and `?` as a shell has them, and a last `*` takes any arguments left. In a Linux machine the program gets EACCES (126 from a shell); in a Windows one, ERROR_ACCESS_DENIED; a first program refused is an error |
 | `--deny HOST\|ADDRESS\|NETWORK[:PORT]` | Refuses connections there (TCP connects, and UDP to each new destination): `0.0.0.0/0` and `::/0` for everything |
 | `--allow HOST\|ADDRESS\|NETWORK[:PORT]` | Lets connections there through, whatever `--deny` says: a host takes its subdomains, and matches the name the machine looked up |
+| `--registries apt` | Its package managers answered by Carbon at `registry.carbon`, and each request sent to `--upstream` as one checked call ([registries](../registries/README.md)). Nothing the machine sends goes anywhere, so it works under `--deny 0.0.0.0/0` and `--network none`. The server is asked what it serves first, and the machine doesn't start if it lacks one. For this run only, as rules are |
+| `--upstream URL\|SERVICE=URL` | The package server: `https://…`, or `http://` to this host's loopback |
+| `--upstream-token-file FILE` | The token sent with every call, as a bearer. It's never in the machine |
+| `--registry-meta KEY=VALUE` | A field of `meta` on every call, for the server (`sid=8f3a`) |
+| `--deny-registry SERVICE[:OP] [FIELD=PATTERN ...]` | Refuses registry calls that match: `npm`, `git:push`, `'apt:deb name=nmap*'`. apt prints `403 Forbidden - this machine's rules refuse it`, and nothing is sent |
 
 `carbon exec [options] NAME COMMAND [ARGS...]` runs a command in a running machine, as `docker exec` does: a process
 of its own (lambda: a session with no parent in the machine; atlas: a console of its own), with the machine's
@@ -142,8 +147,9 @@ digests. `carbon history IMAGE` is the history as a table; `carbon tag SOURCE TA
 `carbon mcp [options]` is Carbon's front door: an MCP server over this Carbon home, on stdin and stdout for an agent's
 client to start, or on the network with `-H` ([`mcp`](../mcp/README.md) has its tools, the Engine API and who may
 connect). `--machine NAME` serves one machine alone; `--host-dir DIR` is a host folder its tools may name (for binds,
-copies, build contexts and archives; none by default, and then no host paths at all); `--deny-exec`, `--deny` and
-`--allow` are rules on every machine it starts, and `--network`, `--memory` and `--timeout` their defaults, as `carbon
+copies, build contexts and archives; none by default, and then no host paths at all); `--deny-exec`, `--deny`,
+`--allow` and `--deny-registry` are rules on every machine it starts, `--network`, `--memory` and `--timeout` their
+defaults, and `--registries`, `--upstream`, `--upstream-token-file` and `--registry-meta` their registries, as `carbon
 run` takes them; `--tools a,b` lists only those.
 
 On the network: `-H ADDR` (repeatable) listens on `host:port` or a Unix socket's path, serving MCP at `POST /mcp` and

@@ -87,6 +87,15 @@ usage: carbon <command> ...
       --deny HOST|ADDRESS|NETWORK[:PORT]     refuse connections there: 0.0.0.0/0 and ::/0 for everything
       --allow HOST|ADDRESS|NETWORK[:PORT]    let connections there through, whatever --deny says: pypi.org:443
                                              (a host takes its subdomains), 10.0.0.0/8, [::1]:53
+      --registries apt                       its package managers answered by Carbon at registry.carbon, and each
+                                             request sent to --upstream as one checked call (POST /v1/apt/deb, …);
+                                             nothing the machine sends goes anywhere, and it works under --deny
+                                             0.0.0.0/0 and --network none
+      --upstream URL|SERVICE=URL             the package server: https://…, or http:// to this host's loopback
+      --upstream-token-file FILE             the token sent with every call (as a bearer), never in the machine
+      --registry-meta KEY=VALUE              a field of meta on every call, for the server: sid=8f3a
+      --deny-registry SERVICE[:OP] [FIELD=PATTERN ...]
+                                             refuse registry calls: npm, git:push, 'apt:deb name=nmap*'
   exec [options] NAME COMMAND [ARGS...]      run a command in a running machine, as docker exec
       -i, --interactive                      keep stdin
       -t, --tty                              a terminal of its own, this one (-it for a shell)
@@ -113,9 +122,9 @@ usage: carbon <command> ...
       -q, --quiet                            print only the image's name
   volume create|ls|inspect|rm [NAME]         volumes: folders kept under CARBON_HOME that machines mount and outlive
   logs [-f] [--tail N] NAME                  what a machine run with -d wrote: -f keeps following until it stops
-  watch NAME [--exec] [--output] [--net] [--json]
+  watch NAME [--exec] [--output] [--net] [--registry] [--json]
                                              what a running machine does, as it does it: the programs it starts,
-                                             what they write, its connections and lookups, and what its rules and
+                                             what they write, its connections, lookups and registry calls, and what its rules and
                                              hooks decided (everything unless some are named; --json: a line each)
   ps [--filter label=KEY[=VALUE]]            the machines, and which are running (ls too); with a filter, only
                                              those with that label (as many filters as wanted, all of them)
@@ -153,8 +162,11 @@ usage: carbon <command> ...
       --machine NAME                         serve one machine alone: its tools, with no machine argument
       --host-dir DIR                         a host folder tools may name, for binds, copies and archives (as many
                                              as wanted; none by default, and then no host paths at all)
-      --deny-exec, --deny, --allow           rules on every machine it starts, as carbon run's
+      --deny-exec, --deny, --allow, --deny-registry
+                                             rules on every machine it starts, as carbon run's
       --network, --memory, --timeout         defaults for every machine it starts, as carbon run's
+      --registries, --upstream, --upstream-token-file, --registry-meta
+                                             registries for every machine it starts, as carbon run's
       --tools NAME,...                       list only these tools
       -H, --host ADDR                        listen on host:port, or a Unix socket's path (no scheme), instead of
                                              stdio: MCP at POST /mcp, and a WebSocket carrying everything, on the
@@ -423,6 +435,7 @@ fn run(carbon: &Carbon, mut args: impl Iterator<Item = String>) -> ! {
     let (mut interactive, mut tty, mut detach) = (false, false, false);
     let mut options: Vec<Box<dyn FnOnce(carbon::MachineSpec) -> carbon::MachineSpec>> = Vec::new();
     let mut rules = Rules::new();
+    let mut registries = carbon::Registries::default();
     while let Some(arg) = args.next() {
         // `--flag=value` as well as `--flag value`, and a short flag's `-p=value` and `-pvalue`, as Docker takes them.
         let (arg, inline) = match arg.split_once('=') {
@@ -560,6 +573,8 @@ fn run(carbon: &Carbon, mut args: impl Iterator<Item = String>) -> ! {
             "--deny-exec" => rules = rules.deny_exec(&value("--deny-exec")),
             "--deny" => rules = rules.deny(&value("--deny")).unwrap_or_else(|e| fail(format!("--deny {e}"))),
             "--allow" => rules = rules.allow(&value("--allow")).unwrap_or_else(|e| fail(format!("--allow {e}"))),
+            "--deny-registry" => rules = rules.deny_registry(&value("--deny-registry")).unwrap_or_else(|e| fail(e)),
+            flag if registry_flag(&mut registries, flag, &mut value) => {}
             flag if flag.starts_with('-') => fail(format!("run doesn't know {flag}")),
             _ if source.is_none() => source = Some(arg),
             _ => {
@@ -590,6 +605,9 @@ fn run(carbon: &Carbon, mut args: impl Iterator<Item = String>) -> ! {
     let mut spec = spec.stdin(if interactive { Stdio::Inherit } else { Stdio::Null }).tty(interactive && tty).relay_signals(!detach).rules(rules);
     for option in options {
         spec = option(spec);
+    }
+    if let Some(r) = registries_given(registries) {
+        spec = spec.registries(r);
     }
     if detach {
         // In a process of its own, which outlives this one: its name, as Docker prints a container's id.
@@ -716,6 +734,7 @@ fn mcp(carbon: &Carbon, mut args: impl Iterator<Item = String>) {
     let mut net = mcp::net::NetOptions::default();
     let (mut tls, mut tlscert, mut tlskey) = (false, None, None);
     let mut rules = Rules::new();
+    let mut registries = carbon::Registries::default();
     while let Some(arg) = args.next() {
         let (arg, inline) = match arg.split_once('=') {
             Some((flag, value)) if flag.starts_with("--") => (flag.to_string(), Some(value.to_string())),
@@ -728,6 +747,8 @@ fn mcp(carbon: &Carbon, mut args: impl Iterator<Item = String>) {
             "--deny-exec" => rules = rules.deny_exec(&value("--deny-exec")),
             "--deny" => rules = rules.deny(&value("--deny")).unwrap_or_else(|e| fail(format!("--deny {e}"))),
             "--allow" => rules = rules.allow(&value("--allow")).unwrap_or_else(|e| fail(format!("--allow {e}"))),
+            "--deny-registry" => rules = rules.deny_registry(&value("--deny-registry")).unwrap_or_else(|e| fail(e)),
+            flag if registry_flag(&mut registries, flag, &mut value) => {}
             "--network" => {
                 let text = value("--network");
                 options.network = Some(carbon::parse_network(&text).unwrap_or_else(|| fail(format!("--network {text}: nat, none or host"))));
@@ -748,12 +769,14 @@ fn mcp(carbon: &Carbon, mut args: impl Iterator<Item = String>) {
             "--allow-origin" => net.allow_origins.push(value("--allow-origin")),
             "--no-auth" => net.no_auth = true,
             other => fail(format!(
-                "mcp doesn't know {other}: --machine, --host-dir, --deny-exec, --deny, --allow, --network, --memory, --timeout, --tools, \
+                "mcp doesn't know {other}: --machine, --host-dir, --deny-exec, --deny, --allow, --deny-registry, --registries, --upstream, \
+                 --upstream-token-file, --registry-meta, --network, --memory, --timeout, --tools, \
                  -H, --engine, --max-sessions, --tls, --tlscert, --tlskey, --token-file, --allow-origin, --no-auth"
             )),
         }
     }
     options.rules = rules;
+    options.registries = registries_given(registries);
     // Docker's TLS flags: --tlscert and --tlskey alone imply --tls, and --tls needs both.
     match (tls || tlscert.is_some() || tlskey.is_some(), tlscert, tlskey) {
         (false, ..) => {}
@@ -780,6 +803,41 @@ fn mcp(carbon: &Carbon, mut args: impl Iterator<Item = String>) {
     mcp::net::serve(server, net).unwrap_or_else(|e| fail(format!("mcp: {e}")));
 }
 
+/// Reads `--registries`, `--upstream`, `--upstream-token-file` and `--registry-meta` into `r`: whether `flag` is one.
+fn registry_flag(r: &mut carbon::Registries, flag: &str, value: &mut dyn FnMut(&str) -> String) -> bool {
+    let taken = std::mem::take(r);
+    *r = match flag {
+        "--registries" => taken.services_flag(&value("--registries")),
+        "--upstream" => taken.upstream_flag(&value("--upstream")).unwrap_or_else(|e| fail(e)),
+        "--upstream-token-file" => {
+            let path = value("--upstream-token-file");
+            let token = std::fs::read_to_string(&path).unwrap_or_else(|e| fail(format!("--upstream-token-file {path}: {e}")));
+            let token = token.trim();
+            if token.is_empty() || token.contains(char::is_whitespace) {
+                fail(format!("--upstream-token-file {path}: one token, on its own"));
+            }
+            taken.token(token)
+        }
+        "--registry-meta" => taken.meta_flag(&value("--registry-meta")).unwrap_or_else(|e| fail(e)),
+        _ => {
+            *r = taken;
+            return false;
+        }
+    };
+    true
+}
+
+/// The registries flags gave, if any: a server or a token with no `--registries` is a mistake, said so.
+fn registries_given(r: carbon::Registries) -> Option<carbon::Registries> {
+    if r.is_empty() {
+        if r != carbon::Registries::default() {
+            fail("--upstream, --upstream-token-file and --registry-meta are for --registries: which ones (apt)?");
+        }
+        return None;
+    }
+    Some(r)
+}
+
 fn watch(machine: &Machine, args: impl Iterator<Item = String>) {
     let mut interest = Interest::none();
     let mut json = false;
@@ -788,8 +846,9 @@ fn watch(machine: &Machine, args: impl Iterator<Item = String>) {
             "--exec" => interest |= Interest::exec(),
             "--output" => interest |= Interest::output(),
             "--net" | "--network" => interest |= Interest::network(),
+            "--registry" | "--registries" => interest |= Interest::registry(),
             "--json" => json = true,
-            other => fail(format!("watch doesn't know {other}: --exec, --output, --net, --json")),
+            other => fail(format!("watch doesn't know {other}: --exec, --output, --net, --registry, --json")),
         }
     }
     if interest.is_empty() {

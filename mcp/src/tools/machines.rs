@@ -212,6 +212,9 @@ fn spec(server: &Server, args: &Args, image: &Image) -> Result<MachineSpec, Fail
     if let Some(m) = args.opt_str("memory").or_else(|| server.options.memory.clone()) {
         spec = spec.memory(m);
     }
+    if let Some(r) = &server.options.registries {
+        spec = spec.registries(r.clone());
+    }
     for text in args.strings("mounts") {
         let mount = Mount::parse(&text)?;
         if let MountKind::Bind(path) = &mount.kind {

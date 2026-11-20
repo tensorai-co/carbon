@@ -66,7 +66,7 @@ fn kind_of(name: &str) -> ErrorKind {
 }
 
 fn kinds(interest: Interest) -> Vec<&'static str> {
-    [(Kind::Exec, "exec"), (Kind::Output, "output"), (Kind::Connect, "connect"), (Kind::Lookup, "lookup")]
+    [(Kind::Exec, "exec"), (Kind::Output, "output"), (Kind::Connect, "connect"), (Kind::Lookup, "lookup"), (Kind::Registry, "registry")]
         .into_iter()
         .filter(|(k, _)| interest.has(*k))
         .map(|(_, name)| name)
@@ -80,6 +80,7 @@ fn interest_of(names: &[String]) -> Interest {
             "output" => Interest::output(),
             "connect" => Interest::connect(),
             "lookup" => Interest::lookup(),
+            "registry" => Interest::registry(),
             _ => Interest::none(),
         }
     })
@@ -134,6 +135,7 @@ fn spec_json(home: &Path, launch: &Launch, rules: &Rules, link: Option<(&Path, I
         "timeout_ms": launch.timeout.map(|t| t.as_millis() as u64),
         "mounts": launch.mounts.as_deref().map(crate::mounts::mounts_json),
         "user": launch.user,
+        "registries": launch.registries.as_ref().map(crate::Registries::to_json),
         "rules": rules.to_json(),
         "link": link.map(|(path, interest)| json!({ "path": path, "kinds": kinds(interest) })),
     })
@@ -213,6 +215,10 @@ fn spec_from_json(v: &Value) -> Result<(PathBuf, Launch, Rules, Option<(PathBuf,
         timeout: v.get("timeout_ms").and_then(Value::as_u64).map(Duration::from_millis),
         mounts: v.get("mounts").filter(|m| !m.is_null()).map(|m| crate::mounts::mounts_from_json(Some(m))),
         user: s("user"),
+        registries: match v.get("registries").filter(|r| !r.is_null()) {
+            Some(r) => Some(crate::Registries::from_json(r).map_err(|_| bad("registries"))?),
+            None => None,
+        },
         hub: Hub::new(),
     };
     let rules = Rules::from_json(v.get("rules").unwrap_or(&Value::Null))?;
@@ -268,6 +274,7 @@ fn decide(hub: &Hub, event: Event) -> Value {
         Event::Output(e) => decision_json(hub.output(e)),
         Event::Connect(e) => decision_json(hub.connect(e)),
         Event::Lookup(e) => decision_json(hub.lookup(e)),
+        Event::Registry(e) => decision_json(hub.registry(e)),
     }
 }
 
@@ -332,6 +339,9 @@ mod unix {
             self.ask(e).unwrap_or(Decision::Deny)
         }
         fn lookup(&self, e: &hooks::Lookup) -> Decision<hooks::Lookup> {
+            self.ask(e).unwrap_or(Decision::Deny)
+        }
+        fn registry(&self, e: &hooks::Registry) -> Decision<hooks::Registry> {
             self.ask(e).unwrap_or(Decision::Deny)
         }
         fn interest(&self) -> Interest {
@@ -600,9 +610,10 @@ mod tests {
             timeout: Some(Duration::from_secs(5)),
             mounts: Some(vec![crate::Mount::volume("data", "/data")]),
             user: Some("node".into()),
+            registries: Some(crate::Registries::new(["apt"]).upstream("https://pkg.example.com").unwrap().token("t").meta("sid", "8f3a")),
             hub: Hub::new(),
         };
-        let rules = Rules::new().deny_exec("rm -rf *").deny("0.0.0.0/0").unwrap();
+        let rules = Rules::new().deny_exec("rm -rf *").deny("0.0.0.0/0").unwrap().deny_registry("apt:deb name=nmap").unwrap();
         let v = spec_json(Path::new("/tmp/home"), &launch, &rules, Some((Path::new("/tmp/link.sock"), Interest::exec() | Interest::lookup())));
         let (home, back, rules_back, link) = spec_from_json(&v).unwrap();
         assert_eq!(home, PathBuf::from("/tmp/home"));
@@ -615,6 +626,7 @@ mod tests {
         assert_eq!(back.labels, [("team".to_string(), "infra".to_string())]);
         assert_eq!(back.extra_hosts.as_ref().map(|h| h[0].to_string()), Some("db:10.0.0.5".to_string()));
         assert_eq!(rules_back, rules);
+        assert_eq!(back.registries, launch.registries);
         assert_eq!(link, Some((PathBuf::from("/tmp/link.sock"), Interest::exec() | Interest::lookup())));
     }
 

@@ -28,6 +28,8 @@ pub struct Loop {
     peers: Mutex<HashMap<SocketAddr, Peer>>,
     names: Mutex<HashMap<String, Vec<IpAddr>>>,
     dns: Mutex<Option<Answer>>,
+    /// The host program's own services at the gateway, by port.
+    services: Mutex<HashMap<u16, Peer>>,
 }
 
 impl Loop {
@@ -42,6 +44,11 @@ impl Loop {
     /// What looking `name` up finds.
     pub fn name(&self, name: &str, addrs: &[IpAddr]) {
         lock(&self.names).insert(name.to_ascii_lowercase(), addrs.to_vec());
+    }
+
+    /// A service of the host program's own at the gateway's `port` ([`Host::gateway`]).
+    pub fn service(&self, port: u16, peer: Peer) {
+        lock(&self.services).insert(port, peer);
     }
 
     /// How the host's DNS servers answer a query.
@@ -180,6 +187,11 @@ impl Host for Arc<Loop> {
 
     fn query(&self, packet: &[u8], _server: Option<SocketAddr>) -> Result<Vec<u8>> {
         lock(&self.dns).as_ref().and_then(|answer| answer(packet)).ok_or(Error::TimedOut)
+    }
+
+    fn gateway(&self, port: u16, wake: Waker) -> Option<Box<dyn HostStream>> {
+        let peer = lock(&self.services).get(&port).copied()?;
+        Some(Box::new(LoopStream { peer: Some(peer), state: Mutex::default(), wake }))
     }
 
     fn addresses(&self) -> Vec<IpAddr> {

@@ -4,7 +4,7 @@
 
 use std::net::IpAddr;
 
-use hooks::{Connect, Decision, Exec, Hooks, Interest};
+use hooks::{Connect, Decision, Exec, Hooks, Interest, Registry};
 use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
@@ -22,6 +22,49 @@ pub struct Rules {
     deny_exec: Vec<Vec<String>>,
     allow: Vec<Target>,
     deny: Vec<Target>,
+    deny_registry: Vec<RegistryRule>,
+}
+
+/// Registry calls a rule refuses: a service, maybe one op of it, and maybe fields that must match (`*` and `?` as a
+/// shell has them): `npm`, `git:push`, `apt:deb name=nmap*`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegistryRule {
+    service: String,
+    op: Option<String>,
+    fields: Vec<(String, String)>,
+}
+
+impl RegistryRule {
+    fn parse(text: &str) -> Result<RegistryRule> {
+        let bad = || Error::invalid(format!("--deny-registry {text}: SERVICE[:OP] [FIELD=PATTERN ...], as npm, git:push, 'apt:deb name=nmap*'"));
+        let mut words = text.split_whitespace();
+        let first = words.next().ok_or_else(bad)?;
+        let (service, op) = match first.split_once(':') {
+            Some((s, o)) if !o.is_empty() => (s, Some(o.to_string())),
+            Some(_) => return Err(bad()),
+            None => (first, None),
+        };
+        if service.is_empty() || !service.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) {
+            return Err(bad());
+        }
+        let fields = words.map(|w| w.split_once('=').filter(|(k, _)| !k.is_empty()).map(|(k, v)| (k.to_string(), v.to_string())).ok_or_else(bad)).collect::<Result<_>>()?;
+        Ok(RegistryRule { service: service.to_string(), op, fields })
+    }
+
+    fn text(&self) -> String {
+        let mut text = self.service.clone();
+        if let Some(op) = &self.op {
+            text = format!("{text}:{op}");
+        }
+        for (k, v) in &self.fields {
+            text = format!("{text} {k}={v}");
+        }
+        text
+    }
+
+    fn matches(&self, r: &Registry) -> bool {
+        r.service == self.service && self.op.as_ref().is_none_or(|op| *op == r.op) && self.fields.iter().all(|(k, pattern)| glob(pattern, r.param(k)))
+    }
 }
 
 /// Where a network rule applies: a name (and the names under it) or a network of addresses, on a port or any.
@@ -158,8 +201,16 @@ impl Rules {
         Ok(self)
     }
 
+    /// Refuses its registries' calls that match `pattern` (`--deny-registry`): a service (`npm`), one of its ops
+    /// (`git:push`), and fields that must match, with `*` and `?` (`apt:deb name=nmap*`). The tool gets its own
+    /// refusal, saying the machine's rules refuse it, and nothing is sent.
+    pub fn deny_registry(mut self, pattern: &str) -> Result<Rules> {
+        self.deny_registry.push(RegistryRule::parse(pattern)?);
+        Ok(self)
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.deny_exec.is_empty() && self.allow.is_empty() && self.deny.is_empty()
+        self.deny_exec.is_empty() && self.allow.is_empty() && self.deny.is_empty() && self.deny_registry.is_empty()
     }
 
     /// These rules and `other`'s together.
@@ -167,6 +218,7 @@ impl Rules {
         self.deny_exec.extend(other.deny_exec);
         self.allow.extend(other.allow);
         self.deny.extend(other.deny);
+        self.deny_registry.extend(other.deny_registry);
         self
     }
 
@@ -176,6 +228,7 @@ impl Rules {
             "deny_exec": self.deny_exec.iter().map(|w| w.join(" ")).collect::<Vec<_>>(),
             "allow": self.allow.iter().map(Target::text).collect::<Vec<_>>(),
             "deny": self.deny.iter().map(Target::text).collect::<Vec<_>>(),
+            "deny_registry": self.deny_registry.iter().map(RegistryRule::text).collect::<Vec<_>>(),
         })
     }
 
@@ -191,6 +244,9 @@ impl Rules {
         }
         for target in list("deny") {
             rules = rules.deny(&target)?;
+        }
+        for pattern in list("deny_registry") {
+            rules = rules.deny_registry(&pattern)?;
         }
         Ok(rules)
     }
@@ -227,6 +283,10 @@ impl Hooks for Rules {
         }
     }
 
+    fn registry(&self, r: &Registry) -> Decision<Registry> {
+        if self.deny_registry.iter().any(|rule| rule.matches(r)) { Decision::deny() } else { Decision::pass() }
+    }
+
     fn interest(&self) -> Interest {
         let mut interest = Interest::none();
         if !self.deny_exec.is_empty() {
@@ -234,6 +294,9 @@ impl Hooks for Rules {
         }
         if !self.allow.is_empty() || !self.deny.is_empty() {
             interest |= Interest::connect();
+        }
+        if !self.deny_registry.is_empty() {
+            interest |= Interest::registry();
         }
         interest
     }
@@ -268,6 +331,23 @@ mod tests {
         let rules = Rules::new().deny_exec("rm -rf *").deny("0.0.0.0/0").unwrap().deny("[::1]:53").unwrap().allow("pypi.org:443").unwrap().allow("10.89.0.0/16").unwrap();
         assert_eq!(Rules::from_json(&rules.to_json()).unwrap(), rules);
         assert_eq!(Rules::new().merge(rules.clone()), rules);
+    }
+
+    #[test]
+    fn registry_rules() {
+        let rules = Rules::new().deny_registry("npm").unwrap().deny_registry("git:push").unwrap().deny_registry("apt:deb name=nmap* arch=amd64").unwrap();
+        let deny = |r: Registry| matches!(rules.registry(&r), Decision::Deny);
+        assert!(deny(Registry::new("npm", "tarball")));
+        assert!(deny(Registry::new("git", "push")));
+        assert!(!deny(Registry::new("git", "pack")));
+        assert!(deny(Registry::new("apt", "deb").with("name", "nmap-common").with("arch", "amd64")));
+        assert!(!deny(Registry::new("apt", "deb").with("name", "nmap").with("arch", "arm64")));
+        assert!(!deny(Registry::new("apt", "release")));
+        assert_eq!(Rules::from_json(&rules.to_json()).unwrap(), rules);
+        assert_eq!(rules.interest(), Interest::registry());
+        for bad in ["", "apt:", "APT", "apt:deb name", "apt:deb =x"] {
+            assert!(Rules::new().deny_registry(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

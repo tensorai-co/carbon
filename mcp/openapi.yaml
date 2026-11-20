@@ -445,7 +445,7 @@ components:
               type: array
               items: { type: string }
               description: "Lines for its /etc/hosts: `NAME:IP` (or `NAME=IP`). Linux machines."
-              examples: [["repo-server.internal:10.8.0.2"]]
+              examples: [["git.internal:10.8.0.2"]]
             Tmpfs:
               type: object
               additionalProperties: { type: string }

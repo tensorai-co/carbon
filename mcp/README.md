@@ -135,7 +135,7 @@ path's and query's parts join the JSON body as params.
 | Method | Params | Answer |
 | --- | --- | --- |
 | `system.version`, `system.ping` | | `{Version, ApiVersion, Os, Arch}`; `"OK"` |
-| `machines.create` | `Image`, `Name`, `Hostname`, `Platform`, `Env` (`NAME=VALUE`s), `Cmd`, `WorkingDir`, `User`, `Labels` (`{key: value}`), `HostConfig` (`ExtraHosts`: `NAME:IP`s; `NetworkMode`: `nat`/`bridge`, `none`, `host`; `Memory` in bytes; `Tmpfs`: `{target: ""}`; `Binds`: `SOURCE:TARGET[:ro]`; `Mounts`: `{Type, Source, Target, ReadOnly}`), and `Rules`: `{Deny, Allow, DenyExec}` | `{Id}` |
+| `machines.create` | `Image`, `Name`, `Hostname`, `Platform`, `Env` (`NAME=VALUE`s), `Cmd`, `WorkingDir`, `User`, `Labels` (`{key: value}`), `HostConfig` (`ExtraHosts`: `NAME:IP`s; `NetworkMode`: `nat`/`bridge`, `none`, `host`; `Memory` in bytes; `Tmpfs`: `{target: ""}`; `Binds`: `SOURCE:TARGET[:ro]`; `Mounts`: `{Type, Source, Target, ReadOnly}`), `Rules`: `{Deny, Allow, DenyExec, DenyRegistry}`, and `Registries`: `{Services, Upstream, Upstreams: {service: URL}, Token, Meta: {key: value}}` (its package managers answered by Carbon, each request sent to the server as a checked call with `Token`, which never goes in the machine; see [registries](../registries/README.md)) | `{Id}` |
 | `machines.start`, `.stop` (`Timeout` s, 10 by default, then killed; answered once stopped), `.kill`, `.wait` (`Timeout`), `.remove` (`Force`) | `Id` | `{}`; `.wait`: `{StatusCode, Ended}` |
 | `machines.inspect`, `.list` (`Label`: `KEY` or `KEY=VALUE`, one or a list, all matching), `.logs` (`Tail`) | `Id` | the machine, with `Config` (`Hostname`, `Env`, `Cmd`, `WorkingDir`, `User`, `Labels`) and `HostConfig.ExtraHosts`; rows `{Id, Name, Image, Created, State, Platform, Labels}`; lines |
 | `machines.exec` | `Id`, `Cmd`, `Env`, `WorkingDir`, `User`, `Timeout`, `Stream` | without `Stream`: `{ExitCode, Stdout, Stderr, TimedOut}`. With one, on a WebSocket: stdin from the client's `stdin` frames until `end`, output as `stdout` and `stderr` frames, then an `exit` frame, and `{ExitCode}` |
@@ -154,6 +154,9 @@ path's and query's parts join the JSON body as params.
   runs, and the stream's id is the client's to choose, unique among its open streams.
 - **Rules** given to `carbon mcp` (and cloud metadata refused) apply to every machine, merged with a request's own
   `Rules`.
+- **Registries** given to `carbon mcp` (`--registries`, `--upstream`, `--upstream-token-file`, `--registry-meta`) go to
+  every machine it starts, unless `machines.create` gives its own `Registries`. No tool takes them, so an agent can't
+  point its machine's package managers anywhere else.
 - **Errors:** JSON-RPC codes `-32602` invalid, `-32004` not found, `-32009` conflict, `-32001` forbidden, `-32005`
   unsupported, `-32000` failed, with `data.kind`. REST uses 400, 404, 409, 403, 501 and 500, with
   `{"message", "kind"}`.

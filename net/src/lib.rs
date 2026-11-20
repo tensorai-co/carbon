@@ -218,6 +218,9 @@ pub struct Config {
     /// Where the resolver asks what it doesn't answer itself, instead of the host's resolver (`--dns`).
     pub dns: Option<SocketAddr>,
     pub mode: Mode,
+    /// Names the machine's DNS answers with its gateway's address, in any mode: where the host program's own
+    /// services are ([`Host::gateway`]).
+    pub gateway_names: Vec<String>,
 }
 
 /// A network interface, as programs see it.
@@ -383,6 +386,9 @@ impl Network {
         if name == "localhost" {
             return Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)]);
         }
+        if self.0.is_gateway_name(&name) {
+            return Ok(vec![IpAddr::V4(self.0.gateway)]);
+        }
         if name.is_empty() || self.0.config.mode == Mode::None {
             return Err(Error::NotFound);
         }
@@ -460,6 +466,11 @@ impl Network {
 impl Shared {
     pub(crate) fn hostname(&self) -> String {
         lock(&self.hostname).clone()
+    }
+
+    /// Whether `name` (lowercase, without its final dot) is one of the gateway's.
+    pub(crate) fn is_gateway_name(&self, name: &str) -> bool {
+        self.config.gateway_names.iter().any(|n| n.trim_end_matches('.').eq_ignore_ascii_case(name))
     }
 
     pub(crate) fn place(&self, ip: IpAddr) -> Place {

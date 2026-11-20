@@ -232,6 +232,10 @@ pub fn event_json(event: &hooks::Event) -> Value {
             "kind": "connect", "proto": if c.proto == hooks::Proto::Tcp { "tcp" } else { "udp" }, "to": c.to.to_string(), "name": c.name,
         }),
         hooks::Event::Lookup(l) => json!({ "kind": "lookup", "name": l.name }),
+        hooks::Event::Registry(r) => json!({
+            "kind": "registry", "service": r.service, "op": r.op,
+            "params": r.params.iter().map(|(n, v)| (n.clone(), Value::from(v.clone()))).collect::<serde_json::Map<String, Value>>(),
+        }),
     }
 }
 
@@ -265,6 +269,11 @@ pub fn event_from_json(v: &Value) -> Option<hooks::Event> {
             name: s("name").map(String::from),
         }),
         "lookup" => hooks::Event::Lookup(hooks::Lookup::new(s("name")?)),
+        "registry" => hooks::Event::Registry(hooks::Registry {
+            service: s("service")?.to_string(),
+            op: s("op")?.to_string(),
+            params: v.get("params").and_then(Value::as_object).map(|m| m.iter().filter_map(|(n, x)| Some((n.clone(), x.as_str()?.to_string()))).collect()).unwrap_or_default(),
+        }),
         _ => return None,
     })
 }

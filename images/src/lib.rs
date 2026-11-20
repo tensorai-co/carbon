@@ -23,6 +23,9 @@ pub use push::{Progress as PushProgress, Pushed, Stage as PushStage};
 pub mod store;
 mod tls;
 
+/// A TLS client configuration that trusts what the host trusts, for anything else that speaks HTTPS for Carbon.
+pub use tls::client_config;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 

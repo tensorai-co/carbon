@@ -83,6 +83,7 @@ mod machine;
 mod mounts;
 mod users;
 mod network;
+mod registries;
 mod rules;
 #[cfg(unix)]
 mod signals;
@@ -105,6 +106,7 @@ pub use files::{Copy, DirEntry, FileInfo, FileKind, Files, MOST_READ, Remove, Wr
 pub use logs::{LogLine, LogReader, LogStream, Logs};
 pub use mounts::{Mount, MountKind, Volume, VolumeInfo};
 pub use network::ExtraHost;
+pub use registries::Registries;
 pub use rules::Rules;
 pub use spec::{Audio, Display, Exit, MachineSpec, MemorySize, Output, Running, parse_size};
 pub use stdio::{Chunks, Stdin, Stdio};

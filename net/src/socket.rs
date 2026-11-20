@@ -437,7 +437,7 @@ impl Socket {
                         other => other,
                     },
                     Place::Local => self.join_tcp(*to),
-                    Place::Gateway => Err(Error::ConnectionRefused),
+                    Place::Gateway => self.connect_gateway(*to),
                     Place::Subnet => Err(Error::HostUnreachable),
                     Place::Out => self.connect_out(*to),
                 }
@@ -583,6 +583,28 @@ impl Socket {
         let mut state = self.state();
         stream.set_nodelay(state.options.nodelay);
         stream.set_keepalive(state.options.keepalive);
+        state.local = Some(Addr::Inet(as_domain(self.0.domain, shown)));
+        state.peer = Some(Addr::Inet(as_domain(self.0.domain, to)));
+        state.error = None;
+        state.conn = Conn::Connecting(stream);
+        settle(&mut state);
+        match state.conn {
+            Conn::Out { .. } => Ok(()),
+            Conn::Failed => Err(state.error.take().unwrap_or(Error::ConnectionRefused)),
+            _ => Err(Error::InProgress),
+        }
+    }
+
+    /// A connection to a service of the host program's own at the gateway ([`crate::Host::gateway`]), made as a
+    /// connection out is, in any mode.
+    fn connect_gateway(&self, to: SocketAddr) -> Result<()> {
+        let bound = self.ensure_bound()?;
+        let stream = self.net().host.gateway(to.port(), waker_for(&self.0.watchers)).ok_or(Error::ConnectionRefused)?;
+        let shown = match to {
+            SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(self.net().address), bound.port()),
+            SocketAddr::V6(_) => SocketAddr::new(unspecified(Domain::Inet6), bound.port()),
+        };
+        let mut state = self.state();
         state.local = Some(Addr::Inet(as_domain(self.0.domain, shown)));
         state.peer = Some(Addr::Inet(as_domain(self.0.domain, to)));
         state.error = None;

@@ -19,6 +19,8 @@ members = [
     "audio/macos",
     "host",
     "net",
+    "registries/core",
+    "registries/apt",
     "gpu",
     "gpu/ir",
     "gpu/frontend",
@@ -58,6 +60,8 @@ audio = { path = "audio" }
 audio-macos = { path = "audio/macos" }
 host = { path = "host" }
 net = { path = "net" }
+registries-core = { path = "registries/core" }
+registries-apt = { path = "registries/apt" }
 gpu = { path = "gpu" }
 gpu-ir = { path = "gpu/ir" }
 gpu-frontend = { path = "gpu/frontend" }

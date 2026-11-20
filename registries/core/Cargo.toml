@@ -1,0 +1,16 @@
+[package]
+name = "registries-core"
+description = "Registries: a machine's package managers answered in Carbon, and each request sent upstream as one checked call"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+hooks.workspace = true
+ureq.workspace = true
+rustls.workspace = true
+serde_json.workspace = true

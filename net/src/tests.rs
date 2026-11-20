@@ -320,6 +320,33 @@ fn the_machines_dns() {
     assert_eq!(&srv[..2], &[0, 5]);
 }
 
+#[test]
+fn the_host_programs_services_at_the_gateway() {
+    for mode in [Mode::Nat, Mode::None] {
+        let host = Loop::new();
+        host.service(80, Peer::Echo);
+        let net = Network::new(Config { hostname: "box".into(), mode, gateway_names: vec!["registry.carbon".into()], ..Default::default() }, Arc::new(host.clone()));
+        // Its names are the gateway's, as the machine's lookups and its DNS give them, in any mode.
+        assert_eq!(net.lookup("Registry.Carbon.").unwrap(), vec![IpAddr::V4(net.gateway())]);
+        let s = net.socket(Domain::Inet, Kind::Datagram).unwrap();
+        let dns = Addr::Inet(SocketAddr::new(IpAddr::V4(net.gateway()), 53));
+        s.send(&query(7, "registry.carbon", 1), Some(&dns), &mut None).unwrap();
+        assert!(until(|| s.ready().read));
+        let a = s.recv(512, false).unwrap().data;
+        assert_eq!(&a[a.len() - 4..], &net.gateway().octets(), "{mode:?}");
+
+        // A connection to its port is the host program's, and only that port answers.
+        let c = net.socket(Domain::Inet, Kind::Stream).unwrap();
+        c.connect(&Addr::Inet(SocketAddr::new(IpAddr::V4(net.gateway()), 80))).unwrap();
+        assert_eq!(c.peer().unwrap(), Addr::Inet(SocketAddr::new(IpAddr::V4(net.gateway()), 80)));
+        assert_eq!(c.send(b"GET / HTTP/1.1\r\n\r\n", None, &mut None), Ok(18));
+        assert!(until(|| c.ready().read));
+        assert_eq!(recv_all(&c), b"GET / HTTP/1.1\r\n\r\n");
+        let other = net.socket(Domain::Inet, Kind::Stream).unwrap();
+        assert_eq!(other.connect(&Addr::Inet(SocketAddr::new(IpAddr::V4(net.gateway()), 8080))), Err(Error::ConnectionRefused));
+    }
+}
+
 fn query(id: u16, name: &str, qtype: u16) -> Vec<u8> {
     let mut q = id.to_be_bytes().to_vec();
     q.extend([0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
