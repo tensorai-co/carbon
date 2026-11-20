@@ -205,7 +205,8 @@ pub(crate) fn run(store: &Store, launch: Launch, notify: &Notify, started: &mut 
                 started(Started { name: name.clone(), stopper: stopper.clone(), ends });
             }
         };
-        let parts = Parts { exec, cpu, program: program.clone(), host_desktop: desktop, network, host: host.clone(), stopper: stopper.clone() };
+        let registry_env = registries.as_ref().map(|r| r.env(crate::registries::NAME)).unwrap_or_default();
+        let parts = Parts { exec, cpu, program: program.clone(), host_desktop: desktop, network, host: host.clone(), stopper: stopper.clone(), registry_env };
         #[cfg(unix)]
         let ended = boot(store, record, &launch, parts, notify, &mut ready, relay.as_ref());
         #[cfg(not(unix))]
@@ -277,6 +278,8 @@ struct Parts {
     network: net::Network,
     host: Arc<MachineHost>,
     stopper: Stopper,
+    /// What its registries' tools need in its environment (`NPM_CONFIG_REGISTRY`, …): over the image's, under `-e`.
+    registry_env: Vec<String>,
 }
 
 /// What the machine's hooks make of its first program: what to run, or an answer to give instead.
@@ -326,10 +329,10 @@ fn hooked_enter(enter: Enter, hub: Hub, os: hooks::Os) -> Enter {
 
 #[allow(clippy::too_many_lines)]
 fn boot(store: &Store, record: &Record, launch: &Launch, parts: Parts, notify: &Notify, ready: &mut dyn FnMut(), #[cfg(unix)] relay: Option<&crate::signals::Relay>) -> Result<i32> {
-    let Parts { exec, cpu, program, host_desktop, network, host, stopper } = parts;
+    let Parts { exec, cpu, program, host_desktop, network, host, stopper, registry_env } = parts;
     let hub = launch.hub.clone();
     let mut env = record.config.env.clone();
-    for var in &launch.env {
+    for var in registry_env.iter().chain(&launch.env) {
         let key = var.split('=').next().unwrap_or("");
         env.retain(|e| e.split('=').next() != Some(key));
         env.push(var.clone());

@@ -26,12 +26,14 @@ atlas.workspace = true
 hooks.workspace = true
 registries-core.workspace = true
 registries-apt = { workspace = true, optional = true }
+registries-npm = { workspace = true, optional = true }
 serde_json.workspace = true
 
 [features]
-default = ["apt"]
+default = ["apt", "npm"]
 # Each registry a machine can be given with --registries.
 apt = ["dep:registries-apt"]
+npm = ["dep:registries-npm"]
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

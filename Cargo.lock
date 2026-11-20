@@ -139,6 +139,7 @@ dependencies = [
  "net",
  "registries-apt",
  "registries-core",
+ "registries-npm",
  "serde_json",
 ]
 
@@ -863,7 +864,16 @@ dependencies = [
  "hooks",
  "rustls",
  "serde_json",
+ "sha2",
  "ureq",
+]
+
+[[package]]
+name = "registries-npm"
+version = "0.2.0"
+dependencies = [
+ "registries-core",
+ "serde_json",
 ]
 
 [[package]]

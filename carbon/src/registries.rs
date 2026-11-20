@@ -27,6 +27,8 @@ pub fn adapters() -> Vec<Arc<dyn Adapter>> {
     let mut all: Vec<Arc<dyn Adapter>> = Vec::new();
     #[cfg(feature = "apt")]
     all.push(registries_apt::Apt::adapter());
+    #[cfg(feature = "npm")]
+    all.push(registries_npm::Npm::adapter());
     all
 }
 

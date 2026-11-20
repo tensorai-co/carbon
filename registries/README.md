@@ -36,11 +36,13 @@ bearer. An answer is JSON, bytes (with `Carbon-Size`, and `Carbon-Digest` when i
 | --- | --- |
 | [`registries-core`](core/src/lib.rs) | `Registries` (what a machine gets: services, servers, token, meta), `Call` and op schemas, `Adapter` and `Conversation`, the HTTP/1.1 a tool is answered with, the upstream client, and `Server`, which ties them together |
 | [`registries-apt`](apt/src/lib.rs) | apt's paths as `release`, `index` and `deb` calls, and the answers back as apt reads them |
+| [`registries-npm`](npm/src/lib.rs) | npm's registry protocol (and so yarn's, pnpm's and bun's) as `packument` and `tarball` calls; each packument's tarball URLs pointed back at the registry, and each tarball checked against its `integrity` as it streams |
 
 `carbon` joins them to a machine ([`carbon/src/registries.rs`](../carbon/src/registries.rs)). With `--registries`,
 its network's DNS answers `registry.carbon` with the gateway's address, and a connection to the gateway's port 80 is
-an in-memory pipe whose other end a `Server` thread serves. Each adapter is a Cargo feature of `carbon` (`apt`, on by
-default).
+an in-memory pipe whose other end a `Server` thread serves. Each adapter is a Cargo feature of `carbon` (`apt` and
+`npm`, both on by default), and says what its tool needs in the machine's environment, which each run gets (over the
+image's, under `-e`) and never keeps.
 
 ```
 carbon ──► registries-core ──► hooks
@@ -62,6 +64,20 @@ carbon ──► registries-core ──► hooks
 
   Anything else apt asks for is a 404 here, which apt reads as "not there". A refusal's reason is in the status line,
   so apt prints why: `403  Forbidden - this machine's rules refuse it`.
+- **npm**, end to end: `npm install` of packages and their dependencies in `node:22-slim` under `--deny 0.0.0.0/0`.
+
+  | npm asks for | The call |
+  | --- | --- |
+  | `/{name}`, `/@scope%2fname` | `packument {name}` |
+  | `/{name}/-/{base}-{version}.tgz` | `tarball {name, version}` |
+
+  The machine gets `NPM_CONFIG_REGISTRY=http://registry.carbon/npm/` (and Yarn's `YARN_NPM_REGISTRY_SERVER`), with
+  audit, fund and the update notifier off. Each packument's `dist.tarball`s are pointed back at the registry, and the
+  `integrity` of each version it offered is kept for the machine: that version's tarball call carries it as
+  `expect.sha512`, and Carbon checks the tarball as it streams, so one that doesn't match is cut short. A refusal is
+  npm's own: a status and `{"error": why}`, which npm prints.
+- **Checked streams:** any byte answer whose call has an `expect` (a hash, a size) is checked as it passes, its last
+  read held back until the whole matches.
 - **Discovery when a machine starts:** each server's `GET /v1/` must list every op of every service asked for, or
   the machine doesn't start, and says which.
 - **Hooks and rules:** each call is a `hooks::Registry` event, decided before it's sent. `--deny-registry 'apt:deb
@@ -72,7 +88,7 @@ carbon ──► registries-core ──► hooks
 ## Testing
 
 ```sh
-cargo test -p registries-core -p registries-apt
+cargo test -p registries-core -p registries-apt -p registries-npm
 cargo test -p carbon --lib registries   # the pipe between the machine and a server thread
 cargo test -p net gateway               # the gateway's port and names
 ```
@@ -82,8 +98,7 @@ protocol above, as the sections under "What's built" say.
 
 ## To do
 
-1. npm: `packument` and `tarball`, `NPM_CONFIG_REGISTRY` set in the machine, and tarballs checked against the
-   packument's `integrity` as they stream.
+1. PyPI: the simple index (PEP 691's JSON) and files, with `PIP_INDEX_URL` and `PIP_TRUSTED_HOST` set.
 2. git: `refs`, `negotiate`, `pack` and `push`, with `insteadOf` set in the machine.
 3. apt with no changed sources: answering `deb.debian.org` and `security.debian.org` themselves (open question 2 in
    the proposal).

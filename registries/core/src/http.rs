@@ -35,6 +35,12 @@ pub struct Native {
     pub body: Body,
 }
 
+impl std::fmt::Debug for Native {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Native({} {})", self.status, self.reason)
+    }
+}
+
 pub enum Body {
     Empty,
     Bytes(Vec<u8>),

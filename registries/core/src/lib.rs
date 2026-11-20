@@ -14,6 +14,7 @@ mod call;
 mod http;
 mod settings;
 mod upstream;
+mod verify;
 
 use std::io::{self, BufReader, Read, Write};
 use std::sync::Arc;
@@ -22,6 +23,7 @@ pub use call::{Call, Expect, Field, Op, check};
 pub use http::{Body, Native, Request, clean, decode_segment};
 pub use settings::Registries;
 pub use upstream::{Answer, Upstream};
+pub use verify::{Verified, base64_decode, hex};
 
 /// One service's translation between a tool's protocol and calls.
 pub trait Adapter: Send + Sync {
@@ -31,6 +33,11 @@ pub trait Adapter: Send + Sync {
     fn ops(&self) -> &'static [Op];
     /// A conversation for one connection, where an adapter keeps what it needs between requests.
     fn conversation(&self) -> Box<dyn Conversation>;
+    /// What the machine's environment needs for its tool to use the registry at `base`
+    /// (`http://registry.carbon/npm/`): `NPM_CONFIG_REGISTRY`, say. None by default: apt reads only files.
+    fn env(&self, _base: &str) -> Vec<(String, String)> {
+        Vec::new()
+    }
 }
 
 /// One connection's requests and answers, for one service.
@@ -77,6 +84,11 @@ impl Server {
     /// The services it answers.
     pub fn services(&self) -> Vec<&'static str> {
         self.adapters.iter().map(|(a, _)| a.service()).collect()
+    }
+
+    /// The environment its tools need, with the registries at `http://{host}/`: `NAME=value`s.
+    pub fn env(&self, host: &str) -> Vec<String> {
+        self.adapters.iter().flat_map(|(a, _)| a.env(&format!("http://{host}/{}/", a.service()))).map(|(k, v)| format!("{k}={v}")).collect()
     }
 
     /// Answers one connection's requests until it ends, on this thread.
@@ -131,7 +143,21 @@ impl Server {
                 return conv.reply(&call, Answer::refused("forbidden", "this machine's rules refuse it"));
             }
         }
-        conv.reply(&call, self.upstream.send(base, &call))
+        let answer = match self.upstream.send(base, &call) {
+            // What's known about the file is checked here too, as it streams: one that doesn't match is cut short,
+            // so the tool never has it whole, whatever the server did.
+            Answer::Bytes { reader, size, offset: 0 } if call.offset == 0 && call.expect.is_some() => {
+                let expect = call.expect.clone().unwrap_or_default();
+                if let (Some(want), Some(got)) = (expect.size, size)
+                    && want != got
+                {
+                    return conv.reply(&call, Answer::refused("unavailable", format!("the package server's file is {got} bytes, not {want}")));
+                }
+                Answer::Bytes { reader: Box::new(Verified::new(reader, &expect)), size, offset: 0 }
+            }
+            other => other,
+        };
+        conv.reply(&call, answer)
     }
 }
 

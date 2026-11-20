@@ -21,6 +21,7 @@ members = [
     "net",
     "registries/core",
     "registries/apt",
+    "registries/npm",
     "gpu",
     "gpu/ir",
     "gpu/frontend",
@@ -62,6 +63,7 @@ host = { path = "host" }
 net = { path = "net" }
 registries-core = { path = "registries/core" }
 registries-apt = { path = "registries/apt" }
+registries-npm = { path = "registries/npm" }
 gpu = { path = "gpu" }
 gpu-ir = { path = "gpu/ir" }
 gpu-frontend = { path = "gpu/frontend" }
