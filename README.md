@@ -542,7 +542,7 @@ process per machine, so one program runs several at once on macOS. (`--rm` and `
 
 **9. Reach and polish**
 
-1. The library's rest ([carbon](carbon/README.md#to-do), [the proposal](docs/carbon_lib.md)): workers, so a
+1. The library's rest ([carbon](carbon/README.md#to-do)): workers, so a
    program runs several machines at once on macOS; files, process lifecycle, accepts, data and the registry hooked;
    an answered Windows exec and an answered connection; checkpoints and rollback, forks, record and
    replay, limits; clients in other languages over the Engine API (carbon-go first). (The crate `carbon`, the CLI

@@ -291,7 +291,7 @@ with [`examples/agent.rs`](examples/agent.rs) and `carbon`.
 
 ## To do
 
-In [the proposal](../docs/carbon_lib.md)'s order:
+In order:
 
 - [x] **Workers** (`launch`), logs and timeouts; **files**, and copies that keep metadata, running or stopped;
       **images'** whole config, `tag` and history.
