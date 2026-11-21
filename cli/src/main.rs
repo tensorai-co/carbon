@@ -87,13 +87,13 @@ usage: carbon <command> ...
       --deny HOST|ADDRESS|NETWORK[:PORT]     refuse connections there: 0.0.0.0/0 and ::/0 for everything
       --allow HOST|ADDRESS|NETWORK[:PORT]    let connections there through, whatever --deny says: pypi.org:443
                                              (a host takes its subdomains), 10.0.0.0/8, [::1]:53
-      --registries apt,npm,pypi,crates,go,maven,git
+      --registries apt,npm,pypi,crates,go,maven,rubygems,git
                                              its package managers and git answered by Carbon at registry.carbon, and each
                                              request sent to --upstream as one checked call (POST /v1/apt/deb, …);
                                              nothing the machine sends goes anywhere, and it works under --deny
                                              0.0.0.0/0 and --network none (npm's NPM_CONFIG_REGISTRY, pip's
-                                             PIP_INDEX_URL, go's GOPROXY, Maven's MAVEN_ARGS, sbt's SBT_OPTS and git's
-                                             insteadOf are set, and cargo's, Maven's, Gradle's and sbt's settings are
+                                             PIP_INDEX_URL, go's GOPROXY, Maven's MAVEN_ARGS, sbt's SBT_OPTS, Bundler's
+                                             mirror, gem's GEMRC and git's insteadOf are set, and cargo's, Maven's, Gradle's and sbt's settings are
                                              in tmpfs, for this run only)
       --upstream URL|SERVICE=URL             the package server: https://…, or http:// to this host's loopback
       --upstream-token-file FILE             the token sent with every call (as a bearer), never in the machine
@@ -835,7 +835,7 @@ fn registry_flag(r: &mut carbon::Registries, flag: &str, value: &mut dyn FnMut(&
 fn registries_given(r: carbon::Registries) -> Option<carbon::Registries> {
     if r.is_empty() {
         if r != carbon::Registries::default() {
-            fail("--upstream, --upstream-token-file and --registry-meta are for --registries: which ones (apt, npm, pypi, crates, go, maven, git)?");
+            fail("--upstream, --upstream-token-file and --registry-meta are for --registries: which ones (apt, npm, pypi, crates, go, maven, rubygems, git)?");
         }
         return None;
     }

@@ -41,6 +41,8 @@ pub fn adapters() -> Vec<Arc<dyn Adapter>> {
     all.push(registries_go::Go::adapter());
     #[cfg(feature = "maven")]
     all.push(registries_maven::Maven::adapter());
+    #[cfg(feature = "rubygems")]
+    all.push(registries_rubygems::Rubygems::adapter());
     all
 }
 

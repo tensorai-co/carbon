@@ -27,6 +27,7 @@ members = [
     "registries/crates",
     "registries/go",
     "registries/maven",
+    "registries/rubygems",
     "gpu",
     "gpu/ir",
     "gpu/frontend",
@@ -74,6 +75,7 @@ registries-git = { path = "registries/git" }
 registries-crates = { path = "registries/crates" }
 registries-go = { path = "registries/go" }
 registries-maven = { path = "registries/maven" }
+registries-rubygems = { path = "registries/rubygems" }
 gpu = { path = "gpu" }
 gpu-ir = { path = "gpu/ir" }
 gpu-frontend = { path = "gpu/frontend" }

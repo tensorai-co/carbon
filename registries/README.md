@@ -40,13 +40,14 @@ bearer. An answer is JSON, bytes (with `Carbon-Size`, and `Carbon-Digest` when i
 | [`registries-crates`](crates/src/lib.rs) | Cargo's sparse index as `index` and `crate` calls; `config.json` answered here, its downloads pointed back at the registry with each one's SHA-256 in its URL; `/.cargo/config.toml` in a tmpfs, replacing crates.io's source |
 | [`registries-go`](go/src/lib.rs) | Go's module proxy protocol as `list`, `latest`, `info`, `mod` and `zip` calls, and its checksum database as `lookup`, `tile` and `head`; `GOPROXY` pointing here, with no `direct`, and `GOSUMDB` kept at `sum.golang.org`, so go checks every module against its signed log itself |
 | [`registries-maven`](maven/src/lib.rs) | A Maven repository's layout as `metadata` and `file` calls, for Maven, Gradle and sbt: a folder's `maven-metadata.xml` (and its checksums, of what the server rebuilt), a version's files (each its own, by name), Maven's plugin repository under `-plugins/` (`for: plugins`) and Gradle's under `-gradle-plugins/` (`repo: gradle-plugins`); Maven's settings, Gradle's init script and sbt's repositories in tmpfs |
+| [`registries-rubygems`](rubygems/src/lib.rs) | RubyGems' compact index (and so Bundler's and `gem`'s) as `versions`, `info`, `gem` and `gemspec` calls; `HEAD /versions` answered here; `BUNDLE_MIRROR__ALL`, and `GEMRC` naming a config in a tmpfs |
 | [`registries-git`](git/src/lib.rs) | git's smart HTTP (v0/v1) as `refs`, `fetch` and `push` calls: every pkt-line read and checked, the ref advertisement written by Carbon, gzip'd and chunked bodies, `insteadOf` for each host the server names |
 | [`registries-npm`](npm/src/lib.rs) | npm's registry protocol (and so yarn's, pnpm's and bun's) as `packument` and `tarball` calls; each packument's tarball URLs pointed back at the registry, and each tarball checked against its `integrity` as it streams |
 
 `carbon` joins them to a machine ([`carbon/src/registries.rs`](../carbon/src/registries.rs)). With `--registries`,
 its network's DNS answers `registry.carbon` with the gateway's address, and a connection to the gateway's port 80 is
 an in-memory pipe whose other end a `Server` thread serves. Each adapter is a Cargo feature of `carbon` (`apt`, `npm`,
-`pypi`, `crates`, `go`, `maven` and `git`, all on by default), and says what its tool needs in the machine: environment (over the
+`pypi`, `crates`, `go`, `maven`, `rubygems` and `git`, all on by default), and says what its tool needs in the machine: environment (over the
 image's, under `-e`), and files where no variable will do (cargo's source replacement), each in a read-only tmpfs at its
 folder. A run gets them; the machine's record and its committed images never do.
 
@@ -149,6 +150,20 @@ carbon ──► registries-core ──► hooks
   this registry alone, and `SBT_OPTS` makes sbt use it for itself and every build
   (`-Dsbt.override.build.repos=true -Dsbt.repository.config=…`). sbt's resolver shows a refusal as "forbidden" and
   its URL, without the server's reason.
+- **RubyGems**, end to end: `bundle install` of a Gemfile with `rack`, `rack-test` and `nokogiri` (its
+  `aarch64-linux-gnu` build), and `gem install rake`, in `ruby:3.3` under `--deny 0.0.0.0/0`.
+
+  | Bundler and gem ask for | The call |
+  | --- | --- |
+  | `GET /versions` | `versions` |
+  | `HEAD /versions` | None: answered here, as `gem` only asks whether there's a compact index |
+  | `/info/{name}` | `info {name}` |
+  | `/gems/{file}.gem`, `/quick/Marshal.4.8/{file}.gemspec.rz` | `gem {file}`, `gemspec {file}` |
+
+  A file's name is passed whole (`nokogiri-1.16.0-aarch64-linux`), since a gem's name may have dashes and a version
+  a platform after one. The machine gets `BUNDLE_MIRROR__ALL`, so Bundler fetches every source's gems here, and
+  `GEMRC` naming `/etc/carbon/rubygems/gemrc`, in a tmpfs, whose one source is this registry, for `gem`. An `/info`
+  answer carries no ETag or digest: Bundler checks a digest against the body, and the server may have rebuilt it.
 - **git**, end to end: clone (empty, full and shallow), push, racing pushes, and a public GitHub repo, in `debian:13`
   under `--deny 0.0.0.0/0`, through a package server.
 
@@ -175,7 +190,7 @@ carbon ──► registries-core ──► hooks
 ## Testing
 
 ```sh
-cargo test -p registries-core -p registries-apt -p registries-npm -p registries-pypi -p registries-crates -p registries-go -p registries-maven -p registries-git
+cargo test -p registries-core -p registries-apt -p registries-npm -p registries-pypi -p registries-crates -p registries-go -p registries-maven -p registries-rubygems -p registries-git
 cargo test -p carbon --lib registries   # the pipe between the machine and a server thread
 cargo test -p net gateway               # the gateway's port and names
 ```
