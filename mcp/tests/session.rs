@@ -225,3 +225,67 @@ fn a_gateway_s_session() {
     let _ = server.kill();
     panic!("carbon mcp still serving after its --max-sessions 1");
 }
+
+/// A package server that answers only what it serves: npm.
+fn npm_server() -> String {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            let body = r#"{"services":{"npm":["packument","tarball"]}}"#;
+            let mut stream = stream;
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// Registries given to machines.create are the machine's when machines.start starts it.
+#[test]
+#[ignore = "needs debian:latest and a host that runs machines"]
+fn registries_given_at_create_are_there_at_start() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let carbon = std::env::var("CARBON").unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../target/release/carbon").to_string());
+    let base = format!("127.0.0.1:{port}");
+    let mut server = Command::new(&carbon)
+        .args(["mcp", "-H", &base, "--engine", "--max-sessions", "1"])
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap_or_else(|e| panic!("{carbon}: {e}"));
+    for _ in 0..500 {
+        if std::net::TcpStream::connect(&base).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let (socket, _) = tungstenite::connect(format!("ws://{base}/")).unwrap();
+    let mut s = Session { socket, next: 0 };
+    let name = format!("mcp-reg-{}", std::process::id());
+    let created = s.ok(
+        "engine/machines.create",
+        json!({
+            "Image": "debian:latest", "Name": name, "Cmd": ["sleep", "infinity"],
+            "Rules": { "Deny": ["0.0.0.0/0"] },
+            "Registries": { "Services": ["npm"], "Upstream": npm_server(), "Token": "t0ken" },
+        }),
+    );
+    let id = created["Id"].as_str().unwrap().to_string();
+    s.ok("engine/machines.start", json!({ "Id": id }));
+    let r = s.ok("engine/machines.exec", json!({ "Id": id, "Cmd": ["sh", "-c", "echo $NPM_CONFIG_REGISTRY; getent hosts registry.carbon >/dev/null && echo resolves; env | grep -c t0ken"], "Timeout": 20 }));
+    let out = r["Stdout"].as_str().unwrap().to_string();
+    assert!(out.contains("http://registry.carbon/npm"), "npm isn't pointed at the registries: {r}");
+    assert!(out.contains("resolves"), "registry.carbon doesn't resolve: {r}");
+    assert!(out.trim_end().ends_with('0'), "the token is in the machine: {r}");
+    s.ok("engine/machines.remove", json!({ "Id": id, "Force": true }));
+    s.socket.close(None).unwrap();
+    let _ = s.socket.read();
+    let _ = server.wait();
+}

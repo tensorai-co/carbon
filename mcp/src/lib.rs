@@ -190,6 +190,9 @@ pub struct Server {
     host_dirs: Vec<PathBuf>,
     processes: Mutex<HashMap<String, Arc<tools::processes::Background>>>,
     events: Mutex<HashMap<String, Arc<tools::events::Feed>>>,
+    /// The registries each machine the Engine API made was given, for each time it's started: in memory only, as a
+    /// machine's registries never go on disk (they hold their server's token).
+    registries: Mutex<HashMap<String, carbon::Registries>>,
 }
 
 /// A request's way to say how it's going, if its client asked (a `progressToken`).
@@ -257,6 +260,7 @@ impl Server {
             host_dirs,
             processes: Mutex::new(HashMap::new()),
             events: Mutex::new(HashMap::new()),
+            registries: Mutex::new(HashMap::new()),
         })
     }
 
@@ -325,6 +329,19 @@ impl Server {
 
     pub(crate) fn carbon(&self) -> &Carbon {
         &self.carbon
+    }
+
+    /// The registries the Engine API gave a machine it made, if any.
+    pub(crate) fn machine_registries(&self, name: &str) -> Option<carbon::Registries> {
+        self.registries.lock().unwrap_or_else(|e| e.into_inner()).get(name).cloned()
+    }
+
+    pub(crate) fn keep_registries(&self, name: &str, registries: Option<carbon::Registries>) {
+        let mut all = self.registries.lock().unwrap_or_else(|e| e.into_inner());
+        match registries {
+            Some(r) => all.insert(name.to_string(), r),
+            None => all.remove(name),
+        };
     }
 
     pub(crate) fn rules(&self) -> &Rules {

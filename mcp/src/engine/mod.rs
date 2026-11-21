@@ -272,13 +272,12 @@ fn create(server: &Server, p: &P) -> R {
         }
     }
     // `Registries`: {"Services": ["apt"], "Upstream": URL, "Upstreams": {"npm": URL}, "Token": T, "Meta": {"sid": …}}.
-    match p.0.get("Registries").filter(|r| !r.is_null()) {
-        Some(r) => spec = spec.registries(registries(&P(r))?),
-        None => {
-            if let Some(r) = &server.options().registries {
-                spec = spec.registries(r.clone());
-            }
-        }
+    let chosen = match p.0.get("Registries").filter(|r| !r.is_null()) {
+        Some(r) => Some(registries(&P(r))?),
+        None => server.options().registries.clone(),
+    };
+    if let Some(r) = &chosen {
+        spec = spec.registries(r.clone());
     }
     for text in host.strings("ExtraHosts")? {
         let extra = carbon::ExtraHost::parse(&text)?;
@@ -333,6 +332,8 @@ fn create(server: &Server, p: &P) -> R {
     let rules = server.rules().clone().merge(rules(&p.sub("Rules"))?);
     let cmd = p.strings("Cmd")?;
     let machine = spec.rules(rules).create_with(cmd)?;
+    // A machine's registries aren't kept with it, so each start gives them again: these.
+    server.keep_registries(machine.name(), chosen);
     Ok(json!({ "Id": machine.name(), "Warnings": [] }))
 }
 
@@ -341,6 +342,10 @@ fn start(server: &Server, p: &P) -> R {
     let mut spec = server.carbon().again(id.clone()).rules(server.rules().clone());
     if let Some(t) = server.options().timeout {
         spec = spec.timeout(t);
+    }
+    // Its registries: the ones machines.create gave it, else the server's.
+    if let Some(r) = server.machine_registries(&id).or_else(|| server.options().registries.clone()) {
+        spec = spec.registries(r);
     }
     spec.launch(Vec::<String>::new())?;
     Ok(json!({}))
@@ -381,7 +386,9 @@ fn remove(server: &Server, p: &P) -> R {
         m.kill()?;
         m.wait(Some(Duration::from_secs(10)));
     }
+    let name = m.name().to_string();
     m.remove()?;
+    server.keep_registries(&name, None);
     Ok(json!({}))
 }
 
