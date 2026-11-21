@@ -102,6 +102,8 @@ pub fn route(server: &Server, peer: &Arc<Peer>, method: &str, path: &str, query:
             ("GET", ["machines", id, "files", "stat"]) => id_route(&mut params, id, "files.stat", false),
             ("GET", ["images"]) => ("images.list", false),
             ("POST", ["images", "pull"]) => ("images.pull", true),
+            ("POST", ["images", "login"]) => ("images.login", true),
+            ("POST", ["images", "logout"]) => ("images.logout", true),
             // An image's name has slashes: everything after `images/`, less a last part that's an action.
             ("POST", ["images", name @ .., "push"]) if !name.is_empty() => name_route(&mut params, name, "images.push", true),
             ("POST", ["images", name @ .., "tag"]) if !name.is_empty() => {

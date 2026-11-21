@@ -146,6 +146,8 @@ pub fn call(server: &Server, peer: &Arc<Peer>, method: &str, params: &Value) -> 
         "files.remove" => remove_file(server, &p),
         "images.pull" => pull(server, &p),
         "images.push" => push(server, &p),
+        "images.login" => login(server, &p),
+        "images.logout" => logout(server, &p),
         "images.tag" => tag(server, &p),
         "images.remove" => remove_image(server, &p),
         "images.inspect" => inspect_image(server, &p),
@@ -681,6 +683,21 @@ fn push(server: &Server, p: &P) -> R {
     }
     let pushed = server.carbon().push_with(&name, &how, |_| {})?;
     Ok(json!({ "Name": pushed.name, "Digest": pushed.digest, "Layers": pushed.layers, "Sent": pushed.sent }))
+}
+
+/// A login to a registry for this server's pulls and pushes, as `carbon login`: checked with the registry, then kept
+/// in the server's home. The secret never comes back.
+fn login(server: &Server, p: &P) -> R {
+    let registry = p.str("Registry")?;
+    let user = p.str("Username")?;
+    let secret = p.str("Password")?;
+    server.carbon().login(&registry, &user, &secret)?;
+    Ok(json!({ "Status": "Login Succeeded" }))
+}
+
+fn logout(server: &Server, p: &P) -> R {
+    let registry = p.str("Registry")?;
+    Ok(json!({ "LoggedOut": server.carbon().logout(&registry)? }))
 }
 
 fn tag(server: &Server, p: &P) -> R {

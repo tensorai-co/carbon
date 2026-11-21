@@ -1,6 +1,6 @@
-//! A session as a gateway runs one, on one WebSocket, against real machines: create from an image with a
-//! hostname, env, rules and a tmpfs; start; write a token into the tmpfs with frames; exec with streams (output, and
-//! stdin); read the file back as frames; commit, and the token isn't in the image; clean up.
+//! A session as a gateway runs one, on one WebSocket, against real machines: log in to a registry; create from an
+//! image with a hostname, env, rules and a tmpfs; start; write a token into the tmpfs with frames; exec with streams
+//! (output, and stdin); read the file back as frames; commit, and the token isn't in the image; clean up.
 //!
 //! It runs `carbon mcp` itself (on macOS a machine's worker is the `carbon` binary run again, signed for the
 //! hypervisor): `$CARBON`, else `target/release/carbon`. And it needs `debian:latest` in this host's Carbon home:
@@ -60,6 +60,35 @@ impl Session {
     }
 }
 
+/// A registry that only answers `/v2/`, and takes one login: `session` / `s3cret`.
+fn login_registry() -> String {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut authorized = false;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                // base64("session:s3cret")
+                authorized |= line.to_ascii_lowercase().starts_with("authorization:") && line.contains("c2Vzc2lvbjpzM2NyZXQ=");
+            }
+            let mut stream = stream;
+            let answer = if authorized {
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+            } else {
+                "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"test\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            };
+            let _ = stream.write_all(answer.as_bytes());
+        }
+    });
+    addr
+}
+
 fn joined(frames: &[(u8, Vec<u8>)], kind: u8) -> String {
     String::from_utf8_lossy(&frames.iter().filter(|f| f.0 == kind).flat_map(|f| f.1.clone()).collect::<Vec<u8>>()).into_owned()
 }
@@ -85,6 +114,16 @@ fn a_gateway_s_session() {
     let mut s = Session { socket, next: 0 };
     let name = format!("mcp-e2e-{}", std::process::id());
     let repo = format!("mcp-e2e-{}", std::process::id());
+
+    // A login for the server's pulls and pushes: refused if the registry refuses it, kept if it takes it.
+    let registry = login_registry();
+    let (reply, _) = s.call("engine/images.login", json!({ "Registry": registry, "Username": "session", "Password": "wrong" }), &[]);
+    assert!(reply.get("error").is_some(), "a refused login: {reply}");
+    let r = s.ok("engine/images.login", json!({ "Registry": registry, "Username": "session", "Password": "s3cret" }));
+    assert_eq!(r["Status"], "Login Succeeded", "{r}");
+    assert!(!r.to_string().contains("s3cret"), "the password came back: {r}");
+    let r = s.ok("engine/images.logout", json!({ "Registry": registry }));
+    assert_eq!(r["LoggedOut"], true, "{r}");
 
     let created = s.ok(
         "engine/machines.create",

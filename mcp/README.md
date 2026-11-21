@@ -68,7 +68,8 @@ the server's own. Its own lines:
 - **`--tools a,b`** lists only those.
 
 A call can add `deny_exec` and `deny` rules of its own to a machine it starts, never an `allow`. Logins for registries
-are the host's: `push_image` uses them, and no tool takes or returns a credential.
+are the host's: `push_image` uses them, and no tool takes or returns a credential. Only the Engine API's
+`images.login` sets one.
 
 ## Results
 
@@ -144,6 +145,7 @@ path's and query's parts join the JSON body as params.
 | `files.read` | `Id`, `Path`, `Stream` | `data` frames then `end`, and `{Size}`; or `{Data}` in base64 |
 | `files.write` | `Id`, `Path`, `Mode`, `Owner`, `Parents`, `Stream` or `Data` (base64) | the bytes from `data` frames until `end`; `{Size}` |
 | `images.pull`, `.push` (`Squash`, `To`), `.tag` (`Source`, `Repo`, `Tag`), `.remove`, `.inspect`, `.list` | `Name` | `{Id, Platform}`; `{…}`; `{}`; rows `{Id, RepoTags, Platform, Created, Source}`, with `Config` and `History` from `inspect` |
+| `images.login`, `.logout` | `Registry`; `Username`, `Password` | `{Status}`, once the registry has taken the login, which the server keeps for its pulls and pushes as `carbon login` does; `{LoggedOut}` |
 
 - **Files on a running machine are what its programs see:** a file written into a tmpfs is in the tmpfs. Secrets go in
   one (`HostConfig.Tmpfs: {"/run/secrets": ""}`) because a tmpfs isn't the disk: `commit` never saves it.

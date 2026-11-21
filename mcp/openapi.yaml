@@ -341,6 +341,54 @@ paths:
                 properties:
                   Id: { type: string }
                   Platform: { type: string }
+  /images/login:
+    post:
+      tags: [images]
+      operationId: images.login
+      description: Logs this server in to a registry, for its pulls and pushes, as `carbon login`. The registry checks the login first; the password never comes back.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [Registry, Username, Password]
+              properties:
+                Registry: { type: string, examples: [ghcr.io, "registry.example:5000"] }
+                Username: { type: string }
+                Password: { type: string }
+      responses:
+        "200":
+          description: Logged in.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  Status: { const: Login Succeeded }
+  /images/logout:
+    post:
+      tags: [images]
+      operationId: images.logout
+      description: Forgets this server's login for a registry.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [Registry]
+              properties:
+                Registry: { type: string }
+      responses:
+        "200":
+          description: Whether it had one.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  LoggedOut: { type: boolean }
   /images/{image}:
     parameters: [{ $ref: "#/components/parameters/Image" }]
     get:
