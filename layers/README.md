@@ -17,7 +17,17 @@ kernel (owner and mode to lambda, attributes to atlas) is that kernel's `M`, kep
   Names and metadata are logged as they change, contents when the disk syncs: `sync`, a program's `fsync` or
   `FlushFileBuffers`, every 16 MiB written, and when the machine ends. A record is length-prefixed and checksummed, so
   a crash leaves the disk as it was at the last whole record.
-- **`freeze`** writes the whole tree as a new index: that's how a machine becomes an image.
+- **`freeze`** writes the whole tree as a new index: that's how a machine becomes an image. The chunks the index
+  names are shared (`Store::share`) from then on, so they're never freed with the machine's files.
+- **Deleting frees space.** A machine's store keeps the chunks the machine wrote as its own, apart from those images
+  share (`Store::own_chunks`). Once about 16 MiB of chunks have been dropped (files removed, cut or written over), the
+  disk syncs and frees each of its own chunks that no file names (`free_unnamed`): the log is synced first, so a chunk
+  only goes once the records that stopped naming it survive a crash. On a full disk, where changed files can't be
+  saved, the chunks they had when last saved are kept and the rest still go. A file held open keeps its chunks until
+  it's let go. A file the store refuses part of (`NoSpace`) keeps all its changes in memory and is saved on the next
+  sync.
+- **Space.** `space` is the size and free space of the disk the store is on, less what's written but not yet saved,
+  for `df`; none for a store in memory.
 - **Tar** (`tar.rs`), both ways: a disk filled from a tar, with hard links, long names, PAX numbers and OCI
   whiteouts; and a disk written as one (`export`), whole or as what differs from another disk (a layer, with
   whiteouts for what's gone). Two files are compared by their chunks' names when both are in the store, so an
@@ -52,14 +62,18 @@ cargo test -p layers
 Extended attributes set, replaced, removed and replayed from the log; a volatile tree never reaching the log, nothing crossing out of it, and a file held open outliving it; an observer
 told of each change in order, with the tree as it is after; writing and removing, folding case (and keeping it through an index), an open file outliving its name; a disk that
 keeps its files when reopened, what wasn't synced lost cleanly after a crash, holes, files cut then grown, ranges zeroed in place (`fallocate`'s punched holes), freezing and
-reopening, and a bad index refused. A tree written as a tar and read back is the same tree (hard links, devices, FIFOs,
+reopening, and a bad index refused. Removing a file frees the machine's own chunks it had, and a crash after leaves the
+other files whole; a file held open keeps its chunks until it's let go; chunks written over are freed once the log
+names the new ones; a full disk frees what it can, keeps what the log still names, and saves the rest once there's
+room; freezing shares what the image names, so it's never freed. A tree written as a tar and read back is the same tree (hard links, devices, FIFOs,
 long paths and big owners through PAX); a layer of what changed, applied to its base, makes the new tree, and a tree
 differs from itself in nothing.
 
 ## To do
 
 - [ ] **Compacting a log in place.** A long-running machine's log only shrinks when it's frozen (`carbon freeze`, then
-      a machine on the new image). Compacting it while the machine runs would need its files' numbers kept.
+      a machine on the new image). Compacting it while the machine runs would need its files' numbers kept. (The
+      chunks deleted files had are freed already; only the log's records stay.)
 - [ ] **Sharing a running machine's disk**, for forking a machine (`sdk`'s `fork`): a second machine on the same
       index and a copy of the log.
 - [x] Files' permissions are kept in each kernel's `M`; lambda checks them.

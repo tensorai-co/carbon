@@ -277,7 +277,7 @@ their output streamed; then commit, push, close.
 | --- | --- | --- | --- |
 | The CPUs and memory | [`exec`](exec/README.md) | Runs a program's machine code in a hardware VM or a process sandbox, and stops it whenever it needs its kernel | Built, on all three hosts |
 | The OS | [`kernels`](kernels/README.md) | lambda (Linux) and atlas (Windows), on a shared `kernels-core`; [obsidian](kernels/obsidian/README.md) (Android) later | Being built |
-| The disk | [`layers`](layers/README.md) | The file system programs see: an image's index, merged, with the machine's own log on top | Built |
+| The disk | [`layers`](layers/README.md) | The file system programs see: an image's index, merged, with the machine's own log on top. `df` shows the host disk it's on, a full one is "No space left on device", and deleting a file frees its space | Built |
 | The screen | [`display`](display/README.md) | The desktop both kernels' windows go on: frames, stacking, focus and input, on a screen in memory or the host's windows | The desktop is built, and shown on macOS, whole or a Mac window for each window |
 | The GPU | [`gpu`](gpu/README.md) | One device both kernels' graphics and compute APIs lower onto: the host's GPU, or one on the CPU | Built: SPIR-V compute and draws on Metal and the CPU device; Vulkan and OpenGL in Linux machines; atlas's Direct3D 11 begun |
 | The sound | [`audio`](audio/README.md) | The mixer every program's sound goes into, and the microphone | Playback built: the mixer, the Mac's speakers, a WAV file, lambda's PulseAudio server |

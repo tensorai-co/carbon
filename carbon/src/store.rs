@@ -669,7 +669,8 @@ mod tests {
         assert_eq!(Record::from_json(&record.to_json()), Some(record));
     }
 
-    /// Chunks a removed machine wrote, and a removed image's, go; a kept image's and a kept machine's stay, readable.
+    /// Chunks a removed image had go; a kept image's and a kept machine's stay, readable. A machine's own chunks are in
+    /// its folder, so they went with it when it was removed.
     #[test]
     fn prune_frees_only_what_nothing_names() {
         let home = std::env::temp_dir().join(format!("carbon-prune-{}", std::process::id()));
@@ -702,6 +703,7 @@ mod tests {
         let kept = machine("keeps", 3);
         machine("goes", 4);
         store.remove("goes").unwrap();
+        assert!(!store.dir("goes").exists(), "a removed machine's own chunks go with its folder");
         store.images.remove("gone:1").unwrap();
 
         // Nothing written in the last quarter hour goes: all of it is that young now.
@@ -714,10 +716,11 @@ mod tests {
             }
         }
         let pruned = store.prune().unwrap();
-        assert!(pruned.chunks >= 2 && pruned.bytes >= 2 * (300 << 10) / 64, "{pruned:?}");
+        assert!(pruned.chunks >= 1 && pruned.bytes >= (300 << 10) / 64, "{pruned:?}");
         let has = |bytes: &[u8]| images::store::DiskStore::chunks(home.join("chunks")).unwrap().has(&images::store::sha256(bytes));
         let chunk = |byte: u8| vec![byte; layers::CHUNK as usize];
-        assert!(has(&chunk(1)) && has(&chunk(3)), "the kept image's and the kept machine's chunks stay");
+        let machine_has = |bytes: &[u8]| store.images.machine_store("keeps").unwrap().has(&images::store::sha256(bytes));
+        assert!(has(&chunk(1)) && machine_has(&chunk(3)), "the kept image's and the kept machine's chunks stay");
         assert!(has(&chunk(5)), "a kept image's lineage's disk stays, for pushing it a layer per step");
         assert!(!has(&chunk(2)) && !has(&chunk(4)), "the removed image's and the removed machine's chunks go");
         let disk = store.disk::<lambda::Meta>(&kept, dir, false).unwrap();

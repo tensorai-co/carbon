@@ -312,7 +312,7 @@ fn failed(path: &str, e: layers::Error) -> Error {
     let kind = match e {
         layers::Error::NotFound => ErrorKind::NotFound,
         layers::Error::Exists => ErrorKind::AlreadyExists,
-        layers::Error::Io => ErrorKind::Io,
+        layers::Error::Io | layers::Error::NoSpace => ErrorKind::Io,
         layers::Error::ReadOnly | layers::Error::Denied => ErrorKind::Denied,
         _ => ErrorKind::InvalidInput,
     };
@@ -326,6 +326,7 @@ fn failed(path: &str, e: layers::Error) -> Error {
         layers::Error::BadName => "isn't a name a file can have",
         layers::Error::CrossFs => "is on another file system",
         layers::Error::Io => "the disk couldn't be read or written",
+        layers::Error::NoSpace => "no space left on the host disk the machine's store is on",
         layers::Error::ReadOnly => "is on a read-only mount",
         layers::Error::Denied => "the host refused it",
         layers::Error::Unsupported => "can't be kept there",

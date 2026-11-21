@@ -1060,11 +1060,19 @@ pub fn get_short_path_name_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Rep
     task.put_wide(cx, a[1], a[2] & 0xffff_ffff, &path)
 }
 
-/// `GetDiskFreeSpaceW(root, &sectors per cluster, &bytes per sector, &free clusters, &clusters)`: a 128 GiB disk with
-/// 96 GiB free, in 4 KiB clusters.
+/// C:'s size and free space, in bytes: the host disk its store is on, or where the store is in memory (or the host
+/// won't say), a 128 GiB disk with 96 GiB free.
+fn disk_space(task: &Task) -> (u64, u64) {
+    lock(&task.k.disk).space().unwrap_or((128 << 30, 96 << 30))
+}
+
+/// `GetDiskFreeSpaceW(root, &sectors per cluster, &bytes per sector, &free clusters, &clusters)`: C:, in 4 KiB
+/// clusters (counts past 32 bits saturate, as Windows' own do).
 pub fn get_disk_free_space_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let (cluster, total, free) = (4096u64, 128u64 << 30, 96u64 << 30);
-    for (at, v) in [(a[1], 8u32), (a[2], 512), (a[3], (free / cluster) as u32), (a[4], (total / cluster) as u32)] {
+    let cluster = 4096u64;
+    let (total, free) = disk_space(task);
+    let clusters = |bytes: u64| (bytes / cluster).min(u64::from(u32::MAX)) as u32;
+    for (at, v) in [(a[1], 8u32), (a[2], 512), (a[3], clusters(free)), (a[4], clusters(total))] {
         if at != 0 && task.mem(cx, true, |t| user::write_u32(&mut t.space(), at, v)).is_err() {
             return task.fail(cx, 998);
         }
@@ -1074,7 +1082,7 @@ pub fn get_disk_free_space_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Rep
 
 /// `GetDiskFreeSpaceExW(folder, &free to the caller, &total, &free)` and `A`: the same disk, in bytes.
 pub fn get_disk_free_space_ex_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let (total, free) = (128u64 << 30, 96u64 << 30);
+    let (total, free) = disk_space(task);
     for (at, v) in [(a[1], free), (a[2], total), (a[3], free)] {
         if at != 0 && task.mem(cx, true, |t| user::write(&mut t.space(), at, &v.to_le_bytes())).is_err() {
             return task.fail(cx, 998);

@@ -20,6 +20,7 @@ pub const ERROR_ACCESS_DENIED: u32 = 5;
 pub const ERROR_SHARING_VIOLATION: u32 = 32;
 /// The disk's store failed under it.
 pub const ERROR_IO_DEVICE: u32 = 1117;
+pub const ERROR_DISK_FULL: u32 = 112;
 pub const ERROR_INVALID_HANDLE: u32 = 6;
 pub const ERROR_NO_MORE_FILES: u32 = 18;
 pub const ERROR_FILE_EXISTS: u32 = 80;
@@ -301,6 +302,7 @@ pub(crate) fn layers_error(e: layers::Error) -> u32 {
         layers::Error::BadName => ERROR_INVALID_NAME,
         layers::Error::CrossFs => ERROR_NOT_SAME_DEVICE,
         layers::Error::Io => ERROR_IO_DEVICE,
+        layers::Error::NoSpace => ERROR_DISK_FULL,
         layers::Error::ReadOnly => ERROR_WRITE_PROTECT,
         layers::Error::Denied => ERROR_ACCESS_DENIED,
         layers::Error::Unsupported => ERROR_NOT_SUPPORTED,

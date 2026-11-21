@@ -34,6 +34,12 @@ pub fn memory_limit() -> Option<u64> {
     sys::memory_limit()
 }
 
+/// The size of the disk `path` is on and how much of it this process may still fill, in bytes; None if the host
+/// won't say.
+pub fn disk_space(path: &std::path::Path) -> Option<(u64, u64)> {
+    sys::disk_space(path)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stream {
     Out,

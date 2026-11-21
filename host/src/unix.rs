@@ -22,6 +22,24 @@ pub fn set_raw(raw: bool) {
     }
 }
 
+/// The size of the file system `path` is on, and how much of it this process may still fill, in bytes.
+pub fn disk_space(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: a NUL-terminated path, and a statvfs to fill in.
+    let s = unsafe {
+        let mut s: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(path.as_ptr(), &mut s) != 0 {
+            return None;
+        }
+        s
+    };
+    // f_blocks and f_bavail count fragments, f_frsize long; `as u64` because their widths differ by host.
+    #[allow(clippy::unnecessary_cast)]
+    let (unit, blocks, available) = (s.f_frsize as u64, s.f_blocks as u64, s.f_bavail as u64);
+    Some((blocks.saturating_mul(unit), available.saturating_mul(unit)))
+}
+
 /// The CPU time the calling thread has used, in nanoseconds.
 pub fn thread_cpu() -> u64 {
     let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };

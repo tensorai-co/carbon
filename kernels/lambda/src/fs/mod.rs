@@ -1791,9 +1791,9 @@ impl Task {
         Ok(0)
     }
 
-    /// `statfs`: every path is on the one disk, which says it's an ext4 of the machine's memory.
-    /// `statfs` (a path) and `fstatfs` (a descriptor): the machine's memory, as the mount the file is on says, with
-    /// its type and flags.
+    /// `statfs` (a path) and `fstatfs` (a descriptor): for the machine's disk, the size and free space of the host disk
+    /// its store is on; for anything else (and a disk whose store is in memory), the machine's memory. With the type
+    /// and flags of the mount the file is on.
     pub(crate) fn statfs(&mut self, cx: &mut Cx<'_>, path_at: Option<u64>, fd: i32, at: u64) -> Result<u64, Errno> {
         let visible = match path_at {
             Some(path_at) => {
@@ -1816,6 +1816,11 @@ impl Task {
             let size = exec.memory().size();
             (size.limit / 4096, size.available / 4096)
         };
+        if what == mount::What::Disk
+            && let Some((size, available)) = lock(&self.k.disk).space()
+        {
+            (total, free) = (size / 4096, available / 4096);
+        }
         // A tmpfs: its size (or the machine's memory), less what its files hold.
         if let Some((tree, size)) = tmpfs {
             total = size.map_or(total, |s| (s / 4096).min(total));

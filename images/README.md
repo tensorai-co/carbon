@@ -14,15 +14,20 @@ made from each tar entry by the caller.
 Everything is under `CARBON_HOME`, or `~/.carbon`:
 
 ```text
-chunks/ab/cdef…                                 every image's and machine's file contents and indexes, by SHA-256, each kept once
+chunks/ab/cdef…                                 images' file contents and indexes, by SHA-256, each kept once however many share it
 images/docker.io/library/debian/13.json         an image: its index, its platform, its whole config, its history, its lineage
 auth.json                                       logins to registries, readable by their owner alone
 machines/dev/machine.json                       a machine: its kernel, its image and that image's index (pinned), its process
 machines/dev/log                                its writable layer: every change to its disk since its image
+machines/dev/chunks/ab/cdef…                    the chunks it wrote that no image has: its own, freed when its files stop naming them
 ```
 
 - **The store** (`store.rs`, `DiskStore`): chunks in files named by their SHA-256, checked as they're read, written by
-  rename; a machine's log, synced with the chunks it names.
+  rename; a machine's log, synced with the chunks it names. A machine's new chunks go in its own folder, so `layers`
+  can free them when its files are deleted, as Docker's overlay2 frees a container's writable layer; committing it
+  moves the chunks the image names into the shared store, and removing it removes the rest with its folder. A full
+  disk (or quota) is `NoSpace`, which machines see as "No space left on device"; `space` is the disk's size and free
+  space, for `df`. A log record a full disk cut short is cut off, so the records after it are still read.
 - **Registries** (`registry.rs`): the distribution API (Docker Hub, GHCR, Quay, any), with a token from each
   registry's challenge (asked for with a login if there is one) or a login on each request if it wants that; HTTPS,
   or plain HTTP to a registry on this host (`localhost:5000`), as Docker treats those.

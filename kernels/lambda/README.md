@@ -254,7 +254,9 @@ The root is the image's layers (Debian's, say) plus `os/`'s file systems. lambda
   remounts (a read-only mount's writes are EROFS), sets propagation, and mounts tmpfs (a volatile tree of `layers`',
   never logged or saved, sized by `size=` for `statfs`), proc, devpts and mqueue; `umount2`, lazily too;
   `pivot_root`. `/proc/<pid>/mounts`, `mountinfo` and `/proc/mounts` list them; `statfs` gives each mount's type and
-  flags. The table is a mount namespace's, held by each process: there's one today. A machine boots with the mounts
+  flags, and for the machine's disk the size and free space of the host disk its store is on (so `df -h /` shows the
+  disk under `CARBON_HOME`); proc and the rest show the machine's memory, as does a disk whose store is in memory. A
+  full host disk is ENOSPC. The table is a mount namespace's, held by each process: there's one today. A machine boots with the mounts
   `Options::mounts` gives (`carbon run -v`), each at where the links on the way to its target lead, as Docker has it
   (`/root/.gradle/init.d`, with `/root/.gradle` a link to `/home/gradle/.gradle`): a host folder or a volume attached to the disk as an external tree and
   mounted over its target (`fuse.carbon` in `mountinfo`, FUSE's magic for `statfs`, a device of its own), one file of

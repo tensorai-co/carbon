@@ -101,6 +101,8 @@ pub enum Error {
     Unsupported,
     /// The store failed, or what's in it (an index, the log, a chunk) is corrupt.
     Io,
+    /// The disk the store is on is full.
+    NoSpace,
 }
 
 impl core::fmt::Display for Error {
@@ -118,6 +120,7 @@ impl core::fmt::Display for Error {
             Error::Denied => "the host refused it",
             Error::Unsupported => "not something this tree can keep",
             Error::Io => "the disk's store failed, or what's in it is corrupt",
+            Error::NoSpace => "no space left on the disk the store is on",
         })
     }
 }
@@ -189,6 +192,8 @@ pub enum New {
 
 /// Once this much has been written and not saved, a disk with a store saves it.
 const DIRTY_MOST: u64 = 16 << 20;
+/// How much of the store's data files may stop naming before the machine's own chunks that nothing names are freed.
+const DROPPED_MOST: u64 = 16 << 20;
 /// Chunks read back from the store, kept for the next read.
 const CACHED: usize = 16;
 
@@ -235,6 +240,16 @@ fn chunk_count(size: u64) -> usize {
     size.div_ceil(CHUNK) as usize
 }
 
+/// How much of the store a file's chunks name, as far as freeing goes: a chunk each.
+fn stored(chunks: &[Chunk]) -> u64 {
+    chunks.iter().filter(|c| matches!(c, Chunk::Stored(_))).count() as u64 * CHUNK
+}
+
+/// The chunks in the store that `chunks` name.
+fn stored_hashes(chunks: &[Chunk]) -> impl Iterator<Item = Hash> + '_ {
+    chunks.iter().filter_map(|c| if let Chunk::Stored(hash) = c { Some(*hash) } else { None })
+}
+
 /// A file system: one tree of files, each with its kernel's `M`.
 pub struct Fs<M> {
     nodes: BTreeMap<Ino, Node<M>>,
@@ -248,6 +263,14 @@ pub struct Fs<M> {
     /// Files changed since they were last saved, each with the smallest size it's had since.
     dirty: BTreeMap<Ino, u64>,
     dirty_bytes: u64,
+    /// About how much of the store files have stopped naming (removed, cut, written over) since the machine's own
+    /// chunks were last freed.
+    dropped: u64,
+    /// Chunks files were written over or cut from since they were last saved: the log still names them until then,
+    /// so they aren't freed.
+    unsaved: alloc::collections::BTreeSet<Hash>,
+    /// A change couldn't be logged, so the log and the files disagree until the disk is opened again: nothing's freed.
+    diverged: bool,
     /// Files a kernel has open, and how many times: one with no links left lives until it's let go.
     held: BTreeMap<Ino, u32>,
     /// Who's told of changes, if anyone.
@@ -270,7 +293,7 @@ impl<M: Clone> Fs<M> {
             ROOT,
             Node { meta: root, modified: 0, generation: 0, links: 2, data: Data::Dir { entries: BTreeMap::new(), parent: ROOT, fold: fold_case }, volatile: None, xattrs: BTreeMap::new() },
         );
-        Fs { nodes, next: ROOT + 1, store: None, cache: RefCell::new(Vec::new()), save: None, dirty: BTreeMap::new(), dirty_bytes: 0, held: BTreeMap::new(), observer: None, ext: RefCell::new(external::Ext::default()) }
+        Fs { nodes, next: ROOT + 1, store: None, cache: RefCell::new(Vec::new()), save: None, dirty: BTreeMap::new(), dirty_bytes: 0, dropped: 0, unsaved: alloc::collections::BTreeSet::new(), diverged: false, held: BTreeMap::new(), observer: None, ext: RefCell::new(external::Ext::default()) }
     }
 
     /// Tells `observer` of every change from now on (none: no one).
@@ -386,11 +409,19 @@ impl<M: Clone> Fs<M> {
             }
             node.links = 0;
             if ino == root || !self.held.contains_key(&ino) {
-                self.nodes.remove(&ino);
+                self.forget(ino);
             }
         }
         self.held.remove(&root);
+        self.free_if_much();
         Ok(())
+    }
+
+    /// The size of the disk the store is on, and what's free on it, in bytes, less what's written but not yet saved:
+    /// what `df` shows for this tree. None when the store isn't on a disk, or there's no store.
+    pub fn space(&self) -> Option<(u64, u64)> {
+        let (total, free) = self.store.as_ref()?.borrow_mut().space()?;
+        Some((total, free.saturating_sub(self.dirty_bytes)))
     }
 
     /// How many bytes the files under `dir` hold (as `df` asks a tmpfs).
@@ -426,7 +457,9 @@ impl<M: Clone> Fs<M> {
     /// Appends to the log, if changes are being logged.
     fn record(&mut self, record: impl FnOnce(fn(&M) -> [u32; 4]) -> Record) -> Result<()> {
         if let (Some(save), Some(store)) = (self.save, &self.store) {
-            store.borrow_mut().log_append(&record(save).encode())?;
+            let appended = store.borrow_mut().log_append(&record(save).encode());
+            self.diverged |= appended.is_err();
+            appended?;
         }
         Ok(())
     }
@@ -678,6 +711,9 @@ impl<M: Clone> Fs<M> {
             let (number, within) = ((at / CHUNK) as usize, (at % CHUNK) as usize);
             let part = (data.len() - done).min(CHUNK as usize - within);
             let existing = self.file(ino)?.chunks.get(number).cloned().unwrap_or(Chunk::Hole);
+            if let Chunk::Stored(hash) = existing {
+                self.dropped_one(hash);
+            }
             let mut bytes = match existing {
                 Chunk::Bytes(bytes, _) => bytes,
                 other => self.chunk_bytes(&other)?,
@@ -703,6 +739,7 @@ impl<M: Clone> Fs<M> {
         self.touched(ino, size_before, data.len() as u64);
         self.tell(Change::Written { ino });
         self.save_if_much()?;
+        self.free_if_much();
         Ok(data.len())
     }
 
@@ -726,6 +763,9 @@ impl<M: Clone> Fs<M> {
         };
         let node = self.node_mut(ino)?;
         let Data::File(file) = &mut node.data else { return Err(Error::IsDir) };
+        // What's cut, and the last chunk kept if it's rewritten, no longer name the store.
+        let kept = last.as_ref().map_or(chunk_count(size), |(number, _)| *number).min(file.chunks.len());
+        let dropped: Vec<Hash> = stored_hashes(&file.chunks[kept..]).collect();
         file.size = size;
         file.chunks.resize(chunk_count(size), Chunk::Hole);
         if let Some((number, chunk)) = last {
@@ -733,8 +773,12 @@ impl<M: Clone> Fs<M> {
         }
         node.modified = now;
         node.generation += 1;
+        for hash in dropped {
+            self.dropped_one(hash);
+        }
         self.touched(ino, size_before.min(size), 0);
         self.tell(Change::Written { ino });
+        self.free_if_much();
         Ok(())
     }
 
@@ -762,6 +806,9 @@ impl<M: Clone> Fs<M> {
             let start = number as u64 * CHUNK;
             let (lo, hi) = ((offset.max(start) - start) as usize, (end.min(start + CHUNK) - start) as usize);
             let existing = self.file(ino)?.chunks.get(number).cloned().unwrap_or(Chunk::Hole);
+            if let Chunk::Stored(hash) = existing {
+                self.dropped_one(hash);
+            }
             let chunk = if lo == 0 && (hi == CHUNK as usize || start + hi as u64 == size) {
                 match existing {
                     Chunk::Hole => continue,
@@ -784,6 +831,7 @@ impl<M: Clone> Fs<M> {
         node.generation += 1;
         self.touched(ino, size, 0);
         self.tell(Change::Written { ino });
+        self.free_if_much();
         Ok(())
     }
 
@@ -994,6 +1042,7 @@ impl<M: Clone> Fs<M> {
         }
         let gone = self.gone(ino);
         self.tell(Change::Removed { dir, name, ino, kind, gone });
+        self.free_if_much();
         Ok(())
     }
 
@@ -1015,14 +1064,14 @@ impl<M: Clone> Fs<M> {
         parent.modified = now;
         if is_dir {
             parent.links -= 1;
-            self.nodes.remove(&ino);
+            self.forget(ino);
         } else {
             let node = self.node_mut(ino)?;
             node.links -= 1;
             if node.links == 0 {
                 // A file that's open stays, nameless and never saved, until it's let go.
                 if !self.held.contains_key(&ino) {
-                    self.nodes.remove(&ino);
+                    self.forget(ino);
                 }
                 self.dirty.remove(&ino);
             }
@@ -1044,9 +1093,66 @@ impl<M: Clone> Fs<M> {
         }
         self.held.remove(&ino);
         if self.nodes.get(&ino).is_some_and(|n| n.links == 0) {
-            self.nodes.remove(&ino);
+            self.forget(ino);
             self.dirty.remove(&ino);
+            self.free_if_much();
         }
+    }
+
+    /// Lets a node go, counting what its chunks named in the store as dropped.
+    fn forget(&mut self, ino: Ino) {
+        if let Some(Node { data: Data::File(file), .. }) = self.nodes.remove(&ino) {
+            self.dropped += stored(&file.chunks);
+        }
+    }
+
+    /// A chunk a logged file no longer names, though the log does until the file's next save.
+    fn dropped_one(&mut self, hash: Hash) {
+        self.dropped += CHUNK;
+        if self.save.is_some() {
+            self.unsaved.insert(hash);
+        }
+    }
+
+    /// Frees the machine's own chunks that nothing names, once enough has been dropped. Best effort: what can't be
+    /// freed now is freed later, and nothing is lost by waiting.
+    fn free_if_much(&mut self) {
+        if self.dropped >= DROPPED_MOST {
+            let _ = self.free_unnamed();
+        }
+    }
+
+    /// Frees every chunk the store keeps as the machine's own that neither a file nor the log names any more, as
+    /// deleting a file frees its space on any disk; how many. The log is synced first, so a chunk is only freed once
+    /// the records that stopped naming it (a removal, a file saved since it was written over) survive a crash. On a
+    /// full disk, where changed files can't be saved, the chunks they had when last saved are kept, and the rest still
+    /// freed. Does nothing for a disk that isn't logged (one being built), a store that shares every chunk, or a disk
+    /// whose log is missing a change.
+    pub fn free_unnamed(&mut self) -> Result<usize> {
+        if self.save.is_none() || self.diverged {
+            return Ok(0);
+        }
+        if self.sync().is_err() {
+            self.store.as_ref().ok_or(Error::Io)?.borrow_mut().log_sync()?;
+        }
+        let store = self.store.as_ref().ok_or(Error::Io)?;
+        let mut unnamed: alloc::collections::BTreeSet<Hash> = store.borrow_mut().own_chunks().into_iter().collect();
+        if !unnamed.is_empty() {
+            for node in self.nodes.values() {
+                if let Data::File(file) = &node.data {
+                    for hash in stored_hashes(&file.chunks) {
+                        unnamed.remove(&hash);
+                    }
+                }
+            }
+            unnamed.retain(|hash| !self.unsaved.contains(hash));
+            let mut store = store.borrow_mut();
+            for hash in &unnamed {
+                store.free(hash)?;
+            }
+        }
+        self.dropped = 0;
+        Ok(unnamed.len())
     }
 
     /// Moves `from_dir`/`from` to `to_dir`/`to`, replacing a file (not a directory) already there.
@@ -1078,6 +1184,7 @@ impl<M: Clone> Fs<M> {
             }
             let replaced = replaced.map(|r| (r, self.gone(r)));
             self.tell(Change::Moved { from_dir, from, to_dir, to, ino, kind, replaced });
+            self.free_if_much();
         }
         Ok(())
     }
@@ -1171,21 +1278,30 @@ impl<M: Clone> Fs<M> {
     /// Puts every changed chunk in the store, and logs each changed file's size and chunks.
     fn save_files(&mut self) -> Result<()> {
         let Some(store) = &self.store else { return Ok(()) };
-        for (ino, cut) in core::mem::take(&mut self.dirty) {
+        // Each file stays dirty until its record is in the log, so one the store refused (a full disk) is saved later.
+        while let Some((&ino, &cut)) = self.dirty.first_key_value() {
             // A file with no name left (open, but removed) is never saved.
-            let Some(Node { data: Data::File(file), modified, links: 1.., .. }) = self.nodes.get_mut(&ino) else { continue };
+            let Some(Node { data: Data::File(file), modified, links: 1.., .. }) = self.nodes.get_mut(&ino) else {
+                self.dirty.remove(&ino);
+                continue;
+            };
+            // Every changed chunk into the store, then the record, then the file names them: a file the store refuses
+            // part of keeps its changes in memory, all of them, for the next try.
             let mut changed = Vec::new();
-            for (number, chunk) in file.chunks.iter_mut().enumerate() {
+            for (number, chunk) in file.chunks.iter().enumerate() {
                 if let Chunk::Bytes(bytes, true) = chunk {
-                    let hash = store.borrow_mut().put(bytes)?;
-                    changed.push((number as u32, Some(hash)));
-                    *chunk = Chunk::Stored(hash);
+                    changed.push((number as u32, Some(store.borrow_mut().put(bytes)?)));
                 }
             }
             let record = Record::File { ino, cut, size: file.size, modified: *modified, chunks: changed };
             if self.save.is_some() {
                 store.borrow_mut().log_append(&record.encode())?;
             }
+            let Record::File { chunks, .. } = record else { unreachable!() };
+            for (number, hash) in chunks {
+                file.chunks[number as usize] = hash.map_or(Chunk::Hole, Chunk::Stored);
+            }
+            self.dirty.remove(&ino);
         }
         self.dirty_bytes = 0;
         Ok(())
@@ -1197,6 +1313,8 @@ impl<M: Clone> Fs<M> {
         if let (Some(store), Some(_)) = (&self.store, self.save) {
             store.borrow_mut().log_sync()?;
         }
+        // Every file's saved, and the log names what they do.
+        self.unsaved.clear();
         Ok(())
     }
 
@@ -1371,6 +1489,12 @@ impl<M: Persist> Fs<M> {
             };
             out.push(index::Out { kind: stat.kind, meta: save(&node.meta), links: node.links, size: stat.size, modified: node.modified, folds_case, content });
         }
+        // The image names these chunks now: they're never freed with the machine's files again.
+        let named: alloc::collections::BTreeSet<Hash> = out.iter().flat_map(|o| match &o.content {
+            index::Content::Chunks(hashes) => hashes.iter().flatten().copied().collect(),
+            _ => Vec::new(),
+        }).collect();
+        store.borrow_mut().share(&named.into_iter().collect::<Vec<_>>())?;
         Ok(index::build(&out))
     }
 }
@@ -1586,9 +1710,57 @@ mod tests {
         fn log_sync(&mut self) -> Result<()> {
             self.0.lock().unwrap().log_sync()
         }
+        fn own_chunks(&mut self) -> Vec<Hash> {
+            self.0.lock().unwrap().own_chunks()
+        }
+        fn free(&mut self, hash: &Hash) -> Result<()> {
+            self.0.lock().unwrap().free(hash)
+        }
+        fn share(&mut self, hashes: &[Hash]) -> Result<()> {
+            self.0.lock().unwrap().share(hashes)
+        }
+    }
+
+    /// A machine's store whose disk can fill: while `full`, new chunks are refused.
+    #[derive(Clone)]
+    struct Fillable(Shared, Arc<core::sync::atomic::AtomicBool>);
+
+    impl Store for Fillable {
+        fn get(&mut self, hash: &Hash) -> Result<Vec<u8>> {
+            self.0.get(hash)
+        }
+        fn put(&mut self, data: &[u8]) -> Result<Hash> {
+            if self.1.load(core::sync::atomic::Ordering::Relaxed) { Err(Error::NoSpace) } else { self.0.put(data) }
+        }
+        fn log_append(&mut self, data: &[u8]) -> Result<()> {
+            self.0.log_append(data)
+        }
+        fn log_read(&mut self) -> Result<Vec<u8>> {
+            self.0.log_read()
+        }
+        fn log_truncate(&mut self, len: u64) -> Result<()> {
+            self.0.log_truncate(len)
+        }
+        fn log_sync(&mut self) -> Result<()> {
+            self.0.log_sync()
+        }
+        fn own_chunks(&mut self) -> Vec<Hash> {
+            self.0.own_chunks()
+        }
+        fn free(&mut self, hash: &Hash) -> Result<()> {
+            self.0.free(hash)
+        }
     }
 
     impl Shared {
+        fn machine() -> Shared {
+            Shared(Arc::new(Mutex::new(MemoryStore::machine())))
+        }
+
+        fn chunk_count(&self) -> usize {
+            self.0.lock().unwrap().chunks()
+        }
+
         fn crashed(&self) -> Shared {
             Shared(Arc::new(Mutex::new(self.0.lock().unwrap().crashed())))
         }
@@ -1618,6 +1790,91 @@ mod tests {
 
     fn read_all(fs: &Fs<u32>, path: &str) -> Vec<u8> {
         fs.contents(fs.resolve(ROOT, path, true).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn removing_a_file_frees_its_chunks() {
+        let store = Shared::machine();
+        let mut fs = open(None, &store);
+        let small = pattern(100_000, 1);
+        fs.put("/keep", New::File, &small, 0o644, 0o755).unwrap();
+        fs.put("/big", New::File, &pattern(20 << 20, 2), 0o644, 0o755).unwrap();
+        fs.sync().unwrap();
+        assert_eq!(store.chunk_count(), 2 + 320);
+        // 20 MiB dropped: past what's let wait, so it's freed as the file goes.
+        let dir = fs.resolve(ROOT, "/", true).unwrap();
+        fs.remove(dir, "big", 0).unwrap();
+        assert_eq!(store.chunk_count(), 2);
+        // A crash after it: the file's gone, and the other is whole.
+        let again = open(None, &store.crashed());
+        assert_eq!(again.resolve(ROOT, "/big", true), Err(Error::NotFound));
+        assert_eq!(read_all(&again, "/keep"), small);
+    }
+
+    #[test]
+    fn a_file_held_open_keeps_its_chunks_until_its_let_go() {
+        let store = Shared::machine();
+        let mut fs = open(None, &store);
+        let data = pattern(20 << 20, 3);
+        let f = fs.put("/f", New::File, &data, 0o644, 0o755).unwrap();
+        fs.sync().unwrap();
+        fs.hold(f);
+        fs.remove(ROOT, "f", 0).unwrap();
+        fs.free_unnamed().unwrap();
+        assert_eq!(fs.contents(f).unwrap(), data);
+        fs.release(f);
+        assert_eq!(store.chunk_count(), 0);
+    }
+
+    #[test]
+    fn written_over_chunks_are_freed_once_the_log_has_the_new_ones() {
+        let store = Shared::machine();
+        let mut fs = open(None, &store);
+        let f = fs.put("/f", New::File, &pattern(200_000, 4), 0o644, 0o755).unwrap();
+        fs.sync().unwrap();
+        let new = pattern(200_000, 5);
+        fs.write(f, 0, &new, 1).unwrap();
+        fs.free_unnamed().unwrap();
+        assert_eq!(store.chunk_count(), 4);
+        assert_eq!(read_all(&open(None, &store.crashed()), "/f"), new);
+    }
+
+    #[test]
+    fn a_full_disk_frees_what_it_can_and_loses_nothing() {
+        let shared = Shared::machine();
+        let full = Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let store = Fillable(shared.clone(), full.clone());
+        let mut fs = Fs::<u32>::open(None, Box::new(store), 0o755, false).unwrap();
+        let (old, new) = (pattern(CHUNK as usize, 6), pattern(CHUNK as usize, 7));
+        let f = fs.put("/f", New::File, &old, 0o644, 0o755).unwrap();
+        fs.put("/big", New::File, &pattern(20 << 20, 8), 0o644, 0o755).unwrap();
+        fs.sync().unwrap();
+        // /f written over, then the disk fills, and /big goes: its chunks are freed, /f's old one isn't.
+        fs.write(f, 0, &new, 1).unwrap();
+        full.store(true, core::sync::atomic::Ordering::Relaxed);
+        fs.remove(ROOT, "big", 2).unwrap();
+        assert_eq!(fs.sync(), Err(Error::NoSpace));
+        assert_eq!(shared.chunk_count(), 1);
+        assert_eq!(read_all(&open(None, &shared.crashed()), "/f"), old);
+        // With room again, /f is saved after all.
+        full.store(false, core::sync::atomic::Ordering::Relaxed);
+        fs.sync().unwrap();
+        let again = open(None, &shared.crashed());
+        assert_eq!(read_all(&again, "/f"), new);
+        assert_eq!(again.resolve(ROOT, "/big", true), Err(Error::NotFound));
+    }
+
+    #[test]
+    fn freezing_shares_what_the_image_names() {
+        let store = Shared::machine();
+        let mut fs = open(None, &store);
+        let data = pattern(20 << 20, 9);
+        fs.put("/f", New::File, &data, 0o644, 0o755).unwrap();
+        let index = fs.freeze().unwrap();
+        fs.remove(ROOT, "f", 0).unwrap();
+        fs.free_unnamed().unwrap();
+        assert_eq!(store.chunk_count(), 320);
+        assert_eq!(read_all(&open(Some(&index), &store.chunks_only()), "/f"), data);
     }
 
     #[test]

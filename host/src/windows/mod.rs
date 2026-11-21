@@ -23,6 +23,16 @@ unsafe extern "system" {
     fn GlobalMemoryStatusEx(status: *mut MemoryStatusEx) -> i32;
     fn GetCurrentThread() -> *mut core::ffi::c_void;
     fn GetThreadTimes(thread: *mut core::ffi::c_void, creation: *mut u64, exit: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
+    fn GetDiskFreeSpaceExW(folder: *const u16, free_to_caller: *mut u64, total: *mut u64, free: *mut u64) -> i32;
+}
+
+/// The size of the volume `path` is on, and how much of it this process may still fill (its quota too), in bytes.
+pub fn disk_space(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let (mut to_caller, mut total, mut free) = (0, 0, 0);
+    // SAFETY: a NUL-terminated folder name, and three u64s to fill in.
+    (unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut to_caller, &mut total, &mut free) } != 0).then_some((total, to_caller))
 }
 
 /// The CPU time the calling thread has used, in nanoseconds: its kernel and user time together.

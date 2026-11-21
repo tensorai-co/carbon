@@ -736,7 +736,8 @@ oleaut32's BSTRs and `VariantInit`, `VariantClear` and `VariantCopy` (a BSTR fre
 added to). In the host: `CompareString` (word sort passing over hyphens and apostrophes, case second and lowercase
 first, `NORM_IGNORECASE`, `NORM_IGNORESYMBOLS`, `SORT_DIGITSASNUMBERS`), `LCMapString` (case one character for one,
 byte reversal, and sort keys in the same order) and `GetStringType`'s three classes; `GetDateFormat` and
-`GetTimeFormat`, in English (United States), with pictures and their flags; `GetDiskFreeSpaceEx`, `GetDriveType`,
+`GetTimeFormat`, in English (United States), with pictures and their flags; `GetDiskFreeSpaceEx` (C: is the host disk
+the machine's store is on, and a full one is `ERROR_DISK_FULL`), `GetDriveType`,
 `FindFirstFileEx`; the console's modes, `ReadConsole`, `SetStdHandle`; `OpenThread`, thread priorities, affinity
 masks and the session; psapi's module paths, module information and memory counters (as kernel32's `K32` functions
 too); `IsBadWritePtr` and `IsBadReadPtr` from the process's regions; `OutputDebugString` into the trace; user32's one
