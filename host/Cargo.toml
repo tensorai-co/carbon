@@ -1,6 +1,6 @@
 [package]
 name = "host"
-description = "What kernels need from the host: standard streams, clocks, randomness, memory, certificate trust"
+description = "What kernels need from the host: standard streams, clocks, randomness, memory, certificate trust, Cloud Run's ID tokens"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,6 +8,10 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# Only for Cloud Run's ID tokens (cloud_run.rs): the metadata server, and a middleware for others' agents.
+ureq.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

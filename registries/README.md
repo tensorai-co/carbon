@@ -30,6 +30,12 @@ bearer. An answer is JSON, bytes (with `Carbon-Size`, and `Carbon-Digest` when i
 `{"error": {"code", "message"}}`, whose code is `invalid`, `unauthorized`, `forbidden`, `not_found`, `too_large` or
 `unavailable`. Each adapter turns a refusal into its tool's own failure, with the message, so the tool says why.
 
+**A private Cloud Run server.** With `CARBON_CLOUD_RUN_ID_TOKENS=1`, on Google Cloud, every call to an
+`https://….run.app` server (and every image pulled from one) also carries the host's own Google ID token for that
+server in `X-Serverless-Authorization`, from the metadata server, so Cloud Run's IAM check lets it in while the token
+above stays in `Authorization`. Each ID token is for that one server only, and like the token, never goes in the
+machine ([`host::cloud_run`](../host/src/cloud_run.rs)).
+
 ## Crates
 
 | Crate | What it is |

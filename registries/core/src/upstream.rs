@@ -54,6 +54,9 @@ impl Upstream {
             .timeout_write(Duration::from_secs(120))
             .redirects(0)
             .user_agent(concat!("carbon/", env!("CARGO_PKG_VERSION")))
+            // On Cloud Run with CARBON_CLOUD_RUN_ID_TOKENS, a private run.app server's IAM check gets the host's ID
+            // token; the registries token stays in Authorization.
+            .middleware(host::cloud_run::Invoker)
             .build();
         Upstream { agent, token, meta }
     }

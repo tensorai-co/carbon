@@ -110,7 +110,8 @@ impl Client {
     /// Connects for `scopes` (`repository:NAME:pull`), with `credentials` if there are any: a token from the registry's
     /// challenge, asked for with them, or them on each request if it wants that.
     pub fn connect(reference: &Reference, scopes: &[String], credentials: Option<&Credentials>) -> Result<Client, String> {
-        let agent = ureq::AgentBuilder::new().tls_config(crate::tls::client_config()?).build();
+        // A private run.app registry's IAM check gets the host's ID token (host::cloud_run), the registry's own auth Authorization.
+        let agent = ureq::AgentBuilder::new().tls_config(crate::tls::client_config()?).middleware(host::cloud_run::Invoker).build();
         let origin = reference.origin();
         let base = format!("{origin}/v2/{}", reference.repository);
         let mut client = Client { agent, origin: origin.clone(), base, auth: Auth::None };

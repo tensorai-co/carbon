@@ -448,6 +448,7 @@ dependencies = [
  "libc",
  "rustls-pki-types",
  "rustls-webpki",
+ "ureq",
 ]
 
 [[package]]
@@ -868,6 +869,7 @@ name = "registries-core"
 version = "0.2.0"
 dependencies = [
  "hooks",
+ "host",
  "rustls",
  "serde_json",
  "sha2",
