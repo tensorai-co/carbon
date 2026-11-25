@@ -194,8 +194,11 @@ impl Kernel {
     /// Finishes an I/O where there's no CPU to write with (a handle dropped as its process ends): told now, its
     /// OVERLAPPED (and what it read, into its buffer) written by the next thread that calls into atlas.
     pub(crate) fn complete_later(&self, c: Completion) {
-        self.notify(&c);
+        let op = c.op.clone();
+        let n = c.data.len() as u64;
+        let error = c.error;
         lock(&self.deferred).push(c);
+        self.tell(&op, n, error);
     }
 
     /// Writes what `complete_later` left: what it read into its buffer, then its OVERLAPPED. The thread it's for

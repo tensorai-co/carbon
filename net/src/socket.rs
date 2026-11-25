@@ -117,6 +117,8 @@ pub struct SocketInfo {
     pub state: TcpState,
     /// Bytes waiting to be read, and written but not yet taken.
     pub queued: (usize, usize),
+    /// Owning process ID from `set_cred` (0 if unset).
+    pub pid: i32,
 }
 
 /// A socket. Dropping it closes it.
@@ -191,7 +193,7 @@ impl Inner {
             Conn::Datagrams(d) => (TcpState::Close, (d.bytes, 0)),
             Conn::Idle | Conn::Failed => (TcpState::Close, (0, 0)),
         };
-        SocketInfo { id: self.id, domain: self.domain, kind: self.kind, local: state.local.clone(), peer: state.peer.clone(), state: tcp, queued }
+        SocketInfo { id: self.id, domain: self.domain, kind: self.kind, local: state.local.clone(), peer: state.peer.clone(), state: tcp, queued, pid: state.cred.pid }
     }
 }
 
@@ -506,7 +508,10 @@ impl Socket {
     /// A connection a published port accepted on the host, for `listener`'s queue as `server`: connected already, to
     /// `local`, from `from` (the client as the machine sees it).
     pub(crate) fn arrive(listener: &Arc<Inner>, server: Socket, stream: Box<dyn HostStream>, local: SocketAddr, from: SocketAddr) -> Result<()> {
-        let options = lock(&listener.state).options;
+        let (options, listener_cred) = {
+            let state = lock(&listener.state);
+            (state.options, state.cred)
+        };
         stream.set_nodelay(options.nodelay);
         stream.set_keepalive(options.keepalive);
         let seen_from = Addr::Inet(as_domain(listener.domain, from));
@@ -514,6 +519,7 @@ impl Socket {
             let mut state = server.state();
             state.local = Some(Addr::Inet(as_domain(listener.domain, local)));
             state.peer = Some(seen_from.clone());
+            state.cred = listener_cred;
             state.options = Options { reuse_addr: false, reuse_port: false, ..options };
             state.conn = Conn::Out { stream, peeked: Vec::new() };
         }

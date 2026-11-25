@@ -213,7 +213,9 @@ pub fn connect_named_pipe(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply 
     let ov = a[1];
     if file.overlapped && ov != 0 {
         let abi = task.abi();
-        let event = task.mem(cx, false, |t| user::read_ptr(&t.space(), ov + abi.overlapped_event(), abi.width)).ok().filter(|&e| e != 0).and_then(|e| task.object(e));
+        let raw_event = task.mem(cx, false, |t| user::read_ptr(&t.space(), ov + abi.overlapped_event(), abi.width)).unwrap_or(0);
+        let skip_port = raw_event & 1 != 0;
+        let event = (raw_event & !1 != 0).then(|| task.object(raw_event & !1)).flatten();
         if let Some(event) = &event {
             task.k.objects.signal(event, |s| s.set = false);
         }
@@ -223,7 +225,7 @@ pub fn connect_named_pipe(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply 
             overlapped: ov,
             buffer: 0,
             event,
-            port: lock(&file.port).clone(),
+            port: if skip_port { None } else { lock(&file.port).clone() },
             routine: None,
         });
         let pending = task.abi().overlapped_result(ports::STATUS_PENDING, 0);

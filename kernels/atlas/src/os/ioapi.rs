@@ -164,6 +164,7 @@ pub fn get_overlapped_result_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> 
         if timeout == 0 {
             return task.fail(cx, ports::ERROR_IO_INCOMPLETE);
         }
+        let event = event & !1;
         let waited = match task.object(if event != 0 { event } else { a[0] }) {
             Some(object) => task.wait_for(cx, &[object], false, timeout, alertable),
             None => return task.fail(cx, ERROR_INVALID_HANDLE),

@@ -181,9 +181,9 @@ enum Outcome {
 
 impl Task {
     /// Where an I/O that's pending completes to.
-    fn new_op(&self, file: &File, overlapped: u64, buffer: u64, event: Option<Arc<crate::objects::Object>>, notify: Notify) -> Arc<ports::Op> {
+    fn new_op(&self, file: &File, overlapped: u64, buffer: u64, event: Option<Arc<crate::objects::Object>>, notify: Notify, skip_port: bool) -> Arc<ports::Op> {
         let (port, routine) = match notify {
-            Notify::Plain => (lock(&file.port).clone(), None),
+            Notify::Plain => (if skip_port { None } else { lock(&file.port).clone() }, None),
             Notify::Routine(r) => (None, Some(r)),
         };
         Arc::new(ports::Op { process: Arc::downgrade(&self.process), thread: Arc::downgrade(&self.control), overlapped, buffer, event, port, routine })
@@ -196,10 +196,13 @@ pub(crate) fn transfer(task: &mut Task, cx: &mut Cx<'_>, handle: u64, buffer: u6
     let Some(file) = task.file_handle(handle) else { return task.fail(cx, ERROR_INVALID_HANDLE) };
     // A file on the disk takes it all at once, as Windows' do (up to 1 GiB here); a pipe or device, 16 MiB at a time.
     let len = (len as usize).min(if matches!(file.node, Node::File(_)) { 1 << 30 } else { 1 << 24 });
-    let (offset, event) = match overlapped(task, cx, ov) {
+    let (offset, raw_event) = match overlapped(task, cx, ov) {
         Some((offset, event)) => (Some(offset), if matches!(notify, Notify::Plain) { event } else { 0 }),
         None => (None, 0),
     };
+    // Low bit of OVERLAPPED.hEvent suppresses posting a completion packet to the completion port.
+    let skip_port = raw_event & 1 != 0;
+    let event = raw_event & !1;
     // The event is unset while the I/O is under way.
     let event = (event != 0).then(|| task.object(event)).flatten();
     if let Some(event) = &event {
@@ -255,7 +258,15 @@ pub(crate) fn transfer(task: &mut Task, cx: &mut Cx<'_>, handle: u64, buffer: u6
         match pipe {
             Some(Err(e)) => finished(Err(e)),
             Some(Ok((pipe, message_mode, nowait))) if asynchronous || nowait => {
-                let op = asynchronous.then(|| task.new_op(&file, ov, buffer, event.clone(), notify));
+                if asynchronous {
+                    // Mark OVERLAPPED pending before publishing `op` so a concurrent writer's
+                    // completion cannot be overwritten with STATUS_PENDING.
+                    let pending = task.abi().overlapped_result(ports::STATUS_PENDING, 0);
+                    if task.mem(cx, true, |t| user::write(&mut t.space(), ov, &pending)).is_err() {
+                        return task.fail(cx, 998);
+                    }
+                }
+                let op = asynchronous.then(|| task.new_op(&file, ov, buffer, event.clone(), notify, skip_port));
                 match pipe.read(len, message_mode, op) {
                     pipes::Read::Data(data, more) => read(data, more),
                     pipes::Read::Ended(e) => finished(Err(e)),
@@ -278,8 +289,6 @@ pub(crate) fn transfer(task: &mut Task, cx: &mut Cx<'_>, handle: u64, buffer: u6
     };
     let (data, n, error) = match outcome {
         Outcome::Pending => {
-            let pending = task.abi().overlapped_result(ports::STATUS_PENDING, 0);
-            let _ = task.mem(cx, true, |t| user::write(&mut t.space(), ov, &pending));
             // `ReadFileEx` says it's under way by succeeding; `ReadFile`, by ERROR_IO_PENDING.
             return match notify {
                 Notify::Routine(_) => Reply::Value(TRUE),
@@ -318,6 +327,7 @@ pub(crate) fn transfer(task: &mut Task, cx: &mut Cx<'_>, handle: u64, buffer: u6
             let port = lock(&file.port).clone();
             if let Some((port, key)) = port
                 && asynchronous
+                && !skip_port
                 && (error != 0 || file.modes.load(std::sync::atomic::Ordering::Relaxed) & SKIP_PORT_ON_SUCCESS == 0)
             {
                 port.post(ports::Packet { bytes: n as u32, key, overlapped: ov, status: ports::status(error) });
@@ -1365,12 +1375,14 @@ pub fn read_directory_changes_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> 
     // Overlapped: done now, or left for the next change.
     if file.overlapped && a[6] != 0 {
         let abi = task.abi();
-        let event = task.mem(cx, false, |t| user::read_ptr(&t.space(), a[6] + abi.overlapped_event(), abi.width)).ok().filter(|&e| e != 0).and_then(|e| task.object(e));
+        let raw_event = task.mem(cx, false, |t| user::read_ptr(&t.space(), a[6] + abi.overlapped_event(), abi.width)).unwrap_or(0);
+        let skip_port = raw_event & 1 != 0;
+        let event = (raw_event & !1 != 0).then(|| task.object(raw_event & !1)).flatten();
         if let Some(event) = &event {
             task.k.objects.signal(event, |s| s.set = false);
         }
         let notify = if a[7] != 0 { Notify::Routine(a[7]) } else { Notify::Plain };
-        let op = task.new_op(&file, a[6], a[1], event, notify);
+        let op = task.new_op(&file, a[6], a[1], event, notify, skip_port);
         match ready {
             Some(records) => {
                 let (data, error) = match encode(&records, room as usize) {

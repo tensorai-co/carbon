@@ -245,15 +245,17 @@ impl Task {
     /// routine to run instead.
     fn socket_op(&mut self, cx: &mut Cx<'_>, file: &File, ov: u64, routine: u64, buffer: u64) -> Arc<Op> {
         let abi = self.abi();
-        let event = self.mem(cx, false, |t| user::read_ptr(&t.space(), ov + abi.overlapped_event(), abi.width)).unwrap_or(0);
+        let raw_event = self.mem(cx, false, |t| user::read_ptr(&t.space(), ov + abi.overlapped_event(), abi.width)).unwrap_or(0);
+        let suppress_iocp = raw_event & 1 != 0;
+        let event_handle = raw_event & !1;
         let (event, port, routine) = if routine != 0 {
             (None, None, Some(routine))
         } else {
-            let event = (event != 0).then(|| self.object(event)).flatten();
+            let event = (event_handle != 0).then(|| self.object(event_handle)).flatten();
             if let Some(e) = &event {
                 self.k.objects.signal(e, |s| s.set = false);
             }
-            (event, lock(&file.port).clone(), None)
+            (event, if suppress_iocp { None } else { lock(&file.port).clone() }, None)
         };
         Arc::new(Op { process: Arc::downgrade(&self.process), thread: Arc::downgrade(&self.control), overlapped: ov, buffer, event, port, routine })
     }
@@ -336,6 +338,7 @@ impl Task {
             _ => return Err(WSAEPROTONOSUPPORT),
         };
         let socket = self.k.net.socket(domain, net_kind).map_err(|e| wsa(&e))?;
+        socket.set_cred(net::Cred { pid: self.process.pid as i32, uid: 0, gid: 0 });
         // Windows' IPv6 sockets are IPv6 only until IPV6_V6ONLY says otherwise, unlike Linux's.
         socket.set_options(|o| o.v6only = domain == net::Domain::Inet6);
         Ok(self.socket_handle(Sock::new(&self.process, socket, af, kind, protocol), overlapped))
@@ -491,6 +494,14 @@ fn connect(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
         let addr = task.addr_arg(cx, a[1], a[2])?;
         let socket = sock.net();
         match socket.connect(&net::Addr::Inet(addr)) {
+            Ok(()) if sock.is_stream() && sock.nonblocking.load(Ordering::Relaxed) => {
+                // On Windows, a non-blocking TCP connect() always returns WSAEWOULDBLOCK (even on loopback)
+                // and delivers FD_CONNECT via WSAEventSelect / writability via select().
+                sock.connecting.store(true, Ordering::Relaxed);
+                sock.rearm(FD_CONNECT);
+                task.wake_net();
+                Err(WSAEWOULDBLOCK.into())
+            }
             Ok(()) => Ok(0),
             Err(net::Error::InProgress) if sock.nonblocking.load(Ordering::Relaxed) => {
                 // FD_CONNECT says how it went.

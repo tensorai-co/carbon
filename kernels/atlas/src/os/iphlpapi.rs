@@ -16,7 +16,7 @@ dll! {
     host GetAdaptersAddresses(5) => get_adapters_addresses;
     missing GetAdaptersInfo;
     host GetBestInterface(2) => get_best_interface;
-    missing GetExtendedTcpTable;
+    host GetExtendedTcpTable(6) => get_extended_tcp_table;
     missing GetIfEntry2;
     host NotifyAddrChange(2) => notify_change;
     // Not written yet: what larger programs import.
@@ -369,6 +369,161 @@ fn get_best_interface(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
         return Reply::Value(ERROR_NO_DATA);
     }
     if task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[1], index)).is_err() {
+        return Reply::Value(ERROR_INVALID_PARAMETER);
+    }
+    Reply::Value(0)
+}
+
+/// `GetExtendedTcpTable(table, &size, order, af, class, reserved)`: the machine's TCP sockets (listeners,
+/// connections, or both) with optional owning PID and module slots, for AF_INET or AF_INET6.
+fn get_extended_tcp_table(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    const ERROR_INSUFFICIENT_BUFFER: u64 = 122;
+    const MIB_TCP_STATE_LISTEN: u32 = 2;
+    const MIB_TCP_STATE_SYN_SENT: u32 = 3;
+    const MIB_TCP_STATE_ESTAB: u32 = 5;
+
+    let (table_at, size_at, order, af, class) = (a[0], a[1], a[2] as u32 != 0, a[3] as u32, a[4] as u32);
+    if size_at == 0 || !matches!(af, AF_INET | AF_INET6) || class > 8 {
+        return Reply::Value(ERROR_INVALID_PARAMETER);
+    }
+    let Ok(room) = task.mem(cx, false, |t| user::read_u32(&t.space(), size_at)) else {
+        return Reply::Value(ERROR_INVALID_PARAMETER);
+    };
+
+    // class % 3: 0 = listeners, 1 = connections, 2 = all.
+    // class / 3: 0 = basic, 1 = owner_pid, 2 = owner_module.
+    let filter = class % 3;
+    let flavor = class / 3;
+    let mut rows = Vec::new();
+    for info in task.k.net.sockets() {
+        if info.kind != net::Kind::Stream {
+            continue;
+        }
+        let mib_state = match info.state {
+            net::TcpState::Listen => MIB_TCP_STATE_LISTEN,
+            net::TcpState::SynSent => MIB_TCP_STATE_SYN_SENT,
+            net::TcpState::Established => MIB_TCP_STATE_ESTAB,
+            net::TcpState::Close => continue,
+        };
+        let is_listener = mib_state == MIB_TCP_STATE_LISTEN;
+        if (filter == 0 && !is_listener) || (filter == 1 && is_listener) {
+            continue;
+        }
+        let Some(net::Addr::Inet(local)) = info.local else { continue };
+        let peer = match info.peer {
+            Some(net::Addr::Inet(p)) if !is_listener => Some(p),
+            _ => None,
+        };
+        let pid = info.pid.max(0) as u32;
+        if af == AF_INET {
+            let local_v4 = match local {
+                std::net::SocketAddr::V4(v4) => v4,
+                std::net::SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+                    Some(ip) => std::net::SocketAddrV4::new(ip, v6.port()),
+                    None => continue,
+                },
+            };
+            let (remote_ip, remote_port) = match peer {
+                Some(std::net::SocketAddr::V4(v4)) => (u32::from_le_bytes(v4.ip().octets()), v4.port()),
+                Some(std::net::SocketAddr::V6(v6)) => match v6.ip().to_ipv4_mapped() {
+                    Some(ip) => (u32::from_le_bytes(ip.octets()), v6.port()),
+                    None => (0, 0),
+                },
+                None => (0, 0),
+            };
+            let local_ip = u32::from_le_bytes(local_v4.ip().octets());
+            rows.push((
+                mib_state,
+                [0u8; 16],
+                local_ip,
+                0u32,
+                local_v4.port(),
+                [0u8; 16],
+                remote_ip,
+                0u32,
+                remote_port,
+                pid,
+            ));
+        } else {
+            let std::net::SocketAddr::V6(local_v6) = local else { continue };
+            let (remote_octets, remote_scope, remote_port) = match peer {
+                Some(std::net::SocketAddr::V6(v6)) => (v6.ip().octets(), v6.scope_id(), v6.port()),
+                _ => ([0u8; 16], 0, 0),
+            };
+            rows.push((
+                mib_state,
+                local_v6.ip().octets(),
+                0u32,
+                local_v6.scope_id(),
+                local_v6.port(),
+                remote_octets,
+                0u32,
+                remote_scope,
+                remote_port,
+                pid,
+            ));
+        }
+    }
+    if order {
+        if af == AF_INET {
+            rows.sort_by_key(|r| (r.2, r.4, r.6, r.8));
+        } else {
+            rows.sort_by_key(|r| (r.1, r.4, r.5, r.8));
+        }
+    }
+
+    let mut out = Vec::new();
+    out.extend((rows.len() as u32).to_le_bytes());
+    // OWNER_MODULE tables contain 8-byte aligned ULONGLONG fields, so Windows pads the 4-byte count to 8 bytes.
+    if flavor == 2 {
+        out.extend([0u8; 4]);
+    }
+    let port_dword = |p: u16| u32::from(p.to_be()).to_le_bytes();
+    for (state, l6, l4, lscope, lport, r6, r4, rscope, rport, pid) in rows {
+        if af == AF_INET {
+            out.extend(state.to_le_bytes());
+            out.extend(l4.to_le_bytes());
+            out.extend(port_dword(lport));
+            out.extend(r4.to_le_bytes());
+            out.extend(port_dword(rport));
+            if flavor >= 1 {
+                out.extend(pid.to_le_bytes());
+            }
+            if flavor == 2 {
+                // liCreateTimestamp (8) + OwningModuleInfo[16] (128).
+                out.extend([0u8; 8 + 128]);
+            }
+        } else if flavor == 0 {
+            // MIB_TCP6ROW: State comes first.
+            out.extend(state.to_le_bytes());
+            out.extend(l6);
+            out.extend(lscope.to_le_bytes());
+            out.extend(port_dword(lport));
+            out.extend(r6);
+            out.extend(rscope.to_le_bytes());
+            out.extend(port_dword(rport));
+        } else {
+            // MIB_TCP6ROW_OWNER_PID / MIB_TCP6ROW_OWNER_MODULE: addresses first, then dwState, dwOwningPid.
+            out.extend(l6);
+            out.extend(lscope.to_le_bytes());
+            out.extend(port_dword(lport));
+            out.extend(r6);
+            out.extend(rscope.to_le_bytes());
+            out.extend(port_dword(rport));
+            out.extend(state.to_le_bytes());
+            out.extend(pid.to_le_bytes());
+            if flavor == 2 {
+                out.extend([0u8; 8 + 128]);
+            }
+        }
+    }
+
+    let need = out.len() as u32;
+    let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), size_at, need));
+    if table_at == 0 || room < need {
+        return Reply::Value(ERROR_INSUFFICIENT_BUFFER);
+    }
+    if task.mem(cx, true, |t| user::write(&mut t.space(), table_at, &out)).is_err() {
         return Reply::Value(ERROR_INVALID_PARAMETER);
     }
     Reply::Value(0)
