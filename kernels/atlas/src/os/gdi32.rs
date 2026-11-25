@@ -103,7 +103,7 @@ dll! {
     missing ExtCreatePen;
     missing ExtEscape;
     missing FillPath;
-    missing GdiAlphaBlend;
+    host GdiAlphaBlend(11) => gdi_alpha_blend;
     missing GdiComment;
     missing GetCharWidthW;
     host GetClipRgn(2) => get_clip_rgn;
@@ -114,26 +114,26 @@ dll! {
     host GetRegionData(3) => get_region_data;
     host GetRgnBox(2) => get_rgn_box;
     missing GetTextFaceA;
-    missing GetWorldTransform;
-    missing IntersectClipRect;
-    missing ModifyWorldTransform;
+    host GetWorldTransform(2) => get_world_transform;
+    host IntersectClipRect(5) => intersect_clip_rect;
+    host ModifyWorldTransform(3) => modify_world_transform;
     missing PlayEnhMetaFile;
     missing PlayEnhMetaFileRecord;
     missing PolyBezierTo;
     host PtInRegion(3) => pt_in_region;
-    missing RestoreDC;
-    missing SaveDC;
+    host RestoreDC(2) => restore_dc;
+    host SaveDC(1) => save_dc;
     missing SelectClipPath;
     missing SetAbortProc;
     missing SetArcDirection;
     missing SetDCPenColor;
     host SetDIBits(7) => set_di_bits;
     missing SetEnhMetaFileBits;
-    missing SetGraphicsMode;
+    host SetGraphicsMode(2) => set_graphics_mode;
     missing SetMiterLimit;
     missing SetPolyFillMode;
     missing SetROP2;
-    missing SetWorldTransform;
+    host SetWorldTransform(2) => set_world_transform;
     missing StartDocW;
     missing StartPage;
     missing StrokeAndFillPath;
@@ -1145,11 +1145,205 @@ fn sync_dib_to_guest(task: &mut Task, cx: &mut Cx<'_>, bitmap: u64) {
     let _ = task.mem(cx, true, |t| user::write(&mut t.space(), dib.bits, &out));
 }
 
-fn sync_dc_dib_from_guest(task: &mut Task, cx: &mut Cx<'_>, hdc: u64) {
+pub(crate) fn sync_dc_dib_from_guest(task: &mut Task, cx: &mut Cx<'_>, hdc: u64) {
     let bmp = task.win32k().gdi.dcs.get(&hdc).filter(|dc| dc.memory).map(|dc| dc.bitmap);
     if let Some(b) = bmp {
         sync_dib_from_guest(task, cx, b);
     }
+}
+
+/// `SetGraphicsMode(hdc, mode)`: `GM_COMPATIBLE` (1) or `GM_ADVANCED` (2). Returns previous mode, or 0 on error.
+fn set_graphics_mode(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let mode = a[1] as u32 as i32;
+    if mode != 1 && mode != 2 {
+        return Reply::Value(0);
+    }
+    let mut w = task.win32k();
+    let Some(dc) = w.gdi.dcs.get_mut(&a[0]) else { return Reply::Value(0) };
+    let prev = std::mem::replace(&mut dc.graphics_mode, mode);
+    Reply::Value(prev as u32 as u64)
+}
+
+fn read_xform(task: &mut Task, cx: &mut Cx<'_>, at: u64) -> Option<[f32; 6]> {
+    if at == 0 {
+        return None;
+    }
+    let b = task.mem(cx, false, |t| user::read_vec(&t.space(), at, 24)).ok()?;
+    let f = |i: usize| f32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+    Some([f(0), f(1), f(2), f(3), f(4), f(5)])
+}
+
+fn mul_xform(a: [f32; 6], b: [f32; 6]) -> [f32; 6] {
+    [
+        a[0] * b[0] + a[1] * b[2],
+        a[0] * b[1] + a[1] * b[3],
+        a[2] * b[0] + a[3] * b[2],
+        a[2] * b[1] + a[3] * b[3],
+        a[4] * b[0] + a[5] * b[2] + b[4],
+        a[4] * b[1] + a[5] * b[3] + b[5],
+    ]
+}
+
+/// `GetWorldTransform(hdc, &xform)`.
+fn get_world_transform(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[1] == 0 {
+        return Reply::Value(0);
+    }
+    let Some(xf) = task.win32k().gdi.dcs.get(&a[0]).map(|dc| dc.xform) else { return Reply::Value(0) };
+    let bytes: Vec<u8> = xf.iter().flat_map(|v| v.to_le_bytes()).collect();
+    Reply::Value(u64::from(task.mem(cx, true, |t| user::write(&mut t.space(), a[1], &bytes)).is_ok()))
+}
+
+/// `SetWorldTransform(hdc, &xform)`.
+fn set_world_transform(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(xf) = read_xform(task, cx, a[1]) else { return Reply::Value(0) };
+    let mut w = task.win32k();
+    let Some(dc) = w.gdi.dcs.get_mut(&a[0]) else { return Reply::Value(0) };
+    if dc.graphics_mode != 2 {
+        return Reply::Value(0);
+    }
+    dc.xform = xf;
+    Reply::Value(1)
+}
+
+/// `ModifyWorldTransform(hdc, &xform, mode)`: `MWT_IDENTITY` (1), `MWT_LEFTMULTIPLY` (2), `MWT_RIGHTMULTIPLY` (3),
+/// `MWT_SET` (4).
+fn modify_world_transform(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let mode = a[2] as u32;
+    let xf = if mode == 1 { Some([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]) } else { read_xform(task, cx, a[1]) };
+    let Some(xf) = xf else { return Reply::Value(0) };
+    let mut w = task.win32k();
+    let Some(dc) = w.gdi.dcs.get_mut(&a[0]) else { return Reply::Value(0) };
+    if dc.graphics_mode != 2 && mode != 1 {
+        return Reply::Value(0);
+    }
+    dc.xform = match mode {
+        1 | 4 => xf,
+        2 => mul_xform(xf, dc.xform),
+        3 => mul_xform(dc.xform, xf),
+        _ => return Reply::Value(0),
+    };
+    Reply::Value(1)
+}
+
+/// `SaveDC(hdc)`: saves the DC's drawing state on its stack and returns its 1-based depth.
+fn save_dc(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let mut w = task.win32k();
+    let Some(dc) = w.gdi.dcs.get_mut(&a[0]) else { return Reply::Value(0) };
+    let snap = crate::win32k::gdi::DcState {
+        clip: dc.clip,
+        text: dc.text,
+        background: dc.background,
+        mode: dc.mode,
+        brush: dc.brush,
+        pen: dc.pen,
+        font: dc.font,
+        position: dc.position,
+        bitmap: dc.bitmap,
+        graphics_mode: dc.graphics_mode,
+        xform: dc.xform,
+    };
+    dc.saved.push(snap);
+    Reply::Value(dc.saved.len() as u64)
+}
+
+/// `RestoreDC(hdc, saved_dc)`: restores a positive 1-based save level or negative relative offset.
+fn restore_dc(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let level = a[1] as u32 as i32;
+    let mut w = task.win32k();
+    let Some(dc) = w.gdi.dcs.get_mut(&a[0]) else { return Reply::Value(0) };
+    let idx = if level < 0 {
+        let off = (-level) as usize;
+        if off == 0 || off > dc.saved.len() {
+            return Reply::Value(0);
+        }
+        dc.saved.len() - off
+    } else if level > 0 {
+        let i = (level - 1) as usize;
+        if i >= dc.saved.len() {
+            return Reply::Value(0);
+        }
+        i
+    } else {
+        return Reply::Value(0);
+    };
+    let snap = dc.saved[idx].clone();
+    dc.saved.truncate(idx);
+    dc.clip = snap.clip;
+    dc.text = snap.text;
+    dc.background = snap.background;
+    dc.mode = snap.mode;
+    dc.brush = snap.brush;
+    dc.pen = snap.pen;
+    dc.font = snap.font;
+    dc.position = snap.position;
+    dc.bitmap = snap.bitmap;
+    dc.graphics_mode = snap.graphics_mode;
+    dc.xform = snap.xform;
+    Reply::Value(1)
+}
+
+/// `IntersectClipRect(hdc, left, top, right, bottom)`.
+fn intersect_clip_rect(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let mut w = task.win32k();
+    let Some(dc) = w.gdi.dcs.get_mut(&a[0]) else { return Reply::Value(0) };
+    let r = Rect::new(a[1] as u32 as i32, a[2] as u32 as i32, a[3] as u32 as i32, a[4] as u32 as i32);
+    dc.clip = dc.clip.intersect(&r);
+    Reply::Value(region_kind(&dc.clip))
+}
+
+/// `GdiAlphaBlend(dst, dx, dy, dw, dh, src, sx, sy, sw, sh, blend)`: copies/scales `src` into `dst` (blending with
+/// `SourceConstantAlpha` and per-pixel alpha when `AC_SRC_ALPHA` is set on a 32-bit DIB).
+fn gdi_alpha_blend(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (dst, dx, dy, dw, dh) = (a[0], a[1] as i32, a[2] as i32, a[3] as i32, a[4] as i32);
+    let (src, sx, sy, sw, sh, blend) = (a[5], a[6] as i32, a[7] as i32, a[8] as i32, a[9] as i32, a[10] as u32);
+    if dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0 {
+        return Reply::Value(0);
+    }
+    sync_dc_dib_from_guest(task, cx, src);
+    let const_alpha = ((blend >> 16) & 0xff) as u32;
+    let src_alpha = (blend >> 24) & 0x01 != 0;
+    let src_bmp = task.win32k().gdi.dcs.get(&src).filter(|dc| dc.memory).map(|dc| dc.bitmap);
+    let argb = if src_alpha { src_bmp.and_then(|b| read_dib_argb(task, cx, b)) } else { None };
+    let surface = {
+        let w = task.win32k();
+        src_bmp.and_then(|b| w.gdi.bitmaps.get(&b).cloned())
+    };
+    let Some(surface) = surface else { return Reply::Value(0) };
+    let ok = task.win32k().draw(dst, |s, (ox, oy), clip, _| {
+        let dest = Rect::new(dx + ox, dy + oy, dx + ox + dw, dy + oy + dh).intersect(clip);
+        for y in dest.top..dest.bottom {
+            let py = sy + ((y - (dy + oy)) as i64 * sh as i64 / dh as i64) as i32;
+            if !(0..surface.height).contains(&py) {
+                continue;
+            }
+            for x in dest.left..dest.right {
+                let px = sx + ((x - (dx + ox)) as i64 * sw as i64 / dw as i64) as i32;
+                if !(0..surface.width).contains(&px) {
+                    continue;
+                }
+                let si = (py * surface.width + px) as usize;
+                let di = (y * s.width + x) as usize;
+                let (sr, sg, sb, sa) = if let Some((_, _, ref pix)) = argb {
+                    let p = pix[si];
+                    ((p >> 16) & 0xff, (p >> 8) & 0xff, p & 0xff, ((p >> 24) & 0xff) * const_alpha / 255)
+                } else {
+                    let p = surface.pixels[si];
+                    (((p >> 16) & 0xff) * const_alpha / 255, ((p >> 8) & 0xff) * const_alpha / 255, (p & 0xff) * const_alpha / 255, const_alpha)
+                };
+                let dst_p = s.pixels[di];
+                let inv = 255 - sa;
+                let r = (sr + ((dst_p >> 16) & 0xff) * inv / 255).min(255);
+                let g = (sg + ((dst_p >> 8) & 0xff) * inv / 255).min(255);
+                let b = (sb + (dst_p & 0xff) * inv / 255).min(255);
+                s.pixels[di] = r << 16 | g << 8 | b;
+            }
+        }
+    });
+    if ok {
+        sync_dc_dib_to_guest(task, cx, dst);
+    }
+    Reply::Value(u64::from(ok))
 }
 
 fn sync_dc_dib_to_guest(task: &mut Task, cx: &mut Cx<'_>, hdc: u64) {

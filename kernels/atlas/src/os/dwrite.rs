@@ -51,7 +51,7 @@ dll! {
     missing AtlasDwFactoryCreateTypography;
     host AtlasDwFactoryGetGdiInterop(2) => factory_get_gdi_interop;
     host AtlasDwFactoryCreateTextLayout(7) => factory_create_text_layout;
-    missing AtlasDwFactoryCreateGdiCompatibleTextLayout;
+    host AtlasDwFactoryCreateGdiCompatibleTextLayout(10) => factory_create_gdi_compatible_text_layout;
     missing AtlasDwFactoryCreateEllipsisTrimmingSign;
     missing AtlasDwFactoryCreateTextAnalyzer;
     host AtlasDwFactoryCreateNumberSubstitution(5) => factory_create_number_substitution;
@@ -2462,12 +2462,32 @@ impl Layout {
 fn factory_create_text_layout(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let (max_width, max_height) = (task.f32_arg(cx, a, 4, 0), task.f32_arg(cx, a, 5, 1));
     let out = task.int_arg(a, 6, 4);
-    let Some(format) = format_of(task, a[3]) else {
+    create_text_layout(task, cx, a[1], a[2], a[3], max_width, max_height, out)
+}
+
+/// `CreateGdiCompatibleTextLayout(text, length, format, layout_width, layout_height, pixels_per_dip, transform, use_gdi_natural, &layout)`.
+fn factory_create_gdi_compatible_text_layout(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (max_width, max_height) = (task.f32_arg(cx, a, 4, 0), task.f32_arg(cx, a, 5, 1));
+    let out = task.int_arg(a, 9, 6);
+    create_text_layout(task, cx, a[1], a[2], a[3], max_width, max_height, out)
+}
+
+fn create_text_layout(
+    task: &mut Task,
+    cx: &mut Cx<'_>,
+    text_ptr: u64,
+    length: u64,
+    format_ptr: u64,
+    max_width: f32,
+    max_height: f32,
+    out: u64,
+) -> Reply {
+    let Some(format) = format_of(task, format_ptr) else {
         let _ = task.write_ptr(cx, out, 0);
         return Reply::Value(E_INVALIDARG);
     };
-    let n = (a[2] as u32 as usize).min(1 << 20);
-    let text = task.read_u16s(cx, a[1], n);
+    let n = (length as u32 as usize).min(1 << 20);
+    let text = task.read_u16s(cx, text_ptr, n);
     if text.len() != n || max_width < 0.0 || max_height < 0.0 {
         let _ = task.write_ptr(cx, out, 0);
         return Reply::Value(E_INVALIDARG);

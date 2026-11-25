@@ -69,6 +69,22 @@ fn stock(index: u64) -> Option<Object> {
     })
 }
 
+/// Saved DC state for `SaveDC` / `RestoreDC`.
+#[derive(Debug, Clone)]
+pub struct DcState {
+    pub clip: Rect,
+    pub text: Rgb,
+    pub background: Rgb,
+    pub mode: u32,
+    pub brush: u64,
+    pub pen: u64,
+    pub font: u64,
+    pub position: (i32, i32),
+    pub bitmap: u64,
+    pub graphics_mode: i32,
+    pub xform: [f32; 6],
+}
+
 #[derive(Debug, Clone)]
 pub struct Dc {
     /// Its window, or 0 for the screen, where drawing goes nowhere yet.
@@ -85,6 +101,12 @@ pub struct Dc {
     /// A memory DC (`CreateCompatibleDC`): it draws into its selected bitmap.
     pub memory: bool,
     pub bitmap: u64,
+    /// `GM_COMPATIBLE` (1) or `GM_ADVANCED` (2).
+    pub graphics_mode: i32,
+    /// World transform (`XFORM`: eM11, eM12, eM21, eM22, eDx, eDy).
+    pub xform: [f32; 6],
+    /// Stack of states pushed by `SaveDC`.
+    pub saved: Vec<DcState>,
 }
 
 /// A font as a LOGFONT describes it: what `CreateFont` was given, and `GetObject` gives back.
@@ -289,6 +311,9 @@ impl Gdi {
             position: (0, 0),
             memory: false,
             bitmap: 0,
+            graphics_mode: 1,
+            xform: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            saved: Vec::new(),
         };
         self.dcs.insert(self.next, dc);
         self.next
@@ -341,21 +366,118 @@ impl Win32k {
         true
     }
 
+    /// Whether `hwnd` or any visible descendant of it owns a presented graphics swap chain.
+    fn has_swap_window(&self, hwnd: u64) -> bool {
+        if self.swap_windows.contains(&hwnd) {
+            return true;
+        }
+        for c in self.z_order(hwnd) {
+            if self.windows.get(&c).is_some_and(|w| w.visible) && self.has_swap_window(c) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// A swap chain's present: `pixels`, `width` by `height` (0x00RRGGBB), into a window's client area from its top
-    /// left, clipped to it, and shown. False for a window that isn't there.
+    /// left, clipped to it and to any visible swapchain-backed children/siblings above it, and shown. False for a
+    /// window that isn't there.
     pub fn present(&mut self, hwnd: u64, width: i32, height: i32, pixels: &[display::Rgb]) -> bool {
         let Some((top, dx, dy)) = self.origin(hwnd) else { return false };
         let Some(client) = self.windows.get(&hwnd).map(|w| w.client()) else { return false };
         let Some(shown) = self.windows.get(&top).map(|w| w.shown).filter(|&s| s != 0) else { return false };
+        self.swap_windows.insert(hwnd);
+        // A hidden child window (or one inside a hidden ancestor) does not paint onto its top-level canvas.
+        let mut cur = hwnd;
+        while cur != top {
+            let Some(w) = self.windows.get(&cur) else { return false };
+            if !w.visible {
+                return true;
+            }
+            cur = w.parent;
+        }
+        // Clip out visible swapchain-backed children (when WS_CLIPCHILDREN is set) and visible swapchain-backed
+        // siblings strictly above `hwnd` or any of its non-top-level ancestors in Z-order. Transparent/input-only
+        // sibling windows without swap chains do not occlude presentation.
+        let mut occluders: Vec<Rect> = Vec::new();
+        if self.windows.get(&hwnd).is_some_and(|w| w.style & super::WS_CLIPCHILDREN != 0) {
+            for c in self.z_order(hwnd) {
+                if let Some(cw) = self.windows.get(&c).filter(|w| w.visible)
+                    && self.has_swap_window(c)
+                {
+                    let r = cw.rect.intersect(&client).offset(dx, dy);
+                    if !r.is_empty() {
+                        occluders.push(r);
+                    }
+                }
+            }
+        }
+        let mut cur = hwnd;
+        while cur != top {
+            let Some(p) = self.windows.get(&cur).map(|w| w.parent) else { break };
+            let Some((_, px, py)) = self.origin(p) else { break };
+            let p_client = self.windows.get(&p).map_or_else(Rect::default, |w| w.client());
+            for sib in self.z_order(p) {
+                if sib == cur {
+                    break;
+                }
+                if let Some(sw) = self.windows.get(&sib).filter(|w| w.visible)
+                    && self.has_swap_window(sib)
+                {
+                    let r = sw.rect.intersect(&p_client).offset(px, py);
+                    if !r.is_empty() {
+                        occluders.push(r);
+                    }
+                }
+            }
+            cur = p;
+        }
         let Some(canvas) = self.canvases.get(&shown) else { return false };
         let clip = client.intersect(&Rect::new(0, 0, width, height)).offset(dx, dy);
         canvas.draw(|s| {
             let clip = clip.intersect(&s.bounds());
-            for y in clip.top..clip.bottom {
-                let (from, to) = (((y - dy) * width + clip.left - dx) as usize, (y * s.width + clip.left) as usize);
-                let n = (clip.right - clip.left).max(0) as usize;
-                if let (Some(src), Some(dst)) = (pixels.get(from..from + n), s.pixels.get_mut(to..to + n)) {
-                    dst.copy_from_slice(src);
+            if occluders.is_empty() {
+                for y in clip.top..clip.bottom {
+                    let (from, to) = (((y - dy) * width + clip.left - dx) as usize, (y * s.width + clip.left) as usize);
+                    let n = (clip.right - clip.left).max(0) as usize;
+                    if let (Some(src), Some(dst)) = (pixels.get(from..from + n), s.pixels.get_mut(to..to + n)) {
+                        dst.copy_from_slice(src);
+                    }
+                }
+            } else {
+                let mut spans = Vec::with_capacity(4);
+                let mut next = Vec::with_capacity(4);
+                for y in clip.top..clip.bottom {
+                    spans.clear();
+                    spans.push((clip.left, clip.right));
+                    for o in &occluders {
+                        if o.top <= y && y < o.bottom {
+                            next.clear();
+                            for &(l, r) in &spans {
+                                if o.right <= l || o.left >= r {
+                                    next.push((l, r));
+                                } else {
+                                    if o.left > l {
+                                        next.push((l, o.left));
+                                    }
+                                    if o.right < r {
+                                        next.push((o.right, r));
+                                    }
+                                }
+                            }
+                            std::mem::swap(&mut spans, &mut next);
+                            if spans.is_empty() {
+                                break;
+                            }
+                        }
+                    }
+                    for &(l, r) in &spans {
+                        let n = (r - l).max(0) as usize;
+                        let (from, to) = (((y - dy) * width + l - dx) as usize, (y * s.width + l) as usize);
+                        if let (Some(src), Some(dst)) = (pixels.get(from..from + n), s.pixels.get_mut(to..to + n)) {
+                            dst.copy_from_slice(src);
+                        }
+                    }
                 }
             }
         });

@@ -17,7 +17,7 @@ pub mod menu;
 pub mod stations;
 mod paint;
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -49,6 +49,7 @@ pub const WM_CLOSE: u32 = 0x10;
 pub const WM_QUIT: u32 = 0x12;
 pub const WM_ERASEBKGND: u32 = 0x14;
 pub const WM_SHOWWINDOW: u32 = 0x18;
+pub const WM_WINDOWPOSCHANGED: u32 = 0x47;
 pub const WM_NCCREATE: u32 = 0x81;
 pub const WM_NCDESTROY: u32 = 0x82;
 pub const WM_KEYDOWN: u32 = 0x100;
@@ -98,6 +99,7 @@ pub const WS_VISIBLE: u32 = 0x1000_0000;
 /// Takes no input: no clicks, no keys, no focus (`EnableWindow`).
 pub const WS_DISABLED: u32 = 0x0800_0000;
 const WS_CLIPSIBLINGS: u32 = 0x0400_0000;
+pub const WS_CLIPCHILDREN: u32 = 0x0200_0000;
 pub const WS_CAPTION: u32 = 0x00c0_0000;
 pub const WS_GROUP: u32 = 0x0002_0000;
 pub const WS_TABSTOP: u32 = 0x0001_0000;
@@ -445,6 +447,10 @@ pub struct Win32k {
     /// Each top-level window's pixels, by its place on the desktop: GDI draws into them, and the desktop shows them
     /// in place, as each drawing commits.
     pub canvases: BTreeMap<u64, display::Canvas>,
+    /// Each parent window's children in top-first Z-order (updated on creation, reparenting and `SetWindowPos`).
+    pub child_order: BTreeMap<u64, Vec<u64>>,
+    /// Windows that have presented a graphics swap chain (used for child/sibling swapchain occlusion clipping).
+    pub swap_windows: BTreeSet<u64>,
     /// The active window, as the desktop last said, and the window keys go to.
     pub active: u64,
     pub focus: u64,
@@ -520,8 +526,40 @@ impl Win32k {
             top.extend(unknown);
             top
         } else {
-            self.windows.iter().rev().filter(|(_, w)| w.parent == parent).map(|(&h, _)| h).collect()
+            let mut out: Vec<u64> = self
+                .child_order
+                .get(&parent)
+                .map(|list| list.iter().copied().filter(|h| self.windows.get(h).is_some_and(|w| w.parent == parent)).collect())
+                .unwrap_or_default();
+            for (&h, w) in self.windows.iter().rev() {
+                if w.parent == parent && !out.contains(&h) {
+                    out.push(h);
+                }
+            }
+            out
         }
+    }
+
+    /// Reorders a child window among its siblings (`SetWindowPos` with `HWND_TOP`, `HWND_BOTTOM`, or a sibling).
+    pub fn reorder_child(&mut self, hwnd: u64, after: i64) {
+        let Some(parent) = self.windows.get(&hwnd).map(|w| w.parent) else { return };
+        if parent == DESKTOP || parent == MESSAGE_ROOT {
+            return;
+        }
+        let mut order = self.z_order(parent);
+        order.retain(|&h| h != hwnd);
+        match after {
+            -1 | 0 => order.insert(0, hwnd),
+            1 => order.push(hwnd),
+            _ => {
+                if let Some(pos) = order.iter().position(|&h| h == after as u64) {
+                    order.insert(pos + 1, hwnd);
+                } else {
+                    order.insert(0, hwnd);
+                }
+            }
+        }
+        self.child_order.insert(parent, order);
     }
 
     /// The window files dropped at a point in a top-level window's client area would go to: the deepest window there
@@ -576,6 +614,8 @@ impl Win32k {
             shots: Vec::new(),
             display,
             canvases: BTreeMap::new(),
+            child_order: BTreeMap::new(),
+            swap_windows: BTreeSet::new(),
             active: 0,
             focus: 0,
             capture: 0,
@@ -725,8 +765,7 @@ impl Win32k {
     /// The deepest shown child window at a point in a window's client area, and the point in that child's.
     pub fn child_at(&self, mut hwnd: u64, mut x: i32, mut y: i32) -> (u64, i32, i32) {
         loop {
-            // Later windows are above earlier ones.
-            let next = self.windows.iter().rev().find(|(_, w)| w.parent == hwnd && w.visible && w.rect.contains(x, y)).map(|(&h, _)| h);
+            let next = self.z_order(hwnd).into_iter().find(|h| self.windows.get(h).is_some_and(|w| w.visible && w.rect.contains(x, y)));
             let Some(child) = next else { return (hwnd, x, y) };
             let r = self.windows[&child].rect;
             (x, y, hwnd) = (x - r.left, y - r.top, child);
@@ -1319,6 +1358,9 @@ impl Task {
                 ansi: class.ansi,
             };
             w.windows.insert(hwnd, window);
+            if parent != DESKTOP && parent != MESSAGE_ROOT {
+                w.child_order.entry(parent).or_default().insert(0, hwnd);
+            }
             w.queue(self.tid, &self.waiter.clone());
             hwnd
         };
@@ -1441,6 +1483,14 @@ impl Task {
             if let Some(win) = w.windows.get_mut(&hwnd) {
                 win.parent = target;
             }
+            if let Some(list) = w.child_order.get_mut(&old) {
+                list.retain(|&h| h != hwnd);
+            }
+            if target != DESKTOP && target != MESSAGE_ROOT {
+                let list = w.child_order.entry(target).or_default();
+                list.retain(|&h| h != hwnd);
+                list.insert(0, hwnd);
+            }
         }
         if old == MESSAGE_ROOT {
             if self.abi().width == 8 { u64::MAX - 2 } else { 0xffff_fffd }
@@ -1474,6 +1524,11 @@ impl Task {
             self.call_wndproc(cx, *h, WM_NCDESTROY, 0, 0)?;
             let mut w = self.win32k();
             if let Some(win) = w.windows.remove(h) {
+                if let Some(list) = w.child_order.get_mut(&win.parent) {
+                    list.retain(|&c| c != *h);
+                }
+                w.child_order.remove(h);
+                w.swap_windows.remove(h);
                 if win.shown != 0 {
                     let shared = w.display.clone();
                     if let Some(c) = w.canvases.remove(&win.shown) {
@@ -1516,9 +1571,11 @@ impl Task {
         let (was, shown) = {
             let mut w = self.win32k();
             let Some(win) = w.windows.get_mut(&hwnd) else { return Ok(false) };
-            // A message-only window is never seen.
+            // A message-only window isn't on the desktop, but still tracks its WS_VISIBLE state for reparenting.
             if win.message_only() {
-                return Ok(false);
+                let was = win.visible;
+                win.visible = show;
+                return Ok(was);
             }
             let was = win.visible;
             win.visible = show;
@@ -1565,7 +1622,8 @@ impl Task {
         Ok(was)
     }
 
-    /// Moves or sizes a window (frame and all), telling it with WM_MOVE and WM_SIZE (its client area).
+    /// Moves or sizes a window (frame and all), telling it with WM_WINDOWPOSCHANGED (whose default sends WM_MOVE and
+    /// WM_SIZE for its client area).
     #[allow(clippy::too_many_arguments)]
     pub fn place_window(&mut self, cx: &mut Cx<'_>, hwnd: u64, x: i32, y: i32, width: i32, height: i32, flags: u32) -> Result<bool, Reply> {
         const NOSIZE: u32 = 1;
@@ -1574,7 +1632,7 @@ impl Task {
         const FRAMECHANGED: u32 = 0x20;
         const SHOWWINDOW: u32 = 0x40;
         const HIDEWINDOW: u32 = 0x80;
-        let (moved, sized, (cx_, cy_), client) = {
+        let (moved, sized, (cx_, cy_), rect, client, owner_pid) = {
             let mut w = self.win32k();
             let Some(win) = w.windows.get_mut(&hwnd) else { return Ok(false) };
             let old = win.rect;
@@ -1594,7 +1652,7 @@ impl Task {
             let (width, height) = if flags & NOSIZE != 0 { (old.width(), old.height()) } else { (width.max(0), height.max(0)) };
             win.rect = Rect::new(x, y, x + width, y + height);
             let sized = (width, height) != (old.width(), old.height()) || win.client() != old_client;
-            let (rect, shown, client, parent) = (win.rect, win.shown, win.client(), win.parent);
+            let (rect, shown, client, parent, pid) = (win.rect, win.shown, win.client(), win.parent, win.pid);
             if sized {
                 w.invalidate(hwnd, None, true);
             }
@@ -1607,18 +1665,45 @@ impl Task {
                 dt::lock(&w.display).set_rect(shown, rect);
                 w.fit(shown);
             }
-            ((x, y) != (old.left, old.top), sized, w.move_origin(hwnd), client)
+            ((x, y) != (old.left, old.top), sized, w.move_origin(hwnd), rect, client, pid)
         };
-        if moved {
-            self.send_message(cx, hwnd, WM_MOVE, 0, words(cx_, cy_))?;
-        }
-        if sized {
-            self.send_message(cx, hwnd, WM_SIZE, 0, words(client.width(), client.height()))?;
-        }
         if flags & SHOWWINDOW != 0 {
             self.show_window(cx, hwnd, if flags & NOACTIVATE != 0 { SW_SHOWNA } else { SW_SHOW })?;
         } else if flags & HIDEWINDOW != 0 {
             self.show_window(cx, hwnd, 0)?;
+        }
+        let mut wp_flags = flags;
+        if moved {
+            wp_flags &= !NOMOVE;
+        } else {
+            wp_flags |= NOMOVE;
+        }
+        if sized {
+            wp_flags &= !NOSIZE;
+        } else {
+            wp_flags |= NOSIZE;
+        }
+        if owner_pid == self.process.pid {
+            // WINDOWPOS: hwnd, hwndInsertAfter, x, y, cx, cy, flags.
+            let w = self.abi().width as usize;
+            let size = (2 * w + 20).next_multiple_of(w);
+            let mut wp = vec![0u8; size];
+            wp[0..w].copy_from_slice(&hwnd.to_le_bytes()[..w]);
+            wp[2 * w..2 * w + 4].copy_from_slice(&rect.left.to_le_bytes());
+            wp[2 * w + 4..2 * w + 8].copy_from_slice(&rect.top.to_le_bytes());
+            wp[2 * w + 8..2 * w + 12].copy_from_slice(&rect.width().to_le_bytes());
+            wp[2 * w + 12..2 * w + 16].copy_from_slice(&rect.height().to_le_bytes());
+            wp[2 * w + 16..2 * w + 20].copy_from_slice(&wp_flags.to_le_bytes());
+            self.with_scratch(cx, size, |_| wp.clone(), |task, cx, at| {
+                task.send_message(cx, hwnd, WM_WINDOWPOSCHANGED, 0, at)
+            })?;
+        } else {
+            if moved {
+                self.send_message(cx, hwnd, WM_MOVE, 0, words(cx_, cy_))?;
+            }
+            if sized {
+                self.send_message(cx, hwnd, WM_SIZE, 0, words(client.width(), client.height()))?;
+            }
         }
         Ok(true)
     }
@@ -1942,6 +2027,30 @@ impl Task {
     pub fn def_window_proc(&mut self, cx: &mut Cx<'_>, hwnd: u64, message: u32, wparam: u64, lparam: u64) -> Result<u64, Reply> {
         match message {
             WM_NCCREATE => Ok(1),
+            WM_WINDOWPOSCHANGED => {
+                const NOSIZE: u32 = 1;
+                const NOMOVE: u32 = 2;
+                let w = self.abi().width as usize;
+                let wp_flags = if lparam != 0 {
+                    self.mem(cx, false, |t| user::read_vec(&t.space(), lparam + (2 * w + 16) as u64, 4))
+                        .ok()
+                        .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                } else {
+                    0
+                };
+                let (origin, client) = {
+                    let k = self.win32k();
+                    let client = k.windows.get(&hwnd).map_or_else(Rect::default, Window::client);
+                    (k.move_origin(hwnd), client)
+                };
+                if wp_flags & NOMOVE == 0 {
+                    self.send_message(cx, hwnd, WM_MOVE, 0, words(origin.0, origin.1))?;
+                }
+                if wp_flags & NOSIZE == 0 {
+                    self.send_message(cx, hwnd, WM_SIZE, 0, words(client.width(), client.height()))?;
+                }
+                Ok(0)
+            }
             WM_CLOSE => {
                 self.destroy_window(cx, hwnd)?;
                 Ok(0)

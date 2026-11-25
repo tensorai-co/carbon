@@ -411,18 +411,18 @@ dll! {
     host RegisterPowerSettingNotification(3) => register_notification;
     host RegisterSuspendResumeNotification(2) => register_notification;
     host RegisterTouchWindow(2) => succeed;
-    missing SetKeyboardState;
+    host SetKeyboardState(1) => set_keyboard_state;
     missing SetMenuInfo;
     host SetProcessDPIAware(0) => succeed;
     host SetProcessWindowStation(1) => set_process_window_station;
     host SetRect(5) => set_rect;
     host SetThreadDesktop(1) => set_thread_desktop;
     missing SetWindowPlacement;
-    missing ToUnicodeEx;
+    host ToUnicodeEx(7) => to_unicode;
     missing UnregisterHotKey;
     host UnregisterPowerSettingNotification(1) => succeed;
     host UnregisterSuspendResumeNotification(1) => succeed;
-    missing UpdateLayeredWindow;
+    host UpdateLayeredWindow(9) => update_layered_window;
     host SendNotifyMessageW(4) => post_message_w;
     host ShowCaret(1) => succeed;
     host HideCaret(1) => succeed;
@@ -911,7 +911,20 @@ fn set_window_long(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], size: usize) -> 
             }
         }
         GWLP_ID => std::mem::replace(&mut win.id, new),
-        GWL_STYLE => u64::from(std::mem::replace(&mut win.style, new as u32 & !0x1000_0000)),
+        GWL_STYLE => {
+            let prev = win.style | if win.visible { win32k::WS_VISIBLE } else { 0 };
+            let vis = (new as u32) & win32k::WS_VISIBLE != 0;
+            win.style = (new as u32) & !win32k::WS_VISIBLE;
+            if win.visible != vis {
+                win.visible = vis;
+                let shown = win.shown;
+                if shown != 0 {
+                    let shared = w.display.clone();
+                    dt::lock(&shared).set_visible(shown, vis);
+                }
+            }
+            u64::from(prev)
+        }
         GWL_EXSTYLE => u64::from(std::mem::replace(&mut win.ex_style, new as u32)),
         GWLP_USERDATA => std::mem::replace(&mut win.userdata, new),
         i if i >= 0 && (i as usize) + size <= win.extra.len() => {
@@ -1404,6 +1417,9 @@ fn set_window_pos(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
         Err(reply) => return reply,
     }
     let (shown, visible) = task.win32k().windows.get(&hwnd).map_or((0, false), |w| (w.shown, w.visible));
+    if shown == 0 && flags & NOZORDER == 0 {
+        task.win32k().reorder_child(hwnd, after);
+    }
     if shown != 0 && flags & NOZORDER == 0 {
         // Another window to go behind: its top-level window's place on the desktop.
         let behind = if after > 1 { shown_of(task, after as u64) } else { None };
@@ -2454,6 +2470,51 @@ fn msg_wait_for_multiple_objects(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) ->
 fn msg_wait_for_multiple_objects_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let flags = a[4] as u32;
     msg_wait(task, cx, a[0], a[1], flags & 1 != 0, a[2] as u32, flags & 2 != 0)
+}
+
+/// `UpdateLayeredWindow(hwnd, hdcDst, pptDst, psize, hdcSrc, pptSrc, crKey, pblend, dwFlags)`:
+/// moves/resizes a layered window when `pptDst`/`psize` are given, and blits `hdcSrc`'s bitmap into its surface.
+fn update_layered_window(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (hwnd, ppt_dst, psize, hdc_src, ppt_src) = (a[0], a[2], a[3], a[4], a[5]);
+    let Some(cur) = task.win32k().windows.get(&hwnd).map(|w| w.rect) else { return Reply::Value(FALSE) };
+    let read_pair = |task: &mut Task, cx: &mut Cx<'_>, at: u64| -> Option<(i32, i32)> {
+        if at == 0 {
+            return None;
+        }
+        let b = task.mem(cx, false, |t| user::read_vec(&t.space(), at, 8)).ok()?;
+        Some((i32::from_le_bytes([b[0], b[1], b[2], b[3]]), i32::from_le_bytes([b[4], b[5], b[6], b[7]])))
+    };
+    let pos = read_pair(task, cx, ppt_dst);
+    let size = read_pair(task, cx, psize);
+    let (x, y) = pos.unwrap_or((cur.left, cur.top));
+    let (w, h) = size.unwrap_or((cur.width(), cur.height()));
+    if pos.is_some() || size.is_some() {
+        if let Err(reply) = task.place_window(cx, hwnd, x, y, w, h, 0) {
+            return reply;
+        }
+    }
+    if hdc_src != 0 {
+        super::gdi32::sync_dc_dib_from_guest(task, cx, hdc_src);
+        let (sx, sy) = read_pair(task, cx, ppt_src).unwrap_or((0, 0));
+        let surface = {
+            let k = task.win32k();
+            k.gdi.dcs.get(&hdc_src).filter(|dc| dc.memory).and_then(|dc| k.gdi.bitmaps.get(&dc.bitmap)).cloned()
+        };
+        if let Some(surf) = surface {
+            let bw = w.max(0).min(surf.width.saturating_sub(sx).max(0));
+            let bh = h.max(0).min(surf.height.saturating_sub(sy).max(0));
+            if bw > 0 && bh > 0 {
+                let mut pixels = vec![0u32; (bw * bh) as usize];
+                for row in 0..bh {
+                    let src_row = (sy + row) as usize * surf.width as usize + sx as usize;
+                    let dst_row = row as usize * bw as usize;
+                    pixels[dst_row..dst_row + bw as usize].copy_from_slice(&surf.pixels[src_row..src_row + bw as usize]);
+                }
+                task.win32k().present(hwnd, bw, bh, &pixels);
+            }
+        }
+    }
+    Reply::Value(TRUE)
 }
 
 /// `SetParent(window, parent)`: reparents `window` under `parent` (0 / `DESKTOP` makes it top-level, `HWND_MESSAGE`

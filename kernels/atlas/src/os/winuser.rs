@@ -159,12 +159,18 @@ pub fn vk_key_scan_ex(_: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
 /// `ToUnicode(vk, scan, &key state, out, room, flags)`: the character the key types with Shift as the state has it
 /// (Ctrl and Alt type nothing); 1, or 0 for none.
 pub fn to_unicode(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Ok(state) = task.mem(cx, false, |t| user::read_vec(&t.space(), a[2], 256)) else { return Reply::Value(0) };
-    let held = |vk: u8| state[vk as usize] & 0x80 != 0;
-    if held(keys::VK_CONTROL) || held(keys::VK_MENU) || a[4] as u32 as i32 <= 0 {
+    if a[2] == 0 || a[3] == 0 || a[4] as u32 as i32 <= 0 {
         return Reply::Value(0);
     }
-    match typed(a[0] as u8, held(keys::VK_SHIFT)) {
+    let Ok(state) = task.mem(cx, false, |t| user::read_vec(&t.space(), a[2], 256)) else { return Reply::Value(0) };
+    let held = |vk: u8| state[vk as usize] & 0x80 != 0;
+    if held(keys::VK_CONTROL) || held(keys::VK_MENU) {
+        return Reply::Value(0);
+    }
+    let vk = a[0] as u8;
+    let caps = state[0x14] & 0x01 != 0;
+    let shift = if (b'A'..=b'Z').contains(&vk) { held(keys::VK_SHIFT) ^ caps } else { held(keys::VK_SHIFT) };
+    match typed(vk, shift) {
         Some(c) => {
             let mut b = [0u16; 2];
             let units: Vec<u8> = c.encode_utf16(&mut b).iter().flat_map(|u| u.to_le_bytes()).collect();
@@ -172,6 +178,17 @@ pub fn to_unicode(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
             Reply::Value(1)
         }
         None => Reply::Value(0),
+    }
+}
+
+/// `SetKeyboardState(&state)`: replaces the 256-byte virtual-key state table.
+pub fn set_keyboard_state(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Ok(state) = task.mem(cx, false, |t| user::read_vec(&t.space(), a[0], 256)) else { return Reply::Value(FALSE) };
+    if state.len() == 256 {
+        task.win32k().keys.copy_from_slice(&state);
+        Reply::Value(TRUE)
+    } else {
+        Reply::Value(FALSE)
     }
 }
 
