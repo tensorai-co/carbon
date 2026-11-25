@@ -174,8 +174,9 @@ pub(crate) fn run(store: &Store, launch: Launch, notify: &Notify, started: &mut 
         None => None,
     };
 
-    // x86 of either width on Apple silicon wants the CPU's own x86 memory ordering.
-    let tso = matches!(record.platform.arch.as_str(), "amd64" | "386") && cfg!(target_arch = "aarch64");
+    // x86 of either width on Apple silicon wants the CPU's own x86 memory ordering; Windows images run x86/x86-64
+    // executables regardless of the image's nominal arch.
+    let tso = (record.platform.os == "windows" || matches!(record.platform.arch.as_str(), "amd64" | "386")) && cfg!(target_arch = "aarch64");
     // Opens exec and boots the kernel on this thread, which its CPUs belong to.
     let mut start = |record: &mut Record, desktop: Option<display::desktop::Shared>| -> Result<i32> {
         let (exec, cpu) = open_exec(launch.isolation, tso, launch.memory, notify)?;

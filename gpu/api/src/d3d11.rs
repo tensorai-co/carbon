@@ -740,6 +740,7 @@ impl Device {
             let image = self.run(move |d| d.image(image_desc))?;
             t.image = Some(image);
             // Device images start as anything; Direct3D's start as given, or zeroes.
+            self.end_pass();
             for i in 0..subs {
                 let (w, h) = t.size(i % levels);
                 let bytes = match initial.get(i as usize) {

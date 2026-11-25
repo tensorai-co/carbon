@@ -16,6 +16,11 @@ const CHUNK: usize = 1 << 20;
 const LARGE: usize = 1 << 20;
 /// A big block's class.
 const BIG: usize = usize::MAX;
+#[cfg(target_pointer_width = "64")]
+const ALLOC_TAG: usize = 0xa110_c000_0000_0000;
+#[cfg(target_pointer_width = "32")]
+const ALLOC_TAG: usize = 0xa110_0000;
+const CLASS_MASK: usize = 0xff;
 const PAGE: usize = 4096;
 
 struct State {
@@ -85,7 +90,7 @@ pub fn allocate(size: usize, zero: bool) -> *mut u8 {
     }
     // SAFETY: a block of 1 << class bytes, ours alone now.
     unsafe {
-        block.cast::<usize>().write(class);
+        block.cast::<usize>().write(ALLOC_TAG | class);
         block.cast::<usize>().add(1).write(size);
         let ptr = block.add(HEADER);
         if zero {
@@ -116,11 +121,15 @@ pub fn usable(ptr: *mut u8) -> usize {
         return 0;
     }
     // SAFETY: `ptr` came from `allocate`, so its header is just before it.
-    let class = unsafe { ptr.sub(HEADER).cast::<usize>().read() };
-    if class == BIG {
+    let raw = unsafe { ptr.sub(HEADER).cast::<usize>().read() };
+    if raw == BIG {
         return ((size(ptr) + HEADER + PAGE - 1) & !(PAGE - 1)) - HEADER;
     }
-    if class >= CLASSES { 0 } else { (1 << class) - HEADER }
+    if raw & !CLASS_MASK != ALLOC_TAG {
+        return 0;
+    }
+    let class = raw & CLASS_MASK;
+    if !(SMALLEST..CLASSES).contains(&class) { 0 } else { (1 << class) - HEADER }
 }
 
 /// The size a block was asked for, or last resized to.
@@ -174,18 +183,26 @@ pub fn free(ptr: *mut u8) {
     }
     // SAFETY: `ptr` came from `allocate`, so its header is just before it.
     let block = unsafe { ptr.sub(HEADER) };
-    let class = unsafe { block.cast::<usize>().read() };
-    if class == BIG {
-        const MEM_RELEASE: u64 = 0x8000;
-        crate::sys::call4(atlas_abi::call::FREE_VIRTUAL_MEMORY, block as usize as u64, 0, MEM_RELEASE, 0);
-        return;
-    }
-    if class >= CLASSES {
-        return;
-    }
-    with(|s| {
+    let release_big = with(|s| {
+        let raw = unsafe { block.cast::<usize>().read() };
+        if raw == BIG {
+            unsafe { block.cast::<usize>().write(0) };
+            return true;
+        }
+        if raw & !CLASS_MASK != ALLOC_TAG {
+            return false;
+        }
+        let class = raw & CLASS_MASK;
+        if !(SMALLEST..CLASSES).contains(&class) {
+            return false;
+        }
         // SAFETY: the block is free now, and holds the list's next pointer.
         unsafe { block.cast::<*mut u8>().write(s.free[class]) };
         s.free[class] = block;
+        false
     });
+    if release_big {
+        const MEM_RELEASE: u64 = 0x8000;
+        crate::sys::call4(atlas_abi::call::FREE_VIRTUAL_MEMORY, block as usize as u64, 0, MEM_RELEASE, 0);
+    }
 }
