@@ -16,6 +16,7 @@ pub mod positioner;
 pub mod raster;
 pub mod selection;
 pub mod sfnt;
+pub mod view;
 
 pub use buffer::{Buffer, Canvas, Format, Pixels};
 pub use desktop::Desktop;

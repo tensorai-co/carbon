@@ -124,6 +124,87 @@ pub fn for_char(c: char) -> Option<(u16, bool)> {
     }
 }
 
+/// A key by its W3C `KeyboardEvent.code` (`KeyA`, `Digit1`, `Enter`, `ShiftLeft`, `ArrowUp`, `F5`, `Numpad7`, ...): the
+/// physical key, whatever the layout, as browsers and most toolkits name it. What an app that embeds the desktop
+/// (`view`) sends its keys as.
+pub fn by_code(code: &str) -> Option<u16> {
+    if let Some(letter) = code.strip_prefix("Key").filter(|l| l.len() == 1) {
+        let c = letter.chars().next()?.to_ascii_lowercase();
+        return c.is_ascii_lowercase().then(|| LETTERS[(c as u8 - b'a') as usize]);
+    }
+    if let Some(digit) = code.strip_prefix("Digit").and_then(|d| d.parse::<usize>().ok()) {
+        return DIGITS.get(digit).copied();
+    }
+    if let Some(f) = code.strip_prefix('F').and_then(|d| d.parse::<u16>().ok()) {
+        return match f {
+            1..=10 => Some(F1 + f - 1),
+            11 => Some(F11),
+            12 => Some(F12),
+            _ => None,
+        };
+    }
+    Some(match code {
+        "Escape" => ESC,
+        "Minus" => MINUS,
+        "Equal" => EQUAL,
+        "Backspace" => BACKSPACE,
+        "Tab" => TAB,
+        "BracketLeft" => LEFT_BRACE,
+        "BracketRight" => RIGHT_BRACE,
+        "Enter" => ENTER,
+        "ControlLeft" => LEFT_CTRL,
+        "ControlRight" => RIGHT_CTRL,
+        "Semicolon" => SEMICOLON,
+        "Quote" => APOSTROPHE,
+        "Backquote" => GRAVE,
+        "ShiftLeft" => LEFT_SHIFT,
+        "ShiftRight" => RIGHT_SHIFT,
+        "Backslash" | "IntlBackslash" => BACKSLASH,
+        "Comma" => COMMA,
+        "Period" => DOT,
+        "Slash" => SLASH,
+        "AltLeft" => LEFT_ALT,
+        "AltRight" => RIGHT_ALT,
+        "Space" => SPACE,
+        "CapsLock" => CAPS_LOCK,
+        "MetaLeft" | "OSLeft" => LEFT_META,
+        "MetaRight" | "OSRight" => RIGHT_META,
+        "Home" => HOME,
+        "End" => END,
+        "PageUp" => PAGE_UP,
+        "PageDown" => PAGE_DOWN,
+        "Insert" => INSERT,
+        "Delete" => DELETE,
+        "ArrowUp" => UP,
+        "ArrowDown" => DOWN,
+        "ArrowLeft" => LEFT,
+        "ArrowRight" => RIGHT,
+        // The keypad, as Linux numbers it.
+        "Numpad7" => 71,
+        "Numpad8" => 72,
+        "Numpad9" => 73,
+        "NumpadSubtract" => 74,
+        "Numpad4" => 75,
+        "Numpad5" => 76,
+        "Numpad6" => 77,
+        "NumpadAdd" => 78,
+        "Numpad1" => 79,
+        "Numpad2" => 80,
+        "Numpad3" => 81,
+        "Numpad0" => 82,
+        "NumpadDecimal" => 83,
+        "NumpadEnter" => 96,
+        "NumpadDivide" => 98,
+        "NumpadMultiply" => 55,
+        "NumLock" => 69,
+        "ScrollLock" => 70,
+        "PrintScreen" => 99,
+        "Pause" => 119,
+        "ContextMenu" => 127,
+        _ => return None,
+    })
+}
+
 /// A key by its name, as `carbon display key` takes it: a letter or digit, `f1` to `f12`, or a name (`enter`, `esc`,
 /// `tab`, `space`, `backspace`, `delete`, `insert`, `home`, `end`, `pageup`, `pagedown`, the arrows, `ctrl`, `shift`,
 /// `alt`, `meta`, and the punctuation keys by name), whatever its case.
@@ -177,4 +258,25 @@ pub fn by_name(name: &str) -> Option<u16> {
         "bracketright" => RIGHT_BRACE,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod code_tests {
+    use super::*;
+
+    #[test]
+    fn w3c_codes_are_the_keys_a_us_keyboard_names() {
+        assert_eq!(by_code("KeyA"), Some(30));
+        assert_eq!(by_code("KeyZ"), by_name("z"));
+        assert_eq!(by_code("Digit0"), Some(11));
+        assert_eq!(by_code("Digit1"), Some(2));
+        assert_eq!(by_code("F5"), Some(F1 + 4));
+        assert_eq!(by_code("F12"), Some(F12));
+        assert_eq!(by_code("ShiftLeft"), Some(LEFT_SHIFT));
+        assert_eq!(by_code("MetaLeft"), Some(LEFT_META));
+        assert_eq!(by_code("ArrowUp"), Some(UP));
+        assert_eq!(by_code("Numpad7"), Some(71));
+        assert_eq!(by_code("Keyboard"), None);
+        assert_eq!(by_code("F13"), None);
+    }
 }

@@ -14,6 +14,7 @@
 //! | `exec <json>` | starts a process; then frames, below |
 //! | `fs <json>` | an operation on its files (below) |
 //! | `watch <json>` | then a JSON line for each hooked event, as it's decided, until either end closes |
+//! | `view <json>` | then its desktop's state and pixels as they change, and input and commands back (below) |
 //!
 //! Text in a request is one line: `%0A` is a new line and `%25` a `%`.
 //!
@@ -27,6 +28,14 @@
 //!
 //! `watch`'s request is `{"kinds": ["exec", "output", "connect", "lookup"]}`; each line after its `ok 0` is an
 //! event as [`observed_json`] writes it.
+//!
+//! `view`'s request is `{"mode": "desktop"|"windows", "width": W, "height": H, "scale": 120ths, "background": "#RRGGBB"}`
+//! (the background optional, the screen's colour where no window is): an app embedding the
+//! machine's desktop ([`display::view`]). After its `ok 0`, frames both ways, as `exec`'s. Out: the view's state (1:
+//! JSON, as [`view_state_json`] writes it) when it changes, and the pixels that changed (2: x, y, width and height,
+//! 4 bytes each, little-endian, then each pixel's `0x00RRGGBB` as 4 bytes little-endian, a row after another: BGRX).
+//! In: commands (1: JSON, as [`view_command_from_json`] reads it): input, a new size, a mode, a tab activated or
+//! closed.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -462,6 +471,224 @@ fn run_watch(stream: &mut std::os::unix::net::UnixStream, interest: hooks::Inter
     Ok(())
 }
 
+/// Past this many bytes, a tile goes as bands of rows: a frame is at most 16 MiB.
+const MOST_TILE_BYTES: usize = 4 << 20;
+
+/// A view's state as JSON: `{"mode", "width", "height", "scale", "tabs": [{"id", "title", "attention",
+/// "minimized"}], "active", "shown", "cursor"}`.
+pub fn view_state_json(state: &display::view::State) -> Value {
+    json!({
+        "mode": state.mode.name(),
+        "width": state.width,
+        "height": state.height,
+        "scale": state.scale,
+        "tabs": state.tabs.iter().map(|t| json!({ "id": t.id, "title": t.title, "attention": t.attention, "minimized": t.minimized })).collect::<Vec<_>>(),
+        "active": state.active,
+        "shown": state.shown,
+        "cursor": state.cursor,
+    })
+}
+
+/// A view's state from JSON, as [`view_state_json`] writes it.
+pub fn view_state_from_json(v: &Value) -> Option<display::view::State> {
+    let int = |k: &str| v.get(k).and_then(Value::as_i64);
+    Some(display::view::State {
+        mode: display::view::Mode::parse(v.get("mode")?.as_str()?)?,
+        width: int("width")? as i32,
+        height: int("height")? as i32,
+        scale: int("scale")? as u32,
+        tabs: v
+            .get("tabs")?
+            .as_array()?
+            .iter()
+            .filter_map(|t| {
+                Some(display::view::Tab {
+                    id: t.get("id")?.as_u64()?,
+                    title: t.get("title")?.as_str()?.to_string(),
+                    attention: t.get("attention").and_then(Value::as_bool).unwrap_or(false),
+                    minimized: t.get("minimized").and_then(Value::as_bool).unwrap_or(false),
+                })
+            })
+            .collect(),
+        active: v.get("active").and_then(Value::as_u64),
+        shown: v.get("shown").and_then(Value::as_u64),
+        cursor: v.get("cursor").and_then(Value::as_str).unwrap_or("default").to_string(),
+    })
+}
+
+/// A command for a view as JSON: `{"type": "pointer", "x", "y"}`, `{"type": "button", "button": "left"|"right"|
+/// "middle", "down"}`, `{"type": "scroll", "x", "y"}` (120ths of a notch, up and right positive), `{"type": "key",
+/// "code", "down"}` (an evdev number) or `{"type": "key", "key": "KeyA", "down"}` (a W3C `KeyboardEvent.code`),
+/// `{"type": "text", "text"}`, `{"type": "resize", "width", "height", "scale"}`, `{"type": "mode", "mode"}`,
+/// `{"type": "activate", "id"}`, `{"type": "close", "id"}`, `{"type": "background", "color": "#RRGGBB"}`.
+pub fn view_command_json(command: &display::view::Command) -> Value {
+    use display::desktop::Button;
+    use display::view::Command;
+    match command {
+        Command::PointerTo(x, y) => json!({ "type": "pointer", "x": x, "y": y }),
+        Command::Button(button, down) => {
+            let name = match button {
+                Button::Left => "left",
+                Button::Right => "right",
+                Button::Middle => "middle",
+            };
+            json!({ "type": "button", "button": name, "down": down })
+        }
+        Command::Scroll { x, y } => json!({ "type": "scroll", "x": x, "y": y }),
+        Command::Key(code, down) => json!({ "type": "key", "code": code, "down": down }),
+        Command::Text(text) => json!({ "type": "text", "text": text }),
+        Command::Resize { width, height, scale } => json!({ "type": "resize", "width": width, "height": height, "scale": scale }),
+        Command::Mode(mode) => json!({ "type": "mode", "mode": mode.name() }),
+        Command::Activate(id) => json!({ "type": "activate", "id": id }),
+        Command::Close(id) => json!({ "type": "close", "id": id }),
+        Command::Background(color) => json!({ "type": "background", "color": format!("#{:06x}", color & 0x00ff_ffff) }),
+    }
+}
+
+/// `#RRGGBB` (or `RRGGBB`) as `0x00RRGGBB`.
+fn parse_color(text: &str) -> Option<u32> {
+    let hex = text.trim().strip_prefix('#').unwrap_or(text.trim());
+    (hex.len() == 6).then(|| u32::from_str_radix(hex, 16).ok()).flatten()
+}
+
+/// A command for a view from JSON, as [`view_command_json`] writes it.
+pub fn view_command_from_json(v: &Value) -> Option<display::view::Command> {
+    use display::desktop::Button;
+    use display::view::{Command, Mode};
+    let int = |k: &str| v.get(k).and_then(Value::as_i64).map(|n| n as i32);
+    let down = || v.get("down").and_then(Value::as_bool);
+    Some(match v.get("type")?.as_str()? {
+        "pointer" => Command::PointerTo(int("x")?, int("y")?),
+        "button" => Command::Button(
+            match v.get("button").and_then(Value::as_str).unwrap_or("left") {
+                "left" => Button::Left,
+                "right" => Button::Right,
+                "middle" => Button::Middle,
+                _ => return None,
+            },
+            down()?,
+        ),
+        "scroll" => Command::Scroll { x: int("x").unwrap_or(0), y: int("y").unwrap_or(0) },
+        "key" => {
+            let code = match v.get("key").and_then(Value::as_str) {
+                Some(name) => display::keys::by_code(name)?,
+                None => u16::try_from(v.get("code")?.as_u64()?).ok()?,
+            };
+            Command::Key(code, down()?)
+        }
+        "text" => Command::Text(v.get("text")?.as_str()?.to_string()),
+        "resize" => Command::Resize { width: int("width")?, height: int("height")?, scale: int("scale").map_or(display::output::SCALE_1X, |s| s as u32) },
+        "mode" => Command::Mode(Mode::parse(v.get("mode")?.as_str()?)?),
+        "activate" => Command::Activate(v.get("id")?.as_u64()?),
+        "close" => Command::Close(v.get("id")?.as_u64()?),
+        "background" => Command::Background(parse_color(v.get("color")?.as_str()?)?),
+        _ => return None,
+    })
+}
+
+/// A tile as frames: one, or bands of its rows if it's big.
+fn tile_frames(tile: &display::view::Tile) -> Vec<Vec<u8>> {
+    let width = tile.width.max(0) as usize;
+    if width == 0 || tile.height <= 0 {
+        return Vec::new();
+    }
+    let rows_per = (MOST_TILE_BYTES / (width * 4)).max(1);
+    let mut out = Vec::new();
+    let mut row = 0usize;
+    while row < tile.height as usize {
+        let rows = rows_per.min(tile.height as usize - row);
+        let mut data = Vec::with_capacity(16 + rows * width * 4);
+        for n in [tile.x, tile.y + row as i32, width as i32, rows as i32] {
+            data.extend(n.to_le_bytes());
+        }
+        for p in &tile.pixels[row * width..(row + rows) * width] {
+            data.extend(p.to_le_bytes());
+        }
+        out.push(frame(2, &data));
+        row += rows;
+    }
+    out
+}
+
+/// A tile from a frame's bytes.
+pub fn tile_from_bytes(data: &[u8]) -> Option<display::view::Tile> {
+    let n = |i: usize| data.get(i * 4..i * 4 + 4).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let (x, y, width, height) = (n(0)?, n(1)?, n(2)?, n(3)?);
+    let pixels: Vec<u32> = data.get(16..)?.chunks_exact(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    (pixels.len() == (width.max(0) * height.max(0)) as usize).then_some(display::view::Tile { x, y, width, height, pixels })
+}
+
+/// A `view` connection: the view's state and pixels out as they change, its commands in, until either end goes or the
+/// machine ends.
+#[cfg(unix)]
+fn run_view(stream: &mut std::os::unix::net::UnixStream, json: &str, desktop: &display::desktop::Shared, served: &Served) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::mpsc;
+    let v: Value = serde_json::from_str(json).unwrap_or(Value::Null);
+    let int = |k: &str, or: i64| v.get(k).and_then(Value::as_i64).unwrap_or(or) as i32;
+    let mode = v.get("mode").and_then(Value::as_str).and_then(display::view::Mode::parse).unwrap_or_default();
+    let mut view = display::view::View::new(desktop, mode, int("width", 1280), int("height", 800), int("scale", 120) as u32);
+    if let Some(color) = v.get("background").and_then(Value::as_str).and_then(parse_color) {
+        view.command(display::view::Command::Background(color));
+    }
+    enum Msg {
+        Command(display::view::Command),
+        Wake,
+        Gone,
+    }
+    let (tx, rx) = mpsc::channel::<Msg>();
+    let wake = tx.clone();
+    view.set_waker(Arc::new(move || {
+        let _ = wake.send(Msg::Wake);
+    }));
+    let mut reader = stream.try_clone()?;
+    std::thread::spawn(move || {
+        while let Some((kind, data)) = read_frame(&mut reader) {
+            if kind == 1
+                && let Some(command) = serde_json::from_slice::<Value>(&data).ok().as_ref().and_then(view_command_from_json)
+                && tx.send(Msg::Command(command)).is_err()
+            {
+                return;
+            }
+        }
+        let _ = tx.send(Msg::Gone);
+    });
+    stream.write_all(b"ok 0
+")?;
+    let mut ready = true;
+    while !served.stopper.is_done() {
+        if ready {
+            let update = view.take();
+            if let Some(state) = &update.state {
+                stream.write_all(&frame(1, view_state_json(state).to_string().as_bytes()))?;
+            }
+            for tile in &update.tiles {
+                for f in tile_frames(tile) {
+                    stream.write_all(&f)?;
+                }
+            }
+            ready = false;
+        }
+        // Wait for something, then take everything that's come since, so a burst of input or damage is one take.
+        let first = match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(m) => m,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        };
+        for msg in std::iter::once(first).chain(rx.try_iter()) {
+            match msg {
+                Msg::Command(command) => {
+                    view.command(command);
+                    ready = true;
+                }
+                Msg::Wake => ready = true,
+                Msg::Gone => return Ok(()),
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn answer(stream: &mut std::os::unix::net::UnixStream, served: &Served) -> std::io::Result<()> {
     use std::io::Write;
@@ -476,6 +703,12 @@ fn answer(stream: &mut std::os::unix::net::UnixStream, served: &Served) -> std::
     }
     if let Some(json) = line.strip_prefix("watch") {
         return run_watch(stream, interest_from_json(json.trim()), served);
+    }
+    if let Some(json) = line.strip_prefix("view") {
+        return match &served.desktop {
+            Some(desktop) => run_view(stream, json.trim(), desktop, served),
+            None => stream.write_all(b"error this machine has no desktop (run it with a display)\n"),
+        };
     }
     if let Some(json) = line.strip_prefix("fs ") {
         return match &served.files {
@@ -904,6 +1137,112 @@ pub(crate) fn ask(_dir: &Path, _request: &str) -> Result<Vec<u8>> {
     Err(Error::unsupported("reaching a running machine from outside it isn't there yet on Windows hosts"))
 }
 
+/// A view of a running machine's desktop, for an app that shows it ([`display::view`]): its state and pixels as they
+/// change (it's an iterator of them), and commands back through a [`ViewerInput`].
+pub struct Viewer {
+    #[cfg(unix)]
+    stream: std::os::unix::net::UnixStream,
+}
+
+/// What a viewer reads next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViewEvent {
+    State(display::view::State),
+    Tile(display::view::Tile),
+}
+
+/// Sends a view commands, from any thread.
+#[derive(Debug)]
+pub struct ViewerInput {
+    #[cfg(unix)]
+    stream: std::sync::Mutex<std::os::unix::net::UnixStream>,
+}
+
+impl Viewer {
+    #[cfg(unix)]
+    pub(crate) fn open(dir: &Path, mode: display::view::Mode, width: i32, height: i32, scale: u32, background: Option<u32>) -> Result<Viewer> {
+        let mut request = json!({ "mode": mode.name(), "width": width, "height": height, "scale": scale });
+        if let Some(color) = background {
+            request["background"] = Value::from(format!("#{:06x}", color & 0x00ff_ffff));
+        }
+        let (stream, _) = open(dir, &format!("view {request}"))?;
+        Ok(Viewer { stream })
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn open(_dir: &Path, _mode: display::view::Mode, _width: i32, _height: i32, _scale: u32, _background: Option<u32>) -> Result<Viewer> {
+        Err(Error::unsupported("viewing a running machine isn't there yet on Windows hosts"))
+    }
+
+    /// Where commands go: input, a new size or mode, a tab activated or closed.
+    pub fn input(&self) -> Result<ViewerInput> {
+        #[cfg(unix)]
+        {
+            Ok(ViewerInput { stream: std::sync::Mutex::new(self.stream.try_clone()?) })
+        }
+        #[cfg(not(unix))]
+        Err(Error::unsupported("viewing a running machine isn't there yet on Windows hosts"))
+    }
+
+    /// Ends the view: the machine's windows go back as they were.
+    pub fn close(&self) {
+        #[cfg(unix)]
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+/// Its states and tiles as they come, each waited for; it ends with the view or the machine.
+impl Iterator for Viewer {
+    type Item = ViewEvent;
+
+    /// The next state or tile, waiting for it; None once the view or the machine ends.
+    fn next(&mut self) -> Option<ViewEvent> {
+        #[cfg(unix)]
+        loop {
+            let (kind, data) = read_frame(&mut self.stream)?;
+            match kind {
+                1 => {
+                    if let Some(state) = serde_json::from_slice::<Value>(&data).ok().as_ref().and_then(view_state_from_json) {
+                        return Some(ViewEvent::State(state));
+                    }
+                }
+                2 => {
+                    if let Some(tile) = tile_from_bytes(&data) {
+                        return Some(ViewEvent::Tile(tile));
+                    }
+                }
+                _ => {}
+            }
+        }
+        #[cfg(not(unix))]
+        None
+    }
+}
+
+impl ViewerInput {
+    pub fn send(&self, command: &display::view::Command) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            let data = view_command_json(command).to_string();
+            let mut stream = self.stream.lock().unwrap_or_else(|p| p.into_inner());
+            stream.write_all(&frame(1, data.as_bytes()))?;
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = command;
+            Err(Error::unsupported("viewing a running machine isn't there yet on Windows hosts"))
+        }
+    }
+
+    /// Ends the view, as [`Viewer::close`].
+    pub fn close(&self) {
+        #[cfg(unix)]
+        let _ = self.stream.lock().unwrap_or_else(|p| p.into_inner()).shutdown(std::net::Shutdown::Both);
+    }
+}
+
 /// A watch on a running machine: its hooked events as they're decided, read from its socket.
 pub struct Watch {
     #[cfg(unix)]
@@ -1088,6 +1427,107 @@ pub(crate) fn exec_attached(_dir: &Path, _request: ExecRequest, _interactive: bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn view_commands_and_states_round_trip_as_json() {
+        use display::desktop::Button;
+        use display::view::{Command, Mode, State, Tab};
+        for command in [
+            Command::PointerTo(3, -4),
+            Command::Button(Button::Right, true),
+            Command::Scroll { x: 0, y: -240 },
+            Command::Key(30, false),
+            Command::Text("héllo".into()),
+            Command::Resize { width: 900, height: 700, scale: 240 },
+            Command::Mode(Mode::Windows),
+            Command::Activate(7),
+            Command::Close(9),
+            Command::Background(0xffffff),
+        ] {
+            assert_eq!(view_command_from_json(&view_command_json(&command)).as_ref(), Some(&command));
+        }
+        // Keys by their W3C names, as a web page or a toolkit sends them.
+        assert_eq!(view_command_from_json(&json!({ "type": "key", "key": "KeyA", "down": true })), Some(Command::Key(30, true)));
+        assert_eq!(view_command_from_json(&json!({ "type": "key", "key": "NoSuchKey", "down": true })), None);
+        assert_eq!(view_command_from_json(&json!({ "type": "background", "color": "#2B3A4A" })), Some(Command::Background(0x2b3a4a)));
+        assert_eq!(view_command_from_json(&json!({ "type": "background", "color": "white" })), None);
+        let state = State { mode: Mode::Windows, width: 640, height: 480, scale: 240, tabs: vec![Tab { id: 3, title: "Files".into(), attention: true, minimized: false }], active: Some(3), shown: Some(3), cursor: "text".into() };
+        assert_eq!(view_state_from_json(&view_state_json(&state)), Some(state));
+    }
+
+    #[test]
+    fn a_big_tile_goes_in_bands_that_come_back_whole() {
+        let tile = display::view::Tile { x: 5, y: 6, width: 2000, height: 1200, pixels: (0..2000 * 1200).map(|i| i as u32 & 0xff_ffff).collect() };
+        let frames = tile_frames(&tile);
+        assert!(frames.len() > 1 && frames.iter().all(|f| f.len() <= 5 + 16 + MOST_TILE_BYTES));
+        let mut pixels = Vec::new();
+        let mut next_y = 6;
+        for f in &frames {
+            let (kind, data) = read_frame(&mut &f[..]).unwrap();
+            assert_eq!(kind, 2);
+            let band = tile_from_bytes(&data).unwrap();
+            assert_eq!((band.x, band.y, band.width), (5, next_y, 2000));
+            next_y += band.height;
+            pixels.extend(band.pixels);
+        }
+        assert_eq!(pixels, tile.pixels);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_viewer_sees_the_desktop_and_drives_it_over_the_socket() {
+        use display::desktop::{self, Event, Spec};
+        use display::view::{Command, Mode};
+        let dir = std::env::temp_dir().join(format!("carbon-view-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shared = display::Desktop::shared(800, 600);
+        let window = {
+            let mut d = desktop::lock(&shared);
+            let id = d.create(Spec { rect: display::Rect::new(20, 20, 320, 220), title: "Terminal".into(), framed: true, fill: 0x00ff00, ..Spec::default() });
+            d.set_visible(id, true);
+            d.activate(id);
+            d.take_events();
+            id
+        };
+        let stopper = Stopper::default();
+        let served = Served { desktop: Some(shared.clone()), enter: None, files: None, stopper: stopper.clone(), hub: hooks::Hub::new() };
+        let control = serve(dir.clone(), served).expect("serving");
+
+        let mut viewer = Viewer::open(&dir, Mode::Desktop, 400, 300, 120, Some(0xffffff)).unwrap();
+        let input = viewer.input().unwrap();
+        let Some(ViewEvent::State(state)) = viewer.next() else { panic!("the state comes first") };
+        assert_eq!((state.width, state.height, state.tabs.len(), state.active), (400, 300, 1, Some(window)));
+        let Some(ViewEvent::Tile(tile)) = viewer.next() else { panic!("then the screen") };
+        assert_eq!((tile.width, tile.height), (400, 300));
+        assert_eq!(tile.pixels[399], 0xffffff, "in the background asked for, from the first frame");
+        let content = desktop::lock(&shared).content_rect(window).unwrap();
+        assert_eq!(tile.pixels[(content.top * 400 + content.left) as usize], 0x00ff00);
+
+        // Input goes in as the user's.
+        input.send(&Command::PointerTo(content.left + 2, content.top + 3)).unwrap();
+        input.send(&Command::Button(display::desktop::Button::Left, true)).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut events = Vec::new();
+        while std::time::Instant::now() < deadline && !events.iter().any(|e| matches!(e, Event::Pointer { what: desktop::Pointer::Down(_), .. })) {
+            events.extend(desktop::lock(&shared).take_events());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(events.iter().any(|e| matches!(e, Event::Pointer { window: w, x: 2, y: 3, what: desktop::Pointer::Down(_), .. } if *w == window)), "{events:?}");
+
+        // A new size: the screen's, and the state says so.
+        input.send(&Command::Resize { width: 500, height: 350, scale: 120 }).unwrap();
+        let resized = std::iter::from_fn(|| viewer.next()).find_map(|e| match e {
+            ViewEvent::State(s) if s.width == 500 => Some(s),
+            _ => None,
+        });
+        assert_eq!(resized.map(|s| s.height), Some(350));
+        assert_eq!(desktop::lock(&shared).output().width, 500);
+
+        viewer.close();
+        stopper.finished();
+        drop(control);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn events_round_trip_as_json() {

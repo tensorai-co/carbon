@@ -167,6 +167,14 @@ in memory, in the host's own windows, or (through [`remote`](../remote/README.md
   screen's at 2×): the logical screen magnified, except that an opaque buffer drawn at the output's scale (a 2× buffer,
   `set_buffer_scale`) is shown pixel for pixel, sharp, where no window above covers it; `Output::rect_to_pixels` maps
   an observer's damage onto it. At 1× it's the logical screen.
+- **Views** (`view.rs`): the desktop as an app embedding it shows it, in a part of its own window (an IDE's side
+  panel), sans-IO. Desktop mode is the whole screen, its size the view's. Windows mode makes each top-level window a
+  tab: every one maximized to the view (put back when the view leaves the mode or goes), the active one's content
+  shown without its frame, its dialogs and popups over it, tabs activated or closed (as their close buttons ask) from the
+  app's own bar. A take gives the view's state when it changed (mode, size, tabs, the active and shown one, the cursor
+  by its CSS name) and tiles of the pixels that changed, at the view's scale; commands take input in the view's
+  coordinates, a new size, a mode. `carbon`'s control socket carries it to another process (`view`, `Screen::view`), and
+  keys come by their W3C `KeyboardEvent.code` (`keys::by_code`), as a page or a toolkit names them.
 - **The Mac's screen** (`display/macos`, the `display-macos` crate): desktop mode, the whole desktop in one
   `NSWindow`, through the Objective-C runtime with no crates. The window's content is the output (resizing it resizes
   the screen, and `carbon display resize` resizes the window), and its backing scale the output's scale (2× on a Retina

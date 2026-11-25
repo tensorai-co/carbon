@@ -640,6 +640,13 @@ impl Screen {
         self.ask(request).map(|b| String::from_utf8_lossy(&b).into_owned())
     }
 
+    /// A live view of the desktop for an app to show in a part of its own window: its state and the pixels that
+    /// change, at the view's size and scale (in 120ths), and commands back. See [`display::view`] for its two modes.
+    /// `background` (`0x00RRGGBB`) paints the screen where no window is from the first frame, to suit the app.
+    pub fn view(&self, mode: crate::view::Mode, width: i32, height: i32, scale: u32, background: Option<u32>) -> Result<crate::wire::Viewer> {
+        crate::wire::Viewer::open(&self.dir, mode, width, height, scale, background)
+    }
+
     /// The screen, as a PNG.
     pub fn screenshot(&self) -> Result<Vec<u8>> {
         self.ask("screenshot")

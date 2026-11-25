@@ -112,7 +112,18 @@ pub use spec::{Audio, Display, Exit, MachineSpec, MemorySize, Output, Running, p
 pub use stdio::{Chunks, Stdin, Stdio};
 pub use images::{PullProgress, PullStage};
 pub use store::{BUILD_CACHE_KEEP, Kernel, PRUNE_GRACE, Pruned, network_name, parse_network};
-pub use wire::Watch;
+pub use wire::{ViewEvent, Viewer, ViewerInput, Watch};
+
+/// Showing a running machine's desktop in an app's own window ([`Screen::view`]): its two modes, its state and pixels,
+/// and the commands an app sends (`Key`s are evdev numbers: [`view::key_by_code`] gives one for a W3C
+/// `KeyboardEvent.code`).
+pub mod view {
+    pub use display::desktop::Button;
+    pub use display::keys::by_code as key_by_code;
+    pub use display::desktop::BACKGROUND;
+    pub use display::output::SCALE_1X;
+    pub use display::view::{Command, Mode, State, Tab, Tile};
+}
 
 /// A hardware VM, the process sandbox, or the best there is.
 pub use exec::Isolation;

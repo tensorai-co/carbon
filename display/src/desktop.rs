@@ -106,7 +106,8 @@ const CORNER: i32 = 16;
 const MIN_WIDTH: i32 = 2 * BORDER + 4 * CAPTION;
 const MIN_HEIGHT: i32 = 2 * BORDER + CAPTION;
 
-const BACKGROUND: Rgb = 0x2b_3a4a;
+/// The screen where no window is, unless it's set (`set_background`).
+pub const BACKGROUND: Rgb = 0x2b_3a4a;
 const OUTLINE: Rgb = 0x1a_2129;
 const ACTIVE: Rgb = 0x3d_5a80;
 const INACTIVE: Rgb = 0x8a_96a3;
@@ -554,6 +555,8 @@ pub struct Desktop {
     events: VecDeque<Event>,
     /// What's changed on the screen since it was last composited.
     damage: Rect,
+    /// The screen where no window is.
+    background: Rgb,
     waker: Option<Waker>,
     /// Others woken with it: each server of a kernel that has more than one (lambda's Wayland and X11).
     wakers: Vec<Waker>,
@@ -699,6 +702,7 @@ impl Desktop {
         Desktop {
             damage: screen.bounds(),
             screen,
+            background: BACKGROUND,
             windows: BTreeMap::new(),
             order: Vec::new(),
             next: 1,
@@ -1562,12 +1566,26 @@ impl Desktop {
         &self.output
     }
 
+    /// The screen's colour where no window is (`0x00RRGGBB`): `BACKGROUND` unless it's been set.
+    pub fn background(&self) -> Rgb {
+        self.background
+    }
+
+    /// Paints the screen where no window is in `color`: what an app showing the desktop picks to suit its own look.
+    pub fn set_background(&mut self, color: Rgb) {
+        let color = color & 0x00ff_ffff;
+        if color != self.background {
+            self.background = color;
+            self.damage_rect(self.screen.bounds());
+        }
+    }
+
     /// Shows it on another output, or the same one changed: the screen takes its size, maximized and fullscreen
     /// windows are made its size again, and each window hears of a new scale (`Scale`).
     pub fn set_output(&mut self, output: Output) {
         let old = std::mem::replace(&mut self.output, output.clone());
         if (old.width, old.height) != (output.width, output.height) {
-            self.screen.resize(output.width, output.height, BACKGROUND);
+            self.screen.resize(output.width, output.height, self.background);
             let bounds = self.screen.bounds();
             let placed: Vec<WindowId> = self.order.iter().copied().filter(|id| self.windows[id].placed_by_desktop()).collect();
             for id in placed {
@@ -2152,7 +2170,7 @@ impl Desktop {
         }
         let (pw, ph) = (self.output.to_pixels(self.screen.width), self.output.to_pixels(self.screen.height));
         if self.hires.as_ref().is_none_or(|s| (s.width, s.height) != (pw, ph)) {
-            self.hires = Some(Surface::new(pw, ph, BACKGROUND));
+            self.hires = Some(Surface::new(pw, ph, self.background));
             self.hires_damage = self.screen.bounds();
         }
         let clip = std::mem::take(&mut self.hires_damage).intersect(&self.screen.bounds());
@@ -2764,7 +2782,7 @@ impl Desktop {
         if clip.is_empty() {
             return;
         }
-        self.screen.fill(&clip, BACKGROUND, &clip);
+        self.screen.fill(&clip, self.background, &clip);
         for id in &self.order {
             let w = &self.windows[id];
             if !w.on_screen() || w.extent().intersect(&clip).is_empty() {
@@ -3088,6 +3106,25 @@ mod tests {
         assert_eq!(screen.get(300, 250), Some(BACKGROUND));
         d.destroy(a);
         assert_eq!(d.screen().get(c.left, c.top), Some(BACKGROUND));
+    }
+
+    #[test]
+    fn the_background_can_be_any_colour_and_shows_at_once() {
+        let mut d = Desktop::new(200, 100);
+        let a = d.create(framed(10, 10, 80, 50));
+        d.set_visible(a, true);
+        let watcher = d.observe();
+        d.take_observed(watcher);
+        assert_eq!(d.background(), BACKGROUND);
+        d.set_background(0xffffff);
+        assert_eq!(d.take_observed(watcher).screen, Rect::new(0, 0, 200, 100), "all of it to show again");
+        assert_eq!(d.screen().get(150, 80), Some(0xffffff));
+        assert_eq!(d.screen().get(10, 10), Some(OUTLINE), "windows are drawn over it as before");
+        // Kept as the screen grows.
+        d.set_output(Output::headless(300, 150, SCALE_1X));
+        assert_eq!(d.screen().get(290, 140), Some(0xffffff));
+        d.set_output(Output::headless(300, 150, 2 * SCALE_1X));
+        assert_eq!(d.screen_pixels().get(590, 290), Some(0xffffff));
     }
 
     #[test]
