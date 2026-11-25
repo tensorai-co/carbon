@@ -953,10 +953,34 @@ impl Emitter {
                 }
                 Ok(Next::End)
             }
+            0xE0..=0xE2 => {
+                // loopne (E0), loope (E1), loop (E2): count rcx/ecx down without touching flags.
+                let wide = self.wide();
+                self.asm.sub_imm(wide, RCX, RCX, 1);
+                let zero = self.asm.len();
+                self.asm.cbz(wide, RCX, 0);
+                let flag = if op != 0xE2 {
+                    let at = self.asm.len();
+                    // E0 branches while ZF=0 (skip when Eq); E1 branches while ZF=1 (skip when Ne).
+                    self.asm.b_cond(if op == 0xE0 { Cond::Eq } else { Cond::Ne }, 0);
+                    Some(at)
+                } else {
+                    None
+                };
+                self.jump(inst.target());
+                let fall = self.asm.len();
+                self.asm.patch(zero, fall);
+                if let Some(at) = flag {
+                    self.asm.patch(at, fall);
+                }
+                self.jump(inst.next());
+                Ok(Next::End)
+            }
             0xE3 => {
-                // jrcxz
+                // jrcxz / jecxz
+                let wide = self.wide();
                 let at = self.asm.len();
-                self.asm.cbz(true, RCX, 0);
+                self.asm.cbz(wide, RCX, 0);
                 self.jump(inst.next());
                 let here = self.asm.len();
                 self.asm.patch(at, here);

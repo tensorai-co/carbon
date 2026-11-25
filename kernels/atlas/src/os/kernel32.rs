@@ -624,9 +624,9 @@ dll! {
     host GetUserGeoID(1) => get_user_geo_id;
     missing HeapCompact;
     host InitializeProcThreadAttributeList(4) => initialize_proc_thread_attribute_list;
-    missing K32GetMappedFileNameW;
+    host K32GetMappedFileNameW(4) => get_mapped_file_name_w;
     host K32GetPerformanceInfo(2) => get_performance_info;
-    missing K32QueryWorkingSetEx;
+    host K32QueryWorkingSetEx(3) => query_working_set_ex;
     host LCIDToLocaleName(4) => lcid_to_locale_name;
     host LocaleNameToLCID(2) => locale_name_to_lcid;
     host LockFile(5) => accept;

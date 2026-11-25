@@ -14,4 +14,6 @@ dll! {
     host EnumProcessModules(4) => enum_process_modules;
     host GetModuleBaseNameA(4) => get_module_base_name_a;
     host GetModuleBaseNameW(4) => get_module_base_name_w;
+    host GetMappedFileNameW(4) => get_mapped_file_name_w;
+    host QueryWorkingSetEx(3) => query_working_set_ex;
 }

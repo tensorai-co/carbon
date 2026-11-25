@@ -539,7 +539,22 @@ fn type_of(handle: &Handle) -> (u8, u32) {
         },
         Handle::Port(_) => (36, 0x1f_0003),
         Handle::Token(_) => (5, 0xf_01ff),
-        Handle::Console(..) | Handle::Input(_) | Handle::File(_) | Handle::Find(_) | Handle::Snapshot(_) => (37, 0x12_019f),
+        Handle::File(f) => {
+            let mut access = 0x12_0080u32; // SYNCHRONIZE | READ_CONTROL | FILE_READ_ATTRIBUTES
+            if f.read {
+                access |= 0x0009; // FILE_READ_DATA | FILE_READ_EA
+            }
+            if f.write {
+                access |= 0x0116; // FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES
+            } else if f.append {
+                access |= 0x0004; // FILE_APPEND_DATA
+            }
+            if f.sharing.delete {
+                access |= 0x0001_0000; // DELETE
+            }
+            (37, access)
+        }
+        Handle::Console(..) | Handle::Input(_) | Handle::Find(_) | Handle::Snapshot(_) => (37, 0x12_019f),
         Handle::Section(_, access) => (42, *access),
         Handle::Key(_) => (44, 0xf_003f),
     }

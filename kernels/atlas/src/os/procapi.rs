@@ -1131,6 +1131,106 @@ pub fn get_performance_info(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Repl
     Reply::Value(TRUE)
 }
 
+/// `K32QueryWorkingSetEx(process, pv, cb)`: fills each `PSAPI_WORKING_SET_EX_INFORMATION`'s `VirtualAttributes`
+/// (`Valid`, `ShareCount`, `Win32Protection`, `Shared`) from the process's mapped regions.
+pub fn query_working_set_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    use crate::process::AreaKind;
+    let Some(process) = task.process_of(a[0]) else { return task.fail(cx, ERROR_INVALID_HANDLE) };
+    let abi = task.abi();
+    let w = abi.width as usize;
+    let entry_size = 2 * w;
+    let cb = a[2] as u32 as usize;
+    if a[1] == 0 || cb == 0 || !cb.is_multiple_of(entry_size) {
+        return task.fail(cx, ERROR_INVALID_PARAMETER);
+    }
+    let Ok(mut buf) = task.mem(cx, false, |t| user::read_vec(&t.space(), a[1], cb)) else {
+        return task.fail(cx, 998);
+    };
+    {
+        let state = lock(&process.state);
+        for chunk in buf.chunks_exact_mut(entry_size) {
+            let va = if w == 8 {
+                u64::from_le_bytes(chunk[..8].try_into().unwrap())
+            } else {
+                u64::from(u32::from_le_bytes(chunk[..4].try_into().unwrap()))
+            };
+            let attrs: u64 = match state.regions.find(va) {
+                Some((_, area)) if !matches!(area.kind, AreaKind::Reserved | AreaKind::Kept) => {
+                    let shared = matches!(area.kind, AreaKind::View | AreaKind::Image | AreaKind::System);
+                    let prot: u64 = match (area.prot.read(), area.prot.write(), area.prot.exec()) {
+                        (false, false, false) => 0,
+                        (true, false, false) => 1,
+                        (false, false, true) => 2,
+                        (true, false, true) => 3,
+                        (true, true, false) => 4,
+                        (true, true, true) => 6,
+                        _ => 4,
+                    };
+                    // Valid (bit 0) | ShareCount (bits 1..4) | Win32Protection (bits 4..9) | Shared (bit 15).
+                    1 | (prot << 4) | if shared { (1 << 1) | (1 << 15) } else { 0 }
+                }
+                _ => 0,
+            };
+            chunk[w..2 * w].copy_from_slice(&abi.ptr(attrs));
+        }
+    }
+    if task.mem(cx, true, |t| user::write(&mut t.space(), a[1], &buf)).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(TRUE)
+}
+
+/// Converts a Windows drive path (`C:\...`) to the NT device path (`\Device\HarddiskVolume3\...`) returned by
+/// `GetMappedFileNameW` (matching `QueryDosDeviceW`).
+fn nt_device_path(path: &str) -> String {
+    let p = path.replace('/', "\\");
+    if let Some(rest) = p.strip_prefix("C:").or_else(|| p.strip_prefix("c:")) {
+        format!("\\Device\\HarddiskVolume3{rest}")
+    } else if p.starts_with('\\') {
+        format!("\\Device\\HarddiskVolume3{p}")
+    } else {
+        format!("\\Device\\HarddiskVolume3\\{p}")
+    }
+}
+
+/// `K32GetMappedFileNameW(process, lpv, out, room)`: NT device path of the file or image mapped at `lpv`.
+pub fn get_mapped_file_name_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    use crate::process::AreaKind;
+    const ERROR_FILE_INVALID: u32 = 1006;
+    let Some(process) = task.process_of(a[0]) else { return task.fail(cx, ERROR_INVALID_HANDLE) };
+    let addr = a[1];
+    let room = a[3] as u32 as usize;
+    let path: Option<String> = {
+        let state = lock(&process.state);
+        match state.regions.find(addr) {
+            Some((_, area)) if area.kind == AreaKind::View => area.view.as_ref().and_then(|v| v.section.path.clone()),
+            Some((_, area)) if area.kind == AreaKind::Image => state
+                .mapped
+                .values()
+                .filter(|(base, _)| *base <= addr)
+                .max_by_key(|(base, _)| *base)
+                .map(|(_, path)| path.clone())
+                .or_else(|| (!state.image.is_empty()).then(|| state.image.clone())),
+            _ => None,
+        }
+    };
+    let Some(path) = path else {
+        return task.fail(cx, ERROR_FILE_INVALID);
+    };
+    if room == 0 {
+        return task.fail(cx, ERROR_INSUFFICIENT_BUFFER);
+    }
+    let nt = nt_device_path(&path);
+    let mut units: Vec<u16> = nt.encode_utf16().collect();
+    units.truncate(room - 1);
+    let n = units.len();
+    let bytes: Vec<u8> = units.iter().chain([&0]).flat_map(|u| u.to_le_bytes()).collect();
+    if task.mem(cx, true, |t| user::write(&mut t.space(), a[2], &bytes)).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(n as u64)
+}
+
 /// What's taken and has nothing to do here: priority classes, boosts, mitigation and process or thread information
 /// set, default DLL folders, job assignments and limits, attribute updates, file locks (no other program shares
 /// the disk), the function tables JIT compilers register (unwinding through their code isn't there yet), power

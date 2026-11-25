@@ -128,7 +128,7 @@ impl Task {
     /// program's folder, `SetDllDirectory`'s, System32 (SysWOW64 for a 32-bit program), Windows, the current directory
     /// (unless `SetDllDirectory` was called), then each folder in `Path`. After `SetDefaultDllDirectories`, only the
     /// folders its flags name.
-    fn dll_search_dirs(&mut self, cx: &mut Cx<'_>) -> Vec<String> {
+    pub(crate) fn dll_search_dirs(&mut self, cx: &mut Cx<'_>) -> Vec<String> {
         let (exe_dir, directory, search, cwd) = {
             let state = lock(&self.process.state);
             (state.exe_dir.clone(), state.dll_directory.clone(), state.dll_search, state.cwd.clone())

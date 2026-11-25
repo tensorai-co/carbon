@@ -17,6 +17,13 @@ use layers::Ino;
 
 use crate::process::{Area, AreaKind, Task};
 
+/// What backs a section's pages when first faulted in.
+pub enum Backing {
+    PageFile,
+    File(Ino),
+    System(Arc<Vec<u8>>),
+}
+
 /// A section's memory.
 pub struct Section {
     exec: SharedExec,
@@ -24,8 +31,10 @@ pub struct Section {
     /// The most a view may be: writable (`PAGE_READWRITE`), and executable.
     pub writable: bool,
     pub executable: bool,
-    /// The file it maps, if not the page file.
-    pub file: Option<Ino>,
+    /// What backs the section (page file, a disk file, or a read-only system-layer image).
+    pub backing: Backing,
+    /// The Windows path of the mapped file, if any (for `GetMappedFileNameW`).
+    pub path: Option<String>,
     /// Its frames by page, made as they're first wanted.
     frames: Mutex<BTreeMap<u64, Frame>>,
     /// The descriptor it was made with or given since; None for its maker's token's default.
@@ -53,8 +62,12 @@ impl Drop for Section {
 }
 
 impl Section {
-    pub fn new(exec: SharedExec, size: u64, writable: bool, executable: bool, file: Option<Ino>) -> Arc<Section> {
-        Arc::new(Section { exec, size, writable, executable, file, frames: Mutex::new(BTreeMap::new()), security: Mutex::new(None) })
+    pub fn new(exec: SharedExec, size: u64, writable: bool, executable: bool, backing: Backing, path: Option<String>) -> Arc<Section> {
+        Arc::new(Section { exec, size, writable, executable, backing, path, frames: Mutex::new(BTreeMap::new()), security: Mutex::new(None) })
+    }
+
+    pub fn is_file(&self) -> bool {
+        !matches!(self.backing, Backing::PageFile)
     }
 
     pub fn pages(&self) -> u64 {
@@ -75,7 +88,10 @@ pub struct View {
 impl Task {
     /// Writes a file mapping's pages in `offsets` back to its file, as far as the file goes.
     pub(crate) fn write_back(&mut self, cx: &mut Cx<'_>, section: &Section, offsets: std::ops::Range<u64>) {
-        let Some(ino) = section.file.filter(|_| section.writable) else { return };
+        let Backing::File(ino) = section.backing else { return };
+        if !section.writable {
+            return;
+        }
         let pages: Vec<(u64, Frame)> = {
             let frames = lock(&section.frames);
             frames.range(offsets.start / PAGE..offsets.end.div_ceil(PAGE)).map(|(i, f)| (*i, *f)).collect()
@@ -131,12 +147,16 @@ pub(crate) fn fault_view(k: &crate::Kernel, cx: &mut Cx<'_>, view: &View, page: 
     }
     // A page of the file, read before exec's lock is taken, if the section doesn't have it yet.
     let mut frames = lock(&section.frames);
-    let data = match (frames.contains_key(&index), section.file) {
-        (false, Some(ino)) => {
+    let data = match (frames.contains_key(&index), &section.backing) {
+        (false, Backing::File(ino)) => {
             let mut data = vec![0u8; PAGE as usize];
-            let n = lock(&k.disk).read(ino, index * PAGE, &mut data).unwrap_or(0);
+            let n = lock(&k.disk).read(*ino, index * PAGE, &mut data).unwrap_or(0);
             data.truncate(n);
             data
+        }
+        (false, Backing::System(bytes)) => {
+            let start = (index * PAGE) as usize;
+            bytes.get(start..).map_or_else(Vec::new, |rest| rest[..rest.len().min(PAGE as usize)].to_vec())
         }
         _ => Vec::new(),
     };

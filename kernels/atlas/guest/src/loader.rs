@@ -657,7 +657,7 @@ fn started_newest_first(out: &mut [u64; MOST_MODULES], threads: bool) -> usize {
         let mut list: [(u32, u64); MOST_MODULES] = [(0, 0); MOST_MODULES];
         let mut n = 0;
         for m in &t.modules[..t.count] {
-            if m.ready && m.order != 0 && Image(m.base).is_dll() && m.name != Name::module(b"ntdll.dll") && !(threads && m.no_thread_calls) {
+            if m.ready && m.count != 0 && m.order != 0 && Image(m.base).is_dll() && m.name != Name::module(b"ntdll.dll") && !(threads && m.no_thread_calls) {
                 list[n] = (m.order, m.base);
                 n += 1;
             }
@@ -667,6 +667,24 @@ fn started_newest_first(out: &mut [u64; MOST_MODULES], threads: bool) -> usize {
             out[i] = *base;
         }
         n
+    })
+}
+
+/// Pins a module across a `DLL_THREAD_ATTACH`/`DLL_THREAD_DETACH` call so a concurrent `FreeLibrary` cannot unmap it
+/// underneath this thread. Returns `Some(true)` if a temporary reference was taken (to be released after), `Some(false)`
+/// if the module is already pinned, or `None` if it is no longer loaded/active.
+fn pin_for_thread(base: u64) -> Option<bool> {
+    with(|t| {
+        let m = t.by_base(base)?;
+        if !m.ready || m.count == 0 || m.no_thread_calls {
+            return None;
+        }
+        if m.count == PINNED {
+            return Some(false);
+        }
+        m.count += 1;
+        set_counts(m.entry, m.count);
+        Some(true)
     })
 }
 
@@ -682,24 +700,32 @@ pub extern "system" fn AtlasThreadStart(start: usize, parameter: usize) -> ! {
     let (start, parameter) = (start as u64, parameter as u64);
     sys::call4(atlas_abi::call::THREAD_STARTED, 0, 0, 0, 0);
     register_thread();
-    let mut at = 0;
-    loop {
-        let next = with(|t| {
-            let m = t.modules[..t.count].get(at).copied();
-            at += 1;
-            m
-        });
-        let Some(m) = next else { break };
-        if let Some((index, dir)) = m.tls {
-            tls_block(index, dir);
+    let mut tls_list = [(0usize, 0u64); MOST_MODULES];
+    let tls_n = with(|t| {
+        let mut n = 0;
+        for m in &t.modules[..t.count] {
+            if m.count != 0
+                && let Some((index, dir)) = m.tls
+            {
+                tls_list[n] = (index, dir);
+                n += 1;
+            }
         }
+        n
+    });
+    for &(index, dir) in &tls_list[..tls_n] {
+        tls_block(index, dir);
     }
     // Oldest first, as they started.
     let mut started = [0u64; MOST_MODULES];
     let n = started_newest_first(&mut started, true);
     for &base in started[..n].iter().rev() {
+        let Some(took) = pin_for_thread(base) else { continue };
         run_tls_callbacks(Image(base), DLL_THREAD_ATTACH);
         dll_main(base, DLL_THREAD_ATTACH, 0);
+        if took {
+            release(base);
+        }
     }
     run_tls_callbacks(exe(), DLL_THREAD_ATTACH);
     // SAFETY: the program's thread routine, as Windows calls it.
@@ -721,8 +747,12 @@ pub extern "system" fn AtlasExitThread(code: u32) -> ! {
         let mut started = [0u64; MOST_MODULES];
         let n = started_newest_first(&mut started, true);
         for &base in &started[..n] {
+            let Some(took) = pin_for_thread(base) else { continue };
             run_tls_callbacks(Image(base), DLL_THREAD_DETACH);
             dll_main(base, DLL_THREAD_DETACH, 0);
+            if took {
+                release(base);
+            }
         }
         unregister_thread();
         free_tls_blocks();

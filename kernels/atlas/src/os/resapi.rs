@@ -70,14 +70,36 @@ impl Task {
         Ok((base + u64::from(found.entry), base + u64::from(found.data), found.size))
     }
 
-    /// A file's bytes, whether it's on the disk or one of atlas's own DLLs.
-    fn file_bytes(&mut self, name: &str) -> Result<Vec<u8>, u32> {
-        let (file, _) = self.open_file(name, 0x8000_0000, crate::files::FILE_SHARE_ALL, 3, 0)?;
-        match &file.node {
-            Node::File(ino) => kernels_core::lock(&self.k.disk).contents(*ino).map(|c| c.to_vec()).map_err(|_| 5),
-            Node::System(image) => Ok(image.to_vec()),
-            _ => Err(5),
+    /// A file's bytes, whether it's on the disk or one of atlas's own DLLs. When `name` has no directory, searches
+    /// the DLL search path just as Windows' `GetFileVersionInfo` (`LoadLibraryEx` with `LOAD_LIBRARY_AS_DATAFILE`) does.
+    fn file_bytes(&mut self, cx: &mut Cx<'_>, name: &str) -> Result<Vec<u8>, u32> {
+        let open_one = |task: &mut Task, path: &str| -> Result<Vec<u8>, u32> {
+            let (file, _) = task.open_file(path, 0x8000_0000, crate::files::FILE_SHARE_ALL, 3, 0)?;
+            match &file.node {
+                Node::File(ino) => kernels_core::lock(&task.k.disk).contents(*ino).map(|c| c.to_vec()).map_err(|_| 5),
+                Node::System(image) => Ok(image.to_vec()),
+                _ => Err(5),
+            }
+        };
+        if let Ok(bytes) = open_one(self, name) {
+            return Ok(bytes);
         }
+        if !name.contains(['\\', '/']) {
+            let mod_name = crate::mapping::module_name(name);
+            let mapped_name = crate::imports::api_set(&mod_name).unwrap_or(&mod_name);
+            if let Some(dll) = crate::os::find(mapped_name) {
+                return Ok(self.k.images.get(self.isa, dll).to_vec());
+            }
+            for dir in self.dll_search_dirs(cx) {
+                let win_dir = format!("C:{}", dir.replace('/', "\\"));
+                for candidate in [format!("{win_dir}\\{name}"), format!("{win_dir}\\{mod_name}")] {
+                    if let Ok(bytes) = open_one(self, &candidate) {
+                        return Ok(bytes);
+                    }
+                }
+            }
+        }
+        Err(crate::files::ERROR_FILE_NOT_FOUND)
     }
 
     /// A file's version information (`RT_VERSION` 1), found through its sections as they are in the file.
@@ -88,7 +110,7 @@ impl Task {
             self.mem(cx, false, |t| user::read_cstr(&t.space(), at, 32768)).map(|b| crate::ansi::text(&b))
         }
         .map_err(|_| ERROR_NOACCESS)?;
-        let bytes = self.file_bytes(&name)?;
+        let bytes = self.file_bytes(cx, &name)?;
         let pe = Pe::parse(&bytes).map_err(|_| 193u32)?; // ERROR_BAD_EXE_FORMAT
         let (root, _) = pe.directory(2).ok_or(resources::ERROR_RESOURCE_DATA_NOT_FOUND)?;
         let offset = |rva: u32| -> Option<usize> {

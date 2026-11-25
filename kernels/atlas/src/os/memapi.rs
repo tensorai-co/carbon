@@ -100,33 +100,53 @@ fn create_file_mapping(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) 
         if size == 0 {
             return task.null(cx, ERROR_INVALID_PARAMETER);
         }
-        Section::new(task.k.exec.clone(), size, writable, executable, None)
+        Section::new(task.k.exec.clone(), size, writable, executable, crate::sections::Backing::PageFile, None)
     } else {
         let handle = lock(&task.process.state).handles.get(file);
         let open = match handle {
             Some(Handle::File(open)) => open,
             _ => return task.null(cx, ERROR_INVALID_HANDLE),
         };
-        let Node::File(ino) = open.node else { return task.null(cx, ERROR_INVALID_HANDLE) };
         if !open.read || (writable && !open.write) {
             return task.null(cx, ERROR_ACCESS_DENIED);
         }
-        let length = lock(&task.k.disk).stat(ino).map(|s| s.size).unwrap_or(0);
-        let size = if size == 0 { length } else { size };
-        if size == 0 {
-            return task.null(cx, ERROR_FILE_INVALID);
-        }
-        // A writable mapping bigger than its file makes the file that big.
-        if size > length {
-            if !writable {
-                return task.null(cx, ERROR_NOT_ENOUGH_MEMORY);
+        let path = (!open.path.is_empty()).then(|| open.path.clone());
+        match &open.node {
+            Node::File(ino) => {
+                let ino = *ino;
+                let length = lock(&task.k.disk).stat(ino).map(|s| s.size).unwrap_or(0);
+                let size = if size == 0 { length } else { size };
+                if size == 0 {
+                    return task.null(cx, ERROR_FILE_INVALID);
+                }
+                // A writable mapping bigger than its file makes the file that big.
+                if size > length {
+                    if !writable {
+                        return task.null(cx, ERROR_NOT_ENOUGH_MEMORY);
+                    }
+                    let now = task.k.host.wall();
+                    if lock(&task.k.disk).truncate(ino, size, now).is_err() {
+                        return task.null(cx, ERROR_NOT_ENOUGH_MEMORY);
+                    }
+                }
+                Section::new(task.k.exec.clone(), size, writable, executable, crate::sections::Backing::File(ino), path)
             }
-            let now = task.k.host.wall();
-            if lock(&task.k.disk).truncate(ino, size, now).is_err() {
-                return task.null(cx, ERROR_NOT_ENOUGH_MEMORY);
+            Node::System(image) => {
+                if writable {
+                    return task.null(cx, ERROR_ACCESS_DENIED);
+                }
+                let length = image.len() as u64;
+                let size = if size == 0 { length } else { size };
+                if size == 0 {
+                    return task.null(cx, ERROR_FILE_INVALID);
+                }
+                if size > length {
+                    return task.null(cx, ERROR_NOT_ENOUGH_MEMORY);
+                }
+                Section::new(task.k.exec.clone(), size, false, executable, crate::sections::Backing::System(image.clone()), path)
             }
+            _ => return task.null(cx, ERROR_INVALID_HANDLE),
         }
-        Section::new(task.k.exec.clone(), size, writable, executable, Some(ino))
     };
     if let Some(d) = task.attributes_descriptor(cx, attributes) {
         let d = d.filled(&lock(&task.effective_token().state)).mapped(&crate::security::SECTION);
@@ -473,7 +493,7 @@ pub fn atlas_query_section(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply
     const SEC_FILE: u64 = 0x80_0000;
     const SEC_COMMIT: u64 = 0x800_0000;
     let Some(section) = task.section_handle(a[0]) else { return Reply::Value(0xc000_0008) }; // STATUS_INVALID_HANDLE
-    let attributes = if section.file.is_some() { SEC_FILE } else { SEC_COMMIT };
+    let attributes = if section.is_file() { SEC_FILE } else { SEC_COMMIT };
     let mut out = section.size.to_le_bytes().to_vec();
     out.extend(attributes.to_le_bytes());
     match task.mem(cx, true, |t| user::write(&mut t.space(), a[1], &out)) {

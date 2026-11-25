@@ -1,6 +1,10 @@
 //! Unwinding one frame: finding a function's `.pdata` entry, and undoing its prolog from its unwind data to get its
 //! caller's registers, as Windows' documentation for each ISA describes them.
 
+use core::cell::UnsafeCell;
+use core::ffi::c_void;
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use crate::arch::Context;
 use crate::loader;
 use crate::pe::{self, Image, u32_at};
@@ -21,17 +25,112 @@ pub struct Unwound {
     pub establisher: u64,
 }
 
-/// The `.pdata` entry for `pc`: its image's base, and the entry's address.
-pub fn lookup(pc: u64) -> Option<(u64, u64)> {
-    let (base, _) = loader::containing(pc)?;
-    let (table, size) = Image(base).dir(pe::DIR_EXCEPTION)?;
+const MOST_DYNAMIC: usize = 64;
+
+#[derive(Clone, Copy)]
+struct DynamicTable {
+    active: bool,
+    table: u64,
+    count: u32,
+    max_count: u32,
+    base: u64,
+    end: u64,
+}
+
+const EMPTY_DYNAMIC: DynamicTable = DynamicTable { active: false, table: 0, count: 0, max_count: 0, base: 0, end: 0 };
+
+struct DynamicTables {
+    busy: AtomicBool,
+    entries: UnsafeCell<[DynamicTable; MOST_DYNAMIC]>,
+}
+
+// SAFETY: `entries` is only touched while `busy` is held.
+unsafe impl Sync for DynamicTables {}
+
+static DYNAMIC: DynamicTables = DynamicTables { busy: AtomicBool::new(false), entries: UnsafeCell::new([EMPTY_DYNAMIC; MOST_DYNAMIC]) };
+
+fn with_dynamic<R>(f: impl FnOnce(&mut [DynamicTable; MOST_DYNAMIC]) -> R) -> R {
+    while DYNAMIC.busy.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+    // SAFETY: held exclusively while `busy` is true.
+    let result = f(unsafe { &mut *DYNAMIC.entries.get() });
+    DYNAMIC.busy.store(false, Ordering::Release);
+    result
+}
+
+/// `RtlAddGrowableFunctionTable(&dynamic_table, function_table, entry_count, max_entry_count, range_base, range_end)`:
+/// registers a dynamic `.pdata` table (used by JIT runtimes like V8) for unwinding.
+#[unsafe(no_mangle)]
+pub extern "system" fn RtlAddGrowableFunctionTable(
+    dynamic_table: *mut *mut c_void,
+    function_table: *const c_void,
+    entry_count: u32,
+    max_entry_count: u32,
+    range_base: usize,
+    range_end: usize,
+) -> u32 {
+    const STATUS_SUCCESS: u32 = 0;
+    const STATUS_INVALID_PARAMETER: u32 = 0xc000_000d;
+    const STATUS_NO_MEMORY: u32 = 0xc000_0017;
+    if dynamic_table.is_null() || function_table.is_null() || entry_count > max_entry_count || range_end <= range_base {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let slot = with_dynamic(|entries| {
+        let idx = entries.iter().position(|e| !e.active)?;
+        entries[idx] = DynamicTable {
+            active: true,
+            table: function_table as u64,
+            count: entry_count,
+            max_count: max_entry_count,
+            base: range_base as u64,
+            end: range_end as u64,
+        };
+        Some(idx)
+    });
+    match slot {
+        Some(idx) => {
+            // SAFETY: caller's out pointer, checked non-null above.
+            unsafe { dynamic_table.write((idx + 1) as *mut c_void) };
+            STATUS_SUCCESS
+        }
+        None => STATUS_NO_MEMORY,
+    }
+}
+
+/// `RtlGrowFunctionTable(dynamic_table, new_entry_count)`: updates the active entry count of a registered table.
+#[unsafe(no_mangle)]
+pub extern "system" fn RtlGrowFunctionTable(dynamic_table: *mut c_void, new_entry_count: u32) {
+    let idx = (dynamic_table as usize).wrapping_sub(1);
+    if idx >= MOST_DYNAMIC {
+        return;
+    }
+    with_dynamic(|entries| {
+        let e = &mut entries[idx];
+        if e.active {
+            e.count = new_entry_count.min(e.max_count);
+        }
+    });
+}
+
+/// `RtlDeleteGrowableFunctionTable(dynamic_table)`: removes a registered growable function table.
+#[unsafe(no_mangle)]
+pub extern "system" fn RtlDeleteGrowableFunctionTable(dynamic_table: *mut c_void) {
+    let idx = (dynamic_table as usize).wrapping_sub(1);
+    if idx >= MOST_DYNAMIC {
+        return;
+    }
+    with_dynamic(|entries| {
+        entries[idx] = EMPTY_DYNAMIC;
+    });
+}
+
+fn search_pdata(base: u64, table: u64, count: u64, pc: u64) -> Option<(u64, u64)> {
     let rva = (pc - base) as u32;
-    let count = size / ENTRY;
-    // The last entry starting at or before `pc`.
     let (mut lo, mut hi) = (0, count);
     while lo < hi {
         let mid = (lo + hi) / 2;
-        // SAFETY: entries in the image's exception directory.
+        // SAFETY: entries in the image's or dynamic table's exception directory.
         if unsafe { u32_at(table + mid * ENTRY) } <= rva {
             lo = mid + 1;
         } else {
@@ -42,6 +141,23 @@ pub fn lookup(pc: u64) -> Option<(u64, u64)> {
     // SAFETY: as above.
     let (begin, length) = unsafe { (u32_at(entry), function_length(base, entry)) };
     (rva >= begin && u64::from(rva - begin) < length).then_some((base, entry))
+}
+
+/// The `.pdata` entry for `pc`: its image's base, and the entry's address.
+pub fn lookup(pc: u64) -> Option<(u64, u64)> {
+    if let Some((base, _)) = loader::containing(pc)
+        && let Some((table, size)) = Image(base).dir(pe::DIR_EXCEPTION)
+    {
+        return search_pdata(base, table, size / ENTRY, pc);
+    }
+    let found = with_dynamic(|entries| {
+        entries
+            .iter()
+            .find(|e| e.active && e.count > 0 && pc >= e.base && pc < e.end)
+            .map(|e| (e.base, e.table, u64::from(e.count)))
+    });
+    let (base, table, count) = found?;
+    search_pdata(base, table, count, pc)
 }
 
 #[cfg(target_arch = "x86_64")]

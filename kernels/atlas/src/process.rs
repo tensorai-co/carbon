@@ -294,7 +294,17 @@ impl Task {
                 self.raise(cx, Raised::simple(status::DATATYPE_MISALIGNMENT, pc), &format!("misaligned at {pc:#x}"))
             }
             Some(Stop::DivideError { pc }) => self.raise(cx, Raised::simple(status::INTEGER_DIVIDE_BY_ZERO, pc), &format!("divide by zero at {pc:#x}")),
-            Some(Stop::FastFail { pc, code }) => self.die(status::STACK_BUFFER_OVERRUN, &format!("fast fail {code} at {pc:#x}")),
+            Some(Stop::FastFail { pc, code }) => {
+                let place = self.where_is(pc);
+                if self.k.options.trace {
+                    let regs = cx.turn(|t| t.thread().regs());
+                    let sp = regs.sp();
+                    let process = self.process.clone();
+                    let frames = self.stack_frames(cx, &process, pc, sp);
+                    self.k.host.write(host::Stream::Err, format!("[{}] pid={} fast fail {code} at {pc:#x} ({place}); stack: {}\n", self.tid, self.process.pid, frames.join(", ")).as_bytes());
+                }
+                self.die(status::STACK_BUFFER_OVERRUN, &format!("fast fail {code} at {pc:#x} ({place})"))
+            }
             Some(Stop::Internal { pc, detail }) => self.die(status::ILLEGAL_INSTRUCTION, &format!("exec couldn't run it at {pc:#x} ({detail:#x})")),
         }
     }
@@ -637,8 +647,27 @@ impl Task {
     }
 
     /// The program touched a page exec hasn't mapped: zeros, if it's committed memory it may touch that way.
+    /// When a thread grows its own stack below its TEB's `StackLimit`, lower `StackLimit` to that page so
+    /// stack probes (`__chkstk`, which writes zero to each page down from `StackLimit`) don't clobber live frames.
     fn fault(&mut self, cx: &mut Cx<'_>, addr: u64, access: Prot) -> bool {
-        fault_in(&self.k, &self.process, cx, addr, access)
+        if !fault_in(&self.k, &self.process, cx, addr, access) {
+            return false;
+        }
+        let page = addr & !(PAGE - 1);
+        let (teb_at, abi) = (self.control.teb, self.abi());
+        cx.turn(|t| {
+            let mut mem = t.space();
+            if let (Ok(bottom), Ok(limit)) = (
+                user::read_ptr(&mem, teb_at + abi.teb.deallocation_stack, abi.width),
+                user::read_ptr(&mem, teb_at + abi.teb.stack_limit, abi.width),
+            ) && bottom != 0
+                && page >= bottom
+                && page < limit
+            {
+                let _ = user::write(&mut mem, teb_at + abi.teb.stack_limit, &abi.ptr(page));
+            }
+        });
+        true
     }
 
     /// `VirtualAlloc`: reserves, commits, or both. Gives the base, or None.
@@ -657,35 +686,62 @@ impl Task {
     pub fn virtual_alloc_in(&mut self, cx: &mut Cx<'_>, process: &Arc<Process>, addr: u64, size: u64, kind: u32, protect: u32) -> Option<u64> {
         const MEM_COMMIT: u32 = 0x1000;
         const MEM_RESERVE: u32 = 0x2000;
-        let prot = prot_from(protect)?;
+        const MEM_RESET: u32 = 0x8_0000;
+        const MEM_TOP_DOWN: u32 = 0x10_0000;
+        const MEM_RESET_UNDO: u32 = 0x100_0000;
         if size == 0 {
             return None;
         }
-        let alloc = images::layout(process.isa).alloc;
         let kept = (!Arc::ptr_eq(process, &self.process)).then(|| lock(&process.remote));
         if kept.as_ref().is_some_and(|gone| **gone) {
             return None;
         }
+        // `MEM_RESET` / `MEM_RESET_UNDO`: advisory hint that committed pages' contents need not be kept (or should be
+        // reclaimed). Keeping them committed and untouched is always valid under Windows' contract.
+        if kind & (MEM_RESET | MEM_RESET_UNDO) != 0 {
+            if addr == 0 {
+                return None;
+            }
+            let range = addr & !(PAGE - 1)..addr.checked_add(size)?.next_multiple_of(PAGE);
+            let state = lock(&process.state);
+            let mut at = range.start;
+            while at < range.end {
+                let (r, a) = state.regions.find(at)?;
+                if matches!(a.kind, AreaKind::Kept | AreaKind::Image | AreaKind::View | AreaKind::System) {
+                    return None;
+                }
+                at = r.end;
+            }
+            return Some(range.start);
+        }
+        let prot = prot_from(protect)?;
+        let alloc = images::layout(process.isa).alloc;
         let mut state = lock(&process.state);
         let commit = kind & MEM_COMMIT != 0;
         let guard = commit && protect & PAGE_GUARD != 0;
         let area = Area { guard, ..Area::of(prot, if commit { AreaKind::Committed } else { AreaKind::Reserved }) };
         if addr == 0 || kind & MEM_RESERVE != 0 {
-            let size = size.next_multiple_of(GRANULE);
-            let base = if addr == 0 {
-                state.regions.free_above(alloc, size, GRANULE)?
+            let (base, span) = if addr == 0 {
+                let span = size.next_multiple_of(GRANULE);
+                let base = if kind & MEM_TOP_DOWN != 0 {
+                    state.regions.free_below(alloc, span, GRANULE)?
+                } else {
+                    state.regions.free_above(alloc, span, GRANULE)?
+                };
+                (base, span)
             } else {
                 let base = addr & !(GRANULE - 1);
-                if !state.regions.is_free(base..base + size) {
+                let end = addr.checked_add(size)?.next_multiple_of(GRANULE);
+                if !state.regions.is_free(base..end) {
                     return None;
                 }
-                base
+                (base, end - base)
             };
-            state.regions.insert(base..base + size, Area { base, ..area });
+            state.regions.insert(base..base + span, Area { base, ..area });
             return Some(base);
         }
         // Committing part of what's reserved.
-        let range = addr & !(PAGE - 1)..(addr + size).next_multiple_of(PAGE);
+        let range = addr & !(PAGE - 1)..addr.checked_add(size)?.next_multiple_of(PAGE);
         let mut at = range.start;
         while at < range.end {
             let (r, a) = state.regions.find(at)?;
@@ -723,13 +779,36 @@ impl Task {
         if matches!(area.kind, AreaKind::Kept | AreaKind::Image | AreaKind::View | AreaKind::System) {
             return false;
         }
+        // The whole reservation this piece came from, if it was split by commits or decommits.
+        let whole = if area.base != 0 {
+            let mut span = range.clone();
+            for (r, a) in state.regions.iter() {
+                if a.base == area.base {
+                    span.start = span.start.min(r.start);
+                    span.end = span.end.max(r.end);
+                }
+            }
+            span
+        } else {
+            range.clone()
+        };
         let range = match kind {
             MEM_RELEASE if size == 0 => {
-                state.regions.remove(range.clone());
-                range
+                if addr != whole.start {
+                    return false;
+                }
+                state.regions.remove(whole.clone());
+                whole
             }
             MEM_DECOMMIT => {
-                let range = addr & !(PAGE - 1)..(addr + size).next_multiple_of(PAGE);
+                let range = if size == 0 {
+                    if addr != whole.start {
+                        return false;
+                    }
+                    whole
+                } else {
+                    addr & !(PAGE - 1)..(addr + size).next_multiple_of(PAGE)
+                };
                 state.regions.update(range.clone(), |a| a.kind = AreaKind::Reserved);
                 range
             }
