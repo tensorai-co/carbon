@@ -560,8 +560,9 @@ fn boot(store: &Store, record: &Record, launch: &Launch, parts: Parts, notify: &
             ready();
             let env = env.iter().filter_map(|e| e.split_once('=')).map(|(k, v)| (k.to_string(), v.to_string())).collect();
             let gpu = open_gpu(launch.gpu, notify)?;
+            let (mixer, _audio) = open_audio(&launch.audio, launch.display, notify)?;
             let pipes = !host::Host::is_terminal(&*host);
-            let options = atlas::Options { stop, env, display: desktop, trace: std::env::var_os("CARBON_TRACE").is_some(), gpu, network: Some(network), pipes, hooks: hub };
+            let options = atlas::Options { stop, env, display: desktop, trace: std::env::var_os("CARBON_TRACE").is_some(), gpu, audio: Some(mixer), network: Some(network), pipes, hooks: hub };
             let argv: Vec<&str> = std::iter::once(path.as_str()).chain(args[1..].iter().map(String::as_str)).collect();
             atlas::boot(exec, cpu, disk, as_host, &argv, options).map(|ended| ended.code as i32).map_err(Error::from)
         }

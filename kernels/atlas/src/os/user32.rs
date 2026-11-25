@@ -304,8 +304,8 @@ dll! {
     host GetPropW(2) => get_prop_w;
     host GetQueueStatus(1) => get_queue_status;
     missing GetRawInputBuffer;
-    host GetRawInputData(5) => raw_input_fail;
-    host GetRawInputDeviceInfoA(4) => raw_input_fail;
+    host GetRawInputData(5) => get_raw_input_data;
+    host GetRawInputDeviceInfoA(4) => get_raw_input_device_info_a;
     host GetRawInputDeviceList(3) => get_raw_input_device_list;
     host GetShellWindow(0) => get_shell_window;
     host GetUpdateRect(3) => get_update_rect;
@@ -333,7 +333,7 @@ dll! {
     host QueryDisplayConfig(6) => not_supported;
     host RegisterDeviceNotificationA(3) => new_handle;
     host RegisterDeviceNotificationW(3) => new_handle;
-    host RegisterRawInputDevices(3) => succeed;
+    host RegisterRawInputDevices(3) => register_raw_input_devices;
     host RegisterWindowMessageA(1) => register_window_message_a;
     host RegisterWindowMessageW(1) => register_window_message_w;
     host RemovePropW(2) => remove_prop_w;
@@ -395,7 +395,7 @@ dll! {
     host GetPointerDevices(2) => get_pointer_devices;
     host GetPointerPenInfo(2) => no_pointer;
     host GetPointerType(2) => no_pointer;
-    missing GetRawInputDeviceInfoW;
+    host GetRawInputDeviceInfoW(4) => get_raw_input_device_info_w;
     missing GetWindowDC;
     host GetWindowRgn(2) => get_window_rgn;
     host InflateRect(3) => inflate_rect;
@@ -711,6 +711,9 @@ fn as_ansi(mut m: Msg) -> Msg {
 fn get_message(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], ansi: bool) -> Reply {
     match task.next_message(cx, filter(a), true, true) {
         Ok(Some(m)) => {
+            if m.message == 0x3bd {
+                super::winmm::mark_hdr_done(task, cx, m.lparam);
+            }
             let width = task.abi().width;
             let bytes = if ansi { as_ansi(m).encode(width) } else { m.encode(width) };
             if task.mem(cx, true, |t| user::write(&mut t.space(), a[0], &bytes)).is_err() {
@@ -735,6 +738,9 @@ fn peek_message(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], ansi: bool) -> Repl
     const PM_REMOVE: u64 = 1;
     match task.next_message(cx, filter(a), a[4] & PM_REMOVE != 0, false) {
         Ok(Some(m)) => {
+            if m.message == 0x3bd {
+                super::winmm::mark_hdr_done(task, cx, m.lparam);
+            }
             let width = task.abi().width;
             let bytes = if ansi { as_ansi(m).encode(width) } else { m.encode(width) };
             let _ = task.mem(cx, true, |t| user::write(&mut t.space(), a[0], &bytes));
@@ -1855,9 +1861,13 @@ fn flash_window_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 }
 
 /// `ClipCursor`: keeps the pointer within a rectangle on the screen, or with NULL, lets it go anywhere. The desktop
-/// keeps it for the active window, while that's active.
+/// keeps it for the active window, while that's active. When raw mouse input is also registered, uses a pointer lock
+/// so relative motion stays unbounded across screen edges.
 fn clip_cursor(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let old = task.win32k().clip.take();
+    let (old, has_raw) = {
+        let mut w = task.win32k();
+        (w.clip.take(), w.raw_mouse.is_some())
+    };
     if let Some((shown, _)) = old {
         task.desktop(|d| d.set_pointer_constraint(shown, None));
     }
@@ -1869,7 +1879,16 @@ fn clip_cursor(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
         let shown = task.desktop(|d| {
             let shown = d.active()?;
             let c = d.content_rect(shown)?;
-            d.set_pointer_constraint(shown, Some(dt::Constraint::Confine(r.offset(-c.left, -c.top))));
+            if has_raw {
+                let (px, py) = d.pointer();
+                if !c.contains(px, py) {
+                    d.warp_pointer((c.left + c.right) / 2, (c.top + c.bottom) / 2);
+                }
+                d.set_relative_motion(shown, true);
+                d.set_pointer_constraint(shown, Some(dt::Constraint::Lock));
+            } else {
+                d.set_pointer_constraint(shown, Some(dt::Constraint::Confine(r.offset(-c.left, -c.top))));
+            }
             Some(shown)
         });
         if let Some(shown) = shown {
@@ -1993,8 +2012,8 @@ fn send_input(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 }
 
 fn set_cursor_pos(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let shared = task.win32k().display.clone();
-    dt::send(&shared, Input::PointerTo(a[0] as i32, a[1] as i32));
+    task.desktop(|d| d.warp_pointer(a[0] as i32, a[1] as i32));
+    task.pump();
     Reply::Value(TRUE)
 }
 
@@ -2712,6 +2731,178 @@ fn create_icon_from_resource(task: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Repl
     Reply::Value(task.win32k().gdi.create_icon(img))
 }
 
-fn raw_input_fail(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
-    Reply::Value(u64::from(u32::MAX))
+const RAW_MOUSE_DEVICE: u64 = 0x10001;
+
+fn register_raw_input_devices(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (ptr, count, cb_size) = (a[0], a[1] as u32 as usize, a[2] as u32 as usize);
+    let abi = task.abi();
+    let expected = 8 + abi.width as usize;
+    if ptr == 0 || cb_size != expected {
+        task.set_last_error(cx, 87); // ERROR_INVALID_PARAMETER
+        return Reply::Value(FALSE);
+    }
+    let Ok(raw) = task.mem(cx, false, |t| user::read_vec(&t.space(), ptr, count.saturating_mul(expected))) else {
+        return Reply::Value(FALSE);
+    };
+    const RIDEV_REMOVE: u32 = 0x0000_0001;
+    for chunk in raw.chunks_exact(expected) {
+        let usage_page = u16::from_le_bytes([chunk[0], chunk[1]]);
+        let usage = u16::from_le_bytes([chunk[2], chunk[3]]);
+        let flags = u32::from_le_bytes(chunk[4..8].try_into().unwrap_or_default());
+        let hwnd = abi.ptr_at(chunk, 8);
+        if usage_page == 0x01 && usage == 0x02 {
+            let (shown, clip) = {
+                let mut w = task.win32k();
+                if flags & RIDEV_REMOVE != 0 {
+                    w.raw_mouse = None;
+                } else {
+                    w.raw_mouse = Some(win32k::RawMouseReg { hwnd });
+                }
+                let target_hwnd = if hwnd != 0 { w.top_level_of(hwnd) } else { Some(w.active) };
+                let shown = target_hwnd.and_then(|h| w.windows.get(&h).map(|win| win.shown)).filter(|&s| s != 0);
+                (shown, w.clip)
+            };
+            let enable = flags & RIDEV_REMOVE == 0;
+            task.desktop(|d| {
+                let id = shown.or_else(|| d.active());
+                if let Some(id) = id {
+                    d.set_relative_motion(id, enable);
+                    if let Some((clip_id, r)) = clip {
+                        if clip_id == id {
+                            if enable {
+                                if let Some(c) = d.content_rect(id) {
+                                    let (px, py) = d.pointer();
+                                    if !c.contains(px, py) {
+                                        d.warp_pointer((c.left + c.right) / 2, (c.top + c.bottom) / 2);
+                                    }
+                                }
+                                d.set_pointer_constraint(id, Some(dt::Constraint::Lock));
+                            } else if let Some(c) = d.content_rect(id) {
+                                d.set_pointer_constraint(id, Some(dt::Constraint::Confine(r.offset(-c.left, -c.top))));
+                            }
+                        }
+                    }
+                }
+            });
+            task.pump();
+        }
+    }
+    Reply::Value(TRUE)
+}
+
+fn get_raw_input_data(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    const RID_INPUT: u32 = 0x1000_0003;
+    const RID_HEADER: u32 = 0x1000_0005;
+    let (hraw, cmd, pdata, pcb_size, cb_header) = (a[0], a[1] as u32, a[2], a[3], a[4] as u32 as usize);
+    let abi = task.abi();
+    let hdr_size = 8 + 2 * abi.width as usize; // 24 on 64-bit, 16 on 32-bit
+    if cb_header != hdr_size || pcb_size == 0 || !matches!(cmd, RID_INPUT | RID_HEADER) {
+        return Reply::Value(u64::from(u32::MAX));
+    }
+    let Some(ev) = task.win32k().raw_inputs.iter().find(|(h, _)| *h == hraw).map(|(_, e)| *e) else {
+        return Reply::Value(u64::from(u32::MAX));
+    };
+    let need = if cmd == RID_HEADER { hdr_size } else { hdr_size + 24 };
+    if pdata == 0 {
+        let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), pcb_size, need as u32));
+        return Reply::Value(0);
+    }
+    let Ok(avail) = task.mem(cx, false, |t| user::read_u32(&t.space(), pcb_size)) else {
+        return Reply::Value(u64::from(u32::MAX));
+    };
+    if (avail as usize) < need {
+        let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), pcb_size, need as u32));
+        return Reply::Value(u64::from(u32::MAX));
+    }
+    let mut buf = Vec::with_capacity(need);
+    // RAWINPUTHEADER: dwType (RIM_TYPEMOUSE=0), dwSize, hDevice, wParam
+    buf.extend(0u32.to_le_bytes());
+    buf.extend(((hdr_size + 24) as u32).to_le_bytes());
+    buf.extend(abi.ptr(RAW_MOUSE_DEVICE));
+    buf.extend(abi.ptr(0));
+    if cmd == RID_INPUT {
+        // RAWMOUSE (24 bytes): usFlags (MOUSE_MOVE_RELATIVE=0), pad(2), usButtonFlags, usButtonData,
+        // ulRawButtons, lLastX, lLastY, ulExtraInformation.
+        buf.extend(0u16.to_le_bytes());
+        buf.extend(0u16.to_le_bytes());
+        buf.extend(ev.button_flags.to_le_bytes());
+        buf.extend(ev.button_data.to_le_bytes());
+        buf.extend(0u32.to_le_bytes());
+        buf.extend(ev.dx.to_le_bytes());
+        buf.extend(ev.dy.to_le_bytes());
+        buf.extend(0u32.to_le_bytes());
+    }
+    if task.mem(cx, true, |t| user::write(&mut t.space(), pdata, &buf)).is_err() {
+        return Reply::Value(u64::from(u32::MAX));
+    }
+    let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), pcb_size, need as u32));
+    Reply::Value(need as u64)
+}
+
+fn get_raw_input_device_info(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply {
+    const RIDI_DEVICENAME: u32 = 0x2000_0007;
+    const RIDI_DEVICEINFO: u32 = 0x2000_000b;
+    let (hdev, cmd, pdata, pcb_size) = (a[0], a[1] as u32, a[2], a[3]);
+    if hdev != RAW_MOUSE_DEVICE || pcb_size == 0 {
+        return Reply::Value(u64::from(u32::MAX));
+    }
+    match cmd {
+        RIDI_DEVICENAME => {
+            let name = "\\\\?\\HID#VID_0000&PID_0001#Mouse";
+            let count = name.len() + 1;
+            if pdata == 0 {
+                let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), pcb_size, count as u32));
+                return Reply::Value(0);
+            }
+            let Ok(avail) = task.mem(cx, false, |t| user::read_u32(&t.space(), pcb_size)) else {
+                return Reply::Value(u64::from(u32::MAX));
+            };
+            if (avail as usize) < count {
+                let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), pcb_size, count as u32));
+                return Reply::Value(u64::from(u32::MAX));
+            }
+            let bytes: Vec<u8> = if wide {
+                name.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect()
+            } else {
+                name.bytes().chain([0]).collect()
+            };
+            let _ = task.mem(cx, true, |t| user::write(&mut t.space(), pdata, &bytes));
+            let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), pcb_size, count as u32));
+            Reply::Value(count as u64)
+        }
+        RIDI_DEVICEINFO => {
+            // RID_DEVICE_INFO is 32 bytes: cbSize(4), dwType(4), RID_DEVICE_INFO_MOUSE(dwId, dwNumberOfButtons, dwSampleRate, fHasHorizontalWheel) + pad.
+            const SIZE: u32 = 32;
+            if pdata == 0 {
+                let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), pcb_size, SIZE));
+                return Reply::Value(0);
+            }
+            let Ok(avail) = task.mem(cx, false, |t| user::read_u32(&t.space(), pcb_size)) else {
+                return Reply::Value(u64::from(u32::MAX));
+            };
+            if avail < SIZE {
+                let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), pcb_size, SIZE));
+                return Reply::Value(u64::from(u32::MAX));
+            }
+            let mut buf = [0u8; 32];
+            buf[0..4].copy_from_slice(&SIZE.to_le_bytes());
+            buf[4..8].copy_from_slice(&0u32.to_le_bytes()); // RIM_TYPEMOUSE
+            buf[8..12].copy_from_slice(&1u32.to_le_bytes()); // dwId
+            buf[12..16].copy_from_slice(&3u32.to_le_bytes()); // dwNumberOfButtons
+            buf[16..20].copy_from_slice(&125u32.to_le_bytes()); // dwSampleRate
+            buf[20..24].copy_from_slice(&1u32.to_le_bytes()); // fHasHorizontalWheel
+            let _ = task.mem(cx, true, |t| user::write(&mut t.space(), pdata, &buf));
+            let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), pcb_size, SIZE));
+            Reply::Value(u64::from(SIZE))
+        }
+        _ => Reply::Value(u64::from(u32::MAX)),
+    }
+}
+
+fn get_raw_input_device_info_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    get_raw_input_device_info(task, cx, a, false)
+}
+
+fn get_raw_input_device_info_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    get_raw_input_device_info(task, cx, a, true)
 }

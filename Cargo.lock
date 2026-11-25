@@ -13,6 +13,7 @@ name = "atlas"
 version = "0.2.0"
 dependencies = [
  "atlas-abi",
+ "audio",
  "display",
  "exec",
  "gpu-api",

@@ -5,14 +5,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use display::desktop::{self, Input, Shared};
+use display::desktop::{self, Constraint, Input, Shared};
 use display::observe::ObserverId;
 use display::output::{Output, SCALE_1X};
 
 use crate::clipboard::Pasteboard;
 use crate::ime;
 use crate::input::{Cursors, Keys, button_of, let_go_buttons};
-use crate::objc::{Frame, Id, Images, NIL, Point, Size, class, frame_for, frame_of, is_main_thread, layer_for, msg, ns_string, pooled, pump, refresh_of, start_app, wake_loop, warp_cursor};
+use crate::objc::{Frame, Id, Images, NIL, Point, Size, associate_mouse, class, frame_for, frame_of, is_main_thread, layer_for, msg, ns_string, pooled, pump, refresh_of, start_app, wake_loop, warp_cursor};
 use crate::{Options, map};
 
 /// Shows the desktop in a window of its own until `done` is set (the machine ended), on the main thread. `close` is
@@ -129,6 +129,8 @@ struct Host {
     buttons: u8,
     cursors: Cursors,
     key_window: bool,
+    locked: bool,
+    frac: (f64, f64),
     board: Pasteboard,
 }
 
@@ -151,7 +153,23 @@ impl Host {
             buttons: 0,
             cursors: Cursors::default(),
             key_window: true,
+            locked: false,
+            frac: (0.0, 0.0),
             board: Pasteboard::new(),
+        }
+    }
+
+    fn set_locked(&mut self, locked: bool) {
+        if self.locked == locked {
+            return;
+        }
+        self.locked = locked;
+        self.frac = (0.0, 0.0);
+        associate_mouse(!locked);
+        if locked {
+            self.cursors.hover(true);
+        } else {
+            self.cursors.unhide();
         }
     }
 
@@ -188,6 +206,16 @@ impl Host {
             return false;
         }
         if let Some((button, bit, down)) = button_of(event, kind) {
+            if self.locked {
+                if down {
+                    self.buttons |= bit;
+                    self.send(Input::Button(button, true));
+                } else if self.buttons & bit != 0 {
+                    self.buttons &= !bit;
+                    self.send(Input::Button(button, false));
+                }
+                return true;
+            }
             let (x, y, inside) = self.location(event);
             if down && inside {
                 self.buttons |= bit;
@@ -203,6 +231,17 @@ impl Host {
         match kind {
             // Moved, and dragged with each button.
             5 | 6 | 7 | 27 => {
+                if self.locked {
+                    self.frac.0 += msg!(f64; event, "deltaX");
+                    self.frac.1 += msg!(f64; event, "deltaY");
+                    let (dx, dy) = (self.frac.0.trunc() as i32, self.frac.1.trunc() as i32);
+                    self.frac.0 -= f64::from(dx);
+                    self.frac.1 -= f64::from(dy);
+                    if (dx, dy) != (0, 0) {
+                        self.send(Input::PointerBy(dx, dy));
+                    }
+                    return true;
+                }
                 let (x, y, inside) = self.location(event);
                 if inside || self.buttons != 0 {
                     self.send(Input::PointerTo(x, y));
@@ -213,11 +252,13 @@ impl Host {
             // The wheel, or a trackpad's two fingers.
             22 => {
                 let (x, y, inside) = self.location(event);
-                if inside {
+                if inside || self.locked {
                     let precise = msg!(bool; event, "hasPreciseScrollingDeltas");
                     let (dx, dy) = (msg!(f64; event, "scrollingDeltaX"), msg!(f64; event, "scrollingDeltaY"));
                     let (sx, sy) = self.scroll.add(dx, dy, precise);
-                    self.send(Input::PointerTo(x, y));
+                    if !self.locked {
+                        self.send(Input::PointerTo(x, y));
+                    }
                     if (sx, sy) != (0, 0) {
                         self.send(Input::Scroll { x: sx, y: sy });
                     }
@@ -272,6 +313,7 @@ impl Host {
 
     /// Everything held, let go.
     fn let_go(&mut self) {
+        self.set_locked(false);
         self.keys.let_go(&self.desktop);
         let_go_buttons(&self.desktop, self.buttons);
         self.buttons = 0;
@@ -280,9 +322,10 @@ impl Host {
 
     /// Shows what changed on the screen since last time, and follows the desktop's cursor and output.
     fn present(&mut self) {
-        let (copied, cursor, resize, offered, warp) = {
+        let (copied, cursor, resize, offered, warp, want_lock) = {
             let mut d = desktop::lock(&self.desktop);
             let observed = d.take_observed(self.observer);
+            let want_lock = self.key_window && d.constrained().is_some_and(|(_, c)| c == Constraint::Lock);
             // Changed from outside (`carbon display resize`): the window follows.
             let resize = observed.output.as_ref().map(|o| (o.width, o.height)).filter(|&s| s != self.size);
             // In the screen's own pixels: at the backing scale, sharp where a window drew at it.
@@ -304,16 +347,17 @@ impl Host {
                 }
                 true
             };
-            (copied, observed.cursor, resize, observed.selections.contains(&display::selection::Selection::Clipboard), observed.warp)
+            (copied, observed.cursor, resize, observed.selections.contains(&display::selection::Selection::Clipboard), observed.warp, want_lock)
         };
-        if let Some((x, y)) = warp {
+        if let Some(cursor) = cursor {
+            self.cursors.set(cursor);
+        }
+        self.set_locked(want_lock);
+        if let Some((x, y)) = warp && !self.locked {
             self.warp(x, y);
         }
         if offered {
             self.board.offered(&self.desktop);
-        }
-        if let Some(cursor) = cursor {
-            self.cursors.set(cursor);
         }
         if let Some((w, h)) = resize {
             self.size = (w, h);

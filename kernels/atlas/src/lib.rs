@@ -101,6 +101,8 @@ pub struct Options {
     pub stop: Stop,
     /// The machine's GPU, if it has one: what DXGI's adapter and Direct3D's devices are.
     pub gpu: Option<gpu_api::Gpu>,
+    /// The machine's audio mixer, if it has one: what `winmm` wave output streams play into.
+    pub audio: Option<audio::Mixer>,
     /// Its standard handles are pipes (to the host's stdin and stdout), not a console: `docker run` without `-t`.
     /// With a console on a terminal, the terminal is raw for as long as the machine runs, and the console edits lines.
     pub pipes: bool,

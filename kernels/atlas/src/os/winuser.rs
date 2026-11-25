@@ -542,10 +542,33 @@ pub fn zero(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
     Reply::Value(0)
 }
 
-/// `GetRawInputDeviceList(&list, &count, size)`: no raw input devices.
+/// `GetRawInputDeviceList(&list, &count, size)`: one virtual mouse device.
 pub fn get_raw_input_device_list(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[1], 0));
-    Reply::Value(0)
+    let abi = task.abi();
+    let entry_size = abi.width as usize * 2; // hDevice (ptr) + dwType (u32 + pad)
+    if a[1] == 0 || (a[2] as u32 as usize) != entry_size {
+        return Reply::Value(u64::from(u32::MAX));
+    }
+    if a[0] == 0 {
+        let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[1], 1));
+        return Reply::Value(0);
+    }
+    let Ok(avail) = task.mem(cx, false, |t| user::read_u32(&t.space(), a[1])) else {
+        return Reply::Value(u64::from(u32::MAX));
+    };
+    if avail < 1 {
+        let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[1], 1));
+        return Reply::Value(u64::from(u32::MAX));
+    }
+    let mut entry = Vec::with_capacity(entry_size);
+    entry.extend(abi.ptr(0x10001));
+    entry.extend(0u32.to_le_bytes()); // RIM_TYPEMOUSE
+    if abi.width == 8 {
+        entry.extend([0u8; 4]);
+    }
+    let _ = task.mem(cx, true, |t| user::write(&mut t.space(), a[0], &entry));
+    let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[1], 1));
+    Reply::Value(1)
 }
 
 /// `OpenInputDesktop(flags, inherit, access)` and `OpenDesktopA`: the thread's desktop.

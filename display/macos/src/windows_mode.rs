@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use display::Rect;
-use display::desktop::{self, Input, Insets, Layer, Shared, WindowId, state};
+use display::desktop::{self, Constraint, Input, Insets, Layer, Shared, WindowId, state};
 use display::observe::{ObserverId, WindowInfo};
 use display::output::{Output, SCALE_1X};
 
@@ -22,7 +22,7 @@ use crate::ime;
 use crate::input::{Cursors, Keys, button_of, let_go_buttons};
 use crate::map;
 use crate::objc::{
-    BOOL, Frame, Id, Images, NIL, Point, Sel, Size, app, class, define_class, frame_for, frame_of, global_location, is_main_thread, layer_for, msg, ns_string, pooled,
+    BOOL, Frame, Id, Images, NIL, Point, Sel, Size, app, associate_mouse, class, define_class, frame_for, frame_of, global_location, is_main_thread, layer_for, msg, ns_string, pooled,
     pump, refresh_of, start_app, wake_loop,
 };
 
@@ -157,6 +157,8 @@ fn show(desktop: Shared, done: &AtomicBool) -> Result<(), String> {
         buttons: 0,
         cursors: Cursors::default(),
         key_ours: false,
+        locked: false,
+        frac: (0.0, 0.0),
         board: Pasteboard::new(),
     };
     // The guest's text cursor, on the Mac's screen: where an input method's window opens.
@@ -211,10 +213,25 @@ struct Host {
     cursors: Cursors,
     /// One of its windows had the keyboard, as last looked.
     key_ours: bool,
+    locked: bool,
+    frac: (f64, f64),
     board: Pasteboard,
 }
 
 impl Host {
+    fn set_locked(&mut self, locked: bool) {
+        if self.locked == locked {
+            return;
+        }
+        self.locked = locked;
+        self.frac = (0.0, 0.0);
+        associate_mouse(!locked);
+        if locked {
+            self.cursors.hover(true);
+        } else {
+            self.cursors.unhide();
+        }
+    }
     fn send(&self, input: Input) {
         desktop::send(&self.desktop, input);
     }
@@ -242,6 +259,16 @@ impl Host {
         let (x, y) = self.space.desktop_point(global_location(event));
         let inside = self.shown.get(&id).is_some_and(|s| s.content.contains(x, y));
         if let Some((button, bit, down)) = button_of(event, kind) {
+            if self.locked {
+                if down {
+                    self.buttons |= bit;
+                    self.send(Input::Button(button, true));
+                } else if self.buttons & bit != 0 {
+                    self.buttons &= !bit;
+                    self.send(Input::Button(button, false));
+                }
+                return true;
+            }
             if down && inside {
                 // What the host raised and made key is what the desktop has on top, so the press goes to it.
                 self.with_desktop(|d| {
@@ -261,6 +288,17 @@ impl Host {
         }
         match kind {
             5 | 6 | 7 | 27 => {
+                if self.locked {
+                    self.frac.0 += msg!(f64; event, "deltaX");
+                    self.frac.1 += msg!(f64; event, "deltaY");
+                    let (dx, dy) = (self.frac.0.trunc() as i32, self.frac.1.trunc() as i32);
+                    self.frac.0 -= f64::from(dx);
+                    self.frac.1 -= f64::from(dy);
+                    if (dx, dy) != (0, 0) {
+                        self.send(Input::PointerBy(dx, dy));
+                    }
+                    return true;
+                }
                 if inside || self.buttons != 0 {
                     self.send(Input::PointerTo(x, y));
                 }
@@ -268,11 +306,13 @@ impl Host {
                 false
             }
             22 => {
-                if inside {
+                if inside || self.locked {
                     let precise = msg!(bool; event, "hasPreciseScrollingDeltas");
                     let (dx, dy) = (msg!(f64; event, "scrollingDeltaX"), msg!(f64; event, "scrollingDeltaY"));
                     let (sx, sy) = self.scroll.add(dx, dy, precise);
-                    self.send(Input::PointerTo(x, y));
+                    if !self.locked {
+                        self.send(Input::PointerTo(x, y));
+                    }
                     if (sx, sy) != (0, 0) {
                         self.send(Input::Scroll { x: sx, y: sy });
                     }
@@ -308,6 +348,7 @@ impl Host {
             None if self.key_ours => {
                 // The keyboard's gone to another app: what's held is let go.
                 self.key_ours = false;
+                self.set_locked(false);
                 self.keys.let_go(&self.desktop);
                 let_go_buttons(&self.desktop, self.buttons);
                 self.buttons = 0;
@@ -346,15 +387,16 @@ impl Host {
     /// What changed on the desktop, followed by the Mac windows: new and gone, each window's state, the active one,
     /// the stacking, content, and the cursor.
     fn present(&mut self) {
-        let (observed, pixels) = {
+        let (observed, pixels, want_lock) = {
             let mut d = desktop::lock(&self.desktop);
             let observed = d.take_observed(self.observer);
+            let want_lock = self.key_ours && d.constrained().is_some_and(|(_, c)| c == Constraint::Lock);
             let mut ids: Vec<WindowId> = observed.damage.iter().map(|(id, _)| *id).collect();
             ids.extend(observed.windows.iter().filter(|w| !self.shown.contains_key(&w.id)).map(|w| w.id));
             ids.sort_unstable();
             ids.dedup();
             let pixels: Vec<_> = ids.into_iter().filter_map(|id| d.read_pixels(id).map(|p| (id, p))).collect();
-            (observed, pixels)
+            (observed, pixels, want_lock)
         };
         for id in &observed.gone {
             self.forget(*id);
@@ -379,6 +421,7 @@ impl Host {
         if let Some(cursor) = observed.cursor {
             self.cursors.set(cursor);
         }
+        self.set_locked(want_lock);
         if observed.selections.contains(&display::selection::Selection::Clipboard) {
             self.board.offered(&self.desktop);
         }
@@ -503,6 +546,7 @@ impl Host {
     }
 
     fn finish(&mut self) {
+        self.set_locked(false);
         self.keys.let_go(&self.desktop);
         let_go_buttons(&self.desktop, self.buttons);
         self.cursors.unhide();

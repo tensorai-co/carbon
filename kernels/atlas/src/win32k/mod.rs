@@ -64,6 +64,7 @@ pub const WM_SYSCOMMAND: u32 = 0x112;
 pub const WM_NCLBUTTONDOWN: u32 = 0xa1;
 pub const WM_TIMER: u32 = 0x113;
 pub const WM_MOUSEMOVE: u32 = 0x200;
+pub const WM_INPUT: u32 = 0x00ff;
 pub const WM_MOUSEWHEEL: u32 = 0x20a;
 pub const WM_ENABLE: u32 = 0xa;
 pub const WM_SETFONT: u32 = 0x30;
@@ -467,6 +468,10 @@ pub struct Win32k {
     /// `ClipCursor`'s rectangle on the screen, and the window on the desktop it confines the pointer for: the active
     /// one when it was set.
     pub clip: Option<(u64, Rect)>,
+    /// Raw mouse input registration (`RegisterRawInputDevices` for Generic Desktop / Mouse) and recent events.
+    pub raw_mouse: Option<RawMouseReg>,
+    pub raw_inputs: VecDeque<(u64, RawMouseEvent)>,
+    pub next_raw_input: u64,
     /// The clipboard as Windows has it: the window that opened it (or `OPENED_BY_NONE` for none), the offer this
     /// machine's windows made of it last and its owner, the handles `GetClipboardData` gave (freed when it's emptied),
     /// and the formats `RegisterClipboardFormatW` named.
@@ -501,6 +506,19 @@ pub struct Win32k {
 pub const SYSTEM_MENUS: u64 = 0x0040_0000;
 /// The commands a system menu has: SC_SIZE, SC_MOVE, SC_MINIMIZE, SC_MAXIMIZE, SC_CLOSE and SC_RESTORE.
 pub const SYSTEM_COMMANDS: [u64; 6] = [0xf000, 0xf010, 0xf020, 0xf030, SC_CLOSE, 0xf120];
+
+#[derive(Debug, Clone, Copy)]
+pub struct RawMouseReg {
+    pub hwnd: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RawMouseEvent {
+    pub dx: i32,
+    pub dy: i32,
+    pub button_flags: u16,
+    pub button_data: u16,
+}
 
 /// What an `HDROP` holds: the files dropped (Windows paths), and where in the window's client area. It's win32k's own
 /// handle, read by shell32's `DragQueryFileW` and `DragQueryPoint`; not global memory a program can lock.
@@ -621,6 +639,9 @@ impl Win32k {
             capture: 0,
             cursor: 0,
             clip: None,
+            raw_mouse: None,
+            raw_inputs: VecDeque::new(),
+            next_raw_input: 0x0052_0001,
             drops: BTreeMap::new(),
             hdrops: BTreeMap::new(),
             drag_files: None,
@@ -889,9 +910,26 @@ impl Win32k {
                     flags |= 8;
                 }
                 let (target, message, wparam, lparam) = match what {
-                    // WM_MOUSELEAVE only comes to a window that asked with TrackMouseEvent, which isn't there yet;
-                    // relative motion is raw input's (WM_INPUT), which isn't either.
-                    Pointer::Leave | Pointer::Relative { .. } => return,
+                    // WM_MOUSELEAVE only comes to a window that asked with TrackMouseEvent, which isn't there yet.
+                    Pointer::Leave => return,
+                    Pointer::Relative { dx, dy } => {
+                        let Some(reg) = self.raw_mouse else { return };
+                        let target = if reg.hwnd != 0 && self.windows.contains_key(&reg.hwnd) {
+                            reg.hwnd
+                        } else if self.focus != 0 {
+                            self.focus
+                        } else {
+                            top
+                        };
+                        let hraw = self.next_raw_input;
+                        self.next_raw_input = self.next_raw_input.wrapping_add(1).max(0x0052_0001);
+                        if self.raw_inputs.len() >= 256 {
+                            self.raw_inputs.pop_front();
+                        }
+                        self.raw_inputs.push_back((hraw, RawMouseEvent { dx, dy, button_flags: 0, button_data: 0 }));
+                        self.post_input(target, WM_INPUT, 0, hraw, time);
+                        return;
+                    }
                     Pointer::Scroll { x: dx, y: dy } => {
                         const WM_MOUSEHWHEEL: u32 = 0x20e;
                         let (sx, sy) = self.screen_origin(top).unwrap_or_default();
@@ -1077,7 +1115,26 @@ impl Win32k {
     }
 
     fn queue(&mut self, tid: u64, waiter: &Arc<Waiter>) -> &mut Queue {
-        self.queues.entry(tid).or_insert_with(|| Queue { posted: VecDeque::new(), sent: VecDeque::new(), quit: None, timers: Vec::new(), waiter: waiter.clone(), keys: [0; 256] })
+        let q = self.queues.entry(tid).or_insert_with(|| Queue { posted: VecDeque::new(), sent: VecDeque::new(), quit: None, timers: Vec::new(), waiter: waiter.clone(), keys: [0; 256] });
+        q.waiter = waiter.clone();
+        q
+    }
+
+    /// Posts a message directly to a thread's queue (creating the queue if the thread hasn't called GetMessage yet).
+    pub fn post_thread_msg(&mut self, tid: u64, message: u32, wparam: u64, lparam: u64, time: u32) -> bool {
+        let q = self.queues.entry(tid).or_insert_with(|| Queue { posted: VecDeque::new(), sent: VecDeque::new(), quit: None, timers: Vec::new(), waiter: Waiter::new(), keys: [0; 256] });
+        q.posted.push_back(Msg { hwnd: 0, message, wparam, lparam, time });
+        q.waiter.wake();
+        true
+    }
+
+    /// Posts a message directly to a window's thread queue.
+    pub fn post_window_msg(&mut self, hwnd: u64, message: u32, wparam: u64, lparam: u64, time: u32) -> bool {
+        let Some(tid) = self.windows.get(&hwnd).map(|w| w.tid) else { return false };
+        let q = self.queues.entry(tid).or_insert_with(|| Queue { posted: VecDeque::new(), sent: VecDeque::new(), quit: None, timers: Vec::new(), waiter: Waiter::new(), keys: [0; 256] });
+        q.posted.push_back(Msg { hwnd, message, wparam, lparam, time });
+        q.waiter.wake();
+        true
     }
 
     /// Where a window's client area is in its top-level window's surface, and that window.

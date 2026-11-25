@@ -99,6 +99,15 @@ unsafe extern "C" {
     fn CGEventGetLocation(event: *mut c_void) -> Point;
     fn CGWarpMouseCursorPosition(to: Point) -> i32;
     fn CGSetLocalEventsSuppressionInterval(seconds: f64) -> i32;
+    fn CGAssociateMouseAndMouseCursorPosition(connected: u32) -> i32;
+}
+
+/// Connects or disconnects mouse movement from the Mac cursor position, for relative pointer lock.
+pub(crate) fn associate_mouse(connected: bool) {
+    // SAFETY: CoreGraphics call taking a plain boolean_t integer.
+    unsafe {
+        CGAssociateMouseAndMouseCursorPosition(u32::from(connected));
+    }
 }
 
 /// Moves the Mac's cursor to a point in a view (its bounds' coordinates, y up), without the quarter second in which
