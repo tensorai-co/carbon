@@ -1704,6 +1704,13 @@ pub fn access_check_call(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 
 // --- Impersonation ---
 
+/// `ImpersonateAnonymousToken(thread)`: the thread acts as the anonymous logon token (`S-1-5-7`).
+pub fn impersonate_anonymous_token(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(thread) = task.thread_of(a[0]) else { return Reply::Value(task.failed(cx, ERROR_INVALID_HANDLE)) };
+    *lock(&thread.token) = Some(Arc::new(Token::anonymous()));
+    Reply::Value(TRUE)
+}
+
 /// `ImpersonateSelf(level)`: this thread acts as an impersonation copy of its process's token.
 pub fn impersonate_self(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let level = a[0] as u32;

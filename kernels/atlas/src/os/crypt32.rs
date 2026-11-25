@@ -30,9 +30,9 @@ dll! {
     // Not written yet: what larger programs import.
     missing CertCreateCertificateChainEngine;
     missing CertCreateSelfSignCertificate;
-    missing CertEnumCertificatesInStore;
-    missing CertFindCertificateInStore;
-    missing CertFindExtension;
+    host CertEnumCertificatesInStore(2) => cert_enum_certificates_in_store;
+    host CertFindCertificateInStore(6) => cert_find_certificate_in_store;
+    host CertFindExtension(3) => cert_find_extension;
     missing CertFreeCertificateChainEngine;
     missing CertGetNameStringA;
     missing CertSetCertificateContextProperty;
@@ -45,14 +45,14 @@ dll! {
     missing CryptStringToBinaryA;
     missing PFXImportCertStore;
     host CertAddStoreToCollection(4) => cert_add_store_to_collection;
-    missing CertCompareCertificateName;
+    host CertCompareCertificateName(3) => cert_compare_certificate_name;
     host CertControlStore(4) => cert_control_store;
     missing CertFindChainInStore;
-    missing CertGetCertificateContextProperty;
+    host CertGetCertificateContextProperty(4) => cert_get_certificate_context_property;
     missing CertGetEnhancedKeyUsage;
     missing CertGetIntendedKeyUsage;
     missing CertGetNameStringW;
-    missing CertOpenSystemStoreW;
+    host CertOpenSystemStoreW(2) => cert_open_store;
     missing CertVerifyTimeValidity;
     missing CryptAcquireCertificatePrivateKey;
     missing CryptMsgClose;
@@ -65,6 +65,7 @@ dll! {
 }
 
 const X509_ASN_ENCODING: u32 = 1;
+const CRYPT_E_NOT_FOUND: u32 = 0x8009_2004;
 const CRYPT_E_ASN1_BADTAG: u32 = 0x8009_310b;
 const E_INVALIDARG: u32 = 0x8007_0057;
 
@@ -442,6 +443,123 @@ fn cert_close_store(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
         }
     });
     Reply::Value(1)
+}
+
+fn read_blob(task: &mut Task, cx: &mut Cx<'_>, at: u64) -> Option<Vec<u8>> {
+    if at == 0 {
+        return None;
+    }
+    let w = task.abi().width;
+    task.mem(cx, false, |t| {
+        let len = user::read_u32(&t.space(), at)? as usize;
+        let ptr = user::read_ptr(&t.space(), at + w, w)?;
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        user::read_vec(&t.space(), ptr, len.min(1 << 20))
+    })
+    .ok()
+}
+
+/// `CertEnumCertificatesInStore(store, prev)`: walks certificates in `store`, freeing `prev` when given.
+fn cert_enum_certificates_in_store(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (store, prev) = (a[0], a[1]);
+    let pid = task.process.pid;
+    let certs = with(|s| s.certificates(pid, store));
+    let start = if prev != 0 {
+        let prev_der = task.context_der(cx, prev).ok();
+        if let Err(r) = task.release_context(cx, prev) {
+            return r;
+        }
+        prev_der.and_then(|d| certs.iter().position(|c| *c == d)).map_or(certs.len(), |i| i + 1)
+    } else {
+        0
+    };
+    let Some(der) = certs.get(start) else {
+        task.set_last_error(cx, CRYPT_E_NOT_FOUND);
+        return Reply::Value(0);
+    };
+    let res = task.new_context(cx, der, store);
+    reply(task, cx, res)
+}
+
+/// `CertFindCertificateInStore(store, encoding, flags, type, param, prev)`: finds the next matching certificate in
+/// `store` (freeing `prev` when given), or NULL with `CRYPT_E_NOT_FOUND`.
+fn cert_find_certificate_in_store(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    const CERT_FIND_ANY: u32 = 0;
+    const CERT_FIND_ISSUER_NAME: u32 = 0x0002_0004;
+    const CERT_FIND_SUBJECT_NAME: u32 = 0x0002_0007;
+    const CERT_FIND_EXISTING: u32 = 0x000d_0000;
+
+    let (store, find_type, param, prev) = (a[0], a[3] as u32, a[4], a[5]);
+    let pid = task.process.pid;
+    let certs = with(|s| s.certificates(pid, store));
+    let start = if prev != 0 {
+        let prev_der = task.context_der(cx, prev).ok();
+        if let Err(r) = task.release_context(cx, prev) {
+            return r;
+        }
+        prev_der.and_then(|d| certs.iter().position(|c| *c == d)).map_or(certs.len(), |i| i + 1)
+    } else {
+        0
+    };
+    let target = match find_type {
+        CERT_FIND_ANY => Some(Vec::new()),
+        CERT_FIND_EXISTING => (param != 0).then(|| task.context_der(cx, param).ok()).flatten(),
+        CERT_FIND_ISSUER_NAME | CERT_FIND_SUBJECT_NAME => read_blob(task, cx, param),
+        _ => None,
+    };
+    let Some(target) = target else {
+        task.set_last_error(cx, CRYPT_E_NOT_FOUND);
+        return Reply::Value(0);
+    };
+    for der in certs.iter().skip(start) {
+        let matched = match find_type {
+            CERT_FIND_ANY => true,
+            CERT_FIND_EXISTING => *der == target,
+            CERT_FIND_ISSUER_NAME => parse(der).is_some_and(|i| i.issuer == target.as_slice()),
+            CERT_FIND_SUBJECT_NAME => parse(der).is_some_and(|i| i.subject == target.as_slice()),
+            _ => false,
+        };
+        if matched {
+            let res = task.new_context(cx, der, store);
+            return reply(task, cx, res);
+        }
+    }
+    task.set_last_error(cx, CRYPT_E_NOT_FOUND);
+    Reply::Value(0)
+}
+
+/// `CertFindExtension(oid, count, extensions)`: locates an extension by ASCII OID in `CERT_EXTENSION[count]`.
+fn cert_find_extension(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (oid_at, count, list_at) = (a[0], a[1] as u32 as usize, a[2]);
+    if oid_at == 0 || list_at == 0 || count == 0 {
+        return Reply::Value(0);
+    }
+    let want = task.text_arg(cx, oid_at, false);
+    let w = task.abi().width;
+    // CERT_EXTENSION: pszObjId (ptr), fCritical (BOOL, padded to ptr), Value (CRYPTOAPI_BLOB: u32 + pad + ptr).
+    let entry_size = if w == 8 { 32 } else { 16 };
+    for i in 0..count.min(1024) {
+        let at = list_at + (i * entry_size) as u64;
+        let Ok(ptr) = task.mem(cx, false, |t| user::read_ptr(&t.space(), at, w)) else { break };
+        if ptr != 0 && task.text_arg(cx, ptr, false) == want {
+            return Reply::Value(at);
+        }
+    }
+    Reply::Value(0)
+}
+
+/// `CertCompareCertificateName(encoding, name1, name2)`.
+fn cert_compare_certificate_name(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (Some(x), Some(y)) = (read_blob(task, cx, a[1]), read_blob(task, cx, a[2])) else { return Reply::Value(0) };
+    Reply::Value(u64::from(x == y))
+}
+
+/// `CertGetCertificateContextProperty(ctx, prop_id, data, &len)`: extended properties aren't attached to contexts.
+fn cert_get_certificate_context_property(task: &mut Task, cx: &mut Cx<'_>, _: &[u64]) -> Reply {
+    task.set_last_error(cx, CRYPT_E_NOT_FOUND);
+    Reply::Value(0)
 }
 
 /// `CertControlStore(store, flags, control, &parameter)`: atlas's stores change only as the program changes them, so

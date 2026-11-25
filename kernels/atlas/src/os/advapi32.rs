@@ -194,7 +194,7 @@ dll! {
     host GetTraceEnableFlags(1) => etw_zero;
     host GetTraceEnableLevel(1) => etw_zero;
     host GetTraceLoggerHandle(1) => get_trace_logger_handle;
-    missing ImpersonateAnonymousToken;
+    host ImpersonateAnonymousToken(1) => impersonate_anonymous_token;
     missing LogonUserW;
     missing LsaNtStatusToWinError;
     missing OpenTraceW;

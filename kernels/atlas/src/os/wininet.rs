@@ -1,6 +1,10 @@
 //! wininet.dll: URL cracking and WinINet exports.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use exec::Isa;
+use kernels_core::lock;
 use kernels_core::thread::Cx;
 use kernels_core::user;
 
@@ -9,24 +13,153 @@ use crate::process::Task;
 
 dll! {
     "WININET.dll";
-    missing HttpAddRequestHeadersW;
-    missing HttpOpenRequestW;
-    missing HttpQueryInfoW;
-    missing HttpSendRequestW;
-    missing InternetCloseHandle;
-    missing InternetConnectW;
+    host HttpAddRequestHeadersW(4) => http_add_request_headers_w;
+    host HttpOpenRequestW(8) => http_open_request_w;
+    host HttpQueryInfoW(5) => http_query_info_w;
+    host HttpSendRequestW(5) => http_send_request_w;
+    host InternetCloseHandle(1) => internet_close_handle;
+    host InternetConnectW(8) => internet_connect_w;
     host InternetCrackUrlW(4) => internet_crack_url_w;
-    missing InternetOpenW;
-    missing InternetQueryDataAvailable;
-    missing InternetReadFile;
-    missing InternetSetOptionW;
+    host InternetOpenW(5) => internet_open_w;
+    host InternetQueryDataAvailable(4) => internet_query_data_available;
+    host InternetReadFile(4) => internet_read_file;
+    host InternetSetOptionW(4) => internet_set_option_w;
     // Not written yet: what larger programs import.
     missing GetUrlCacheEntryInfoExW;
 }
 
+const ERROR_INVALID_HANDLE: u32 = 6;
 const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 const ERROR_INTERNET_UNRECOGNIZED_SCHEME: u32 = 12006;
+const ERROR_INTERNET_CANNOT_CONNECT: u32 = 12029;
+const ERROR_HTTP_HEADER_NOT_FOUND: u32 = 12150;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InetKind {
+    Session,
+    Connect,
+    Request,
+}
+
+struct InetState {
+    next: u64,
+    handles: HashMap<u64, InetKind>,
+}
+
+static INET: Mutex<Option<InetState>> = Mutex::new(None);
+
+fn with_inet<R>(f: impl FnOnce(&mut InetState) -> R) -> R {
+    let mut guard = lock(&INET);
+    let state = guard.get_or_insert_with(|| InetState { next: 0x00cc_0000, handles: HashMap::new() });
+    f(state)
+}
+
+fn new_handle(kind: InetKind) -> u64 {
+    with_inet(|s| {
+        s.next += 4;
+        let h = s.next;
+        s.handles.insert(h, kind);
+        h
+    })
+}
+
+/// `InternetOpenW(agent, access_type, proxy, bypass, flags)`: opens a WinINet session handle.
+fn internet_open_w(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(new_handle(InetKind::Session))
+}
+
+/// `InternetConnectW(session, server, port, user, pass, service, flags, context)`: opens a connection handle.
+fn internet_connect_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[1] == 0 {
+        task.set_last_error(cx, ERROR_INVALID_PARAMETER);
+        return Reply::Value(0);
+    }
+    let valid = with_inet(|s| s.handles.get(&a[0]).copied() == Some(InetKind::Session));
+    if !valid {
+        task.set_last_error(cx, ERROR_INVALID_HANDLE);
+        return Reply::Value(0);
+    }
+    Reply::Value(new_handle(InetKind::Connect))
+}
+
+/// `HttpOpenRequestW(connect, verb, object, version, referer, accept_types, flags, context)`: opens a request handle.
+fn http_open_request_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let valid = with_inet(|s| s.handles.get(&a[0]).copied() == Some(InetKind::Connect));
+    if !valid {
+        task.set_last_error(cx, ERROR_INVALID_HANDLE);
+        return Reply::Value(0);
+    }
+    Reply::Value(new_handle(InetKind::Request))
+}
+
+/// `HttpAddRequestHeadersW(request, headers, length, modifiers)`.
+fn http_add_request_headers_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let valid = with_inet(|s| s.handles.get(&a[0]).copied() == Some(InetKind::Request));
+    if !valid {
+        task.set_last_error(cx, ERROR_INVALID_HANDLE);
+        return Reply::Value(0);
+    }
+    Reply::Value(1)
+}
+
+/// `HttpSendRequestW(request, headers, headers_len, optional, optional_len)`: reports connection unavailable.
+fn http_send_request_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let valid = with_inet(|s| s.handles.get(&a[0]).copied() == Some(InetKind::Request));
+    task.set_last_error(cx, if valid { ERROR_INTERNET_CANNOT_CONNECT } else { ERROR_INVALID_HANDLE });
+    Reply::Value(0)
+}
+
+/// `HttpQueryInfoW(request, info_level, buffer, &buffer_len, &index)`.
+fn http_query_info_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let valid = with_inet(|s| s.handles.get(&a[0]).copied() == Some(InetKind::Request));
+    task.set_last_error(cx, if valid { ERROR_HTTP_HEADER_NOT_FOUND } else { ERROR_INVALID_HANDLE });
+    Reply::Value(0)
+}
+
+/// `InternetQueryDataAvailable(file, &bytes_available, flags, context)`.
+fn internet_query_data_available(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let valid = with_inet(|s| s.handles.contains_key(&a[0]));
+    if !valid {
+        task.set_last_error(cx, ERROR_INVALID_HANDLE);
+        return Reply::Value(0);
+    }
+    if a[1] != 0 {
+        let _ = task.mem(cx, true, |t| user::write(&mut t.space(), a[1], &0u32.to_le_bytes()));
+    }
+    Reply::Value(1)
+}
+
+/// `InternetReadFile(file, buffer, bytes_to_read, &bytes_read)`: reports EOF (0 bytes read).
+fn internet_read_file(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let valid = with_inet(|s| s.handles.contains_key(&a[0]));
+    if !valid {
+        task.set_last_error(cx, ERROR_INVALID_HANDLE);
+        return Reply::Value(0);
+    }
+    if a[3] != 0 {
+        let _ = task.mem(cx, true, |t| user::write(&mut t.space(), a[3], &0u32.to_le_bytes()));
+    }
+    Reply::Value(1)
+}
+
+/// `InternetSetOptionW(handle, option, buffer, buffer_len)`.
+fn internet_set_option_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[0] != 0 && !with_inet(|s| s.handles.contains_key(&a[0])) {
+        task.set_last_error(cx, ERROR_INVALID_HANDLE);
+        return Reply::Value(0);
+    }
+    Reply::Value(1)
+}
+
+/// `InternetCloseHandle(handle)`.
+fn internet_close_handle(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let removed = with_inet(|s| s.handles.remove(&a[0]).is_some());
+    if !removed {
+        task.set_last_error(cx, ERROR_INVALID_HANDLE);
+    }
+    Reply::Value(u64::from(removed))
+}
 
 const INTERNET_SCHEME_UNKNOWN: i32 = 0;
 const INTERNET_SCHEME_FTP: i32 = 1;

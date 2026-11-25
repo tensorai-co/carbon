@@ -492,6 +492,7 @@ dll! {
     host SetConsoleTitleW(1) => set_console_title_w;
     host SetConsoleTitleA(1) => set_console_title_a;
     host GetConsoleTitleW(2) => get_console_title_w;
+    host GetConsoleWindow(0) => zero;
     host SetStdHandle(2) => set_std_handle;
     host OpenThread(3) => open_thread;
     host SetThreadPriority(2) => set_thread_priority;

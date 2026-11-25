@@ -1028,6 +1028,26 @@ impl Token {
         Token { id: new_luid(), state: Mutex::new(state), security: Mutex::new(None) }
     }
 
+    /// An anonymous logon impersonation token (`NT AUTHORITY\ANONYMOUS LOGON`, S-1-5-7) for `ImpersonateAnonymousToken`.
+    pub fn anonymous() -> Token {
+        let anon = Sid::new(5, &[7]);
+        Token::with(TokenState {
+            user: anon.clone(),
+            user_deny_only: false,
+            groups: vec![(Sid::new(1, &[0]), GROUP_DEFAULT), (Sid::new(16, &[0]), SE_GROUP_INTEGRITY)],
+            privileges: Vec::new(),
+            owner: anon.clone(),
+            primary_group: anon,
+            default_dacl: None,
+            kind: 2,
+            level: 2,
+            session: 1,
+            modified: new_luid(),
+            restricted: Vec::new(),
+            write_restricted: false,
+        })
+    }
+
     /// A copy, with an ID of its own: `DuplicateTokenEx`'s, and what a new process gets of its parent's.
     pub fn duplicate(&self, kind: u32, level: u32) -> Token {
         let mut state = kernels_core::lock(&self.state).clone();
