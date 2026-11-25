@@ -272,12 +272,12 @@ dll! {
     missing ChangeDisplaySettingsExW;
     host CharLowerBuffW(2) => char_lower_buff_w;
     host CloseDesktop(1) => close_desktop;
-    missing CopyIcon;
+    host CopyIcon(1) => copy_icon;
     missing CopyImage;
     host CreateCaret(4) => succeed;
     missing CreateIconFromResource;
     missing CreateIconFromResourceEx;
-    missing CreateIconIndirect;
+    host CreateIconIndirect(1) => create_icon_indirect;
     host DestroyCaret(0) => succeed;
     host DisplayConfigGetDeviceInfo(1) => not_supported;
     host DisplayConfigSetDeviceInfo(1) => not_supported;
@@ -294,7 +294,7 @@ dll! {
     host GetCursorInfo(1) => get_cursor_info;
     host GetDisplayConfigBufferSizes(3) => not_supported;
     host GetDoubleClickTime(0) => get_double_click_time;
-    missing GetIconInfo;
+    host GetIconInfo(2) => get_icon_info;
     host GetKeyboardLayout(1) => get_keyboard_layout;
     host GetKeyboardLayoutList(2) => get_keyboard_layout_list;
     host GetKeyboardState(1) => get_keyboard_state;
@@ -341,12 +341,12 @@ dll! {
     host SendNotifyMessageA(4) => post_message_w;
     host SetCaretPos(2) => succeed;
     host SetCoalescableTimer(5) => set_timer;
-    host SetLayeredWindowAttributes(4) => succeed;
+    host SetLayeredWindowAttributes(4) => set_layered_window_attributes;
     host SetParent(2) => set_parent;
     host SetPropW(3) => set_prop_w;
     host SetRectEmpty(1) => set_rect_empty;
     host SetWinEventHook(7) => new_handle;
-    host SetWindowRgn(3) => succeed;
+    host SetWindowRgn(3) => set_window_rgn;
     host SetWindowsHookExW(4) => new_handle;
     host ShowCursor(1) => show_cursor;
     host ShutdownBlockReasonCreate(2) => succeed;
@@ -364,7 +364,7 @@ dll! {
     host GetClassNameW(3) => get_class_name_w;
     missing BeginDeferWindowPos;
     missing CharToOemBuffW;
-    missing CharUpperW;
+    host CharUpperW(1) => char_upper_w;
     missing CloseTouchInputHandle;
     host CloseWindowStation(1) => close_window_station;
     host CreateDesktopW(6) => create_desktop_w;
@@ -389,7 +389,7 @@ dll! {
     host GetCaretBlinkTime(0) => get_caret_blink_time;
     host GetGuiResources(2) => zero;
     missing GetLastInputInfo;
-    missing GetLayeredWindowAttributes;
+    host GetLayeredWindowAttributes(4) => get_layered_window_attributes;
     missing GetMenuInfo;
     host GetPointerDevice(2) => no_pointer;
     host GetPointerDevices(2) => get_pointer_devices;
@@ -397,7 +397,7 @@ dll! {
     host GetPointerType(2) => no_pointer;
     missing GetRawInputDeviceInfoW;
     missing GetWindowDC;
-    missing GetWindowRgn;
+    host GetWindowRgn(2) => get_window_rgn;
     host InflateRect(3) => inflate_rect;
     missing InvertRect;
     host LockWindowUpdate(1) => succeed;
@@ -895,6 +895,21 @@ fn set_window_long(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], size: usize) -> 
             std::mem::replace(&mut win.wndproc, new)
         }
         GWLP_HINSTANCE => std::mem::replace(&mut win.instance, new),
+        GWLP_HWNDPARENT => {
+            if win.parent == DESKTOP {
+                let next = if new == DESKTOP { 0 } else { new };
+                std::mem::replace(&mut win.owner, next)
+            } else {
+                let next = if new == 0 || new == DESKTOP {
+                    DESKTOP
+                } else if win32k::is_hwnd_message(new) || new == win32k::MESSAGE_ROOT {
+                    win32k::MESSAGE_ROOT
+                } else {
+                    new
+                };
+                std::mem::replace(&mut win.parent, next)
+            }
+        }
         GWLP_ID => std::mem::replace(&mut win.id, new),
         GWL_STYLE => u64::from(std::mem::replace(&mut win.style, new as u32 & !0x1000_0000)),
         GWL_EXSTYLE => u64::from(std::mem::replace(&mut win.ex_style, new as u32)),
@@ -1335,7 +1350,13 @@ fn is_window_enabled(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
 }
 
 fn get_client_rect(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(r) = task.win32k().windows.get(&a[0]).map(|w| w.client()) else { return Reply::Value(FALSE) };
+    let r = if a[0] == DESKTOP {
+        let (w, h) = task.desktop(|d| d.size());
+        display::Rect::new(0, 0, w, h)
+    } else {
+        let Some(r) = task.win32k().windows.get(&a[0]).map(|w| w.client()) else { return Reply::Value(FALSE) };
+        r
+    };
     Reply::Value(u64::from(task.write_rect(cx, a[1], &r)))
 }
 
@@ -1347,6 +1368,10 @@ fn get_window_rect(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 
 /// A window's whole rectangle, on the screen.
 pub(crate) fn window_rect_on_screen(task: &mut Task, hwnd: u64) -> Option<display::Rect> {
+    if hwnd == DESKTOP {
+        let (w, h) = task.desktop(|d| d.size());
+        return Some(display::Rect::new(0, 0, w, h));
+    }
     {
         let w = task.win32k();
         w.windows.get(&hwnd).map(|win| {
@@ -1419,7 +1444,7 @@ fn adjust_window_rect(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 }
 
 fn is_window(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
-    Reply::Value(u64::from(task.window_exists(a[0])))
+    Reply::Value(u64::from(a[0] == DESKTOP || task.window_exists(a[0])))
 }
 
 /// Whether a top-level window is in a state on the desktop: maximized, or minimized.
@@ -2431,23 +2456,66 @@ fn msg_wait_for_multiple_objects_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64])
     msg_wait(task, cx, a[0], a[1], flags & 1 != 0, a[2] as u32, flags & 2 != 0)
 }
 
-/// `SetParent(window, parent)`: the parent it had (a top-level window's is the desktop, given back as 0 as Windows
-/// does for one that had none); the window moves under the new one, where it is relative to its client area.
+/// `SetParent(window, parent)`: reparents `window` under `parent` (0 / `DESKTOP` makes it top-level, `HWND_MESSAGE`
+/// makes it message-only) and returns its previous parent.
 fn set_parent(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(task.set_parent(cx, a[0], a[1]))
+}
+
+/// `SetWindowRgn(hwnd, hrgn, redraw)`: associates a region with the window (or clears it when `hrgn` is 0), taking
+/// ownership of `hrgn`.
+fn set_window_rgn(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
     let mut w = task.win32k();
-    if a[1] != 0 && !w.windows.contains_key(&a[1]) {
-        drop(w);
-        task.set_last_error(cx, 1400);
+    if !w.windows.contains_key(&a[0]) {
+        return Reply::Value(FALSE);
+    }
+    if a[1] == 0 {
+        w.window_regions.remove(&a[0]);
+    } else {
+        let Some(r) = w.gdi.region(a[1]) else { return Reply::Value(FALSE) };
+        w.window_regions.insert(a[0], r);
+        w.gdi.delete(a[1]);
+    }
+    Reply::Value(TRUE)
+}
+
+/// `GetWindowRgn(hwnd, hrgn)`: copies the window's region into `hrgn`; returns `ERROR` (0) when none is set.
+fn get_window_rgn(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let mut w = task.win32k();
+    let Some(&r) = w.window_regions.get(&a[0]) else { return Reply::Value(0) };
+    if !w.gdi.set_region(a[1], r) {
         return Reply::Value(0);
     }
-    let Some(win) = w.windows.get_mut(&a[0]) else {
-        drop(w);
-        task.set_last_error(cx, 1400);
-        return Reply::Value(0);
-    };
-    let old = win.parent;
-    win.parent = if a[1] == win32k::DESKTOP { 0 } else { a[1] };
-    Reply::Value(if old == 0 { win32k::DESKTOP } else { old })
+    Reply::Value(if r.right <= r.left || r.bottom <= r.top { 1 } else { 2 })
+}
+
+/// `SetLayeredWindowAttributes(hwnd, crKey, bAlpha, dwFlags)`.
+fn set_layered_window_attributes(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let mut w = task.win32k();
+    if !w.windows.contains_key(&a[0]) {
+        return Reply::Value(FALSE);
+    }
+    w.layered.insert(a[0], (a[1] as u32, a[2] as u8, a[3] as u32));
+    Reply::Value(TRUE)
+}
+
+/// `GetLayeredWindowAttributes(hwnd, &crKey, &bAlpha, &dwFlags)`.
+fn get_layered_window_attributes(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some((key, alpha, flags)) = task.win32k().layered.get(&a[0]).copied() else { return Reply::Value(FALSE) };
+    let _ = task.mem(cx, true, |t| {
+        let mut mem = t.space();
+        if a[1] != 0 {
+            user::write_u32(&mut mem, a[1], key)?;
+        }
+        if a[2] != 0 {
+            user::write(&mut mem, a[2], &[alpha])?;
+        }
+        if a[3] != 0 {
+            user::write_u32(&mut mem, a[3], flags)?;
+        }
+        Ok(())
+    });
+    Reply::Value(TRUE)
 }
 
 /// `WindowFromDC(dc)`: the window a DC draws in; the desktop window for the screen's (`GetDC(NULL)`'s), as Windows
@@ -2455,4 +2523,121 @@ fn set_parent(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 fn window_from_dc(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
     let w = task.win32k();
     Reply::Value(w.gdi.dcs.get(&a[0]).filter(|dc| !dc.memory).map_or(0, |dc| if dc.hwnd == 0 { DESKTOP } else { dc.hwnd }))
+}
+
+/// `CreateIconIndirect(&ICONINFO)`: builds an icon or cursor from `hbmColor` (or a double-height monochrome
+/// `hbmMask`) and `hbmMask`, syncing DIB section pixel memory from the guest first.
+fn create_icon_indirect(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[0] == 0 {
+        return Reply::Value(0);
+    }
+    let abi = task.abi();
+    let w = abi.width;
+    let Ok((x_hot, y_hot, hbm_mask, hbm_color)) = task.mem(cx, false, |t| {
+        let mem = t.space();
+        let x = user::read_u32(&mem, a[0] + 4)? as i32;
+        let y = user::read_u32(&mem, a[0] + 8)? as i32;
+        let mask_off = if w == 8 { 16 } else { 12 };
+        let color_off = mask_off + w;
+        Ok((x, y, user::read_ptr(&mem, a[0] + mask_off, w)?, user::read_ptr(&mem, a[0] + color_off, w)?))
+    }) else {
+        return Reply::Value(0);
+    };
+    if hbm_color != 0 {
+        super::gdi32::sync_dib_from_guest(task, cx, hbm_color);
+    }
+    if hbm_mask != 0 {
+        super::gdi32::sync_dib_from_guest(task, cx, hbm_mask);
+    }
+    let argb_from_dib = if hbm_color != 0 { super::gdi32::read_dib_argb(task, cx, hbm_color) } else { None };
+    let mut win32k = task.win32k();
+    let image = if let Some((width, height, pixels)) = argb_from_dib {
+        let has_alpha = pixels.iter().any(|&p| p >> 24 != 0);
+        let pixels = if has_alpha {
+            pixels
+        } else if let Some(mask) = win32k.gdi.bitmaps.get(&hbm_mask) {
+            pixels
+                .into_iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let (x, y) = (i as i32 % width, i as i32 / width);
+                    let transparent = x < mask.width && y < mask.height && mask.pixels[(y * mask.width + x) as usize] != 0;
+                    if transparent { 0 } else { 0xff00_0000 | (p & 0xff_ffff) }
+                })
+                .collect()
+        } else {
+            pixels.into_iter().map(|p| 0xff00_0000 | (p & 0xff_ffff)).collect()
+        };
+        win32k::image::Image { width, height, pixels, hotspot: (x_hot, y_hot) }
+    } else if let Some(color) = win32k.gdi.bitmaps.get(&hbm_color).cloned() {
+        let mask = win32k.gdi.bitmaps.get(&hbm_mask);
+        let pixels = color
+            .pixels
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| {
+                let (x, y) = (i as i32 % color.width, i as i32 / color.width);
+                let transparent = mask.is_some_and(|m| x < m.width && y < m.height && m.pixels[(y * m.width + x) as usize] != 0);
+                if transparent { 0 } else { 0xff00_0000 | (p & 0xff_ffff) }
+            })
+            .collect();
+        win32k::image::Image { width: color.width, height: color.height, pixels, hotspot: (x_hot, y_hot) }
+    } else if let Some(mask) = win32k.gdi.bitmaps.get(&hbm_mask).cloned() {
+        let height = (mask.height / 2).max(1);
+        let mut pixels = vec![0u32; (mask.width * height) as usize];
+        for y in 0..height {
+            for x in 0..mask.width {
+                let and_bit = mask.pixels[(y * mask.width + x) as usize] != 0;
+                let xor_y = y + height;
+                let xor_bit = xor_y < mask.height && mask.pixels[(xor_y * mask.width + x) as usize] != 0;
+                pixels[(y * mask.width + x) as usize] = match (and_bit, xor_bit) {
+                    (false, false) => 0xff00_0000,
+                    (false, true) => 0xffff_ffff,
+                    (true, true) => 0xff80_8080,
+                    (true, false) => 0,
+                };
+            }
+        }
+        win32k::image::Image { width: mask.width, height, pixels, hotspot: (x_hot, y_hot) }
+    } else {
+        return Reply::Value(0);
+    };
+    Reply::Value(win32k.gdi.create_icon(image))
+}
+
+/// `CopyIcon(hIcon)`: duplicates an icon or cursor handle.
+fn copy_icon(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let mut w = task.win32k();
+    let Some(img) = w.gdi.icons.get(&a[0]).cloned() else { return Reply::Value(0) };
+    Reply::Value(w.gdi.create_icon(img))
+}
+
+/// `GetIconInfo(hIcon, &ICONINFO)`: fills an `ICONINFO` with fresh color and mask bitmaps from the icon.
+fn get_icon_info(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[1] == 0 {
+        return Reply::Value(0);
+    }
+    let (hotspot, hbm_mask, hbm_color) = {
+        let mut w = task.win32k();
+        let Some(img) = w.gdi.icons.get(&a[0]).cloned() else { return Reply::Value(0) };
+        let color = img.to_surface();
+        let mut mask = display::Surface::new(img.width, img.height, 0);
+        for (dst, &p) in mask.pixels.iter_mut().zip(&img.pixels) {
+            *dst = if p >> 24 == 0 { 0xff_ffff } else { 0 };
+        }
+        let hbm_mask = w.gdi.create_bitmap(mask);
+        let hbm_color = w.gdi.create_bitmap(color);
+        (img.hotspot, hbm_mask, hbm_color)
+    };
+    let abi = task.abi();
+    let mut buf = Vec::new();
+    buf.extend(1u32.to_le_bytes()); // fIcon = TRUE
+    buf.extend((hotspot.0 as u32).to_le_bytes());
+    buf.extend((hotspot.1 as u32).to_le_bytes());
+    if abi.width == 8 {
+        buf.extend([0u8; 4]);
+    }
+    buf.extend(abi.ptr(hbm_mask));
+    buf.extend(abi.ptr(hbm_color));
+    Reply::Value(u64::from(task.mem(cx, true, |t| user::write(&mut t.space(), a[1], &buf)).is_ok()))
 }

@@ -40,20 +40,20 @@ dll! {
     host IsUserAnAdmin(0) @ 680 => is_user_an_admin;
     // Not written yet: what larger programs import.
     missing ExtractIconExA;
-    missing SHAppBarMessage;
+    host SHAppBarMessage(2) => sh_app_bar_message;
     missing SHCreateItemFromParsingName;
     missing SHGetMalloc;
     missing SHOpenFolderAndSelectItems;
     missing SHOpenWithDialog;
     missing ShellExecuteExA;
-    missing Shell_NotifyIconW;
+    host Shell_NotifyIconW(2) => shell_notify_icon;
     host SetCurrentProcessExplicitAppUserModelID(1) => set_app_user_model_id;
-    missing SHChangeNotify;
+    host SHChangeNotify(4) => sh_change_notify;
     missing SHGetDesktopFolder;
-    missing SHGetPropertyStoreForWindow;
+    host SHGetPropertyStoreForWindow(3) => sh_get_property_store_for_window;
     missing SHGetStockIconInfo;
-    missing SHQueryUserNotificationState;
-    missing Shell_NotifyIconA;
+    host SHQueryUserNotificationState(1) => sh_query_user_notification_state;
+    host Shell_NotifyIconA(2) => shell_notify_icon;
 }
 
 /// `DragAcceptFiles`: whether a window takes files dropped on it (its `WS_EX_ACCEPTFILES`).
@@ -661,6 +661,66 @@ fn is_user_an_admin(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
 /// `SetCurrentProcessExplicitAppUserModelID(id)`: taken; there's no taskbar to group windows by it.
 fn set_app_user_model_id(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
     Reply::Value(S_OK)
+}
+
+/// `SHGetPropertyStoreForWindow(hwnd, riid, &ppv)`: no taskbar property store is attached to windows.
+fn sh_get_property_store_for_window(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[2] == 0 {
+        return Reply::Value(E_INVALIDARG);
+    }
+    let _ = task.write_ptr(cx, a[2], 0);
+    Reply::Value(0x8000_4002) // E_NOINTERFACE
+}
+
+/// `SHChangeNotify(event, flags, item1, item2)`: shell namespace refresh notification (no desktop shell).
+fn sh_change_notify(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(0)
+}
+
+/// `SHQueryUserNotificationState(&state)`: report `QUNS_ACCEPTS_NOTIFICATIONS` (5).
+fn sh_query_user_notification_state(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[0] == 0 {
+        return Reply::Value(E_INVALIDARG);
+    }
+    if task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[0], 5)).is_err() {
+        return Reply::Value(E_INVALIDARG);
+    }
+    Reply::Value(S_OK)
+}
+
+/// `Shell_NotifyIconW/A(message, &data)`: no system tray; report success so tray-using apps proceed cleanly.
+fn shell_notify_icon(_: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(u64::from(a[1] != 0))
+}
+
+/// `SHAppBarMessage(message, &data)`: answers taskbar state and position queries.
+fn sh_app_bar_message(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    const ABM_GETSTATE: u32 = 4;
+    const ABM_GETTASKBARPOS: u32 = 5;
+    let msg = a[0] as u32;
+    let data = a[1];
+    if data == 0 {
+        return Reply::Value(0);
+    }
+    match msg {
+        ABM_GETSTATE => Reply::Value(0),
+        ABM_GETTASKBARPOS => {
+            let (w, h) = task.desktop(|d| (d.output().width, d.output().height));
+            // APPBARDATA: cbSize(4), [pad 4 on x64], hWnd(w), uCallbackMessage(4), uEdge(4), rc(16), lParam(w).
+            let width = task.abi().width;
+            let edge_off = if width == 8 { 20 } else { 12 };
+            let rc_off = edge_off + 4;
+            let mut buf = Vec::with_capacity(20);
+            buf.extend(3u32.to_le_bytes()); // ABE_BOTTOM
+            for v in [0i32, h, w, h] {
+                buf.extend(v.to_le_bytes());
+            }
+            let _ = task.mem(cx, true, |t| user::write(&mut t.space(), data + edge_off, &buf));
+            let _ = rc_off;
+            Reply::Value(1)
+        }
+        _ => Reply::Value(0),
+    }
 }
 
 #[cfg(test)]

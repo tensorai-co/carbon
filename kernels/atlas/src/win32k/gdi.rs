@@ -141,6 +141,21 @@ impl LogFont {
     }
 }
 
+/// Backing guest memory and format for a `CreateDIBSection` bitmap.
+#[derive(Debug, Clone, Copy)]
+pub struct DibSection {
+    pub pid: u64,
+    pub bits: u64,
+    pub width: i32,
+    /// Signed height from BITMAPINFOHEADER (negative = top-down).
+    pub height: i32,
+    pub bits_per_pixel: u16,
+    pub compression: u32,
+    pub stride: usize,
+    pub masks: [u32; 3],
+    pub owned_alloc: bool,
+}
+
 #[derive(Default)]
 pub struct Gdi {
     objects: HashMap<u64, Object>,
@@ -150,6 +165,8 @@ pub struct Gdi {
     next: u64,
     /// Bitmaps' pixels, and icons' and cursors'.
     pub bitmaps: HashMap<u64, Surface>,
+    /// DIB section backing buffers in guest memory, by bitmap handle.
+    pub dibs: HashMap<u64, DibSection>,
     pub icons: HashMap<u64, super::image::Image>,
 }
 
@@ -210,6 +227,7 @@ impl Gdi {
     /// Deletes an object made by `create`, and a bitmap's or icon's pixels; stock objects stay.
     pub fn delete(&mut self, handle: u64) -> bool {
         self.bitmaps.remove(&handle);
+        self.dibs.remove(&handle);
         self.icons.remove(&handle);
         if handle < STOCK {
             self.fonts.remove(&handle);

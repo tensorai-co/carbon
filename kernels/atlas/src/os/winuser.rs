@@ -232,7 +232,7 @@ pub fn is_child(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
     for _ in 0..64 {
         let Some(win) = w.windows.get(&at) else { return Reply::Value(FALSE) };
         if win.top_level() {
-            return Reply::Value(FALSE);
+            return Reply::Value(u64::from(a[0] == win32k::DESKTOP));
         }
         if win.parent == a[0] {
             return Reply::Value(TRUE);
@@ -375,22 +375,48 @@ pub fn get_clipboard_sequence_number(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) ->
     Reply::Value(1)
 }
 
+fn map_case_utf16(units: &[u16], upper: bool) -> Vec<u8> {
+    char::decode_utf16(units.iter().copied())
+        .flat_map(|c| {
+            let c = c.unwrap_or('\u{fffd}');
+            let one = if upper {
+                let mut u = c.to_uppercase();
+                if u.len() == 1 { u.next().unwrap_or(c) } else { c }
+            } else {
+                let mut l = c.to_lowercase();
+                if l.len() == 1 { l.next().unwrap_or(c) } else { c }
+            };
+            let mut buf = [0u16; 2];
+            one.encode_utf16(&mut buf).iter().flat_map(|u| u.to_le_bytes()).collect::<Vec<u8>>()
+        })
+        .collect()
+}
+
 /// `CharLowerBuffW(text, length)`: lowercased where it is, one character for one.
 pub fn char_lower_buff_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let n = a[1] as u32 as usize;
     let Ok(b) = task.mem(cx, false, |t| user::read_vec(&t.space(), a[0], n * 2)) else { return Reply::Value(0) };
     let units: Vec<u16> = b.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
-    let lower: Vec<u8> = char::decode_utf16(units.iter().copied())
-        .flat_map(|c| {
-            let c = c.unwrap_or('\u{fffd}');
-            let mut l = c.to_lowercase();
-            let one = if l.len() == 1 { l.next().unwrap_or(c) } else { c };
-            let mut buf = [0u16; 2];
-            one.encode_utf16(&mut buf).iter().flat_map(|u| u.to_le_bytes()).collect::<Vec<u8>>()
-        })
-        .collect();
+    let lower = map_case_utf16(&units, false);
     let _ = task.mem(cx, true, |t| user::write(&mut t.space(), a[0], &lower));
     Reply::Value(n as u64)
+}
+
+/// `CharUpperW(lpsz)`: uppercases either a single UTF-16 code unit (when the high word is 0) or a NUL-terminated
+/// UTF-16 string in place, returning the uppercased code unit or the original pointer.
+pub fn char_upper_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let arg = a[0];
+    if arg >> 16 == 0 {
+        let ch = char::from_u32(arg as u32).unwrap_or('\u{fffd}');
+        let mut u = ch.to_uppercase();
+        let one = if u.len() == 1 { u.next().unwrap_or(ch) } else { ch };
+        return Reply::Value(u64::from(one as u32 & 0xffff));
+    }
+    let Ok(text) = task.mem(cx, false, |t| user::read_wstr(&t.space(), arg, 65536)) else { return Reply::Value(arg) };
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let upper = map_case_utf16(&units, true);
+    let _ = task.mem(cx, true, |t| user::write(&mut t.space(), arg, &upper));
+    Reply::Value(arg)
 }
 
 // ---- The display ----

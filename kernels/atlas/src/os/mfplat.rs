@@ -1,6 +1,11 @@
-//! mfplat.dll: declared so the programs that import it load; each export says it isn't written yet when called.
+//! mfplat.dll: Media Foundation platform stubs; `MFStartup` reports `E_NOTIMPL` (as on Windows N editions without
+//! the Media Feature Pack), `MFShutdown` succeeds, and `MFTEnumEx` returns zero transforms.
 
-use super::dll;
+use kernels_core::thread::Cx;
+use kernels_core::user;
+
+use super::{Reply, dll};
+use crate::process::Task;
 
 dll! {
     "MFPLAT.dll";
@@ -22,8 +27,29 @@ dll! {
     missing MFGetSystemTime;
     missing MFInitMediaTypeFromWaveFormatEx;
     missing MFLockDXGIDeviceManager;
-    missing MFShutdown;
-    missing MFStartup;
-    missing MFTEnumEx;
+    host MFShutdown(0) => mf_shutdown;
+    host MFStartup(2) => mf_startup;
+    host MFTEnumEx(6) => mft_enum_ex;
     missing MFUnlockDXGIDeviceManager;
+}
+
+const E_NOTIMPL: u64 = 0x8000_4001;
+
+fn mf_startup(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(E_NOTIMPL)
+}
+
+fn mf_shutdown(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(0)
+}
+
+/// `MFTEnumEx(category, flags, input_type, output_type, &activates, &count)`: no Media Foundation transforms.
+fn mft_enum_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[4] != 0 {
+        let _ = task.write_ptr(cx, a[4], 0);
+    }
+    if a[5] != 0 {
+        let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[5], 0));
+    }
+    Reply::Value(0)
 }

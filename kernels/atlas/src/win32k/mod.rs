@@ -88,7 +88,7 @@ pub const DESKTOP: u64 = 0x10010;
 /// the screen, and `FindWindow` and `EnumWindows` pass them by.
 pub const MESSAGE_ROOT: u64 = 0x10014;
 /// `HWND_MESSAGE`, as a program passes it: (HWND)-3, at its pointers' width.
-fn is_hwnd_message(h: u64) -> bool {
+pub(crate) fn is_hwnd_message(h: u64) -> bool {
     h as u32 == 0xffff_fffd && (h >> 32 == 0 || h >> 32 == 0xffff_ffff)
 }
 pub const SCREEN: (i32, i32) = (1280, 800);
@@ -484,6 +484,9 @@ pub struct Win32k {
     pub menus: BTreeMap<u64, menu::Menu>,
     pub tracking: Option<menu::Tracking>,
     pub menu_bars: BTreeMap<u64, u64>,
+    /// Per-window clipping regions (`SetWindowRgn` / `GetWindowRgn`) and layered attributes (`SetLayeredWindowAttributes`).
+    pub window_regions: BTreeMap<u64, Rect>,
+    pub layered: BTreeMap<u64, (u32, u8, u32)>,
     /// Window stations and desktops.
     pub stations: stations::Stations,
 }
@@ -592,6 +595,8 @@ impl Win32k {
             menus: BTreeMap::new(),
             tracking: None,
             menu_bars: BTreeMap::new(),
+            window_regions: BTreeMap::new(),
+            layered: BTreeMap::new(),
             stations: stations::Stations::default(),
         };
         w.register_system_classes();
@@ -1245,12 +1250,12 @@ impl Task {
             rect[3] = 480;
         }
         // A top-level window's parent, as CreateWindowExW has it, is its owner; HWND_MESSAGE makes it message-only.
-        let (parent, owner) = if is_hwnd_message(parent) {
+        let (parent, owner) = if is_hwnd_message(parent) || parent == MESSAGE_ROOT {
             (MESSAGE_ROOT, 0)
         } else if child {
             (parent, 0)
         } else {
-            (DESKTOP, parent)
+            (DESKTOP, if parent == DESKTOP { 0 } else { parent })
         };
         let hwnd = {
             let mut w = self.win32k();
@@ -1378,6 +1383,72 @@ impl Task {
         self.win32k().windows.contains_key(&hwnd)
     }
 
+    /// `SetParent(hwnd, new_parent)`: reparents `hwnd` under `new_parent` (0 or `DESKTOP` makes it top-level,
+    /// `HWND_MESSAGE` makes it message-only), managing its desktop surface across top-level transitions. Returns the
+    /// previous parent HWND, or 0 with `ERROR_INVALID_WINDOW_HANDLE` on invalid handles.
+    pub fn set_parent(&mut self, cx: &mut Cx<'_>, hwnd: u64, new_parent: u64) -> u64 {
+        let target = if new_parent == 0 || new_parent == DESKTOP {
+            DESKTOP
+        } else if is_hwnd_message(new_parent) || new_parent == MESSAGE_ROOT {
+            MESSAGE_ROOT
+        } else {
+            new_parent
+        };
+        let mut w = self.win32k();
+        if (target != DESKTOP && target != MESSAGE_ROOT && (!w.windows.contains_key(&target) || target == hwnd))
+            || !w.windows.contains_key(&hwnd)
+        {
+            drop(w);
+            self.set_last_error(cx, ERROR_INVALID_WINDOW_HANDLE);
+            return 0;
+        }
+        let (old, old_shown, class_name, pid, rect, text, style, ex_style, owner, visible) = {
+            let win = &w.windows[&hwnd];
+            (win.parent, win.shown, win.class.clone(), win.pid, win.rect, win.text.clone(), win.style, win.ex_style, win.owner, win.visible)
+        };
+        if old != target {
+            if target != DESKTOP && old_shown != 0 {
+                w.canvases.remove(&old_shown);
+                let shared = w.display.clone();
+                dt::lock(&shared).destroy(old_shown);
+                if let Some(win) = w.windows.get_mut(&hwnd) {
+                    win.shown = 0;
+                    win.framed = false;
+                }
+            } else if target == DESKTOP && old_shown == 0 {
+                let background = w.class_by_name(pid, &class_name).cloned().map_or(0xffffff, |c| self.background_of(&w, &c));
+                let owner_shown = w.windows.get(&owner).map_or(0, |o| o.shown);
+                let layer = if ex_style & WS_EX_TOPMOST != 0 { Layer::Top } else { Layer::Normal };
+                let role = if owner_shown != 0 { Role::Dialog { parent: owner_shown } } else { Role::Toplevel };
+                let is_framed = framed(style);
+                let spec = Spec { rect, title: text, framed: is_framed, layer, role, fill: background, client: pid, no_activate: ex_style & WS_EX_NOACTIVATE != 0 };
+                let mut d = dt::lock(&w.display);
+                let shown = d.create(spec);
+                let content = d.content_rect(shown).unwrap_or_default();
+                let canvas = display::Canvas::new(content.width(), content.height(), background);
+                d.attach(shown, Some(canvas.buffer()));
+                d.commit(shown);
+                if visible {
+                    d.set_visible(shown, true);
+                }
+                drop(d);
+                w.canvases.insert(shown, canvas);
+                if let Some(win) = w.windows.get_mut(&hwnd) {
+                    win.shown = shown;
+                    win.framed = is_framed;
+                }
+            }
+            if let Some(win) = w.windows.get_mut(&hwnd) {
+                win.parent = target;
+            }
+        }
+        if old == MESSAGE_ROOT {
+            if self.abi().width == 8 { u64::MAX - 2 } else { 0xffff_fffd }
+        } else {
+            old
+        }
+    }
+
     /// `DestroyWindow`: WM_DESTROY to it and then its children, then WM_NCDESTROY to them, children first.
     pub fn destroy_window(&mut self, cx: &mut Cx<'_>, hwnd: u64) -> Result<bool, Reply> {
         let family = {
@@ -1426,6 +1497,8 @@ impl Task {
             w.controls.remove(h);
             w.system_menus.remove(h);
             w.menu_bars.remove(h);
+            w.window_regions.remove(h);
+            w.layered.remove(h);
             for q in w.queues.values_mut() {
                 q.posted.retain(|m| m.hwnd != *h);
                 q.timers.retain(|t| t.hwnd != *h);

@@ -40,8 +40,8 @@ dll! {
     host GetObjectW(3) => get_object_w;
     host GetObjectA(3) => get_object_a;
     host SetStretchBltMode(2) => set_stretch_blt_mode;
-    missing CreateDIBSection;
-    missing StretchDIBits;
+    host CreateDIBSection(6) => create_dib_section;
+    host StretchDIBits(13) => stretch_di_bits;
     // Not written yet: what installers import.
     // Fonts a program brings in memory, information contexts, and OpenGL's pixel formats.
     host AddFontMemResourceEx(4) => add_font_mem_resource_ex;
@@ -59,7 +59,7 @@ dll! {
     host CreateFontA(14) => create_font_a;
     host CreateFontIndirectA(1) => create_font_indirect_a;
     host CreateRectRgn(4) => create_rect_rgn;
-    missing DescribePixelFormat;
+    host DescribePixelFormat(4) => describe_pixel_format;
     host EnumFontFamiliesExA(5) => enum_font_families_ex_a;
     host EnumFontFamiliesExW(5) => enum_font_families_ex_w;
     missing ExtTextOutA;
@@ -82,7 +82,7 @@ dll! {
     host SelectClipRgn(2) => select_clip_rgn;
     host SetBrushOrgEx(4) => set_origin;
     missing SetDCBrushColor;
-    missing SetDIBitsToDevice;
+    host SetDIBitsToDevice(12) => set_di_bits_to_device;
     host SetDeviceGammaRamp(2) => nothing;
     host SetMapMode(2) => set_map_mode;
     host SetRectRgn(5) => set_rect_rgn;
@@ -93,26 +93,26 @@ dll! {
     missing CloseEnhMetaFile;
     missing CloseFigure;
     missing CreateEnhMetaFileW;
-    missing CreateRectRgnIndirect;
+    host CreateRectRgnIndirect(1) => create_rect_rgn_indirect;
     missing DeleteEnhMetaFile;
     missing EndDoc;
     missing EndPage;
     missing EndPath;
     missing EnumEnhMetaFile;
-    missing EqualRgn;
+    host EqualRgn(2) => equal_rgn;
     missing ExtCreatePen;
     missing ExtEscape;
     missing FillPath;
     missing GdiAlphaBlend;
     missing GdiComment;
     missing GetCharWidthW;
-    missing GetClipRgn;
+    host GetClipRgn(2) => get_clip_rgn;
     missing GetEnhMetaFileBits;
     missing GetEnhMetaFileHeader;
-    missing GetObjectType;
+    host GetObjectType(1) => get_object_type;
     missing GetOutlineTextMetricsW;
-    missing GetRegionData;
-    missing GetRgnBox;
+    host GetRegionData(3) => get_region_data;
+    host GetRgnBox(2) => get_rgn_box;
     missing GetTextFaceA;
     missing GetWorldTransform;
     missing IntersectClipRect;
@@ -120,7 +120,7 @@ dll! {
     missing PlayEnhMetaFile;
     missing PlayEnhMetaFileRecord;
     missing PolyBezierTo;
-    missing PtInRegion;
+    host PtInRegion(3) => pt_in_region;
     missing RestoreDC;
     missing SaveDC;
     missing SelectClipPath;
@@ -275,18 +275,51 @@ fn get_object(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply 
         return Reply::Value(n as u64);
     }
     let w = task.abi().width as usize;
-    let size = if w == 8 { 32 } else { 24 };
-    let Some((width, height)) = task.win32k().gdi.bitmaps.get(&a[0]).map(|s| (s.width, s.height)) else { return Reply::Value(0) };
+    let bmp_size = if w == 8 { 32 } else { 24 };
+    let dib_size = if w == 8 { 104 } else { 84 };
+    let (width, height, dib) = {
+        let g = &task.win32k().gdi;
+        let Some(s) = g.bitmaps.get(&a[0]) else { return Reply::Value(0) };
+        (s.width, s.height, g.dibs.get(&a[0]).copied())
+    };
+    let req = a[1] as u32 as usize;
+    let out_size = if dib.is_some() && req >= dib_size { dib_size } else { bmp_size };
     if a[2] == 0 {
-        return Reply::Value(size as u64);
+        return Reply::Value(bmp_size as u64);
     }
-    let mut b = vec![0u8; size];
-    for (o, v) in [(4, width), (8, height), (12, width * 4)] {
+    let mut b = vec![0u8; out_size];
+    let (stride, bpp, bits_ptr) = match dib {
+        Some(d) => (d.stride as i32, d.bits_per_pixel, d.bits),
+        None => (width * 4, 32, 0),
+    };
+    for (o, v) in [(4, width), (8, height), (12, stride)] {
         b[o..o + 4].copy_from_slice(&v.to_le_bytes());
     }
     b[16..18].copy_from_slice(&1u16.to_le_bytes());
-    b[18..20].copy_from_slice(&32u16.to_le_bytes());
-    let n = size.min(a[1] as u32 as usize);
+    b[18..20].copy_from_slice(&bpp.to_le_bytes());
+    if bits_ptr != 0 {
+        let ptr_off = if w == 8 { 24 } else { 20 };
+        let bytes = task.abi().ptr(bits_ptr);
+        b[ptr_off..ptr_off + w].copy_from_slice(&bytes);
+    }
+    if let Some(d) = dib
+        && out_size == dib_size
+    {
+        // dsBmih (BITMAPINFOHEADER, 40 bytes) right after dsBm, then dsBitfields[3] (12 bytes), dshSection, dsOffset.
+        let h = bmp_size;
+        b[h..h + 4].copy_from_slice(&40u32.to_le_bytes());
+        b[h + 4..h + 8].copy_from_slice(&d.width.to_le_bytes());
+        b[h + 8..h + 12].copy_from_slice(&d.height.to_le_bytes());
+        b[h + 12..h + 14].copy_from_slice(&1u16.to_le_bytes());
+        b[h + 14..h + 16].copy_from_slice(&d.bits_per_pixel.to_le_bytes());
+        b[h + 16..h + 20].copy_from_slice(&d.compression.to_le_bytes());
+        b[h + 20..h + 24].copy_from_slice(&((d.stride * d.height.unsigned_abs() as usize) as u32).to_le_bytes());
+        for (i, m) in d.masks.iter().enumerate() {
+            let off = h + 40 + i * 4;
+            b[off..off + 4].copy_from_slice(&m.to_le_bytes());
+        }
+    }
+    let n = out_size.min(req);
     if task.mem(cx, true, |t| user::write(&mut t.space(), a[2], &b[..n])).is_err() {
         return Reply::Value(0);
     }
@@ -294,21 +327,33 @@ fn get_object(task: &mut Task, cx: &mut Cx<'_>, a: &[u64], wide: bool) -> Reply 
 }
 
 /// `BitBlt(dst, x, y, cx, cy, src, sx, sy, rop)`.
-fn bit_blt(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+fn bit_blt(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    sync_dc_dib_from_guest(task, cx, a[5]);
+    sync_dc_dib_from_guest(task, cx, a[0]);
     let (x, y, w, h) = (a[1] as i32, a[2] as i32, a[3] as i32, a[4] as i32);
     let (sx, sy) = (a[6] as i32, a[7] as i32);
     let to = Rect::new(x, y, x + w, y + h);
     let from = Rect::new(sx, sy, sx + w, sy + h);
-    Reply::Value(u64::from(task.win32k().blit(a[0], to, a[5], from, a[8] as u32)))
+    let ok = task.win32k().blit(a[0], to, a[5], from, a[8] as u32);
+    if ok {
+        sync_dc_dib_to_guest(task, cx, a[0]);
+    }
+    Reply::Value(u64::from(ok))
 }
 
 /// `StretchBlt(dst, x, y, cx, cy, src, sx, sy, scx, scy, rop)`: scaled, each pixel the nearest.
-fn stretch_blt(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+fn stretch_blt(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    sync_dc_dib_from_guest(task, cx, a[5]);
+    sync_dc_dib_from_guest(task, cx, a[0]);
     let (x, y, w, h) = (a[1] as i32, a[2] as i32, a[3] as i32, a[4] as i32);
     let (sx, sy, sw, sh) = (a[6] as i32, a[7] as i32, a[8] as i32, a[9] as i32);
     let to = Rect::new(x, y, x + w, y + h);
     let from = Rect::new(sx, sy, sx + sw, sy + sh);
-    Reply::Value(u64::from(task.win32k().blit(a[0], to, a[5], from, a[10] as u32)))
+    let ok = task.win32k().blit(a[0], to, a[5], from, a[10] as u32);
+    if ok {
+        sync_dc_dib_to_guest(task, cx, a[0]);
+    }
+    Reply::Value(u64::from(ok))
 }
 
 /// `SetStretchBltMode`: stretching is always to the nearest pixel; the mode before, BLACKONWHITE.
@@ -320,8 +365,21 @@ fn select_object(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
     Reply::Value(task.win32k().gdi.select(a[0], a[1]).unwrap_or(0))
 }
 
-fn delete_object(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
-    Reply::Value(u64::from(task.win32k().gdi.delete(a[0])))
+fn delete_object(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let dib = task.win32k().gdi.dibs.get(&a[0]).copied();
+    let deleted = task.win32k().gdi.delete(a[0]);
+    if deleted
+        && let Some(dib) = dib
+        && dib.pid == task.process.pid
+        && dib.bits != 0
+    {
+        if dib.owned_alloc {
+            let _ = task.virtual_free(cx, dib.bits, 0, 0x8000);
+        } else {
+            let _ = super::memapi::unmap_view_of_file(task, cx, &[dib.bits & !0xffff]);
+        }
+    }
+    Reply::Value(u64::from(deleted))
 }
 
 /// Sets one of a DC's colours or modes, giving the one it had.
@@ -431,6 +489,41 @@ fn choose_pixel_format(_: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
     Reply::Value(u64::from(a[1] != 0))
 }
 
+/// `DescribePixelFormat(dc, format, bytes, &descriptor)`: describes format 1 (32-bit BGRA, no OpenGL), returning the
+/// maximum pixel format index (1), or 0 for an out-of-range format.
+fn describe_pixel_format(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let format = a[1] as u32 as i32;
+    let n_bytes = a[2] as u32;
+    let ppfd = a[3];
+    if ppfd == 0 {
+        return Reply::Value(1);
+    }
+    if format != 1 || n_bytes < 40 {
+        return Reply::Value(0);
+    }
+    let mut pfd = [0u8; 40];
+    pfd[0..2].copy_from_slice(&40u16.to_le_bytes()); // nSize
+    pfd[2..4].copy_from_slice(&1u16.to_le_bytes()); // nVersion
+    // PFD_DRAW_TO_WINDOW (0x04) | PFD_SUPPORT_GDI (0x10)
+    pfd[4..8].copy_from_slice(&0x0000_0014u32.to_le_bytes());
+    pfd[8] = 0; // PFD_TYPE_RGBA
+    pfd[9] = 32; // cColorBits
+    pfd[10] = 8; // cRedBits
+    pfd[11] = 16; // cRedShift
+    pfd[12] = 8; // cGreenBits
+    pfd[13] = 8; // cGreenShift
+    pfd[14] = 8; // cBlueBits
+    pfd[15] = 0; // cBlueShift
+    pfd[16] = 8; // cAlphaBits
+    pfd[17] = 24; // cAlphaShift
+    pfd[23] = 24; // cDepthBits
+    pfd[24] = 8; // cStencilBits
+    if task.mem(cx, true, |t| user::write(&mut t.space(), ppfd, &pfd)).is_err() {
+        return Reply::Value(0);
+    }
+    Reply::Value(1)
+}
+
 /// `SetPixelFormat(dc, format, &descriptor)`: format 1 is taken; there's no OpenGL to draw with it yet.
 fn set_pixel_format(_: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
     Reply::Value(u64::from(a[1] as u32 == 1))
@@ -517,6 +610,98 @@ fn rect_args(a: &[u64]) -> Rect {
 /// `CreateRectRgn(left, top, right, bottom)`.
 fn create_rect_rgn(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
     Reply::Value(task.win32k().gdi.create(Object::Region(rect_args(a))))
+}
+
+/// `CreateRectRgnIndirect(&rect)`.
+fn create_rect_rgn_indirect(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(r) = task.read_rect(cx, a[0]) else { return Reply::Value(0) };
+    Reply::Value(task.win32k().gdi.create(Object::Region(r)))
+}
+
+/// `EqualRgn(a, b)`: TRUE if both regions cover the same rectangle (or are both empty).
+fn equal_rgn(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let w = task.win32k();
+    let (Some(x), Some(y)) = (w.gdi.region(a[0]), w.gdi.region(a[1])) else { return Reply::Value(0) };
+    let eq = (region_kind(&x) == NULLREGION && region_kind(&y) == NULLREGION) || x == y;
+    Reply::Value(u64::from(eq))
+}
+
+/// `GetClipRgn(hdc, hrgn)`: 1 if a custom clip region was copied into `hrgn`, 0 if none is set, -1 on error.
+fn get_clip_rgn(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let mut w = task.win32k();
+    let Some((hwnd, clip)) = w.gdi.dcs.get(&a[0]).map(|dc| (dc.hwnd, dc.clip)) else {
+        return Reply::Value((-1i32) as u32 as u64);
+    };
+    let whole = w.windows.get(&hwnd).map(|win| win.client()).unwrap_or(Rect { left: 0, top: 0, right: i32::MAX / 2, bottom: i32::MAX / 2 });
+    if clip == whole {
+        return Reply::Value(0);
+    }
+    Reply::Value(if w.gdi.set_region(a[1], clip) { 1 } else { (-1i32) as u32 as u64 })
+}
+
+/// `GetRgnBox(hrgn, &rect)`: writes the bounding rectangle and returns `NULLREGION` or `SIMPLEREGION`.
+fn get_rgn_box(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(r) = task.win32k().gdi.region(a[0]) else { return Reply::Value(0) };
+    let out = if region_kind(&r) == NULLREGION { Rect::default() } else { r };
+    if a[1] != 0 {
+        task.write_rect(cx, a[1], &out);
+    }
+    Reply::Value(region_kind(&r))
+}
+
+/// `GetRegionData(hrgn, count, data)`: `RGNDATAHEADER` (32 bytes) followed by 0 or 1 `RECT`s.
+fn get_region_data(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(r) = task.win32k().gdi.region(a[0]) else { return Reply::Value(0) };
+    let empty = region_kind(&r) == NULLREGION;
+    let rect_count: u32 = if empty { 0 } else { 1 };
+    let rgn_size = rect_count * 16;
+    let total = 32 + rgn_size;
+    if a[2] == 0 {
+        return Reply::Value(u64::from(total));
+    }
+    if (a[1] as u32) < total {
+        return Reply::Value(0);
+    }
+    let bound = if empty { Rect::default() } else { r };
+    let mut buf = Vec::with_capacity(total as usize);
+    for v in [32u32, 1, rect_count, rgn_size] {
+        buf.extend(v.to_le_bytes());
+    }
+    for v in [bound.left, bound.top, bound.right, bound.bottom] {
+        buf.extend(v.to_le_bytes());
+    }
+    if !empty {
+        for v in [r.left, r.top, r.right, r.bottom] {
+            buf.extend(v.to_le_bytes());
+        }
+    }
+    if task.mem(cx, true, |t| user::write(&mut t.space(), a[2], &buf)).is_err() {
+        return Reply::Value(0);
+    }
+    Reply::Value(u64::from(total))
+}
+
+/// `PtInRegion(hrgn, x, y)`.
+fn pt_in_region(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(r) = task.win32k().gdi.region(a[0]) else { return Reply::Value(0) };
+    let (x, y) = (a[1] as u32 as i32, a[2] as u32 as i32);
+    Reply::Value(u64::from(x >= r.left && x < r.right && y >= r.top && y < r.bottom))
+}
+
+/// `GetObjectType(h)`: returns `OBJ_PEN`..`OBJ_MEMDC` (or 0 for an unknown handle).
+fn get_object_type(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let w = task.win32k();
+    if let Some(dc) = w.gdi.dcs.get(&a[0]) {
+        return Reply::Value(if dc.memory { 10 } else { 3 });
+    }
+    Reply::Value(match w.gdi.object(a[0]) {
+        Some(Object::Pen(_)) => 1,
+        Some(Object::Brush(_)) => 2,
+        Some(Object::Font) => 6,
+        Some(Object::Bitmap) => 7,
+        Some(Object::Region(_)) => 8,
+        Some(Object::Icon) | None => 0,
+    })
 }
 
 /// `SetRectRgn(region, left, top, right, bottom)`.
@@ -745,6 +930,7 @@ fn read_info(task: &mut Task, cx: &mut Cx<'_>, at: u64) -> Option<(Vec<u8>, Vec<
 fn get_di_bits(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     const ERROR_INVALID_PARAMETER: u32 = 87;
     let (bitmap, first, lines, bits_at, info_at) = (a[1], a[2] as u32 as usize, a[3] as u32 as usize, a[4], a[5]);
+    sync_dib_from_guest(task, cx, bitmap);
     let Some(surface) = task.win32k().gdi.bitmaps.get(&bitmap).cloned() else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
     let Some((header, after)) = read_info(task, cx, info_at) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
     if bits_at == 0 {
@@ -807,7 +993,249 @@ fn set_di_bits(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
             surface.pixels[(row * surface.width + x) as usize] = from_dib(src, x as usize, &f);
         }
     }
+    drop(w);
+    sync_dib_to_guest(task, cx, bitmap);
     Reply::Value(lines as u64)
+}
+
+/// `CreateDIBSection(hdc, &bmi, usage, &ppvBits, hSection, offset)`: allocates a DIB-backed bitmap whose pixel
+/// buffer lives in guest memory at `*ppvBits` and stays synchronized with GDI operations.
+fn create_dib_section(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    use crate::win32k::gdi::DibSection;
+    const ERROR_INVALID_PARAMETER: u32 = 87;
+    let (bmi_at, ppv_bits, section, offset) = (a[1], a[3], a[4], a[5] as u32 as u64);
+    if bmi_at == 0 {
+        return task.fail(cx, ERROR_INVALID_PARAMETER);
+    }
+    let Some((header, after)) = read_info(task, cx, bmi_at) else {
+        return task.fail(cx, ERROR_INVALID_PARAMETER);
+    };
+    let u32_at = |b: &[u8], at: usize| b.get(at..at + 4).map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]));
+    let Some(width) = u32_at(&header, 4).map(|v| v as i32) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
+    let Some(height) = u32_at(&header, 8).map(|v| v as i32) else { return task.fail(cx, ERROR_INVALID_PARAMETER) };
+    let bits_per_pixel = u16::from_le_bytes([header[14], header[15]]);
+    let compression = u32_at(&header, 16).unwrap_or(0);
+    let abs_height = height.unsigned_abs() as i32;
+    if width <= 0 || abs_height <= 0 || width > 16384 || abs_height > 16384 || !matches!(bits_per_pixel, 1 | 4 | 8 | 16 | 24 | 32) {
+        return task.fail(cx, ERROR_INVALID_PARAMETER);
+    }
+    let masks = match (bits_per_pixel, compression) {
+        (16, 0) => [0x7c00, 0x03e0, 0x001f],
+        (24 | 32, 0) => [0xff_0000, 0xff00, 0xff],
+        (16 | 32, 3) => [u32_at(&after, 0).unwrap_or(0xff_0000), u32_at(&after, 4).unwrap_or(0xff00), u32_at(&after, 8).unwrap_or(0xff)],
+        (_, 0) => [0, 0, 0],
+        _ => return task.fail(cx, ERROR_INVALID_PARAMETER),
+    };
+    let stride = (width as usize * usize::from(bits_per_pixel)).div_ceil(32) * 4;
+    let Some(byte_size) = stride.checked_mul(abs_height as usize) else {
+        return task.fail(cx, ERROR_INVALID_PARAMETER);
+    };
+    let (bits, owned_alloc) = if section != 0 {
+        let aligned = offset & !0xffff;
+        let map_len = (offset - aligned) + byte_size as u64;
+        let Reply::Value(base) = super::memapi::map_view_of_file(task, cx, &[section, 0x0002, 0, aligned, map_len]) else {
+            return Reply::Value(0);
+        };
+        if base == 0 {
+            return Reply::Value(0);
+        }
+        (base + (offset - aligned), false)
+    } else {
+        let alloc_size = (byte_size as u64).max(4096);
+        let Some(base) = task.virtual_alloc(cx, 0, alloc_size, 0x3000, 0x04) else {
+            return task.fail(cx, 8);
+        };
+        (base, true)
+    };
+    if ppv_bits != 0 && task.write_ptr(cx, ppv_bits, bits).is_err() {
+        if owned_alloc {
+            let _ = task.virtual_free(cx, bits, 0, 0x8000);
+        } else {
+            let _ = super::memapi::unmap_view_of_file(task, cx, &[bits & !0xffff]);
+        }
+        return task.fail(cx, 998);
+    }
+    let pid = task.process.pid;
+    let mut w = task.win32k();
+    let handle = w.gdi.create_bitmap(display::Surface::new(width, abs_height, 0));
+    w.gdi.dibs.insert(handle, DibSection { pid, bits, width, height, bits_per_pixel, compression, stride, masks, owned_alloc });
+    Reply::Value(handle)
+}
+
+/// Copies a DIB section's guest pixel buffer into its host `Surface`, if `bitmap` is a DIB section of this process.
+pub(crate) fn sync_dib_from_guest(task: &mut Task, cx: &mut Cx<'_>, bitmap: u64) {
+    let Some(dib) = task.win32k().gdi.dibs.get(&bitmap).copied() else { return };
+    if dib.pid != task.process.pid || dib.bits == 0 {
+        return;
+    }
+    let abs_height = dib.height.unsigned_abs() as usize;
+    let Ok(raw) = task.mem(cx, false, |t| user::read_vec(&t.space(), dib.bits, dib.stride * abs_height)) else { return };
+    let fmt = DibFormat { width: dib.width, height: dib.height, bits: dib.bits_per_pixel, masks: dib.masks };
+    let mut w = task.win32k();
+    let Some(surface) = w.gdi.bitmaps.get_mut(&bitmap) else { return };
+    for line in 0..abs_height {
+        let row = fmt.row(line, surface.height);
+        if !(0..surface.height).contains(&row) {
+            continue;
+        }
+        let src = &raw[line * dib.stride..(line + 1) * dib.stride];
+        for x in 0..dib.width.min(surface.width) as usize {
+            surface.pixels[row as usize * surface.width as usize + x] = match dib.bits_per_pixel {
+                1 => if (src[x / 8] >> (7 - x % 8)) & 1 != 0 { 0xff_ffff } else { 0 },
+                8 => {
+                    let v = u32::from(src[x]);
+                    v << 16 | v << 8 | v
+                }
+                16 | 24 | 32 => from_dib(src, x, &fmt),
+                _ => 0,
+            };
+        }
+    }
+}
+
+/// Reads a 32-bit DIB section's guest pixel buffer as top-down `0xAARRGGBB` (preserving alpha for `CreateIconIndirect`).
+pub(crate) fn read_dib_argb(task: &mut Task, cx: &mut Cx<'_>, bitmap: u64) -> Option<(i32, i32, Vec<u32>)> {
+    let dib = task.win32k().gdi.dibs.get(&bitmap).copied()?;
+    if dib.pid != task.process.pid || dib.bits == 0 || dib.bits_per_pixel != 32 {
+        return None;
+    }
+    let abs_height = dib.height.unsigned_abs() as i32;
+    let raw = task.mem(cx, false, |t| user::read_vec(&t.space(), dib.bits, dib.stride * abs_height as usize)).ok()?;
+    let fmt = DibFormat { width: dib.width, height: dib.height, bits: 32, masks: dib.masks };
+    let mut pixels = vec![0u32; (dib.width * abs_height) as usize];
+    for line in 0..abs_height as usize {
+        let row = fmt.row(line, abs_height);
+        if !(0..abs_height).contains(&row) {
+            continue;
+        }
+        let src = &raw[line * dib.stride..(line + 1) * dib.stride];
+        for x in 0..dib.width as usize {
+            let v = u32::from_le_bytes([src[4 * x], src[4 * x + 1], src[4 * x + 2], src[4 * x + 3]]);
+            let rgb = channel(v, fmt.masks[0]) << 16 | channel(v, fmt.masks[1]) << 8 | channel(v, fmt.masks[2]);
+            let a = (v >> 24) & 0xff;
+            pixels[row as usize * dib.width as usize + x] = a << 24 | rgb;
+        }
+    }
+    Some((dib.width, abs_height, pixels))
+}
+
+/// Copies a DIB section's host `Surface` back into its guest pixel buffer after host GDI drawing.
+fn sync_dib_to_guest(task: &mut Task, cx: &mut Cx<'_>, bitmap: u64) {
+    let (dib, surface) = {
+        let w = task.win32k();
+        let Some(&dib) = w.gdi.dibs.get(&bitmap) else { return };
+        let Some(surface) = w.gdi.bitmaps.get(&bitmap).cloned() else { return };
+        (dib, surface)
+    };
+    if dib.pid != task.process.pid || dib.bits == 0 || !matches!(dib.bits_per_pixel, 16 | 24 | 32) {
+        return;
+    }
+    let abs_height = dib.height.unsigned_abs() as usize;
+    let fmt = DibFormat { width: dib.width, height: dib.height, bits: dib.bits_per_pixel, masks: dib.masks };
+    let mut out = Vec::with_capacity(abs_height * dib.stride);
+    for line in 0..abs_height {
+        let row = fmt.row(line, surface.height);
+        let start = out.len();
+        for x in 0..dib.width {
+            let rgb = if (0..surface.height).contains(&row) && x < surface.width { surface.pixels[(row * surface.width + x) as usize] } else { 0 };
+            to_dib(rgb & 0xff_ffff, &fmt, &mut out);
+        }
+        out.resize(start + dib.stride, 0);
+    }
+    let _ = task.mem(cx, true, |t| user::write(&mut t.space(), dib.bits, &out));
+}
+
+fn sync_dc_dib_from_guest(task: &mut Task, cx: &mut Cx<'_>, hdc: u64) {
+    let bmp = task.win32k().gdi.dcs.get(&hdc).filter(|dc| dc.memory).map(|dc| dc.bitmap);
+    if let Some(b) = bmp {
+        sync_dib_from_guest(task, cx, b);
+    }
+}
+
+fn sync_dc_dib_to_guest(task: &mut Task, cx: &mut Cx<'_>, hdc: u64) {
+    let bmp = task.win32k().gdi.dcs.get(&hdc).filter(|dc| dc.memory).map(|dc| dc.bitmap);
+    if let Some(b) = bmp {
+        sync_dib_to_guest(task, cx, b);
+    }
+}
+
+/// `StretchDIBits(hdc, xDest, yDest, wDest, hDest, xSrc, ySrc, wSrc, hSrc, bits, &bmi, usage, rop)`.
+fn stretch_di_bits(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (hdc, dx, dy, dw, dh) = (a[0], a[1] as i32, a[2] as i32, a[3] as i32, a[4] as i32);
+    let (sx, sy, sw, sh) = (a[5] as i32, a[6] as i32, a[7] as i32, a[8] as i32);
+    let (bits_at, info_at, rop) = (a[9], a[10], a[12] as u32);
+    if bits_at == 0 || info_at == 0 || dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0 {
+        return Reply::Value(0);
+    }
+    let Some((header, after)) = read_info(task, cx, info_at) else { return Reply::Value(0) };
+    let Some(f) = DibFormat::parse(&header, &after) else { return Reply::Value(0) };
+    let abs_h = f.height.unsigned_abs() as i32;
+    let Ok(bits) = task.mem(cx, false, |t| user::read_vec(&t.space(), bits_at, f.stride() * abs_h as usize)) else { return Reply::Value(0) };
+    let mut src_surf = display::Surface::new(f.width, abs_h, 0);
+    for line in 0..abs_h as usize {
+        let row = f.row(line, abs_h);
+        if !(0..abs_h).contains(&row) {
+            continue;
+        }
+        let slice = &bits[line * f.stride()..(line + 1) * f.stride()];
+        for x in 0..f.width as usize {
+            src_surf.pixels[row as usize * f.width as usize + x] = from_dib(slice, x, &f);
+        }
+    }
+    let mut sub = display::Surface::new(sw, sh, 0);
+    let all = sub.bounds();
+    let src_rect = Rect::new(sx, sy, sx + sw, sy + sh);
+    crate::win32k::image::copy(&mut sub, 0, 0, &src_surf, &src_rect, 0xcc_0020, &all);
+    let scaled = if (dw, dh) != (sw, sh) {
+        crate::win32k::image::Image::from_surface(&sub).scaled(dw, dh).to_surface()
+    } else {
+        sub
+    };
+    let ok = task.win32k().draw(hdc, |s, (ox, oy), clip, _| {
+        let b = scaled.bounds();
+        crate::win32k::image::copy(s, dx + ox, dy + oy, &scaled, &b, rop, clip);
+    });
+    if ok {
+        sync_dc_dib_to_guest(task, cx, hdc);
+        Reply::Value(abs_h as u64)
+    } else {
+        Reply::Value(0)
+    }
+}
+
+/// `SetDIBitsToDevice(hdc, xDest, yDest, w, h, xSrc, ySrc, startScan, cLines, bits, &bmi, usage)`.
+fn set_di_bits_to_device(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (hdc, dx, dy, w, h, sx, sy) = (a[0], a[1] as i32, a[2] as i32, a[3] as i32, a[4] as i32, a[5] as i32, a[6] as i32);
+    let (start_scan, c_lines, bits_at, info_at) = (a[7] as u32 as usize, a[8] as u32 as usize, a[9], a[10]);
+    if bits_at == 0 || info_at == 0 || w <= 0 || h <= 0 || c_lines == 0 {
+        return Reply::Value(0);
+    }
+    let Some((header, after)) = read_info(task, cx, info_at) else { return Reply::Value(0) };
+    let Some(f) = DibFormat::parse(&header, &after) else { return Reply::Value(0) };
+    let abs_h = f.height.unsigned_abs() as i32;
+    let lines = c_lines.min((abs_h as usize).saturating_sub(start_scan));
+    let Ok(bits) = task.mem(cx, false, |t| user::read_vec(&t.space(), bits_at, f.stride() * lines)) else { return Reply::Value(0) };
+    let mut src_surf = display::Surface::new(f.width, abs_h, 0);
+    for i in 0..lines {
+        let row = f.row(start_scan + i, abs_h);
+        if !(0..abs_h).contains(&row) {
+            continue;
+        }
+        let slice = &bits[i * f.stride()..(i + 1) * f.stride()];
+        for x in 0..f.width as usize {
+            src_surf.pixels[row as usize * f.width as usize + x] = from_dib(slice, x, &f);
+        }
+    }
+    let src_rect = Rect::new(sx, sy, sx + w, sy + h);
+    let ok = task.win32k().draw(hdc, |s, (ox, oy), clip, _| {
+        crate::win32k::image::copy(s, dx + ox, dy + oy, &src_surf, &src_rect, 0xcc_0020, clip);
+    });
+    if ok {
+        sync_dc_dib_to_guest(task, cx, hdc);
+        Reply::Value(lines as u64)
+    } else {
+        Reply::Value(0)
+    }
 }
 
 #[cfg(test)]
