@@ -1340,16 +1340,36 @@ fn texels(format: u32, ty: u32, internal: u32, width: u32, height: u32, data: &[
         UNSIGNED_BYTE => (float_internal(internal).unwrap_or(if srgb { Format::Rgba8Srgb } else { Format::Rgba8Unorm }), 1),
         FLOAT => (float_internal(internal).unwrap_or(Format::Rgba32Float), 4),
         HALF_FLOAT | 0x8d61 => (float_internal(internal).unwrap_or(Format::Rgba16Float), 2),
-        // The packed kinds: 5-6-5, 4-4-4-4, 5-5-5-1, and 8-8-8-8 reversed.
-        0x8363 | 0x8033 | 0x8034 | 0x8367 => (Format::Rgba8Unorm, 0),
+        // Packed float: UNSIGNED_INT_10F_11F_11F_REV (11-bit R, 11-bit G, 10-bit B unsigned floats).
+        0x8c3b => (float_internal(internal).unwrap_or(Format::Rgba16Float), 0),
+        // Packed integer kinds: 5-6-5, 4-4-4-4(/REV), 5-5-5-1(/REV), 8-8-8-8(/REV), 10-10-10-2(/REV).
+        0x8363 | 0x8033 | 0x8034 | 0x8365 | 0x8366 | 0x8035 | 0x8367 | 0x8036 | 0x8368 => {
+            (float_internal(internal).unwrap_or(if srgb { Format::Rgba8Srgb } else { Format::Rgba8Unorm }), 0)
+        }
         _ => return Err(INVALID_ENUM),
     };
     let n = (width * height) as usize;
     let mut out = Vec::with_capacity(n * fmt.bytes() as usize);
     if size == 0 {
-        let unit = if ty == 0x8367 { 4 } else { 2 };
+        let unit = if matches!(ty, 0x8035 | 0x8367 | 0x8036 | 0x8368 | 0x8c3b) { 4 } else { 2 };
         if data.len() < n * unit {
             return Err(INVALID_VALUE);
+        }
+        if ty == 0x8c3b {
+            for i in 0..n {
+                let p = u32::from_le_bytes([data[4 * i], data[4 * i + 1], data[4 * i + 2], data[4 * i + 3]]);
+                let r = half(((p & 0x7ff) << 4) as u16);
+                let g = half((((p >> 11) & 0x7ff) << 4) as u16);
+                let b = half((((p >> 22) & 0x3ff) << 5) as u16);
+                for v in [r, g, b, 1.0] {
+                    match fmt {
+                        Format::Rgba32Float => out.extend((v as f32).to_le_bytes()),
+                        Format::Rgba16Float => out.extend(to_half(v as f32).to_le_bytes()),
+                        _ => out.push((v * 255.0).round().clamp(0.0, 255.0) as u8),
+                    }
+                }
+            }
+            return Ok((fmt, out));
         }
         for i in 0..n {
             let rgba: [u8; 4] = match ty {
@@ -1361,9 +1381,34 @@ fn texels(format: u32, ty: u32, internal: u32, width: u32, height: u32, data: &[
                     let p = u16::from_le_bytes([data[2 * i], data[2 * i + 1]]);
                     [scale(p >> 12, 15), scale((p >> 8) & 15, 15), scale((p >> 4) & 15, 15), scale(p & 15, 15)]
                 }
+                0x8365 => {
+                    let p = u16::from_le_bytes([data[2 * i], data[2 * i + 1]]);
+                    let c = [scale(p & 15, 15), scale((p >> 4) & 15, 15), scale((p >> 8) & 15, 15), scale(p >> 12, 15)];
+                    if format == BGRA { [c[2], c[1], c[0], c[3]] } else { c }
+                }
                 0x8034 => {
                     let p = u16::from_le_bytes([data[2 * i], data[2 * i + 1]]);
                     [scale(p >> 11, 31), scale((p >> 6) & 31, 31), scale((p >> 1) & 31, 31), if p & 1 != 0 { 255 } else { 0 }]
+                }
+                0x8366 => {
+                    let p = u16::from_le_bytes([data[2 * i], data[2 * i + 1]]);
+                    let c = [scale(p & 31, 31), scale((p >> 5) & 31, 31), scale((p >> 10) & 31, 31), if p & 0x8000 != 0 { 255 } else { 0 }];
+                    if format == BGRA { [c[2], c[1], c[0], c[3]] } else { c }
+                }
+                0x8035 => {
+                    let p = u32::from_le_bytes([data[4 * i], data[4 * i + 1], data[4 * i + 2], data[4 * i + 3]]);
+                    let b = [(p >> 24) as u8, (p >> 16) as u8, (p >> 8) as u8, p as u8];
+                    if format == BGRA { [b[2], b[1], b[0], b[3]] } else { b }
+                }
+                0x8036 => {
+                    let p = u32::from_le_bytes([data[4 * i], data[4 * i + 1], data[4 * i + 2], data[4 * i + 3]]);
+                    let c = [scale((p >> 22) as u16 & 1023, 1023), scale((p >> 12) as u16 & 1023, 1023), scale((p >> 2) as u16 & 1023, 1023), scale((p & 3) as u16, 3)];
+                    if format == BGRA { [c[2], c[1], c[0], c[3]] } else { c }
+                }
+                0x8368 => {
+                    let p = u32::from_le_bytes([data[4 * i], data[4 * i + 1], data[4 * i + 2], data[4 * i + 3]]);
+                    let c = [scale((p & 1023) as u16, 1023), scale(((p >> 10) & 1023) as u16, 1023), scale(((p >> 20) & 1023) as u16, 1023), scale((p >> 30) as u16, 3)];
+                    if format == BGRA { [c[2], c[1], c[0], c[3]] } else { c }
                 }
                 _ => {
                     // 8-8-8-8 reversed: the bytes in memory order, as format names them.
@@ -1371,9 +1416,21 @@ fn texels(format: u32, ty: u32, internal: u32, width: u32, height: u32, data: &[
                     if format == BGRA { [b[2], b[1], b[0], b[3]] } else { b }
                 }
             };
-            out.extend(rgba);
+            match fmt {
+                Format::Rgba32Float => {
+                    for ch in rgba {
+                        out.extend((f32::from(ch) / 255.0).to_le_bytes());
+                    }
+                }
+                Format::Rgba16Float => {
+                    for ch in rgba {
+                        out.extend(to_half(f32::from(ch) / 255.0).to_le_bytes());
+                    }
+                }
+                _ => out.extend(rgba),
+            }
         }
-        return Ok((Format::Rgba8Unorm, out));
+        return Ok((fmt, out));
     }
     if data.len() < n * comps * size {
         return Err(INVALID_VALUE);

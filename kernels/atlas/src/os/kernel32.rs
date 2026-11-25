@@ -493,6 +493,12 @@ dll! {
     host SetConsoleTitleA(1) => set_console_title_a;
     host GetConsoleTitleW(2) => get_console_title_w;
     host GetConsoleWindow(0) => zero;
+    missing GetBinaryTypeA;
+    host GetSystemTimeAdjustment(3) => get_system_time_adjustment;
+    guest RtlRestoreContext;
+    host SetProcessDEPPolicy(1) => accept;
+    host SetSearchPathMode(1) => accept;
+    missing SetSystemTime;
     host SetStdHandle(2) => set_std_handle;
     host OpenThread(3) => open_thread;
     host SetThreadPriority(2) => set_thread_priority;
@@ -623,7 +629,7 @@ dll! {
     host GetUserDefaultLocaleName(2) => get_user_default_locale_name;
     host GetUserDefaultUILanguage(0) => get_user_default_lcid;
     host GetUserGeoID(1) => get_user_geo_id;
-    missing HeapCompact;
+    host HeapCompact(2) => zero;
     host InitializeProcThreadAttributeList(4) => initialize_proc_thread_attribute_list;
     host K32GetMappedFileNameW(4) => get_mapped_file_name_w;
     host K32GetPerformanceInfo(2) => get_performance_info;
@@ -1056,4 +1062,16 @@ fn get_console_screen_buffer_info(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -
         return task.fail(cx, 998);
     }
     Reply::Value(TRUE)
+}
+
+/// `GetSystemTimeAdjustment(&adjustment, &increment, &disabled)`: standard 15.625 ms tick, no periodic adjustment.
+fn get_system_time_adjustment(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    const TICK: u32 = 156_250; // 15.625 ms in 100 ns units
+    let mut ok = true;
+    for (ptr, val) in [(a[0], TICK), (a[1], TICK), (a[2], 1u32)] {
+        if ptr != 0 {
+            ok &= task.mem(cx, true, |t| user::write(&mut t.space(), ptr, &val.to_le_bytes())).is_ok();
+        }
+    }
+    Reply::Value(u64::from(ok))
 }

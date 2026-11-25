@@ -266,17 +266,17 @@ dll! {
     host MsgWaitForMultipleObjectsEx(5) => msg_wait_for_multiple_objects_ex;
     // Not written yet: what larger programs import.
     host ActivateKeyboardLayout(2) => activate_keyboard_layout;
-    missing AttachThreadInput;
+    host AttachThreadInput(3) => succeed;
     host CallNextHookEx(4) => zero;
-    missing ChangeDisplaySettingsExA;
-    missing ChangeDisplaySettingsExW;
+    host ChangeDisplaySettingsExA(5) => zero;
+    host ChangeDisplaySettingsExW(5) => zero;
     host CharLowerBuffW(2) => char_lower_buff_w;
     host CloseDesktop(1) => close_desktop;
     host CopyIcon(1) => copy_icon;
-    missing CopyImage;
+    host CopyImage(5) => copy_image;
     host CreateCaret(4) => succeed;
-    missing CreateIconFromResource;
-    missing CreateIconFromResourceEx;
+    host CreateIconFromResource(4) => create_icon_from_resource;
+    host CreateIconFromResourceEx(7) => create_icon_from_resource;
     host CreateIconIndirect(1) => create_icon_indirect;
     host DestroyCaret(0) => succeed;
     host DisplayConfigGetDeviceInfo(1) => not_supported;
@@ -304,8 +304,8 @@ dll! {
     host GetPropW(2) => get_prop_w;
     host GetQueueStatus(1) => get_queue_status;
     missing GetRawInputBuffer;
-    missing GetRawInputData;
-    missing GetRawInputDeviceInfoA;
+    host GetRawInputData(5) => raw_input_fail;
+    host GetRawInputDeviceInfoA(4) => raw_input_fail;
     host GetRawInputDeviceList(3) => get_raw_input_device_list;
     host GetShellWindow(0) => get_shell_window;
     host GetUpdateRect(3) => get_update_rect;
@@ -2701,4 +2701,17 @@ fn get_icon_info(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     buf.extend(abi.ptr(hbm_mask));
     buf.extend(abi.ptr(hbm_color));
     Reply::Value(u64::from(task.mem(cx, true, |t| user::write(&mut t.space(), a[1], &buf)).is_ok()))
+}
+
+fn copy_image(_: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(a[0])
+}
+
+fn create_icon_from_resource(task: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    let img = crate::win32k::image::Image { width: 16, height: 16, pixels: vec![0; 16 * 16], hotspot: (0, 0) };
+    Reply::Value(task.win32k().gdi.create_icon(img))
+}
+
+fn raw_input_fail(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(u64::from(u32::MAX))
 }

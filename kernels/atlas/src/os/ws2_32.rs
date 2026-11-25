@@ -90,8 +90,8 @@ dll! {
     host WSAWaitForMultipleEvents(5) => wait_for_multiple_objects_ex;
     missing WSCEnumProtocols;
     missing getnameinfo;
-    missing inet_ntop;
-    missing inet_pton;
+    host inet_ntop(4) => inet_ntop;
+    host inet_pton(3) => inet_pton;
     missing WSADuplicateSocketW;
     missing WSAEnumNameSpaceProvidersW;
     host WSALookupServiceBeginW(3) => wsa_lookup_service;
@@ -108,6 +108,64 @@ const SOCKET_ERROR: u64 = 0xffff_ffff;
 /// INVALID_SOCKET, all ones at either width.
 const INVALID_SOCKET: u64 = u64::MAX;
 const MSG_PEEK: u64 = 0x2;
+
+fn inet_ntop(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (family, addr_ptr, dst_ptr, size) = (a[0] as u16, a[1], a[2], a[3] as usize);
+    if addr_ptr == 0 || dst_ptr == 0 || size == 0 {
+        task.set_last_error(cx, WSAEFAULT);
+        return Reply::Value(0);
+    }
+    let text = match family {
+        AF_INET => {
+            let Ok(b) = task.mem(cx, false, |t| user::read_vec(&t.space(), addr_ptr, 4)) else { return Reply::Value(0) };
+            std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]).to_string()
+        }
+        AF_INET6 => {
+            let Ok(b) = task.mem(cx, false, |t| user::read_vec(&t.space(), addr_ptr, 16)) else { return Reply::Value(0) };
+            let arr: [u8; 16] = b.try_into().unwrap();
+            std::net::Ipv6Addr::from(arr).to_string()
+        }
+        _ => {
+            task.set_last_error(cx, WSAEAFNOSUPPORT);
+            return Reply::Value(0);
+        }
+    };
+    if text.len() + 1 > size {
+        task.set_last_error(cx, WSAEINVAL);
+        return Reply::Value(0);
+    }
+    let mut out = text.into_bytes();
+    out.push(0);
+    if task.mem(cx, true, |t| user::write(&mut t.space(), dst_ptr, &out)).is_err() {
+        return Reply::Value(0);
+    }
+    Reply::Value(dst_ptr)
+}
+
+fn inet_pton(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (family, src_ptr, dst_ptr) = (a[0] as u16, a[1], a[2]);
+    if src_ptr == 0 || dst_ptr == 0 {
+        task.set_last_error(cx, WSAEFAULT);
+        return Reply::Value(SOCKET_ERROR);
+    }
+    let text = task.text_arg(cx, src_ptr, false);
+    match family {
+        AF_INET => {
+            let Ok(ip) = text.parse::<std::net::Ipv4Addr>() else { return Reply::Value(0) };
+            let _ = task.mem(cx, true, |t| user::write(&mut t.space(), dst_ptr, &ip.octets()));
+            Reply::Value(1)
+        }
+        AF_INET6 => {
+            let Ok(ip) = text.parse::<std::net::Ipv6Addr>() else { return Reply::Value(0) };
+            let _ = task.mem(cx, true, |t| user::write(&mut t.space(), dst_ptr, &ip.octets()));
+            Reply::Value(1)
+        }
+        _ => {
+            task.set_last_error(cx, WSAEAFNOSUPPORT);
+            Reply::Value(SOCKET_ERROR)
+        }
+    }
+}
 const FIONBIO: u32 = 0x8004_667e;
 const FIONREAD: u32 = 0x4004_667f;
 const SIOCATMARK: u32 = 0x4004_7307;

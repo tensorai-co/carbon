@@ -10,7 +10,9 @@ use crate::process::Task;
 dll! {
     "SETUPAPI.dll";
     missing CM_Get_DevNode_Status;
-    missing CM_Locate_DevNodeA;
+    host CM_Get_Device_IDA(4) => cm_no_devnode;
+    host CM_Get_Parent(3) => cm_no_devnode;
+    host CM_Locate_DevNodeA(3) => cm_no_devnode;
     missing SetupCopyOEMInfW;
     missing SetupDiBuildDriverInfoList;
     missing SetupDiCallClassInstaller;
@@ -86,6 +88,10 @@ fn no_device(task: &mut Task, cx: &mut Cx<'_>, _: &[u64]) -> Reply {
 /// `SetupDiOpenDeviceInterfaceW(set, path, flags, &data)`: no interface has that path.
 fn no_interface(task: &mut Task, cx: &mut Cx<'_>, _: &[u64]) -> Reply {
     task.fail(cx, ERROR_NO_SUCH_DEVICE_INTERFACE)
+}
+
+fn cm_no_devnode(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(0x0d) // CR_NO_SUCH_DEVNODE
 }
 
 /// Windows' device setup classes, by name, and their GUIDs (`devguid.h`).

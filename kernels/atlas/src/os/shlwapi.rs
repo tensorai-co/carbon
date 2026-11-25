@@ -13,6 +13,8 @@ dll! {
     host PathFileExistsW(1) => path_file_exists_w;
     missing SHDeleteKeyA;
     host PathFileExistsA(1) => path_file_exists_a;
+    host PathAppendA(2) => path_append_a;
+    host PathIsRelativeA(1) => path_is_relative_a;
     // Not written yet: what larger programs import.
     missing AssocQueryStringW;
     missing PathFindExtensionW;
@@ -33,6 +35,40 @@ fn path_file_exists_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 
 fn path_file_exists_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     path_file_exists(task, cx, a, false)
+}
+
+/// `PathAppendA(pszPath, pszMore)`: appends `pszMore` onto `pszPath` (buffer size `MAX_PATH` = 260) with a backslash
+/// separator if needed.
+fn path_append_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    const MAX_PATH: usize = 260;
+    if a[0] == 0 || a[1] == 0 {
+        return Reply::Value(0);
+    }
+    let mut base = task.text_arg(cx, a[0], false);
+    let more = task.text_arg(cx, a[1], false);
+    let more_trimmed = more.trim_start_matches(['\\', '/']);
+    if !base.is_empty() && !base.ends_with(['\\', '/']) && !more_trimmed.is_empty() {
+        base.push('\\');
+    }
+    base.push_str(more_trimmed);
+    let bytes = crate::ansi::bytes(&base);
+    if bytes.len() + 1 > MAX_PATH {
+        return Reply::Value(0);
+    }
+    let mut out = bytes;
+    out.push(0);
+    Reply::Value(u64::from(task.mem(cx, true, |t| kernels_core::user::write(&mut t.space(), a[0], &out)).is_ok()))
+}
+
+/// `PathIsRelativeA(path)`: true when `path` does not begin with a drive letter or backslash/slash.
+fn path_is_relative_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[0] == 0 {
+        return Reply::Value(1);
+    }
+    let s = task.text_arg(cx, a[0], false);
+    let b = s.as_bytes();
+    let abs = b.starts_with(b"\\") || b.starts_with(b"/") || (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':');
+    Reply::Value(u64::from(!abs))
 }
 
 /// `PathMatchSpecW(path, specs)`: whether the path matches any of the `;`-separated wildcard specs (`*.txt; *.log`),

@@ -210,7 +210,7 @@ mod x64 {
     /// # Safety
     ///
     /// The code at `pc` and the stack are readable.
-    unsafe fn finish_epilog(c: &mut Context, frame_reg: usize) -> bool {
+    unsafe fn finish_epilog(fn_start: u64, fn_end: u64, c: &mut Context, frame_reg: usize) -> bool {
         // SAFETY: as the caller says, for each read.
         unsafe {
             let mut at = c.pc;
@@ -242,7 +242,7 @@ mod x64 {
                     _ => {}
                 }
             }
-            // Pops, then a return or a jump: only then is it an epilog.
+            // Pops, then a return or a tail jump: only then is it an epilog.
             let pops = at;
             loop {
                 let rex = u8_at(at) & 0xf0 == 0x40;
@@ -253,7 +253,20 @@ mod x64 {
                 at += 1 + u64::from(rex);
             }
             let last = u8_at(at);
-            let ends = matches!(last, 0xc3 | 0xc2 | 0xe9 | 0xeb) || last == 0xf3 && u8_at(at + 1) == 0xc3 || last == 0x48 && u8_at(at + 1) == 0xff;
+            let tail_jmp = match last {
+                // `jmp rel8` / `jmp rel32`: only a tail call if the target lies outside this function.
+                0xeb => {
+                    let target = (at + 2).wrapping_add(u8_at(at + 1) as i8 as i64 as u64);
+                    target < fn_start || target >= fn_end
+                }
+                0xe9 => {
+                    let target = (at + 5).wrapping_add(u32_at(at + 1) as i32 as i64 as u64);
+                    target < fn_start || target >= fn_end
+                }
+                0x48 if u8_at(at + 1) == 0xff => true,
+                _ => false,
+            };
+            let ends = matches!(last, 0xc3 | 0xc2) || (last == 0xf3 && u8_at(at + 1) == 0xc3) || tail_jmp;
             if !ends {
                 return false;
             }
@@ -304,7 +317,9 @@ mod x64 {
                         i += slots(byte & 0xf, byte >> 4);
                     }
                     unwound.establisher = if frame_reg != 0 && set { c.x[frame_reg].wrapping_sub(frame_offset) } else { c.x[RSP] };
-                    if !in_prolog && finish_epilog(c, frame_reg) {
+                    let fn_start = base + u64::from(u32_at(function));
+                    let fn_end = base + u64::from(u32_at(function + 4));
+                    if !in_prolog && finish_epilog(fn_start, fn_end, c, frame_reg) {
                         return Ok(unwound);
                     }
                 }

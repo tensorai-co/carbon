@@ -33,6 +33,7 @@ dll! {
     host waveInPrepareHeader(3) => bad_handle;
     host waveInReset(1) => bad_handle;
     host waveInStart(1) => bad_handle;
+    host waveInStop(1) => bad_handle;
     host waveInUnprepareHeader(3) => bad_handle;
     host waveOutClose(1) => bad_handle;
     host waveOutGetDevCapsA(3) => bad_device;

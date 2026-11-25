@@ -146,7 +146,7 @@ dll! {
     host RegUnLoadKeyA(2) => reg_unload_key_a;
     host RegRestoreKeyW(3) => reg_restore_key_w;
     host RegRestoreKeyA(3) => reg_restore_key_a;
-    missing CryptAcquireContextW;
+    host CryptAcquireContextW(5) => crypt_acquire_context;
     // The event log, which nothing reads here, and random bytes.
     host RegisterEventSourceW(2) => register_event_source;
     host RegisterEventSourceA(2) => register_event_source;
@@ -159,13 +159,13 @@ dll! {
     host CloseServiceHandle(1) => close_service_handle;
     missing ControlService;
     host CreateProcessAsUserW(11) => create_process_as_user_w;
-    missing CryptAcquireContextA;
+    host CryptAcquireContextA(5) => crypt_acquire_context;
     missing CryptCreateHash;
     missing CryptDestroyHash;
-    missing CryptGenRandom;
+    host CryptGenRandom(3) => crypt_gen_random;
     missing CryptGetHashParam;
     missing CryptHashData;
-    missing CryptReleaseContext;
+    host CryptReleaseContext(2) => crypt_release_context;
     host EventRegister(4) => event_register;
     host EventSetInformation(4) => etw_zero;
     host EventUnregister(1) => etw_zero;
@@ -927,4 +927,27 @@ fn etw_zero(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
 /// there's nothing to stop: ERROR_SUCCESS.
 fn reg_disable_predefined_cache(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
     Reply::Value(0)
+}
+
+const CRYPT_PROV: u64 = 0xc000_0001;
+
+fn crypt_acquire_context(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[0] == 0 || task.write_ptr(cx, a[0], CRYPT_PROV).is_err() {
+        task.set_last_error(cx, 87);
+        return Reply::Value(0);
+    }
+    Reply::Value(1)
+}
+
+fn crypt_gen_random(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let len = a[1] as u32 as usize;
+    if (a[2] == 0 && len != 0) || !task.random_into(cx, a[2], len) {
+        task.set_last_error(cx, 87);
+        return Reply::Value(0);
+    }
+    Reply::Value(1)
+}
+
+fn crypt_release_context(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(1)
 }

@@ -16,6 +16,7 @@ dependencies = [
  "display",
  "exec",
  "gpu-api",
+ "gpu-wire",
  "hooks",
  "host",
  "kernels-core",

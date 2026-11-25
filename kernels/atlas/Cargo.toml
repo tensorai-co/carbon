@@ -18,6 +18,7 @@ atlas-abi.workspace = true
 display.workspace = true
 net.workspace = true
 gpu-api.workspace = true
+gpu-wire.workspace = true
 hooks.workspace = true
 
 [dev-dependencies]

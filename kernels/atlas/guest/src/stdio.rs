@@ -6,7 +6,7 @@
 //! Streams aren't buffered on their way out: each write goes to the file then. Reading has a buffer, for `fgets` and
 //! `ungetc`.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use atlas_abi::ansi::{from_1252, to_1252};
 
@@ -16,7 +16,11 @@ host!(get_std_handle, b"GetStdHandle", (which));
 host!(write_file, b"WriteFile", (handle, buffer, count, written, overlapped));
 host!(read_file, b"ReadFile", (handle, buffer, count, read, overlapped));
 host!(create_file_a, b"CreateFileA", (name, access, share, attributes, disposition, flags, template));
+host!(create_file_w, b"CreateFileW", (name, access, share, attributes, disposition, flags, template));
 host!(close_handle, b"CloseHandle", (handle));
+host!(get_file_type, b"GetFileType", (handle));
+host!(get_file_information_by_handle, b"GetFileInformationByHandle", (handle, info));
+host!(duplicate_handle, b"DuplicateHandle", (src_proc, src_h, dst_proc, dst_h, access, inherit, opts));
 #[cfg(not(target_arch = "x86"))]
 host!(set_file_pointer_ex, b"SetFilePointerEx", (handle, distance, new, method));
 // On x86 its LARGE_INTEGER distance is two stack slots, low half first.
@@ -39,6 +43,11 @@ const BUFFER: usize = 4096;
 #[repr(C)]
 pub struct File {
     handle: u64,
+    /// Assigned POSIX fd (-1 if not yet registered in `FDS`).
+    fd: i32,
+    /// Reentrant stream lock (`_lock_file` / `_unlock_file`).
+    lock_owner: AtomicU32,
+    lock_count: AtomicU32,
     /// Opened for reading, writing, appending; in text mode; at its end; in error.
     read: bool,
     write: bool,
@@ -56,7 +65,22 @@ pub struct File {
 
 impl File {
     const fn standard(which: u8) -> File {
-        File { handle: 0, read: which == 0, write: which != 0, append: false, text: true, eof: false, error: false, standard: which + 1, at: 0, have: 0, buffer: [0; BUFFER] }
+        File {
+            handle: 0,
+            fd: which as i32,
+            lock_owner: AtomicU32::new(0),
+            lock_count: AtomicU32::new(0),
+            read: which == 0,
+            write: which != 0,
+            append: false,
+            text: true,
+            eof: false,
+            error: false,
+            standard: which + 1,
+            at: 0,
+            have: 0,
+            buffer: [0; BUFFER],
+        }
     }
 
     fn handle(&mut self) -> u64 {
@@ -179,6 +203,46 @@ fn stream<'a>(f: *mut File) -> Option<&'a mut File> {
 
 // ---- Streams ----
 
+fn parse_mode_bytes(mode: &[u8]) -> Option<(bool, bool, bool, u64, bool)> {
+    let plus = mode.contains(&b'+');
+    let (read, write, append, disposition) = match mode.first() {
+        Some(b'r') => (true, plus, false, 3),
+        Some(b'w') if mode.contains(&b'x') => (plus, true, false, 1),
+        Some(b'w') => (plus, true, false, 2),
+        Some(b'a') => (plus, true, true, 4),
+        _ => return None,
+    };
+    let text = !mode.contains(&b'b');
+    Some((read, write, append, disposition, text))
+}
+
+fn alloc_file(handle: u64, fd: i32, read: bool, write: bool, append: bool, text: bool) -> *mut File {
+    let f = crate::heap::allocate(size_of::<File>(), true).cast::<File>();
+    if f.is_null() {
+        return f;
+    }
+    // SAFETY: the new stream.
+    unsafe {
+        f.write(File {
+            handle,
+            fd,
+            lock_owner: AtomicU32::new(0),
+            lock_count: AtomicU32::new(0),
+            read,
+            write,
+            append,
+            text,
+            eof: false,
+            error: false,
+            standard: 0,
+            at: 0,
+            have: 0,
+            buffer: [0; BUFFER],
+        });
+    }
+    f
+}
+
 /// `fopen(name, mode)`: `r`, `w`, `a`, each with `+`, and `b`, `t` and `x`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn AtlasCrtFopen(name: *const u8, mode: *const u8) -> *mut File {
@@ -190,37 +254,110 @@ pub unsafe extern "C" fn AtlasCrtFopen(name: *const u8, mode: *const u8) -> *mut
     }
     // SAFETY: the program's mode string.
     let mode = unsafe { core::slice::from_raw_parts(mode, crate::crt::AtlasCrtStrlen(mode)) };
-    let plus = mode.contains(&b'+');
-    let (read, write, append, disposition) = match mode.first() {
-        Some(b'r') => (true, plus, false, 3),
-        Some(b'w') if mode.contains(&b'x') => (plus, true, false, 1),
-        Some(b'w') => (plus, true, false, 2),
-        Some(b'a') => (plus, true, true, 4),
-        _ => {
-            crate::crt::set_errno(22);
-            return core::ptr::null_mut();
-        }
+    let Some((read, write, append, disposition, text)) = parse_mode_bytes(mode) else {
+        crate::crt::set_errno(22);
+        return core::ptr::null_mut();
     };
     let access = if read { GENERIC_READ } else { 0 } | if write { GENERIC_WRITE } else { 0 };
     let handle = create_file_a(name as u64, access, 3, 0, disposition, 0x80, 0);
     if handle == crate::pe::INVALID_HANDLE || handle == 0 {
-        // ENOENT, EEXIST, EACCES, as the error was.
-        crate::crt::set_errno(match crate::RtlGetLastWin32Error() {
-            2 | 3 => 2,
-            80 | 183 => 17,
-            _ => 13,
-        });
+        crate::crt::set_errno(crate::crt_ext::map_win32_errno());
         return core::ptr::null_mut();
     }
-    let f = crate::heap::allocate(size_of::<File>(), true).cast::<File>();
+    let f = alloc_file(handle, -1, read, write, append, text);
     if f.is_null() {
         close_handle(handle);
-        return f;
     }
-    let text = !mode.contains(&b'b');
-    // SAFETY: the new stream.
-    unsafe { f.write(File { handle, read, write, append, text, eof: false, error: false, standard: 0, at: 0, have: 0, buffer: [0; BUFFER] }) };
     f
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtWfopen(name: *const u16, mode: *const u16) -> *mut File {
+    const GENERIC_READ: u64 = 0x8000_0000;
+    const GENERIC_WRITE: u64 = 0x4000_0000;
+    if name.is_null() || mode.is_null() {
+        crate::crt::set_errno(22);
+        return core::ptr::null_mut();
+    }
+    let mut mbuf = [0u8; 32];
+    let mlen = unsafe { crate::crt::AtlasCrtWcslen(mode) }.min(mbuf.len());
+    for i in 0..mlen {
+        mbuf[i] = unsafe { *mode.add(i) } as u8;
+    }
+    let Some((read, write, append, disposition, text)) = parse_mode_bytes(&mbuf[..mlen]) else {
+        crate::crt::set_errno(22);
+        return core::ptr::null_mut();
+    };
+    let access = if read { GENERIC_READ } else { 0 } | if write { GENERIC_WRITE } else { 0 };
+    let handle = create_file_w(name as u64, access, 3, 0, disposition, 0x80, 0);
+    if handle == crate::pe::INVALID_HANDLE || handle == 0 {
+        crate::crt::set_errno(crate::crt_ext::map_win32_errno());
+        return core::ptr::null_mut();
+    }
+    let f = alloc_file(handle, -1, read, write, append, text);
+    if f.is_null() {
+        close_handle(handle);
+    }
+    f
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtFsopen(name: *const u8, mode: *const u8, _shflag: i32) -> *mut File {
+    unsafe { AtlasCrtFopen(name, mode) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtWfsopen(name: *const u16, mode: *const u16, _shflag: i32) -> *mut File {
+    unsafe { AtlasCrtWfopen(name, mode) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtFreopen(name: *const u8, mode: *const u8, f: *mut File) -> *mut File {
+    let Some(file) = stream(f) else {
+        crate::crt::set_errno(22);
+        return core::ptr::null_mut();
+    };
+    if name.is_null() || mode.is_null() {
+        crate::crt::set_errno(22);
+        return core::ptr::null_mut();
+    }
+    let mode_s = unsafe { core::slice::from_raw_parts(mode, crate::crt::AtlasCrtStrlen(mode)) };
+    let Some((read, write, append, disposition, text)) = parse_mode_bytes(mode_s) else {
+        crate::crt::set_errno(22);
+        return core::ptr::null_mut();
+    };
+    const GENERIC_READ: u64 = 0x8000_0000;
+    const GENERIC_WRITE: u64 = 0x4000_0000;
+    let access = if read { GENERIC_READ } else { 0 } | if write { GENERIC_WRITE } else { 0 };
+    let handle = create_file_a(name as u64, access, 3, 0, disposition, 0x80, 0);
+    if handle == crate::pe::INVALID_HANDLE || handle == 0 {
+        crate::crt::set_errno(crate::crt_ext::map_win32_errno());
+        return core::ptr::null_mut();
+    }
+    if file.standard == 0 && file.handle != 0 {
+        close_handle(file.handle);
+    }
+    file.handle = handle;
+    file.read = read;
+    file.write = write;
+    file.append = append;
+    file.text = text;
+    file.eof = false;
+    file.error = false;
+    file.at = 0;
+    file.have = 0;
+    f
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtFreopenS(pfile: *mut *mut File, name: *const u8, mode: *const u8, f: *mut File) -> i32 {
+    if pfile.is_null() {
+        crate::crt::set_errno(22);
+        return 22;
+    }
+    let r = unsafe { AtlasCrtFreopen(name, mode, f) };
+    unsafe { *pfile = r };
+    if r.is_null() { unsafe { *crate::crt::AtlasCrtErrno() } } else { 0 }
 }
 
 #[unsafe(no_mangle)]
@@ -229,8 +366,89 @@ pub extern "C" fn AtlasCrtFclose(f: *mut File) -> i32 {
     if file.standard != 0 {
         return 0;
     }
+    if file.fd >= 3 {
+        fd_release(file.fd);
+    }
     close_handle(file.handle);
     crate::heap::free(f.cast());
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtLockFile(f: *mut File) {
+    let Some(file) = stream(f) else { return };
+    let me = (crate::teb() as usize as u32) | 1;
+    if file.lock_owner.load(Ordering::Relaxed) == me {
+        file.lock_count.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    while file.lock_owner.compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+    file.lock_count.store(1, Ordering::Relaxed);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtUnlockFile(f: *mut File) {
+    let Some(file) = stream(f) else { return };
+    let count = file.lock_count.load(Ordering::Relaxed);
+    if count <= 1 {
+        file.lock_count.store(0, Ordering::Relaxed);
+        file.lock_owner.store(0, Ordering::Release);
+    } else {
+        file.lock_count.store(count - 1, Ordering::Relaxed);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtSetbuf(_f: *mut File, _buffer: *mut u8) {}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtFgetpos(f: *mut File, pos: *mut i64) -> i32 {
+    if pos.is_null() {
+        crate::crt::set_errno(22);
+        return -1;
+    }
+    let p = AtlasCrtFtelli64(f);
+    if p < 0 {
+        return -1;
+    }
+    unsafe { pos.write_unaligned(p) };
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtFsetpos(f: *mut File, pos: *const i64) -> i32 {
+    if pos.is_null() {
+        crate::crt::set_errno(22);
+        return -1;
+    }
+    AtlasCrtFseeki64(f, unsafe { pos.read_unaligned() }, 0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtFgetwc(f: *mut File) -> u32 {
+    let c = AtlasCrtFgetc(f);
+    if c == EOF { 0xffff } else { u32::from(from_1252(c as u8)) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtFputwc(c: u16, f: *mut File) -> u32 {
+    let b = to_1252(c).unwrap_or(b'?');
+    if AtlasCrtFputc(i32::from(b), f) == EOF { 0xffff } else { u32::from(c) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtUngetwc(c: u32, f: *mut File) -> u32 {
+    if c == 0xffff {
+        return 0xffff;
+    }
+    let b = to_1252(c as u16).unwrap_or(b'?');
+    if AtlasCrtUngetc(i32::from(b), f) == EOF { 0xffff } else { c }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtGetStreamBufferPointers(_f: *mut File, _base: *mut usize, _ptr: *mut usize, _cnt: *mut usize) -> i32 {
     0
 }
 
@@ -425,24 +643,409 @@ pub extern "C" fn AtlasCrtRewind(f: *mut File) {
     AtlasCrtClearerr(f);
 }
 
-/// `_fileno`: 0, 1 and 2 for the standard streams; others by their handle.
-#[unsafe(no_mangle)]
-pub extern "C" fn AtlasCrtFileno(f: *mut File) -> i32 {
-    stream(f).map_or(-1, |f| if f.standard != 0 { i32::from(f.standard - 1) } else { (f.handle & 0x7fff_ffff) as i32 })
+// ---- POSIX file descriptor table ----
+
+const MAX_FDS: usize = 256;
+
+#[derive(Clone, Copy)]
+struct FdSlot {
+    used: bool,
+    handle: u64,
+    text: bool,
+    append: bool,
 }
 
-/// `_setmode(fd, mode)`: _O_TEXT (0x4000) or _O_BINARY (0x8000) for a standard stream; the mode before.
+impl FdSlot {
+    const EMPTY: FdSlot = FdSlot { used: false, handle: 0, text: false, append: false };
+}
+
+static FD_LOCK: AtomicBool = AtomicBool::new(false);
+static mut FDS: [FdSlot; MAX_FDS] = [FdSlot::EMPTY; MAX_FDS];
+
+fn with_fds<R>(f: impl FnOnce(&mut [FdSlot; MAX_FDS]) -> R) -> R {
+    while FD_LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+    // SAFETY: protected by FD_LOCK.
+    let r = f(unsafe { &mut *(&raw mut FDS) });
+    FD_LOCK.store(false, Ordering::Release);
+    r
+}
+
+fn fd_alloc(handle: u64, text: bool, append: bool) -> i32 {
+    with_fds(|fds| {
+        for i in 3..MAX_FDS {
+            if !fds[i].used {
+                fds[i] = FdSlot { used: true, handle, text, append };
+                return i as i32;
+            }
+        }
+        -1
+    })
+}
+
+fn fd_release(fd: i32) -> Option<FdSlot> {
+    if !(3..MAX_FDS as i32).contains(&fd) {
+        return None;
+    }
+    with_fds(|fds| {
+        let s = fds[fd as usize];
+        if s.used {
+            fds[fd as usize] = FdSlot::EMPTY;
+            Some(s)
+        } else {
+            None
+        }
+    })
+}
+
+fn fd_get(fd: i32) -> Option<FdSlot> {
+    if (0..3).contains(&fd) {
+        // SAFETY: the three standard streams.
+        let file = unsafe { &mut *AtlasCrtIob(fd as u32) };
+        let handle = file.handle();
+        return Some(FdSlot { used: true, handle, text: file.text, append: false });
+    }
+    if !(3..MAX_FDS as i32).contains(&fd) {
+        return None;
+    }
+    with_fds(|fds| {
+        let s = fds[fd as usize];
+        s.used.then_some(s)
+    })
+}
+
+/// `_fileno`: 0, 1 and 2 for the standard streams; others get a slot in the fd table.
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtFileno(f: *mut File) -> i32 {
+    let Some(file) = stream(f) else { return -1 };
+    if file.standard != 0 {
+        return i32::from(file.standard - 1);
+    }
+    if file.fd < 0 {
+        file.fd = fd_alloc(file.handle, file.text, file.append);
+    }
+    file.fd
+}
+
+/// `_setmode(fd, mode)`: _O_TEXT (0x4000) or _O_BINARY (0x8000); the mode before.
 #[unsafe(no_mangle)]
 pub extern "C" fn AtlasCrtSetmode(fd: i32, mode: i32) -> i32 {
-    if !(0..3).contains(&fd) {
+    if (0..3).contains(&fd) {
+        // SAFETY: the standard streams.
+        let file = unsafe { &mut *AtlasCrtIob(fd as u32) };
+        let before = if file.text { 0x4000 } else { 0x8000 };
+        file.text = mode & 0x8000 == 0;
+        return before;
+    }
+    if !(3..MAX_FDS as i32).contains(&fd) {
         crate::crt::set_errno(9);
         return -1;
     }
-    // SAFETY: the standard streams.
-    let file = unsafe { &mut *AtlasCrtIob(fd as u32) };
-    let before = if file.text { 0x4000 } else { 0x8000 };
-    file.text = mode & 0x8000 == 0;
-    before
+    with_fds(|fds| {
+        let s = &mut fds[fd as usize];
+        if !s.used {
+            crate::crt::set_errno(9);
+            return -1;
+        }
+        let before = if s.text { 0x4000 } else { 0x8000 };
+        s.text = mode & 0x8000 == 0;
+        before
+    })
+}
+
+fn open_flags(oflag: i32) -> (u64, u64, bool, bool) {
+    const O_WRONLY: i32 = 0x0001;
+    const O_RDWR: i32 = 0x0002;
+    const O_APPEND: i32 = 0x0008;
+    const O_CREAT: i32 = 0x0100;
+    const O_TRUNC: i32 = 0x0200;
+    const O_EXCL: i32 = 0x0400;
+    const O_BINARY: i32 = 0x8000;
+    const GENERIC_READ: u64 = 0x8000_0000;
+    const GENERIC_WRITE: u64 = 0x4000_0000;
+    let access = match oflag & 3 {
+        O_WRONLY => GENERIC_WRITE,
+        O_RDWR => GENERIC_READ | GENERIC_WRITE,
+        _ => GENERIC_READ,
+    };
+    let disposition = match (oflag & O_CREAT != 0, oflag & O_EXCL != 0, oflag & O_TRUNC != 0) {
+        (true, true, _) => 1,   // CREATE_NEW
+        (true, false, true) => 2, // CREATE_ALWAYS
+        (true, false, false) => 4, // OPEN_ALWAYS
+        (false, _, true) => 5,  // TRUNCATE_EXISTING
+        (false, _, false) => 3, // OPEN_EXISTING
+    };
+    let text = oflag & O_BINARY == 0;
+    let append = oflag & O_APPEND != 0;
+    (access, disposition, text, append)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtOpen(path: *const u8, oflag: i32, _pmode: i32) -> i32 {
+    if path.is_null() {
+        crate::crt::set_errno(22);
+        return -1;
+    }
+    let (access, disp, text, append) = open_flags(oflag);
+    let h = create_file_a(path as usize as u64, access, 3, 0, disp, 0x80, 0);
+    if h == crate::pe::INVALID_HANDLE || h == 0 {
+        crate::crt::set_errno(crate::crt_ext::map_win32_errno());
+        return -1;
+    }
+    let fd = fd_alloc(h, text, append);
+    if fd < 0 {
+        close_handle(h);
+        crate::crt::set_errno(24);
+    }
+    fd
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtWopen(path: *const u16, oflag: i32, _pmode: i32) -> i32 {
+    if path.is_null() {
+        crate::crt::set_errno(22);
+        return -1;
+    }
+    let (access, disp, text, append) = open_flags(oflag);
+    let h = create_file_w(path as usize as u64, access, 3, 0, disp, 0x80, 0);
+    if h == crate::pe::INVALID_HANDLE || h == 0 {
+        crate::crt::set_errno(crate::crt_ext::map_win32_errno());
+        return -1;
+    }
+    let fd = fd_alloc(h, text, append);
+    if fd < 0 {
+        close_handle(h);
+        crate::crt::set_errno(24);
+    }
+    fd
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtSopenS(pfd: *mut i32, path: *const u8, oflag: i32, _shflag: i32, pmode: i32) -> i32 {
+    if pfd.is_null() {
+        crate::crt::set_errno(22);
+        return 22;
+    }
+    let fd = unsafe { AtlasCrtOpen(path, oflag, pmode) };
+    unsafe { *pfd = fd };
+    if fd < 0 { unsafe { *crate::crt::AtlasCrtErrno() } } else { 0 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtClose(fd: i32) -> i32 {
+    if (0..3).contains(&fd) {
+        return 0;
+    }
+    let Some(s) = fd_release(fd) else {
+        crate::crt::set_errno(9);
+        return -1;
+    };
+    close_handle(s.handle);
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtRead(fd: i32, buf: *mut u8, count: u32) -> i32 {
+    if buf.is_null() {
+        crate::crt::set_errno(22);
+        return -1;
+    }
+    let Some(s) = fd_get(fd) else {
+        crate::crt::set_errno(9);
+        return -1;
+    };
+    let mut got = 0u32;
+    if read_file(s.handle, buf as usize as u64, u64::from(count), (&raw mut got) as usize as u64, 0) == 0 {
+        crate::crt::set_errno(5);
+        return -1;
+    }
+    got as i32
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtWrite(fd: i32, buf: *const u8, count: u32) -> i32 {
+    if buf.is_null() {
+        crate::crt::set_errno(22);
+        return -1;
+    }
+    let Some(s) = fd_get(fd) else {
+        crate::crt::set_errno(9);
+        return -1;
+    };
+    if s.append {
+        let mut end = 0i64;
+        seek(s.handle, 0, (&raw mut end) as usize as u64, 2);
+    }
+    let mut wrote = 0u32;
+    if write_file(s.handle, buf as usize as u64, u64::from(count), (&raw mut wrote) as usize as u64, 0) == 0 {
+        crate::crt::set_errno(5);
+        return -1;
+    }
+    wrote as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtLseeki64(fd: i32, offset: i64, origin: i32) -> i64 {
+    let Some(s) = fd_get(fd) else {
+        crate::crt::set_errno(9);
+        return -1;
+    };
+    let mut new_pos = 0i64;
+    if seek(s.handle, offset, (&raw mut new_pos) as usize as u64, origin as u64) == 0 {
+        crate::crt::set_errno(22);
+        return -1;
+    }
+    new_pos
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtGetOsfhandle(fd: i32) -> isize {
+    match fd_get(fd) {
+        Some(s) => s.handle as isize,
+        None => {
+            crate::crt::set_errno(9);
+            -1
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtIsatty(fd: i32) -> i32 {
+    let Some(s) = fd_get(fd) else { return 0 };
+    // FILE_TYPE_CHAR = 2
+    i32::from(get_file_type(s.handle) == 2)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtFdopen(fd: i32, mode: *const u8) -> *mut File {
+    if mode.is_null() {
+        crate::crt::set_errno(22);
+        return core::ptr::null_mut();
+    }
+    let Some(s) = fd_get(fd) else {
+        crate::crt::set_errno(9);
+        return core::ptr::null_mut();
+    };
+    let mode_s = unsafe { core::slice::from_raw_parts(mode, crate::crt::AtlasCrtStrlen(mode)) };
+    let Some((read, write, append, _, text)) = parse_mode_bytes(mode_s) else {
+        crate::crt::set_errno(22);
+        return core::ptr::null_mut();
+    };
+    alloc_file(s.handle, fd, read, write, append, text)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtDup(fd: i32) -> i32 {
+    let Some(s) = fd_get(fd) else {
+        crate::crt::set_errno(9);
+        return -1;
+    };
+    let mut dup_h = 0usize;
+    let cur = usize::MAX as u64; // GetCurrentProcess() = -1
+    if duplicate_handle(cur, s.handle, cur, (&raw mut dup_h) as usize as u64, 0, 1, 2) == 0 {
+        crate::crt::set_errno(9);
+        return -1;
+    }
+    let new_fd = fd_alloc(dup_h as u64, s.text, s.append);
+    if new_fd < 0 {
+        close_handle(dup_h as u64);
+        crate::crt::set_errno(24);
+    }
+    new_fd
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtDup2(fd1: i32, fd2: i32) -> i32 {
+    if !(0..MAX_FDS as i32).contains(&fd2) {
+        crate::crt::set_errno(9);
+        return -1;
+    }
+    let Some(s) = fd_get(fd1) else {
+        crate::crt::set_errno(9);
+        return -1;
+    };
+    if fd1 == fd2 {
+        return 0;
+    }
+    let mut dup_h = 0usize;
+    let cur = usize::MAX as u64;
+    if duplicate_handle(cur, s.handle, cur, (&raw mut dup_h) as usize as u64, 0, 1, 2) == 0 {
+        crate::crt::set_errno(9);
+        return -1;
+    }
+    if (0..3).contains(&fd2) {
+        // SAFETY: standard stream.
+        let file = unsafe { &mut *AtlasCrtIob(fd2 as u32) };
+        file.handle = dup_h as u64;
+        return 0;
+    }
+    with_fds(|fds| {
+        if fds[fd2 as usize].used {
+            close_handle(fds[fd2 as usize].handle);
+        }
+        fds[fd2 as usize] = FdSlot { used: true, handle: dup_h as u64, text: s.text, append: s.append };
+    });
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtFstat64(fd: i32, buf: *mut crate::crt_ext::Stat64) -> i32 {
+    if buf.is_null() {
+        crate::crt::set_errno(22);
+        return -1;
+    }
+    let Some(s) = fd_get(fd) else {
+        crate::crt::set_errno(9);
+        return -1;
+    };
+    let mut info = [0u32; 13];
+    if get_file_information_by_handle(s.handle, info.as_mut_ptr() as usize as u64) == 0 {
+        // Pipe/char device fallback: minimal valid stat.
+        let st = crate::crt_ext::fill_stat64(0, 0, 0, 0, 0);
+        unsafe { buf.write(st) };
+        return 0;
+    }
+    let size = (u64::from(info[8]) << 32) | u64::from(info[9]);
+    let st = crate::crt_ext::fill_stat64(
+        info[0],
+        size,
+        crate::crt_ext::filetime_to_unix(info[1], info[2]),
+        crate::crt_ext::filetime_to_unix(info[3], info[4]),
+        crate::crt_ext::filetime_to_unix(info[5], info[6]),
+    );
+    unsafe { buf.write(st) };
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtFstat64i32(fd: i32, buf: *mut crate::crt_ext::Stat64i32) -> i32 {
+    if buf.is_null() {
+        crate::crt::set_errno(22);
+        return -1;
+    }
+    let mut st = core::mem::MaybeUninit::<crate::crt_ext::Stat64>::uninit();
+    if unsafe { AtlasCrtFstat64(fd, st.as_mut_ptr()) } != 0 {
+        return -1;
+    }
+    let s = unsafe { st.assume_init() };
+    unsafe {
+        buf.write(crate::crt_ext::Stat64i32 {
+            st_dev: s.st_dev,
+            st_ino: s.st_ino,
+            st_mode: s.st_mode,
+            st_nlink: s.st_nlink,
+            st_uid: s.st_uid,
+            st_gid: s.st_gid,
+            _pad0: 0,
+            st_rdev: s.st_rdev,
+            st_size: s.st_size as i32,
+            st_atime: s.st_atime,
+            st_mtime: s.st_mtime,
+            st_ctime: s.st_ctime,
+        });
+    }
+    0
 }
 
 // ---- printf ----
@@ -1081,6 +1684,388 @@ pub extern "C" fn AtlasCrtVsnprintfS(_options: u64, buffer: *mut u8, size: usize
         return -1;
     }
     n
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtVswprintfS(_options: u64, buffer: *mut u16, size: usize, fmt: *const u16, _locale: usize, args: *const u8) -> i32 {
+    if buffer.is_null() || size == 0 {
+        crate::crt::set_errno(22);
+        return -1;
+    }
+    let n = AtlasCrtVswprintf(STANDARD_SNPRINTF, buffer, size, fmt, 0, args);
+    if n < 0 || n as usize >= size {
+        unsafe { *buffer = 0 };
+        crate::crt::set_errno(34);
+        return -1;
+    }
+    n
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtVsnwprintfS(_options: u64, buffer: *mut u16, size: usize, max: usize, fmt: *const u16, _locale: usize, args: *const u8) -> i32 {
+    if buffer.is_null() || size == 0 {
+        crate::crt::set_errno(22);
+        return -1;
+    }
+    let room = if max == usize::MAX { size } else { (max + 1).min(size) };
+    let n = AtlasCrtVswprintf(STANDARD_SNPRINTF, buffer, room, fmt, 0, args);
+    if n < 0 || n as usize >= room {
+        if max == usize::MAX || (n as usize) > max {
+            return -1;
+        }
+        unsafe { *buffer = 0 };
+        crate::crt::set_errno(34);
+        return -1;
+    }
+    n
+}
+
+// ---- scanf ----
+
+trait ScanSource {
+    fn peek(&mut self) -> Option<u8>;
+    fn next(&mut self) -> Option<u8>;
+    fn consumed(&self) -> usize;
+}
+
+struct SliceSource<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl ScanSource for SliceSource<'_> {
+    fn peek(&mut self) -> Option<u8> {
+        self.data.get(self.pos).copied()
+    }
+    fn next(&mut self) -> Option<u8> {
+        let b = self.data.get(self.pos).copied()?;
+        self.pos += 1;
+        Some(b)
+    }
+    fn consumed(&self) -> usize {
+        self.pos
+    }
+}
+
+struct FileSource<'a> {
+    file: &'a mut File,
+    count: usize,
+}
+
+impl ScanSource for FileSource<'_> {
+    fn peek(&mut self) -> Option<u8> {
+        let c = get(self.file);
+        if c == EOF {
+            return None;
+        }
+        AtlasCrtUngetc(c, self.file);
+        Some(c as u8)
+    }
+    fn next(&mut self) -> Option<u8> {
+        let c = get(self.file);
+        if c == EOF {
+            return None;
+        }
+        self.count += 1;
+        Some(c as u8)
+    }
+    fn consumed(&self) -> usize {
+        self.count
+    }
+}
+
+fn is_ascii_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+}
+
+fn scan_core(src: &mut dyn ScanSource, fmt: &[u8], args: &mut Args) -> i32 {
+    let mut assigned = 0i32;
+    let mut fi = 0usize;
+    while fi < fmt.len() {
+        let fc = fmt[fi];
+        fi += 1;
+        if is_ascii_space(fc) {
+            while src.peek().is_some_and(is_ascii_space) {
+                src.next();
+            }
+            continue;
+        }
+        if fc != b'%' {
+            if src.peek() == Some(fc) {
+                src.next();
+                continue;
+            }
+            return if assigned == 0 && src.peek().is_none() { EOF } else { assigned };
+        }
+        if fi >= fmt.len() {
+            break;
+        }
+        if fmt[fi] == b'%' {
+            fi += 1;
+            if src.peek() == Some(b'%') {
+                src.next();
+                continue;
+            }
+            break;
+        }
+        let suppress = fmt[fi] == b'*';
+        if suppress {
+            fi += 1;
+        }
+        let mut width = 0usize;
+        while fi < fmt.len() && fmt[fi].is_ascii_digit() {
+            width = width * 10 + usize::from(fmt[fi] - b'0');
+            fi += 1;
+        }
+        let max_w = if width == 0 { usize::MAX } else { width };
+        let mut bits = 32u32;
+        if fi < fmt.len() {
+            match fmt[fi] {
+                b'h' if fi + 1 < fmt.len() && fmt[fi + 1] == b'h' => { bits = 8; fi += 2; }
+                b'h' => { bits = 16; fi += 1; }
+                b'l' if fi + 1 < fmt.len() && fmt[fi + 1] == b'l' => { bits = 64; fi += 2; }
+                b'l' => { bits = 33; fi += 1; } // 33 = `long` / `double`
+                b'z' | b't' | b'I' => { bits = POINTER_BITS; fi += 1; }
+                b'j' => { bits = 64; fi += 1; }
+                _ => {}
+            }
+        }
+        if fi >= fmt.len() {
+            break;
+        }
+        let conv = fmt[fi];
+        fi += 1;
+        if conv == b'n' {
+            if !suppress {
+                let p = args.next() as usize as *mut i32;
+                if !p.is_null() {
+                    unsafe { p.write_unaligned(src.consumed() as i32) };
+                }
+            }
+            continue;
+        }
+        if conv != b'c' && conv != b'[' {
+            while src.peek().is_some_and(is_ascii_space) {
+                src.next();
+            }
+        }
+        if src.peek().is_none() {
+            return if assigned == 0 { EOF } else { assigned };
+        }
+        match conv {
+            b'd' | b'i' | b'u' | b'x' | b'X' | b'o' | b'p' => {
+                let mut buf = [0u8; 64];
+                let mut n = 0usize;
+                if n < max_w && matches!(src.peek(), Some(b'+' | b'-')) {
+                    buf[n] = src.next().unwrap();
+                    n += 1;
+                }
+                let mut base = match conv {
+                    b'd' | b'u' => 10,
+                    b'o' => 8,
+                    b'x' | b'X' | b'p' => 16,
+                    _ => 0,
+                };
+                if n < max_w && src.peek() == Some(b'0') {
+                    buf[n] = src.next().unwrap();
+                    n += 1;
+                    if (base == 0 || base == 16) && n < max_w && matches!(src.peek(), Some(b'x' | b'X')) {
+                        buf[n] = src.next().unwrap();
+                        n += 1;
+                        base = 16;
+                    } else if base == 0 {
+                        base = 8;
+                    }
+                } else if base == 0 {
+                    base = 10;
+                }
+                while n < max_w && n + 1 < buf.len() {
+                    let Some(c) = src.peek() else { break };
+                    let ok = match c {
+                        b'0'..=b'7' => true,
+                        b'8'..=b'9' => base >= 10,
+                        b'a'..=b'f' | b'A'..=b'F' => base == 16,
+                        _ => false,
+                    };
+                    if !ok {
+                        break;
+                    }
+                    buf[n] = src.next().unwrap();
+                    n += 1;
+                }
+                buf[n] = 0;
+                let mut end = core::ptr::null();
+                let val = if conv == b'd' || conv == b'i' {
+                    unsafe { crate::crt::AtlasCrtStrtoll(buf.as_ptr(), &mut end, base) as u64 }
+                } else {
+                    unsafe { crate::crt::AtlasCrtStrtoull(buf.as_ptr(), &mut end, base) }
+                };
+                if end == buf.as_ptr() {
+                    break;
+                }
+                if !suppress {
+                    let p = args.next() as usize;
+                    if p != 0 {
+                        unsafe {
+                            match if conv == b'p' { POINTER_BITS } else { bits } {
+                                8 => (p as *mut u8).write_unaligned(val as u8),
+                                16 => (p as *mut u16).write_unaligned(val as u16),
+                                64 => (p as *mut u64).write_unaligned(val),
+                                _ => (p as *mut u32).write_unaligned(val as u32),
+                            }
+                        }
+                    }
+                    assigned += 1;
+                }
+            }
+            b'f' | b'F' | b'e' | b'E' | b'g' | b'G' | b'a' | b'A' => {
+                let mut buf = [0u8; 128];
+                let mut n = 0usize;
+                while n < max_w && n + 1 < buf.len() {
+                    let Some(c) = src.peek() else { break };
+                    if c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.') {
+                        buf[n] = src.next().unwrap();
+                        n += 1;
+                    } else {
+                        break;
+                    }
+                }
+                buf[n] = 0;
+                let mut end = core::ptr::null();
+                let val = unsafe { crate::crt::AtlasCrtStrtod(buf.as_ptr(), &mut end) };
+                if end == buf.as_ptr() {
+                    break;
+                }
+                if !suppress {
+                    let p = args.next() as usize;
+                    if p != 0 {
+                        unsafe {
+                            if bits == 33 || bits == 64 {
+                                (p as *mut f64).write_unaligned(val);
+                            } else {
+                                (p as *mut f32).write_unaligned(val as f32);
+                            }
+                        }
+                    }
+                    assigned += 1;
+                }
+            }
+            b's' => {
+                let dst = if suppress { core::ptr::null_mut() } else { args.next() as usize as *mut u8 };
+                let mut n = 0usize;
+                while n < max_w {
+                    let Some(c) = src.peek() else { break };
+                    if is_ascii_space(c) {
+                        break;
+                    }
+                    src.next();
+                    if !dst.is_null() {
+                        unsafe { *dst.add(n) = c };
+                    }
+                    n += 1;
+                }
+                if n == 0 {
+                    break;
+                }
+                if !dst.is_null() {
+                    unsafe { *dst.add(n) = 0 };
+                }
+                if !suppress {
+                    assigned += 1;
+                }
+            }
+            b'c' => {
+                let need = if width == 0 { 1 } else { width };
+                let dst = if suppress { core::ptr::null_mut() } else { args.next() as usize as *mut u8 };
+                let mut n = 0usize;
+                while n < need {
+                    let Some(c) = src.next() else { break };
+                    if !dst.is_null() {
+                        unsafe { *dst.add(n) = c };
+                    }
+                    n += 1;
+                }
+                if n < need {
+                    break;
+                }
+                if !suppress {
+                    assigned += 1;
+                }
+            }
+            b'[' => {
+                let invert = fi < fmt.len() && fmt[fi] == b'^';
+                if invert {
+                    fi += 1;
+                }
+                let mut table = [false; 256];
+                let mut first = true;
+                while fi < fmt.len() && (first || fmt[fi] != b']') {
+                    first = false;
+                    let c = fmt[fi];
+                    fi += 1;
+                    if fi + 1 < fmt.len() && fmt[fi] == b'-' && fmt[fi + 1] != b']' {
+                        let end = fmt[fi + 1];
+                        fi += 2;
+                        for b in c..=end {
+                            table[usize::from(b)] = true;
+                        }
+                    } else {
+                        table[usize::from(c)] = true;
+                    }
+                }
+                if fi < fmt.len() && fmt[fi] == b']' {
+                    fi += 1;
+                }
+                let dst = if suppress { core::ptr::null_mut() } else { args.next() as usize as *mut u8 };
+                let mut n = 0usize;
+                while n < max_w {
+                    let Some(c) = src.peek() else { break };
+                    if table[usize::from(c)] == invert {
+                        break;
+                    }
+                    src.next();
+                    if !dst.is_null() {
+                        unsafe { *dst.add(n) = c };
+                    }
+                    n += 1;
+                }
+                if n == 0 {
+                    break;
+                }
+                if !dst.is_null() {
+                    unsafe { *dst.add(n) = 0 };
+                }
+                if !suppress {
+                    assigned += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+    assigned
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtVsscanf(_options: u64, buf: *const u8, count: usize, fmt: *const u8, _loc: usize, args: *const u8) -> i32 {
+    if buf.is_null() || fmt.is_null() {
+        return EOF;
+    }
+    let len = if count == usize::MAX { unsafe { crate::crt::AtlasCrtStrlen(buf) } } else { unsafe { crate::crt::AtlasCrtStrnlen(buf, count) } };
+    let data = unsafe { core::slice::from_raw_parts(buf, len) };
+    let fmt_s = unsafe { core::slice::from_raw_parts(fmt, crate::crt::AtlasCrtStrlen(fmt)) };
+    let mut src = SliceSource { data, pos: 0 };
+    scan_core(&mut src, fmt_s, &mut Args(args))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtVfscanf(_options: u64, f: *mut File, fmt: *const u8, _loc: usize, args: *const u8) -> i32 {
+    let Some(file) = stream(f) else { return EOF };
+    if fmt.is_null() {
+        return EOF;
+    }
+    let fmt_s = unsafe { core::slice::from_raw_parts(fmt, crate::crt::AtlasCrtStrlen(fmt)) };
+    let mut src = FileSource { file, count: 0 };
+    scan_core(&mut src, fmt_s, &mut Args(args))
 }
 
 // ---- user32's wsprintf ----

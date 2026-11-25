@@ -489,8 +489,8 @@ fn choose_pixel_format(_: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
     Reply::Value(u64::from(a[1] != 0))
 }
 
-/// `DescribePixelFormat(dc, format, bytes, &descriptor)`: describes format 1 (32-bit BGRA, no OpenGL), returning the
-/// maximum pixel format index (1), or 0 for an out-of-range format.
+/// `DescribePixelFormat(dc, format, bytes, &descriptor)`: describes format 1 (32-bit BGRA with 24-bit depth and 8-bit
+/// stencil, advertising OpenGL double-buffering when a GPU is available), returning the maximum pixel format index (1).
 fn describe_pixel_format(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let format = a[1] as u32 as i32;
     let n_bytes = a[2] as u32;
@@ -504,8 +504,10 @@ fn describe_pixel_format(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let mut pfd = [0u8; 40];
     pfd[0..2].copy_from_slice(&40u16.to_le_bytes()); // nSize
     pfd[2..4].copy_from_slice(&1u16.to_le_bytes()); // nVersion
-    // PFD_DRAW_TO_WINDOW (0x04) | PFD_SUPPORT_GDI (0x10)
-    pfd[4..8].copy_from_slice(&0x0000_0014u32.to_le_bytes());
+    // PFD_DRAW_TO_WINDOW (0x04) | PFD_SUPPORT_OPENGL (0x20) | PFD_DOUBLEBUFFER (0x01) when GPU is present,
+    // else PFD_DRAW_TO_WINDOW (0x04) | PFD_SUPPORT_GDI (0x10).
+    let flags: u32 = if task.k.options.gpu.is_some() { 0x0000_0025 } else { 0x0000_0014 };
+    pfd[4..8].copy_from_slice(&flags.to_le_bytes());
     pfd[8] = 0; // PFD_TYPE_RGBA
     pfd[9] = 32; // cColorBits
     pfd[10] = 8; // cRedBits
@@ -524,14 +526,14 @@ fn describe_pixel_format(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     Reply::Value(1)
 }
 
-/// `SetPixelFormat(dc, format, &descriptor)`: format 1 is taken; there's no OpenGL to draw with it yet.
+/// `SetPixelFormat(dc, format, &descriptor)`: format 1 is taken.
 fn set_pixel_format(_: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
     Reply::Value(u64::from(a[1] as u32 == 1))
 }
 
-/// `SwapBuffers(dc)`: nothing drawn behind to show.
-fn swap_buffers(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
-    Reply::Value(1)
+/// `SwapBuffers(dc)`: presents the OpenGL back buffer to the window if active.
+fn swap_buffers(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    super::opengl32::swap_buffers(task, cx, a[0])
 }
 
 /// `GetCurrentObject(dc, type)`: the pen (OBJ_PEN, 1), brush (2), font (6) or bitmap (7) the DC has selected.

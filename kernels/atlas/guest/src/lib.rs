@@ -13,6 +13,7 @@ mod services;
 mod arch;
 mod com;
 mod crt;
+mod crt_ext;
 mod env;
 mod exception;
 mod fiber;

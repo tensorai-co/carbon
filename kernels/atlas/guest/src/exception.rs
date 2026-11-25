@@ -463,6 +463,13 @@ pub extern "system" fn RtlUnwindEx(target_frame: usize, target_ip: usize, record
 
 #[cfg(not(target_arch = "x86"))]
 #[unsafe(no_mangle)]
+pub extern "system" fn RtlRestoreContext(context: *const Context, _record: *mut Record) -> ! {
+    // SAFETY: caller's context record.
+    sys::continue_with(unsafe { &*context })
+}
+
+#[cfg(not(target_arch = "x86"))]
+#[unsafe(no_mangle)]
 pub extern "system" fn RtlUnwind(target_frame: usize, target_ip: usize, record: *mut Record, return_value: usize) -> ! {
     let (target_frame, target_ip, return_value) = (target_frame as u64, target_ip as u64, return_value as u64);
     RtlUnwindEx(target_frame as usize, target_ip as usize, record, return_value as usize, core::ptr::null_mut(), 0)

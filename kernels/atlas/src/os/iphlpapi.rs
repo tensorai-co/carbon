@@ -27,6 +27,11 @@ dll! {
     missing IpReleaseAddress;
     missing IpRenewAddress;
     host NotifyRouteChange(2) => notify_change;
+    host if_nametoindex(1) => if_nametoindex;
+}
+
+fn if_nametoindex(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(0)
 }
 
 /// ERROR_IO_PENDING, and ERROR_NOT_SUPPORTED.

@@ -2,6 +2,7 @@
 //! each DLL's image from its declaration (`images`), and nothing is ever a file of its own.
 
 pub mod advapi32;
+pub mod avrt;
 pub mod bthprops;
 pub mod bcrypt;
 pub mod bcryptprimitives;
@@ -85,6 +86,7 @@ pub mod winspool;
 pub mod wintrust;
 pub mod winusb;
 pub mod winuser;
+pub mod wldap32;
 pub mod ws2_32;
 pub mod wsock32;
 pub mod wtsapi32;
@@ -189,7 +191,7 @@ pub(crate) use dll;
 /// Every system DLL atlas has.
 pub static DLLS: &[&Dll] = &[&kernel32::DLL, &user32::DLL, &advapi32::DLL, &gdi32::DLL, &shell32::DLL, &version::DLL, &ucrtbase::DLL, &comctl32::DLL, &ole32::DLL, &psapi::DLL, &oleaut32::DLL, &bcrypt::DLL, &crypt32::DLL, &ws2_32::DLL, &wsock32::DLL,
     &cfgmgr32::DLL, &comdlg32::DLL, &dwmapi::DLL, &dwrite::DLL, &dxgi::DLL, &dxva2::DLL, &hid::DLL, &imagehlp::DLL, &imm32::DLL, &iphlpapi::DLL, &msdmo::DLL, &msimg32::DLL, &mswsock::DLL, &ncrypt::DLL, &opengl32::DLL, &pdh::DLL, &powrprof::DLL, &rpcrt4::DLL, &secur32::DLL, &setupapi::DLL, &shlwapi::DLL, &usp10::DLL, &winhttp::DLL, &wininet::DLL, &winmm::DLL, &wtsapi32::DLL, &shcore::DLL,
-    &bcryptprimitives::DLL, &credui::DLL, &cryptui::DLL, &d3d11::DLL, &d3d12::DLL, &d3d9::DLL, &dbghelp::DLL, &dhcpcsvc::DLL, &esent::DLL, &fontsub::DLL, &mf::DLL, &mfplat::DLL, &mfreadwrite::DLL, &ndfapi::DLL, &netapi32::DLL, &oleacc::DLL, &propsys::DLL, &uiautomationcore::DLL, &urlmon::DLL, &userenv::DLL, &uxtheme::DLL, &wevtapi::DLL, &wintrust::DLL, &winusb::DLL, &combase::DLL, &winspool::DLL, &bthprops::DLL];
+    &bcryptprimitives::DLL, &credui::DLL, &cryptui::DLL, &d3d11::DLL, &d3d12::DLL, &d3d9::DLL, &dbghelp::DLL, &dhcpcsvc::DLL, &esent::DLL, &fontsub::DLL, &mf::DLL, &mfplat::DLL, &mfreadwrite::DLL, &ndfapi::DLL, &netapi32::DLL, &oleacc::DLL, &propsys::DLL, &uiautomationcore::DLL, &urlmon::DLL, &userenv::DLL, &uxtheme::DLL, &wevtapi::DLL, &wintrust::DLL, &winusb::DLL, &combase::DLL, &winspool::DLL, &bthprops::DLL, &avrt::DLL, &wldap32::DLL];
 
 /// The DLL called `name` (`kernel32`, `KERNEL32.DLL`, …), by its index in [`DLLS`].
 pub fn find(name: &str) -> Option<usize> {

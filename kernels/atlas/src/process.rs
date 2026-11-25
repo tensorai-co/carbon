@@ -93,6 +93,8 @@ pub(crate) struct ProcState {
     pub error_mode: u32,
     /// The COM objects of atlas's it has, by their blocks' addresses (`os/com.rs`).
     pub com: BTreeMap<u64, crate::os::com::Com>,
+    /// OpenGL driver state for this process (`os/opengl32.rs`).
+    pub gl: Option<Arc<crate::os::opengl32::GlState>>,
 }
 
 /// What the program was promised in a region.
@@ -1143,7 +1145,7 @@ pub(crate) fn launch(k: &Arc<Kernel>, cx: &mut Cx<'_>, launch: Launch) -> Result
     let mut threads = BTreeMap::new();
     threads.insert(tid, control.clone());
     let cwd = cwd.unwrap_or_else(|| format!("C:\\{}", exe_dir.trim_start_matches('/').replace('/', "\\")));
-    let state = ProcState { console, space, dispatcher, thread_start, peb, threads, mapped, exe_dir, dll_directory: None, dll_search: 0, cwd, regions, handles, std_handles, command_line: command, exiting: None, windows10, parent, created: crate::files::filetime(k.host.wall()), image: windows_path.clone(), token, error_mode: 0, com: BTreeMap::new() };
+    let state = ProcState { console, space, dispatcher, thread_start, peb, threads, mapped, exe_dir, dll_directory: None, dll_search: 0, cwd, regions, handles, std_handles, command_line: command, exiting: None, windows10, parent, created: crate::files::filetime(k.host.wall()), image: windows_path.clone(), token, error_mode: 0, com: BTreeMap::new(), gl: None };
     let object = Object::new(objects_mod::Kind::Process(pid), State::default());
     let process = Arc::new(Process { pid, isa, state: Mutex::new(state), remote: Mutex::new(false), object, ended: (Mutex::new(None), Condvar::new()), net: Mutex::default() });
     k.started(&process);

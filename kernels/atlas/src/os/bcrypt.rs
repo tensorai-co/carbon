@@ -11,6 +11,16 @@ dll! {
     // Not written yet: what larger programs import.
     host BCryptCloseAlgorithmProvider(2) => b_crypt_close_algorithm_provider;
     host BCryptOpenAlgorithmProvider(4) => b_crypt_open_algorithm_provider;
+    missing BCryptCreateHash;
+    missing BCryptDestroyHash;
+    missing BCryptDestroyKey;
+    missing BCryptDuplicateHash;
+    missing BCryptEncrypt;
+    missing BCryptFinishHash;
+    missing BCryptGenerateSymmetricKey;
+    missing BCryptGetProperty;
+    missing BCryptHashData;
+    missing BCryptSetProperty;
 }
 
 const STATUS_INVALID_HANDLE: u64 = 0xc000_0008;
