@@ -308,7 +308,7 @@ impl Task {
     }
 
     fn trace_gfx(&self, what: &str) {
-        if self.k.options.trace {
+        if self.k.options.trace || std::env::var_os("CARBON_TRACE_GFX").is_some() {
             self.k.host.write(host::Stream::Err, format!("atlas: d3d11: {what}\n").as_bytes());
         }
     }
@@ -1278,31 +1278,41 @@ fn format_support(format: u32) -> u32 {
     const VERTEX: u32 = 0x2;
     const INDEX: u32 = 0x4;
     const TEXTURE2D: u32 = 0x20;
+    const TEXTURE3D: u32 = 0x40;
+    const TEXTURECUBE: u32 = 0x80;
+    const SHADER_LOAD: u32 = 0x100;
     const SAMPLE: u32 = 0x200;
+    const SAMPLE_COMPARISON: u32 = 0x400;
     const MIP: u32 = 0x1000;
     const MIP_AUTOGEN: u32 = 0x2000;
     const RENDER_TARGET: u32 = 0x4000;
     const BLENDABLE: u32 = 0x8000;
     const DEPTH_STENCIL: u32 = 0x10000;
     const CPU_LOCKABLE: u32 = 0x20000;
+    const MULTISAMPLE_RESOLVE: u32 = 0x40000;
     const DISPLAY: u32 = 0x80000;
+    const CAST_WITHIN_BIT_LAYOUT: u32 = 0x100000;
+    const MULTISAMPLE_RENDERTARGET: u32 = 0x200000;
+    const MULTISAMPLE_LOAD: u32 = 0x400000;
+    const SHADER_GATHER: u32 = 0x800000;
+    const BACK_BUFFER_CAST: u32 = 0x1000000;
     let mut s = 0;
     if let Ok(f) = d3d::texture_format(format, 0) {
-        s |= TEXTURE2D | MIP | CPU_LOCKABLE;
+        s |= TEXTURE2D | TEXTURECUBE | SHADER_LOAD | MIP | CPU_LOCKABLE | CAST_WITHIN_BIT_LAYOUT;
         if f.is_depth() {
-            s |= DEPTH_STENCIL;
+            s |= DEPTH_STENCIL | SAMPLE | SAMPLE_COMPARISON | MULTISAMPLE_RENDERTARGET;
         } else {
-            s |= SAMPLE;
+            s |= TEXTURE3D | SAMPLE | SHADER_GATHER;
             if f.is_renderable() {
-                s |= RENDER_TARGET | BLENDABLE | MIP_AUTOGEN;
+                s |= RENDER_TARGET | BLENDABLE | MIP_AUTOGEN | MULTISAMPLE_RENDERTARGET | MULTISAMPLE_RESOLVE | MULTISAMPLE_LOAD;
             }
         }
     }
     if matches!(format, D24_UNORM_S8_UINT | D16_UNORM | D32_FLOAT) {
-        s |= TEXTURE2D | MIP | DEPTH_STENCIL;
+        s |= TEXTURE2D | TEXTURECUBE | SHADER_LOAD | SAMPLE | SAMPLE_COMPARISON | MIP | DEPTH_STENCIL | CAST_WITHIN_BIT_LAYOUT | MULTISAMPLE_RENDERTARGET;
     }
     if matches!(format, R8G8B8A8_UNORM | B8G8R8A8_UNORM | R8G8B8A8_UNORM_SRGB | B8G8R8A8_UNORM_SRGB | R10G10B10A2_UNORM) {
-        s |= DISPLAY;
+        s |= DISPLAY | BACK_BUFFER_CAST;
     }
     if matches!(format, R32G32B32A32_FLOAT | R32G32B32_FLOAT | R32G32_FLOAT | R32_FLOAT | R32G32B32A32_UINT | R32G32B32_UINT | R32G32_UINT | R32_UINT | R32G32B32A32_SINT | R32G32B32_SINT | R32G32_SINT | R32_SINT | R8G8B8A8_UNORM) {
         s |= BUFFER | VERTEX;

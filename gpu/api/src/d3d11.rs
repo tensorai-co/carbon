@@ -716,9 +716,6 @@ impl Device {
         if desc.sample_count > 1 {
             return unsupported("multisampled textures");
         }
-        if desc.misc & misc::TEXTURECUBE != 0 {
-            return unsupported("cube textures");
-        }
         let format = texture_format(desc.format, desc.bind)?;
         let most = gpu::ImageDesc::most_levels(desc.width, desc.height);
         let levels = if desc.mip_levels == 0 { most } else { desc.mip_levels.min(most) };
@@ -825,7 +822,7 @@ impl Device {
                     if !view_compatible(d.format, t.format) {
                         return unsupported(format!("a DXGI format {} view of a {:?} texture", d.format, t.format));
                     }
-                    if !matches!(d.dimension, 4 | 5) {
+                    if !matches!(d.dimension, 4 | 5 | 9 | 10) {
                         return unsupported(format!("shader resource views of dimension {}", d.dimension));
                     }
                 }

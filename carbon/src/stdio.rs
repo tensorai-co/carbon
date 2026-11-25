@@ -346,6 +346,9 @@ impl Host for MachineHost {
     fn open_font(&self, id: &str) -> Option<Arc<dyn HostFont>> {
         self.std.open_font(id)
     }
+    fn open_font_bytes(&self, bytes: &[u8]) -> Option<Arc<dyn HostFont>> {
+        self.std.open_font_bytes(bytes)
+    }
 }
 
 #[cfg(test)]

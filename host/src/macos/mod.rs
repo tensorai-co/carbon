@@ -5,7 +5,7 @@ mod fonts;
 mod trust;
 
 pub use crate::unix::{disk_space, random, set_raw, terminal_size, thread_cpu};
-pub use fonts::{fonts, open_font};
+pub use fonts::{fonts, open_font, open_font_bytes};
 pub use trust::check as check_certificates;
 
 unsafe extern "C" {

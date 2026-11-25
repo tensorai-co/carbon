@@ -276,6 +276,90 @@ fn checksum(data: &[u8]) -> u32 {
     })
 }
 
+/// How many faces an SFNT file or TrueType Collection (`ttcf`) holds.
+pub fn face_count(data: &[u8]) -> usize {
+    if data.len() < 12 {
+        return 0;
+    }
+    if &data[0..4] == b"ttcf" {
+        return (Be(data).u32(8) as usize).min(256);
+    }
+    match &data[0..4] {
+        [0, 1, 0, 0] | b"OTTO" | b"true" | b"typ1" => 1,
+        _ => 0,
+    }
+}
+
+/// Extracts face `index`'s table directory from an SFNT file or TrueType Collection.
+pub fn tables(data: &[u8], index: usize) -> Option<Vec<([u8; 4], &[u8])>> {
+    if data.len() < 12 {
+        return None;
+    }
+    let header_at = if &data[0..4] == b"ttcf" {
+        let count = Be(data).u32(8) as usize;
+        if index >= count || 12 + 4 * (index + 1) > data.len() {
+            return None;
+        }
+        Be(data).u32(12 + 4 * index) as usize
+    } else if index == 0 {
+        0
+    } else {
+        return None;
+    };
+    let h = Be(data.get(header_at..)?);
+    let n = usize::from(h.u16(4));
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let rec = header_at + 12 + 16 * i;
+        let tag_bytes = data.get(rec..rec + 4)?;
+        let tag = [tag_bytes[0], tag_bytes[1], tag_bytes[2], tag_bytes[3]];
+        let offset = Be(data).u32(rec + 8) as usize;
+        let length = Be(data).u32(rec + 12) as usize;
+        let slice = data.get(offset..offset.checked_add(length)?)?;
+        out.push((tag, slice));
+    }
+    Some(out)
+}
+
+/// Reads a string (by OpenType `nameID`) from a `name` table, preferring Windows Unicode en-US.
+pub fn name(table: &[u8], id: u16) -> Option<String> {
+    let t = Be(table);
+    if table.len() < 6 {
+        return None;
+    }
+    let count = usize::from(t.u16(2));
+    let storage = usize::from(t.u16(4));
+    let mut best: Option<(u8, String)> = None;
+    for i in 0..count {
+        let at = 6 + 12 * i;
+        if at + 12 > table.len() {
+            break;
+        }
+        if t.u16(at + 6) != id {
+            continue;
+        }
+        let (platform, encoding, lang) = (t.u16(at), t.u16(at + 2), t.u16(at + 4));
+        let (len, off) = (usize::from(t.u16(at + 8)), usize::from(t.u16(at + 10)));
+        let Some(raw) = table.get(storage + off..storage + off + len) else { continue };
+        let (rank, decoded) = match (platform, encoding) {
+            (3, 1 | 10) => {
+                let units: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+                (if lang == 0x0409 { 4 } else { 3 }, String::from_utf16_lossy(&units))
+            }
+            (0, _) => {
+                let units: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+                (2, String::from_utf16_lossy(&units))
+            }
+            (1, 0) => (1, raw.iter().map(|&b| char::from(b)).collect()),
+            _ => continue,
+        };
+        if !decoded.is_empty() && best.as_ref().is_none_or(|(r, _)| rank > *r) {
+            best = Some((rank, decoded));
+        }
+    }
+    best.map(|(_, s)| s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

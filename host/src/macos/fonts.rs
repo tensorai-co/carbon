@@ -34,6 +34,7 @@ unsafe extern "C" {
     fn CFNumberGetValue(number: CFTypeRef, kind: CFIndex, value: *mut c_void) -> u8;
     fn CFDataGetLength(data: CFTypeRef) -> CFIndex;
     fn CFDataGetBytePtr(data: CFTypeRef) -> *const u8;
+    fn CFDataCreate(allocator: CFTypeRef, bytes: *const u8, length: CFIndex) -> CFTypeRef;
 }
 
 #[link(name = "CoreText", kind = "framework")]
@@ -50,6 +51,7 @@ unsafe extern "C" {
     fn CTFontCollectionCreateMatchingFontDescriptors(collection: CFTypeRef) -> CFTypeRef;
     fn CTFontDescriptorCopyAttribute(descriptor: CFTypeRef, attribute: CFTypeRef) -> CFTypeRef;
     fn CTFontCreateWithName(name: CFTypeRef, size: f64, matrix: *const c_void) -> CFTypeRef;
+    fn CTFontCreateWithGraphicsFont(graphics_font: CFTypeRef, size: f64, matrix: *const c_void, attributes: CFTypeRef) -> CFTypeRef;
     fn CTFontCreateCopyWithAttributes(font: CFTypeRef, size: f64, matrix: *const c_void, attributes: CFTypeRef) -> CFTypeRef;
     fn CTFontCopyPostScriptName(font: CFTypeRef) -> CFTypeRef;
     fn CTFontGetUnitsPerEm(font: CFTypeRef) -> u32;
@@ -61,6 +63,8 @@ unsafe extern "C" {
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
+    fn CGDataProviderCreateWithCFData(data: CFTypeRef) -> CFTypeRef;
+    fn CGFontCreateWithDataProvider(provider: CFTypeRef) -> CFTypeRef;
     fn CGPathApply(path: CFTypeRef, info: *mut c_void, function: extern "C" fn(*mut c_void, *const CGPathElement));
 }
 
@@ -182,6 +186,23 @@ pub fn open_font(id: &str) -> Option<Arc<dyn HostFont>> {
         }
         let units = f64::from(CTFontGetUnitsPerEm(probe.0).max(16));
         let font = Owned::new(CTFontCreateCopyWithAttributes(probe.0, units, std::ptr::null(), std::ptr::null()))?;
+        Some(Arc::new(Font(font)))
+    }
+}
+
+/// Opens a font face from raw SFNT (OpenType/TrueType) bytes via Core Graphics and Core Text.
+pub fn open_font_bytes(bytes: &[u8]) -> Option<Arc<dyn HostFont>> {
+    if bytes.is_empty() {
+        return None;
+    }
+    // SAFETY: CFData copies `bytes`; each Core Foundation / Graphics / Text handle is owned and released on drop.
+    unsafe {
+        let data = Owned::new(CFDataCreate(std::ptr::null(), bytes.as_ptr(), bytes.len() as CFIndex))?;
+        let provider = Owned::new(CGDataProviderCreateWithCFData(data.0))?;
+        let cg = Owned::new(CGFontCreateWithDataProvider(provider.0))?;
+        let probe = Owned::new(CTFontCreateWithGraphicsFont(cg.0, 12.0, std::ptr::null(), std::ptr::null()))?;
+        let units = f64::from(CTFontGetUnitsPerEm(probe.0).max(16));
+        let font = Owned::new(CTFontCreateWithGraphicsFont(cg.0, units, std::ptr::null(), std::ptr::null()))?;
         Some(Arc::new(Font(font)))
     }
 }

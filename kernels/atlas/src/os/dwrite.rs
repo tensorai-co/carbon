@@ -11,15 +11,20 @@
 //! returns some (`return_f32`); the integer arguments after them are where each ISA's convention puts them.
 
 use std::collections::HashMap;
+use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use display::sfnt;
 use exec::{FpRegs, Isa};
+use host::FontFace;
 use kernels_core::lock;
 use kernels_core::thread::Cx;
 use kernels_core::user;
 
 use super::com::{Guid, Object, com_add_ref, com_query_interface, com_release, guid};
 use super::{Reply, dll};
+use crate::files::{FILE_SHARE_ALL, Node};
 use crate::fonts::{self, Face, Fonts};
 use crate::process::Task;
 
@@ -31,11 +36,11 @@ dll! {
     host AtlasComAddRef(1) => com_add_ref;
     host AtlasComRelease(1) => com_release;
     host AtlasDwFactoryGetSystemFontCollection(3) => factory_get_system_font_collection;
-    missing AtlasDwFactoryCreateCustomFontCollection;
+    host AtlasDwFactoryCreateCustomFontCollection(5) => factory_create_custom_font_collection;
     host AtlasDwFactoryRegisterFontCollectionLoader(2) => accept;
     host AtlasDwFactoryUnregisterFontCollectionLoader(2) => accept;
-    missing AtlasDwFactoryCreateFontFileReference;
-    missing AtlasDwFactoryCreateCustomFontFileReference;
+    host AtlasDwFactoryCreateFontFileReference(4) => factory_create_font_file_reference;
+    host AtlasDwFactoryCreateCustomFontFileReference(5) => factory_create_custom_font_file_reference;
     host AtlasDwFactoryCreateFontFace(7) => factory_create_font_face;
     host AtlasDwFactoryCreateRenderingParams(2) => factory_create_rendering_params;
     host AtlasDwFactoryCreateMonitorRenderingParams(3) => factory_create_monitor_rendering_params;
@@ -49,12 +54,34 @@ dll! {
     missing AtlasDwFactoryCreateGdiCompatibleTextLayout;
     missing AtlasDwFactoryCreateEllipsisTrimmingSign;
     missing AtlasDwFactoryCreateTextAnalyzer;
-    missing AtlasDwFactoryCreateNumberSubstitution;
+    host AtlasDwFactoryCreateNumberSubstitution(5) => factory_create_number_substitution;
     host AtlasDwFactoryCreateGlyphRunAnalysis(9) => factory_create_glyph_run_analysis;
+    missing AtlasDwFactoryGetEudcFontCollection;
+    host AtlasDwFactory1CreateCustomRenderingParams(8) => factory1_create_custom_rendering_params;
+    host AtlasDwFactoryGetSystemFontFallback(2) => factory_get_system_font_fallback;
+    missing AtlasDwFactoryCreateFontFallbackBuilder;
+    host AtlasDwFactoryTranslateColorGlyphRun(9) => factory_translate_color_glyph_run;
+    host AtlasDwFactory2CreateCustomRenderingParams(9) => factory2_create_custom_rendering_params;
+    host AtlasDwFactory2CreateGlyphRunAnalysis(10) => factory2_create_glyph_run_analysis;
+    host AtlasDwFactory3CreateGlyphRunAnalysis(10) => factory2_create_glyph_run_analysis;
+    host AtlasDwFactory3CreateCustomRenderingParams(9) => factory2_create_custom_rendering_params;
+    missing AtlasDwFactoryCreateFontFaceReference;
+    missing AtlasDwFactoryCreateFontFaceReferencePath;
+    missing AtlasDwFactoryGetSystemFontSet;
+    missing AtlasDwFactoryCreateFontSetBuilder;
+    missing AtlasDwFactoryCreateFontCollectionFromFontSet;
+    host AtlasDwFactory3GetSystemFontCollection(4) => factory3_get_system_font_collection;
+    missing AtlasDwFactoryGetFontDownloadQueue;
+    host AtlasDwFallbackMapCharacters(12) => fallback_map_characters;
     host AtlasDwCollectionGetFontFamilyCount(1) => collection_get_font_family_count;
     host AtlasDwCollectionGetFontFamily(3) => collection_get_font_family;
     host AtlasDwCollectionFindFamilyName(4) => collection_find_family_name;
     host AtlasDwCollectionGetFontFromFontFace(3) => collection_get_font_from_font_face;
+    missing AtlasDwCollectionGetFontSet;
+    host AtlasDwCollection1GetFontFamily(3) => collection_get_font_family;
+    host AtlasDwParamsGetGrayscaleEnhancedContrast(1) => params_get_enhanced_contrast;
+    host AtlasDwParamsGetGridFitMode(1) => zero;
+    host AtlasDwParamsGetRenderingMode1(1) => params_get_rendering_mode;
     host AtlasDwListGetFontCollection(2) => list_get_font_collection;
     host AtlasDwListGetFontCount(1) => list_get_font_count;
     host AtlasDwListGetFont(3) => list_get_font;
@@ -89,7 +116,7 @@ dll! {
     host AtlasDwFaceGetGlyphIndices(4) => face_get_glyph_indices;
     host AtlasDwFaceTryGetFontTable(6) => face_try_get_font_table;
     host AtlasDwFaceReleaseFontTable(2) => zero;
-    missing AtlasDwFaceGetGlyphRunOutline;
+    host AtlasDwFaceGetGlyphRunOutline(9) => face_get_glyph_run_outline;
     host AtlasDwFaceGetRecommendedRenderingMode(6) => face_get_recommended_rendering_mode;
     host AtlasDwFaceGetGdiCompatibleMetrics(5) => face_get_gdi_compatible_metrics;
     host AtlasDwFaceGetGdiCompatibleGlyphMetrics(9) => face_get_gdi_compatible_glyph_metrics;
@@ -97,6 +124,9 @@ dll! {
     host AtlasDwFileGetLoader(2) => file_get_loader;
     host AtlasDwFileAnalyze(5) => file_analyze;
     host AtlasDwLoaderCreateStreamFromKey(4) => loader_create_stream_from_key;
+    host AtlasDwLocalLoaderGetFilePathLengthFromKey(4) => local_loader_get_file_path_length_from_key;
+    host AtlasDwLocalLoaderGetFilePathFromKey(5) => local_loader_get_file_path_from_key;
+    host AtlasDwLocalLoaderGetLastWriteTimeFromKey(4) => local_loader_get_last_write_time_from_key;
     host AtlasDwStreamReadFileFragment(5) => stream_read_file_fragment;
     host AtlasDwStreamReleaseFileFragment(2) => zero;
     host AtlasDwStreamGetFileSize(2) => stream_get_file_size;
@@ -180,7 +210,7 @@ dll! {
     missing AtlasDwInteropCreateBitmapRenderTarget;
 }
 
-const FACTORY: [&str; 24] = [
+const FACTORY: [&str; 40] = [
     "AtlasComQueryInterface", "AtlasComAddRef", "AtlasComRelease", "AtlasDwFactoryGetSystemFontCollection",
     "AtlasDwFactoryCreateCustomFontCollection", "AtlasDwFactoryRegisterFontCollectionLoader",
     "AtlasDwFactoryUnregisterFontCollectionLoader", "AtlasDwFactoryCreateFontFileReference",
@@ -191,10 +221,24 @@ const FACTORY: [&str; 24] = [
     "AtlasDwFactoryGetGdiInterop", "AtlasDwFactoryCreateTextLayout", "AtlasDwFactoryCreateGdiCompatibleTextLayout",
     "AtlasDwFactoryCreateEllipsisTrimmingSign", "AtlasDwFactoryCreateTextAnalyzer",
     "AtlasDwFactoryCreateNumberSubstitution", "AtlasDwFactoryCreateGlyphRunAnalysis",
+    // IDWriteFactory1
+    "AtlasDwFactoryGetEudcFontCollection", "AtlasDwFactory1CreateCustomRenderingParams",
+    // IDWriteFactory2
+    "AtlasDwFactoryGetSystemFontFallback", "AtlasDwFactoryCreateFontFallbackBuilder",
+    "AtlasDwFactoryTranslateColorGlyphRun", "AtlasDwFactory2CreateCustomRenderingParams",
+    "AtlasDwFactory2CreateGlyphRunAnalysis",
+    // IDWriteFactory3
+    "AtlasDwFactory3CreateGlyphRunAnalysis", "AtlasDwFactory3CreateCustomRenderingParams",
+    "AtlasDwFactoryCreateFontFaceReference", "AtlasDwFactoryCreateFontFaceReferencePath",
+    "AtlasDwFactoryGetSystemFontSet", "AtlasDwFactoryCreateFontSetBuilder",
+    "AtlasDwFactoryCreateFontCollectionFromFontSet", "AtlasDwFactory3GetSystemFontCollection",
+    "AtlasDwFactoryGetFontDownloadQueue",
 ];
-const COLLECTION: [&str; 7] = [
+const COLLECTION: [&str; 9] = [
     "AtlasComQueryInterface", "AtlasComAddRef", "AtlasComRelease", "AtlasDwCollectionGetFontFamilyCount",
     "AtlasDwCollectionGetFontFamily", "AtlasDwCollectionFindFamilyName", "AtlasDwCollectionGetFontFromFontFace",
+    // IDWriteFontCollection1
+    "AtlasDwCollectionGetFontSet", "AtlasDwCollection1GetFontFamily",
 ];
 const FAMILY: [&str; 9] = [
     "AtlasComQueryInterface", "AtlasComAddRef", "AtlasComRelease", "AtlasDwListGetFontCollection",
@@ -228,17 +272,22 @@ const FILE: [&str; 6] = [
     "AtlasComQueryInterface", "AtlasComAddRef", "AtlasComRelease", "AtlasDwFileGetReferenceKey",
     "AtlasDwFileGetLoader", "AtlasDwFileAnalyze",
 ];
-const LOADER: [&str; 4] = [
+const LOADER: [&str; 7] = [
     "AtlasComQueryInterface", "AtlasComAddRef", "AtlasComRelease", "AtlasDwLoaderCreateStreamFromKey",
+    // IDWriteLocalFontFileLoader
+    "AtlasDwLocalLoaderGetFilePathLengthFromKey", "AtlasDwLocalLoaderGetFilePathFromKey",
+    "AtlasDwLocalLoaderGetLastWriteTimeFromKey",
 ];
 const STREAM: [&str; 7] = [
     "AtlasComQueryInterface", "AtlasComAddRef", "AtlasComRelease", "AtlasDwStreamReadFileFragment",
     "AtlasDwStreamReleaseFileFragment", "AtlasDwStreamGetFileSize", "AtlasDwStreamGetLastWriteTime",
 ];
-const PARAMS: [&str; 8] = [
+const PARAMS: [&str; 11] = [
     "AtlasComQueryInterface", "AtlasComAddRef", "AtlasComRelease", "AtlasDwParamsGetGamma",
     "AtlasDwParamsGetEnhancedContrast", "AtlasDwParamsGetClearTypeLevel", "AtlasDwParamsGetPixelGeometry",
     "AtlasDwParamsGetRenderingMode",
+    // IDWriteRenderingParams1, 2, 3
+    "AtlasDwParamsGetGrayscaleEnhancedContrast", "AtlasDwParamsGetGridFitMode", "AtlasDwParamsGetRenderingMode1",
 ];
 const ANALYSIS: [&str; 6] = [
     "AtlasComQueryInterface", "AtlasComAddRef", "AtlasComRelease", "AtlasDwAnalysisGetAlphaTextureBounds",
@@ -284,19 +333,32 @@ const INTEROP: [&str; 8] = [
     "AtlasDwInteropConvertFontToLOGFONT", "AtlasDwInteropConvertFontFaceToLOGFONT",
     "AtlasDwInteropCreateFontFaceFromHdc", "AtlasDwInteropCreateBitmapRenderTarget",
 ];
+const FALLBACK: [&str; 4] = [
+    "AtlasComQueryInterface", "AtlasComAddRef", "AtlasComRelease", "AtlasDwFallbackMapCharacters",
+];
+const NUMBER_SUBSTITUTION: [&str; 3] = [
+    "AtlasComQueryInterface", "AtlasComAddRef", "AtlasComRelease",
+];
 
 const S_OK: u64 = 0;
+const E_FAIL: u64 = 0x8000_4005;
 const E_INVALIDARG: u64 = 0x8007_0057;
 const E_POINTER: u64 = 0x8000_4003;
 const E_OUTOFMEMORY: u64 = 0x8007_000e;
 const E_NOT_SUFFICIENT_BUFFER: u64 = 0x8007_007a;
 /// DWRITE_E_NOFONT: no font matches.
 const DWRITE_E_NOFONT: u64 = 0x8898_5002;
+/// DWRITE_E_FILENOTFOUND: font file does not exist.
+const DWRITE_E_FILENOTFOUND: u64 = 0x8898_5003;
 /// DWRITE_E_FILEFORMAT: a font file that isn't one of the machine's.
 const DWRITE_E_FILEFORMAT: u64 = 0x8898_5000;
 
 const IID_FACTORY: Guid = guid(0xb859_ee5a, 0xd838, 0x4b5b, [0xa2, 0xe8, 0x1a, 0xdc, 0x7d, 0x93, 0xdb, 0x48]);
+const IID_FACTORY1: Guid = guid(0x3057_2f99, 0xdac6, 0x41db, [0xa1, 0x6e, 0x04, 0x86, 0x30, 0x7e, 0x60, 0x6a]);
+const IID_FACTORY2: Guid = guid(0x0439_fc60, 0xca44, 0x4994, [0x8d, 0xee, 0x3a, 0x9a, 0xf7, 0xb7, 0x32, 0xec]);
+const IID_FACTORY3: Guid = guid(0x9a1b_41c3, 0xd3bb, 0x466a, [0x87, 0xfc, 0xfe, 0x67, 0x55, 0x6a, 0x3b, 0x65]);
 const IID_COLLECTION: Guid = guid(0xa84c_ee02, 0x3eea, 0x4eee, [0xa8, 0x27, 0x87, 0xc1, 0xa0, 0x2a, 0x0f, 0xcc]);
+const IID_COLLECTION1: Guid = guid(0x5358_5141, 0xd9f8, 0x4095, [0x83, 0x21, 0xd7, 0x3c, 0xf6, 0xbd, 0x11, 0x6b]);
 const IID_FAMILY: Guid = guid(0xda20_d8ef, 0x812a, 0x4c43, [0x98, 0x02, 0x62, 0xec, 0x4a, 0xbd, 0x7a, 0xdd]);
 const IID_LIST: Guid = guid(0x1a0d_8438, 0x1d97, 0x4ec1, [0xae, 0xf9, 0xa2, 0xfb, 0x86, 0xed, 0x6a, 0xcb]);
 const IID_FONT: Guid = guid(0xacd1_6696, 0x8c14, 0x4f5d, [0x87, 0x7e, 0xfe, 0x3f, 0xc1, 0xd3, 0x27, 0x37]);
@@ -304,30 +366,104 @@ const IID_FACE: Guid = guid(0x5f49_804d, 0x7024, 0x4d43, [0xbf, 0xa9, 0xd2, 0x59
 const IID_STRINGS: Guid = guid(0x0825_6209, 0x099a, 0x4b34, [0xb8, 0x6d, 0xc2, 0x2b, 0x11, 0x0e, 0x77, 0x71]);
 const IID_FILE: Guid = guid(0x739d_886a, 0xcef5, 0x47dc, [0x87, 0x69, 0x1a, 0x8b, 0x41, 0xbe, 0xbb, 0xb0]);
 const IID_LOADER: Guid = guid(0x727c_ad4e, 0xd6af, 0x4c9e, [0x8a, 0x08, 0xd6, 0x95, 0xb1, 0x1c, 0xaa, 0x49]);
+const IID_LOCAL_LOADER: Guid = guid(0xb2d9_f3ec, 0xc9fe, 0x4a11, [0xa2, 0xec, 0xd8, 0x62, 0x08, 0xf7, 0xc0, 0xa2]);
 const IID_STREAM: Guid = guid(0x6d48_65fe, 0x0ab8, 0x4d91, [0x8f, 0x62, 0x5d, 0xd6, 0xbe, 0x34, 0xa3, 0xe0]);
 const IID_PARAMS: Guid = guid(0x2f0d_a53a, 0x2add, 0x47cd, [0x82, 0xee, 0xd9, 0xec, 0x34, 0x68, 0x8e, 0x75]);
+const IID_PARAMS1: Guid = guid(0x9441_3cf4, 0xa6fc, 0x4248, [0x8b, 0x50, 0x66, 0x74, 0x34, 0x8f, 0xca, 0xd3]);
+const IID_PARAMS2: Guid = guid(0xf9d7_11c3, 0x9777, 0x40ae, [0x87, 0xe8, 0x3e, 0x5a, 0xf9, 0xbf, 0x09, 0x48]);
+const IID_PARAMS3: Guid = guid(0xb792_4baa, 0x391b, 0x412a, [0x8c, 0x5c, 0xe4, 0x4c, 0xc2, 0xd8, 0x67, 0xdc]);
 const IID_ANALYSIS: Guid = guid(0x7d97_dbf7, 0xe085, 0x42d4, [0x81, 0xe3, 0x6a, 0x88, 0x3b, 0xde, 0xd1, 0x18]);
 const IID_FORMAT: Guid = guid(0x9c90_6818, 0x31d7, 0x4fd3, [0xa1, 0x51, 0x7c, 0x5e, 0x22, 0x5d, 0xb5, 0x5a]);
 const IID_LAYOUT: Guid = guid(0x5373_7037, 0x6d14, 0x410b, [0x9b, 0xfe, 0x0b, 0x18, 0x2b, 0xb7, 0x09, 0x61]);
 const IID_INTEROP: Guid = guid(0x1edd_9491, 0x9853, 0x4299, [0x89, 0x8f, 0x64, 0x32, 0x98, 0x3b, 0x6f, 0x3a]);
+const IID_FALLBACK: Guid = guid(0xefa0_08f9, 0xf7a1, 0x48bf, [0xb0, 0x5c, 0xf2, 0x24, 0x71, 0x3c, 0xc0, 0xff]);
+const IID_NUMBER_SUBSTITUTION: Guid = guid(0x1488_5cc9, 0xbab0, 0x4f90, [0xb6, 0xed, 0x5c, 0x36, 0x6a, 0x2c, 0xd0, 0x3d]);
+/// DWRITE_E_NOCOLOR: glyph run has no color layers; caller should render normally.
+const DWRITE_E_NOCOLOR: u64 = 0x8898_500c;
 
-/// A DirectWrite object of atlas's: what it is, by the machine's font list's numbers.
+static NEXT_CUSTOM_ID: AtomicUsize = AtomicUsize::new(1 << 30);
+
+/// One face loaded from a custom font file or loader (not in the host's system list).
+pub struct CustomFace {
+    pub id: usize,
+    pub info: FontFace,
+    pub face: Arc<Face>,
+    pub bytes: Arc<Vec<u8>>,
+    pub loader: u64,
+    pub key: Vec<u8>,
+}
+
+impl fmt::Debug for CustomFace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CustomFace").field("id", &self.id).field("family", &self.info.family).field("style", &self.info.style).finish()
+    }
+}
+
+/// Either a face in the machine's system font list or a custom loaded face.
+#[derive(Debug, Clone)]
+pub enum FontSource {
+    System(usize),
+    Custom(Arc<CustomFace>),
+}
+
+/// One family in a custom font collection.
+#[derive(Debug, Clone)]
+pub struct CustomFamily {
+    pub name: String,
+    pub faces: Vec<FontSource>,
+}
+
+/// Either a family in the system collection or one in a custom collection.
+#[derive(Debug, Clone)]
+pub enum FamilyRef {
+    System(usize),
+    Custom(Arc<Vec<CustomFamily>>, usize),
+}
+
+/// Backing store of an `IDWriteFontFile`.
+#[derive(Debug, Clone)]
+pub enum FileSource {
+    System(usize),
+    Custom { id: usize, loader: u64, key: Vec<u8>, bytes: Arc<Vec<u8>>, faces: Vec<Arc<CustomFace>> },
+}
+
+/// Backing store of an `IDWriteFontFileStream`.
+#[derive(Debug, Clone)]
+pub enum StreamSource {
+    System(usize),
+    Custom(usize, Arc<Vec<u8>>),
+}
+
+/// Alpha texture format produced by a glyph run analysis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlphaTexture {
+    /// `DWRITE_RENDERING_MODE_ALIASED`: 1x1 bi-level (0 or 255).
+    Aliased,
+    /// `DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE`: 1x1 8-bit antialiased alpha.
+    Grayscale,
+    /// `DWRITE_TEXT_ANTIALIAS_MODE_CLEARTYPE`: 3x1 8-bit RGB alpha.
+    ClearType,
+}
+
+/// A DirectWrite object of atlas's: what it is, by the machine's font list's numbers or custom font data.
 #[derive(Debug, Clone)]
 pub enum Dw {
     Factory,
-    /// The system font collection.
-    Collection,
-    Family(usize),
-    List(Vec<usize>),
-    Font(usize),
+    /// The system font collection (`None`) or a custom font collection (`Some`).
+    Collection(Option<Arc<Vec<CustomFamily>>>),
+    Family(FamilyRef),
+    List(Option<Arc<Vec<CustomFamily>>>, Vec<FontSource>),
+    Font(FontSource),
     Strings(Vec<(String, String)>),
-    Face(usize),
-    File(usize),
+    Face(FontSource),
+    File(FileSource),
     Loader,
-    Stream(usize),
+    Stream(StreamSource),
     Params { gamma: f32, contrast: f32, clear_type: f32, geometry: u32, mode: u32 },
-    Analysis { left: i32, top: i32, width: usize, height: usize, alpha: Arc<Vec<u8>>, aliased: bool },
+    Analysis { left: i32, top: i32, width: usize, height: usize, alpha: Arc<Vec<u8>>, texture: AlphaTexture },
     Interop,
+    Fallback,
+    NumberSubstitution,
     Format(Box<Format>),
     Layout(Box<Layout>),
 }
@@ -382,19 +518,21 @@ struct Line {
 /// Whether an object answers for an interface (IUnknown aside).
 pub fn answers(dw: &Dw, iid: &Guid) -> bool {
     match dw {
-        Dw::Factory => *iid == IID_FACTORY,
-        Dw::Collection => *iid == IID_COLLECTION,
+        Dw::Factory => *iid == IID_FACTORY || *iid == IID_FACTORY1 || *iid == IID_FACTORY2 || *iid == IID_FACTORY3,
+        Dw::Collection(_) => *iid == IID_COLLECTION || *iid == IID_COLLECTION1,
         Dw::Family(_) => *iid == IID_FAMILY || *iid == IID_LIST,
-        Dw::List(_) => *iid == IID_LIST,
+        Dw::List(_, _) => *iid == IID_LIST,
         Dw::Font(_) => *iid == IID_FONT,
         Dw::Strings(_) => *iid == IID_STRINGS,
         Dw::Face(_) => *iid == IID_FACE,
         Dw::File(_) => *iid == IID_FILE,
-        Dw::Loader => *iid == IID_LOADER,
+        Dw::Loader => *iid == IID_LOADER || *iid == IID_LOCAL_LOADER,
         Dw::Stream(_) => *iid == IID_STREAM,
-        Dw::Params { .. } => *iid == IID_PARAMS,
+        Dw::Params { .. } => *iid == IID_PARAMS || *iid == IID_PARAMS1 || *iid == IID_PARAMS2 || *iid == IID_PARAMS3,
         Dw::Analysis { .. } => *iid == IID_ANALYSIS,
         Dw::Interop => *iid == IID_INTEROP,
+        Dw::Fallback => *iid == IID_FALLBACK,
+        Dw::NumberSubstitution => *iid == IID_NUMBER_SUBSTITUTION,
         Dw::Format(_) => *iid == IID_FORMAT,
         Dw::Layout(_) => *iid == IID_LAYOUT || *iid == IID_FORMAT,
     }
@@ -403,9 +541,9 @@ pub fn answers(dw: &Dw, iid: &Guid) -> bool {
 fn table_of(dw: &Dw) -> &'static [&'static str] {
     match dw {
         Dw::Factory => &FACTORY,
-        Dw::Collection => &COLLECTION,
+        Dw::Collection(_) => &COLLECTION,
         Dw::Family(_) => &FAMILY,
-        Dw::List(_) => &LIST,
+        Dw::List(_, _) => &LIST,
         Dw::Font(_) => &FONT,
         Dw::Strings(_) => &STRINGS,
         Dw::Face(_) => &FACE,
@@ -415,6 +553,8 @@ fn table_of(dw: &Dw) -> &'static [&'static str] {
         Dw::Params { .. } => &PARAMS,
         Dw::Analysis { .. } => &ANALYSIS,
         Dw::Interop => &INTEROP,
+        Dw::Fallback => &FALLBACK,
+        Dw::NumberSubstitution => &NUMBER_SUBSTITUTION,
         Dw::Format(_) => &FORMAT,
         Dw::Layout(_) => &LAYOUT,
     }
@@ -438,6 +578,44 @@ impl Task {
 
     fn face(&self, index: usize) -> Option<Arc<Face>> {
         self.fonts().open(&self.k.host, index)
+    }
+
+    fn source_face(&self, src: &FontSource) -> Option<Arc<Face>> {
+        match src {
+            FontSource::System(i) => self.face(*i),
+            FontSource::Custom(cf) => Some(cf.face.clone()),
+        }
+    }
+
+    fn source_info(&self, src: &FontSource) -> FontFace {
+        match src {
+            FontSource::System(i) => self.fonts().faces[*i].clone(),
+            FontSource::Custom(cf) => cf.info.clone(),
+        }
+    }
+
+    fn source_id(&self, src: &FontSource) -> usize {
+        match src {
+            FontSource::System(i) => *i,
+            FontSource::Custom(cf) => cf.id,
+        }
+    }
+
+    /// Invokes COM vtable method `slot` on guest interface pointer `obj` with extra arguments `rest`.
+    fn com_call(&mut self, cx: &mut Cx<'_>, obj: u64, slot: u64, rest: &[u64]) -> Result<u64, Reply> {
+        let w = self.abi().width;
+        let vtable = self.get_ptr_at(cx, obj);
+        if vtable == 0 {
+            return Ok(E_FAIL);
+        }
+        let target = self.get_ptr_at(cx, vtable + slot * w);
+        if target == 0 {
+            return Ok(E_FAIL);
+        }
+        let mut args = Vec::with_capacity(1 + rest.len());
+        args.push(obj);
+        args.extend_from_slice(rest);
+        self.upcall(cx, target, &args)
     }
 
     /// A new object, written to `out`: S_OK, or E_OUTOFMEMORY.
@@ -549,7 +727,14 @@ fn zero(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
 /// `DWriteCreateFactory(type, &iid, &factory)`: shared or isolated, the same.
 fn d_write_create_factory(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let iid = task.read_guid(cx, a[1]);
-    if iid.is_none_or(|i| i != IID_FACTORY && i != [0; 16] && i != super::com::guid(0, 0, 0, [0xc0, 0, 0, 0, 0, 0, 0, 0x46])) {
+    if iid.is_none_or(|i| {
+        i != IID_FACTORY
+            && i != IID_FACTORY1
+            && i != IID_FACTORY2
+            && i != IID_FACTORY3
+            && i != [0; 16]
+            && i != super::com::guid(0, 0, 0, [0xc0, 0, 0, 0, 0, 0, 0, 0x46])
+    }) {
         if a[2] != 0 {
             let _ = task.write_ptr(cx, a[2], 0);
         }
@@ -560,15 +745,288 @@ fn d_write_create_factory(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply 
 
 // ---- The factory ----
 
-fn factory_get_system_font_collection(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    task.give(cx, a[1], Dw::Collection)
+fn hr_failed(hr: u64) -> bool {
+    (hr as u32) & 0x8000_0000 != 0
 }
 
-/// `CreateFontFace(type, count, &files, index, simulations, &face)`: from one of the machine's font files.
+fn parse_custom_faces(task: &Task, bytes: Arc<Vec<u8>>, loader: u64, key: &[u8]) -> Vec<Arc<CustomFace>> {
+    let count = sfnt::face_count(&bytes);
+    let mut faces = Vec::with_capacity(count);
+    for i in 0..count {
+        if let Some((info, face)) = Face::from_bytes(&task.k.host, &bytes, i) {
+            let id = NEXT_CUSTOM_ID.fetch_add(1, Ordering::Relaxed);
+            faces.push(Arc::new(CustomFace { id, info, face, bytes: bytes.clone(), loader, key: key.to_vec() }));
+        }
+    }
+    faces
+}
+
+/// Reads an entire font file from a guest `IDWriteFontFileLoader` + reference key via COM upcalls.
+fn read_loader_stream(task: &mut Task, cx: &mut Cx<'_>, loader: u64, key_ptr: u64, key_size: u64) -> Result<Option<Vec<u8>>, Reply> {
+    let stream = task.with_scratch(cx, 16, |_| vec![0u8; 16], |task, cx, out| {
+        let hr = task.com_call(cx, loader, 3, &[key_ptr, key_size, out])?;
+        if hr_failed(hr) {
+            return Ok(0);
+        }
+        Ok(task.get_ptr_at(cx, out))
+    })?;
+    if stream == 0 {
+        return Ok(None);
+    }
+    let size = task.with_scratch(cx, 16, |_| vec![0u8; 16], |task, cx, out| {
+        let hr = task.com_call(cx, stream, 5, &[out])?;
+        if hr_failed(hr) {
+            return Ok(0u64);
+        }
+        let b = task.mem(cx, false, |t| user::read_vec(&t.space(), out, 8)).unwrap_or_default();
+        Ok(if b.len() == 8 { u64::from_le_bytes(b.try_into().unwrap_or_default()) } else { 0 })
+    })?;
+    let bytes = if size > 0 && size <= 64 * 1024 * 1024 {
+        let w = task.abi().width;
+        task.with_scratch(cx, 16, |_| vec![0u8; 16], |task, cx, out| {
+            let ctx_out = out + 8;
+            let hr = if w == 4 {
+                task.com_call(cx, stream, 3, &[out, 0, 0, size & 0xffff_ffff, size >> 32, ctx_out])?
+            } else {
+                task.com_call(cx, stream, 3, &[out, 0, size, ctx_out])?
+            };
+            if hr_failed(hr) {
+                return Ok(None);
+            }
+            let frag = task.get_ptr_at(cx, out);
+            let ctx = task.get_ptr_at(cx, ctx_out);
+            let data = if frag != 0 { task.mem(cx, false, |t| user::read_vec(&t.space(), frag, size as usize)).ok() } else { None };
+            let _ = task.com_call(cx, stream, 4, &[ctx])?;
+            Ok(data)
+        })?
+    } else {
+        None
+    };
+    let _ = task.com_call(cx, stream, 2, &[])?;
+    Ok(bytes)
+}
+
+fn factory_get_system_font_collection(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    task.give(cx, a[1], Dw::Collection(None))
+}
+
+/// `IDWriteFactory::CreateCustomFontCollection(loader, key, key_size, &collection)`.
+fn factory_create_custom_font_collection(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (factory, loader, key, key_size, out) = (a[0], a[1], a[2], a[3] as u32 as u64, a[4]);
+    if out == 0 {
+        return Reply::Value(E_POINTER);
+    }
+    let _ = task.write_ptr(cx, out, 0);
+    if loader == 0 {
+        return Reply::Value(E_INVALIDARG);
+    }
+    let enumerator = match task.with_scratch(cx, 16, |_| vec![0u8; 16], |task, cx, scratch| {
+        let hr = task.com_call(cx, loader, 3, &[factory, key, key_size, scratch])?;
+        if hr_failed(hr) {
+            return Ok(Err(hr));
+        }
+        Ok(Ok(task.get_ptr_at(cx, scratch)))
+    }) {
+        Ok(Ok(e)) if e != 0 => e,
+        Ok(Err(hr)) => return Reply::Value(hr),
+        Ok(Ok(_)) => return Reply::Value(E_FAIL),
+        Err(reply) => return reply,
+    };
+
+    let mut collected: Vec<FontSource> = Vec::new();
+    let mut err_hr: Option<u64> = None;
+    for _ in 0..4096 {
+        let step = task.with_scratch(cx, 16, |_| vec![0u8; 16], |task, cx, scratch| {
+            let hr = task.com_call(cx, enumerator, 3, &[scratch])?;
+            if hr_failed(hr) {
+                return Ok(Err(hr));
+            }
+            let b = task.mem(cx, false, |t| user::read_vec(&t.space(), scratch, 4)).unwrap_or_default();
+            let has = b.len() == 4 && u32::from_le_bytes([b[0], b[1], b[2], b[3]]) != 0;
+            if !has {
+                return Ok(Ok(None));
+            }
+            let file_out = scratch + 8;
+            let hr = task.com_call(cx, enumerator, 4, &[file_out])?;
+            if hr_failed(hr) {
+                return Ok(Err(hr));
+            }
+            Ok(Ok(Some(task.get_ptr_at(cx, file_out))))
+        });
+        match step {
+            Ok(Ok(None)) => break,
+            Ok(Ok(Some(font_file))) => {
+                if font_file != 0 {
+                    match task.of(font_file) {
+                        Some(Dw::File(FileSource::System(idx))) => collected.push(FontSource::System(idx)),
+                        Some(Dw::File(FileSource::Custom { faces, .. })) => {
+                            for cf in faces {
+                                collected.push(FontSource::Custom(cf));
+                            }
+                        }
+                        _ => {}
+                    }
+                    if let Err(reply) = task.com_call(cx, font_file, 2, &[]) {
+                        return reply;
+                    }
+                }
+            }
+            Ok(Err(hr)) => {
+                err_hr = Some(hr);
+                break;
+            }
+            Err(reply) => return reply,
+        }
+    }
+    if let Err(reply) = task.com_call(cx, enumerator, 2, &[]) {
+        return reply;
+    }
+    if let Some(hr) = err_hr {
+        return Reply::Value(hr);
+    }
+
+    let mut families: Vec<CustomFamily> = Vec::new();
+    for src in collected {
+        let fam_name = task.source_info(&src).family;
+        if let Some(existing) = families.iter_mut().find(|f| f.name.eq_ignore_ascii_case(&fam_name)) {
+            existing.faces.push(src);
+        } else {
+            families.push(CustomFamily { name: fam_name, faces: vec![src] });
+        }
+    }
+    task.give(cx, out, Dw::Collection(Some(Arc::new(families))))
+}
+
+/// `IDWriteFactory::CreateFontFileReference(filePath, lastWriteTime, &fontFile)`.
+fn factory_create_font_file_reference(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let out = a[3];
+    if out == 0 {
+        return Reply::Value(E_POINTER);
+    }
+    let _ = task.write_ptr(cx, out, 0);
+    if a[1] == 0 {
+        return Reply::Value(E_INVALIDARG);
+    }
+    let path = task.text_arg(cx, a[1], true);
+    if let Some(idx) = virtual_font_index(&path)
+        && idx < task.fonts().faces.len()
+    {
+        return task.give(cx, out, Dw::File(FileSource::System(idx)));
+    }
+    let bytes = match task.open_file(&path, 0x8000_0000, FILE_SHARE_ALL, 3, 0) {
+        Ok((file, _)) => match &file.node {
+            Node::File(ino) => match lock(&task.k.disk).contents(*ino) {
+                Ok(c) => c.to_vec(),
+                Err(_) => return Reply::Value(DWRITE_E_FILENOTFOUND),
+            },
+            Node::System(image) => image.to_vec(),
+            _ => return Reply::Value(DWRITE_E_FILENOTFOUND),
+        },
+        Err(_) => return Reply::Value(DWRITE_E_FILENOTFOUND),
+    };
+    let key: Vec<u8> = path.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+    let bytes = Arc::new(bytes);
+    let faces = parse_custom_faces(task, bytes.clone(), 0, &key);
+    let id = NEXT_CUSTOM_ID.fetch_add(1, Ordering::Relaxed);
+    task.give(cx, out, Dw::File(FileSource::Custom { id, loader: 0, key, bytes, faces }))
+}
+
+/// `IDWriteFactory::CreateCustomFontFileReference(key, key_size, loader, &fontFile)`.
+fn factory_create_custom_font_file_reference(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (key_ptr, key_size, loader, out) = (a[1], a[2] as u32 as usize, a[3], a[4]);
+    if out == 0 {
+        return Reply::Value(E_POINTER);
+    }
+    let _ = task.write_ptr(cx, out, 0);
+    if loader == 0 || (key_size > 0 && key_ptr == 0) {
+        return Reply::Value(E_INVALIDARG);
+    }
+    let key = if key_size > 0 {
+        task.mem(cx, false, |t| user::read_vec(&t.space(), key_ptr, key_size.min(65536))).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if matches!(task.of(loader), Some(Dw::Loader)) && key.len() == 4 {
+        let face = u32::from_le_bytes([key[0], key[1], key[2], key[3]]) as usize;
+        if face < task.fonts().faces.len() {
+            return task.give(cx, out, Dw::File(FileSource::System(face)));
+        }
+        return Reply::Value(E_INVALIDARG);
+    }
+    let bytes = match read_loader_stream(task, cx, loader, key_ptr, key_size as u64) {
+        Ok(Some(b)) => Arc::new(b),
+        Ok(None) => Arc::new(Vec::new()),
+        Err(reply) => return reply,
+    };
+    let faces = parse_custom_faces(task, bytes.clone(), loader, &key);
+    let id = NEXT_CUSTOM_ID.fetch_add(1, Ordering::Relaxed);
+    task.give(cx, out, Dw::File(FileSource::Custom { id, loader, key, bytes, faces }))
+}
+
+/// `IDWriteFactory3::GetSystemFontCollection(includeDownloadableFonts, &collection, checkForUpdates)`.
+fn factory3_get_system_font_collection(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    task.give(cx, a[2], Dw::Collection(None))
+}
+
+/// `IDWriteFactory2::GetSystemFontFallback(&fallback)`.
+fn factory_get_system_font_fallback(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    task.give(cx, a[1], Dw::Fallback)
+}
+
+/// `IDWriteFactory::CreateNumberSubstitution(method, locale, ignore_user_override, &sub)`.
+fn factory_create_number_substitution(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    task.give(cx, a[4], Dw::NumberSubstitution)
+}
+
+/// `IDWriteFactory2::TranslateColorGlyphRun(...)`: no color glyph layers.
+fn factory_translate_color_glyph_run(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let out = task.int_arg(a, 8, 6);
+    if out != 0 {
+        let _ = task.write_ptr(cx, out, 0);
+    }
+    Reply::Value(DWRITE_E_NOCOLOR)
+}
+
+/// `IDWriteFontFallback::MapCharacters(source, pos, len, collection, base_family, weight, style, stretch, &mapped_len, &mapped_font, &scale)`.
+fn fallback_map_characters(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let text_len = a[3] as u32;
+    let family_name = if a[5] != 0 { task.text_arg(cx, a[5], true) } else { String::new() };
+    let (weight, italic, stretch) = (a[6] as u16, wants_italic(a[7]), a[8] as u16);
+    let (mapped_len_out, mapped_font_out, scale_out) = (a[9], a[10], a[11]);
+    let fonts = task.fonts();
+    let face = if !family_name.is_empty() {
+        fonts.find(&family_name).and_then(|f| fonts.matching(f, weight, stretch, italic))
+    } else {
+        None
+    }
+    .or_else(|| fonts.families.first().and_then(|_| fonts.matching(0, weight, stretch, italic)))
+    .or_else(|| (!fonts.faces.is_empty()).then_some(0));
+    task.dw_put_u32(cx, mapped_len_out, text_len);
+    task.dw_put_u32(cx, scale_out, 1.0f32.to_bits());
+    match face {
+        Some(i) => task.give(cx, mapped_font_out, Dw::Font(FontSource::System(i))),
+        None => {
+            if mapped_font_out != 0 {
+                let _ = task.write_ptr(cx, mapped_font_out, 0);
+            }
+            Reply::Value(S_OK)
+        }
+    }
+}
+
+/// `CreateFontFace(type, count, &files, index, simulations, &face)`: from a system or custom font file.
 fn factory_create_font_face(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let first = if a[1] >= 1 && a[2] != 0 { task.get_ptr_at(cx, a[2]) } else { 0 };
+    let first = if a[2] >= 1 && a[3] != 0 { task.get_ptr_at(cx, a[3]) } else { 0 };
+    let face_index = a[4] as u32 as usize;
     match task.of(first) {
-        Some(Dw::File(face)) => task.give(cx, a[6], Dw::Face(face)),
+        Some(Dw::File(FileSource::System(face))) => task.give(cx, a[6], Dw::Face(FontSource::System(face))),
+        Some(Dw::File(FileSource::Custom { faces, .. })) => match faces.get(face_index).or_else(|| faces.first()) {
+            Some(cf) => task.give(cx, a[6], Dw::Face(FontSource::Custom(cf.clone()))),
+            None => {
+                let _ = task.write_ptr(cx, a[6], 0);
+                Reply::Value(DWRITE_E_FILEFORMAT)
+            }
+        },
         _ => {
             let _ = task.write_ptr(cx, a[6], 0);
             Reply::Value(DWRITE_E_FILEFORMAT)
@@ -596,6 +1054,20 @@ fn factory_create_custom_rendering_params(task: &mut Task, cx: &mut Cx<'_>, a: &
     task.give(cx, out, Dw::Params { gamma, contrast, clear_type, geometry, mode })
 }
 
+/// `IDWriteFactory1::CreateCustomRenderingParams(gamma, contrast, grayscale_contrast, clear_type, geometry, mode, &params)`.
+fn factory1_create_custom_rendering_params(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (gamma, contrast, clear_type) = (task.f32_arg(cx, a, 1, 0), task.f32_arg(cx, a, 2, 1), task.f32_arg(cx, a, 4, 3));
+    let (geometry, mode, out) = (task.int_arg(a, 5, 1) as u32, task.int_arg(a, 6, 2) as u32, task.int_arg(a, 7, 3));
+    task.give(cx, out, Dw::Params { gamma, contrast, clear_type, geometry, mode })
+}
+
+/// `IDWriteFactory2/3::CreateCustomRenderingParams(gamma, contrast, grayscale_contrast, clear_type, geometry, mode, grid_fit, &params)`.
+fn factory2_create_custom_rendering_params(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (gamma, contrast, clear_type) = (task.f32_arg(cx, a, 1, 0), task.f32_arg(cx, a, 2, 1), task.f32_arg(cx, a, 4, 3));
+    let (geometry, mode, out) = (task.int_arg(a, 5, 1) as u32, task.int_arg(a, 6, 2) as u32, task.int_arg(a, 8, 4));
+    task.give(cx, out, Dw::Params { gamma, contrast, clear_type, geometry, mode })
+}
+
 fn factory_get_gdi_interop(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     task.give(cx, a[1], Dw::Interop)
 }
@@ -615,16 +1087,42 @@ fn factory_create_glyph_run_analysis(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]
         let _ = task.write_ptr(cx, out, 0);
         return Reply::Value(E_INVALIDARG);
     }
+    let texture = if mode == MODE_ALIASED { AlphaTexture::Aliased } else { AlphaTexture::ClearType };
+    create_glyph_run_analysis(task, cx, a[1], ppd, transform_at, texture, x, y, out)
+}
+
+/// `IDWriteFactory2/3::CreateGlyphRunAnalysis(&run, &transform, mode, measuring, grid_fit, antialias, x, y, &analysis)`.
+fn factory2_create_glyph_run_analysis(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (run_at, transform_at, mode) = (a[1], a[2], a[3] as u32);
+    let antialias = a[6] as u32;
+    let (x, y) = (task.f32_arg(cx, a, 7, 0), task.f32_arg(cx, a, 8, 1));
+    let out = task.int_arg(a, 9, 7);
+    if mode == MODE_OUTLINE || run_at == 0 {
+        let _ = task.write_ptr(cx, out, 0);
+        return Reply::Value(E_INVALIDARG);
+    }
+    // DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE (1) uses DWRITE_TEXTURE_ALIASED_1x1 with 8-bit grayscale alpha.
+    let texture = if mode == MODE_ALIASED {
+        AlphaTexture::Aliased
+    } else if antialias == 1 {
+        AlphaTexture::Grayscale
+    } else {
+        AlphaTexture::ClearType
+    };
+    create_glyph_run_analysis(task, cx, run_at, 1.0, transform_at, texture, x, y, out)
+}
+
+fn create_glyph_run_analysis(task: &mut Task, cx: &mut Cx<'_>, run_at: u64, ppd: f32, transform_at: u64, texture: AlphaTexture, x: f32, y: f32, out: u64) -> Reply {
     // DWRITE_GLYPH_RUN: the face, the em size, the count, then the indices', advances' and offsets' arrays.
     let w = task.abi().width;
-    let run = task.mem(cx, false, |t| user::read_vec(&t.space(), a[1], (6 * w) as usize)).unwrap_or_default();
+    let run = task.mem(cx, false, |t| user::read_vec(&t.space(), run_at, (6 * w) as usize)).unwrap_or_default();
     let ptr = |i: u64| task.abi().ptr_at(&run, i as usize);
     let face_ptr = ptr(0);
     let em = f32::from_le_bytes(run[w as usize..w as usize + 4].try_into().unwrap_or_default());
     let count = u32::from_le_bytes(run[w as usize + 4..w as usize + 8].try_into().unwrap_or_default()) as usize;
     let (indices_at, advances_at, offsets_at) = (ptr(w + 8), ptr(2 * w + 8), ptr(3 * w + 8));
-    let Some(Dw::Face(face_index)) = task.of(face_ptr) else { return Reply::Value(E_INVALIDARG) };
-    let Some(face) = task.face(face_index) else { return Reply::Value(E_INVALIDARG) };
+    let Some(Dw::Face(src)) = task.of(face_ptr) else { return Reply::Value(E_INVALIDARG) };
+    let Some(face) = task.source_face(&src) else { return Reply::Value(E_INVALIDARG) };
     let count = count.min(4096);
     let indices = task.read_u16s(cx, indices_at, count);
     let advances = if advances_at != 0 { task.read_f32s(cx, advances_at, count) } else { Vec::new() };
@@ -649,32 +1147,50 @@ fn factory_create_glyph_run_analysis(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]
         Some((l, t, r, b)) => {
             let (width, height) = ((r - l) as usize, (b - t) as usize);
             let alpha = if width * height <= 1 << 24 { display::raster::fill(&steps, l, t, width, height) } else { Vec::new() };
-            Dw::Analysis { left: l, top: t, width, height, alpha: Arc::new(alpha), aliased: mode == MODE_ALIASED }
+            Dw::Analysis { left: l, top: t, width, height, alpha: Arc::new(alpha), texture }
         }
-        None => Dw::Analysis { left: 0, top: 0, width: 0, height: 0, alpha: Arc::new(Vec::new()), aliased: mode == MODE_ALIASED },
+        None => Dw::Analysis { left: 0, top: 0, width: 0, height: 0, alpha: Arc::new(Vec::new()), texture },
     };
     task.give(cx, out, analysis)
 }
 
-// ---- The system font collection, its families and lists ----
+// ---- Font collections, families and lists ----
 
-fn collection_get_font_family_count(task: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
-    Reply::Value(task.fonts().families.len() as u64)
+fn collection_get_font_family_count(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let n = match task.of(a[0]) {
+        Some(Dw::Collection(Some(fams))) => fams.len(),
+        _ => task.fonts().families.len(),
+    };
+    Reply::Value(n as u64)
 }
 
 fn collection_get_font_family(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let index = a[1] as u32 as usize;
-    if index >= task.fonts().families.len() {
-        let _ = task.write_ptr(cx, a[2], 0);
-        return Reply::Value(E_INVALIDARG);
+    match task.of(a[0]) {
+        Some(Dw::Collection(Some(fams))) => {
+            if index >= fams.len() {
+                let _ = task.write_ptr(cx, a[2], 0);
+                return Reply::Value(E_INVALIDARG);
+            }
+            task.give(cx, a[2], Dw::Family(FamilyRef::Custom(fams, index)))
+        }
+        _ => {
+            if index >= task.fonts().families.len() {
+                let _ = task.write_ptr(cx, a[2], 0);
+                return Reply::Value(E_INVALIDARG);
+            }
+            task.give(cx, a[2], Dw::Family(FamilyRef::System(index)))
+        }
     }
-    task.give(cx, a[2], Dw::Family(index))
 }
 
 /// `FindFamilyName(name, &index, &exists)`: UINT_MAX and FALSE for one there isn't.
 fn collection_find_family_name(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let name = task.text_arg(cx, a[1], true);
-    let found = task.fonts().find(&name);
+    let found = match task.of(a[0]) {
+        Some(Dw::Collection(Some(fams))) => fams.iter().position(|f| f.name.eq_ignore_ascii_case(&name)),
+        _ => task.fonts().find(&name),
+    };
     task.dw_put_u32(cx, a[2], found.map_or(u32::MAX, |i| i as u32));
     task.dw_put_u32(cx, a[3], u32::from(found.is_some()));
     Reply::Value(S_OK)
@@ -691,16 +1207,21 @@ fn collection_get_font_from_font_face(task: &mut Task, cx: &mut Cx<'_>, a: &[u64
 }
 
 /// A family's or a list's faces.
-fn faces_of(task: &Task, dw: &Dw) -> Vec<usize> {
+fn faces_of(task: &Task, dw: &Dw) -> Vec<FontSource> {
     match dw {
-        Dw::Family(f) => task.fonts().families.get(*f).map(|f| f.faces.clone()).unwrap_or_default(),
-        Dw::List(faces) => faces.clone(),
+        Dw::Family(FamilyRef::System(f)) => task.fonts().families.get(*f).map(|f| f.faces.iter().copied().map(FontSource::System).collect()).unwrap_or_default(),
+        Dw::Family(FamilyRef::Custom(col, f)) => col.get(*f).map(|f| f.faces.clone()).unwrap_or_default(),
+        Dw::List(_, faces) => faces.clone(),
         _ => Vec::new(),
     }
 }
 
 fn list_get_font_collection(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    task.give(cx, a[1], Dw::Collection)
+    let custom = match task.of(a[0]) {
+        Some(Dw::Family(FamilyRef::Custom(col, _))) | Some(Dw::List(Some(col), _)) => Some(col),
+        _ => None,
+    };
+    task.give(cx, a[1], Dw::Collection(custom))
 }
 
 fn list_get_font_count(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
@@ -711,7 +1232,7 @@ fn list_get_font_count(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
 fn list_get_font(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let faces = task.of(a[0]).map(|d| faces_of(task, &d)).unwrap_or_default();
     match faces.get(a[1] as u32 as usize) {
-        Some(&face) => task.give(cx, a[2], Dw::Font(face)),
+        Some(face) => task.give(cx, a[2], Dw::Font(face.clone())),
         None => {
             let _ = task.write_ptr(cx, a[2], 0);
             Reply::Value(E_INVALIDARG)
@@ -720,8 +1241,11 @@ fn list_get_font(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 }
 
 fn family_get_family_names(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(Dw::Family(f)) = task.of(a[0]) else { return Reply::Value(E_INVALIDARG) };
-    let name = task.fonts().families[f].name.clone();
+    let name = match task.of(a[0]) {
+        Some(Dw::Family(FamilyRef::System(f))) => task.fonts().families[f].name.clone(),
+        Some(Dw::Family(FamilyRef::Custom(col, f))) => col[f].name.clone(),
+        _ => return Reply::Value(E_INVALIDARG),
+    };
     task.give(cx, a[1], Dw::Strings(vec![("en-us".into(), name)]))
 }
 
@@ -730,9 +1254,32 @@ fn wants_italic(style: u64) -> bool {
     style as u32 != 0
 }
 
+fn match_key(info: &FontFace, weight: u16, stretch: u16, italic: bool) -> (u32, u32, u32) {
+    let stretch_d = (i32::from(info.stretch) - i32::from(stretch)).unsigned_abs();
+    let slant = u32::from(info.italic != italic);
+    let (w, want) = (i32::from(info.weight), i32::from(weight));
+    let weight_d = match want {
+        400..=500 if w >= want && w <= 500 => (w - want) as u32,
+        400..=500 if w < want => 1000 + (want - w) as u32,
+        400..=500 => 2000 + (w - want) as u32,
+        _ if want < 400 && w <= want => (want - w) as u32,
+        _ if want < 400 => 1000 + (w - want) as u32,
+        _ if w >= want => (w - want) as u32,
+        _ => 1000 + (want - w) as u32,
+    };
+    (stretch_d, slant, weight_d)
+}
+
 fn family_get_first_matching_font(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(Dw::Family(f)) = task.of(a[0]) else { return Reply::Value(E_INVALIDARG) };
-    match task.fonts().matching(f, a[1] as u16, a[2] as u16, wants_italic(a[3])) {
+    let (weight, stretch, italic) = (a[1] as u16, a[2] as u16, wants_italic(a[3]));
+    let best = match task.of(a[0]) {
+        Some(Dw::Family(FamilyRef::System(f))) => task.fonts().matching(f, weight, stretch, italic).map(FontSource::System),
+        Some(Dw::Family(FamilyRef::Custom(col, f))) => col
+            .get(f)
+            .and_then(|fam| fam.faces.iter().min_by_key(|s| match_key(&task.source_info(s), weight, stretch, italic)).cloned()),
+        _ => return Reply::Value(E_INVALIDARG),
+    };
+    match best {
         Some(face) => task.give(cx, a[4], Dw::Font(face)),
         None => {
             let _ = task.write_ptr(cx, a[4], 0);
@@ -743,67 +1290,74 @@ fn family_get_first_matching_font(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -
 
 /// `GetMatchingFonts(weight, stretch, style, &list)`: every face of the family, the nearest first.
 fn family_get_matching_fonts(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(Dw::Family(f)) = task.of(a[0]) else { return Reply::Value(E_INVALIDARG) };
-    let fonts = task.fonts();
-    let mut faces = fonts.families[f].faces.clone();
-    let (weight, stretch, italic) = (i32::from(a[1] as u16), i32::from(a[2] as u16), wants_italic(a[3]));
-    faces.sort_by_key(|&i| {
-        let face = &fonts.faces[i];
-        ((i32::from(face.stretch) - stretch).abs(), face.italic != italic, (i32::from(face.weight) - weight).abs())
-    });
-    task.give(cx, a[4], Dw::List(faces))
+    let (weight, stretch, italic) = (a[1] as u16, a[2] as u16, wants_italic(a[3]));
+    let (col, mut faces) = match task.of(a[0]) {
+        Some(Dw::Family(FamilyRef::System(f))) => (None, task.fonts().families[f].faces.iter().copied().map(FontSource::System).collect::<Vec<_>>()),
+        Some(Dw::Family(FamilyRef::Custom(col, f))) => (Some(col.clone()), col[f].faces.clone()),
+        _ => return Reply::Value(E_INVALIDARG),
+    };
+    faces.sort_by_key(|s| match_key(&task.source_info(s), weight, stretch, italic));
+    task.give(cx, a[4], Dw::List(col, faces))
 }
 
 // ---- Fonts ----
 
-fn font_index(task: &Task, this: u64) -> Option<usize> {
+fn font_source(task: &Task, this: u64) -> Option<FontSource> {
     match task.of(this)? {
-        Dw::Font(i) | Dw::Face(i) => Some(i),
+        Dw::Font(s) | Dw::Face(s) => Some(s),
         _ => None,
     }
 }
 
 fn font_get_font_family(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(face) = font_index(task, a[0]) else { return Reply::Value(E_INVALIDARG) };
-    let family = task.fonts().families.iter().position(|f| f.faces.contains(&face)).unwrap_or(0);
-    task.give(cx, a[1], Dw::Family(family))
+    let Some(src) = font_source(task, a[0]) else { return Reply::Value(E_INVALIDARG) };
+    match src {
+        FontSource::System(face) => {
+            let family = task.fonts().families.iter().position(|f| f.faces.contains(&face)).unwrap_or(0);
+            task.give(cx, a[1], Dw::Family(FamilyRef::System(family)))
+        }
+        FontSource::Custom(cf) => {
+            let col = Arc::new(vec![CustomFamily { name: cf.info.family.clone(), faces: vec![FontSource::Custom(cf)] }]);
+            task.give(cx, a[1], Dw::Family(FamilyRef::Custom(col, 0)))
+        }
+    }
 }
 
 fn font_get_weight(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
-    Reply::Value(font_index(task, a[0]).map_or(400, |i| u64::from(task.fonts().faces[i].weight)))
+    Reply::Value(font_source(task, a[0]).map_or(400, |s| u64::from(task.source_info(&s).weight)))
 }
 
 fn font_get_stretch(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
-    Reply::Value(font_index(task, a[0]).map_or(5, |i| u64::from(task.fonts().faces[i].stretch)))
+    Reply::Value(font_source(task, a[0]).map_or(5, |s| u64::from(task.source_info(&s).stretch)))
 }
 
 fn font_get_style(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
-    Reply::Value(font_index(task, a[0]).map_or(0, |i| if task.fonts().faces[i].italic { 2 } else { 0 }))
+    Reply::Value(font_source(task, a[0]).map_or(0, |s| if task.source_info(&s).italic { 2 } else { 0 }))
 }
 
 /// Whether its character map is a symbol font's (Windows' symbol encoding, 3/0), as Wingdings' is.
-fn is_symbol(task: &Task, face: usize) -> bool {
-    let Some(f) = task.face(face) else { return false };
+fn is_symbol(task: &Task, src: &FontSource) -> bool {
+    let Some(f) = task.source_face(src) else { return false };
     let Some(cmap) = f.table(*b"cmap") else { return false };
     let n = usize::from(u16::from_be_bytes([cmap.get(2).copied().unwrap_or(0), cmap.get(3).copied().unwrap_or(0)]));
     (0..n).all(|i| cmap.get(4 + 8 * i..8 + 8 * i).is_some_and(|e| e == [0, 3, 0, 0]))
 }
 
 fn font_is_symbol_font(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
-    Reply::Value(font_index(task, a[0]).map_or(0, |i| u64::from(is_symbol(task, i))))
+    Reply::Value(font_source(task, a[0]).map_or(0, |s| u64::from(is_symbol(task, &s))))
 }
 
 fn font_get_face_names(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(face) = font_index(task, a[0]) else { return Reply::Value(E_INVALIDARG) };
-    let style = task.fonts().faces[face].style.clone();
+    let Some(src) = font_source(task, a[0]) else { return Reply::Value(E_INVALIDARG) };
+    let style = task.source_info(&src).style;
     task.give(cx, a[1], Dw::Strings(vec![("en-us".into(), style)]))
 }
 
 /// `GetInformationalStrings(id, &strings, &exists)`: the full name (DWRITE_INFORMATIONAL_STRING_FULL_NAME, 15), the
 /// PostScript name (16), and the family and face names Win32 and typographic families give (1, 2, 13, 14).
 fn font_get_informational_strings(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(face) = font_index(task, a[0]) else { return Reply::Value(E_INVALIDARG) };
-    let f = task.fonts().faces[face].clone();
+    let Some(src) = font_source(task, a[0]) else { return Reply::Value(E_INVALIDARG) };
+    let f = task.source_info(&src);
     let value = match a[1] as u32 {
         1 | 13 => Some(f.family),
         2 | 14 => Some(f.style),
@@ -836,7 +1390,7 @@ fn metrics_bytes(face: &Face) -> Vec<u8> {
 }
 
 fn font_get_metrics(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    if let Some(face) = font_index(task, a[0]).and_then(|i| task.face(i)) {
+    if let Some(face) = font_source(task, a[0]).and_then(|s| task.source_face(&s)) {
         let b = metrics_bytes(&face);
         task.dw_put(cx, a[1], &b);
     }
@@ -844,18 +1398,18 @@ fn font_get_metrics(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 }
 
 fn font_has_character(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let has = font_index(task, a[0]).and_then(|i| task.face(i)).is_some_and(|f| f.glyph(a[1] as u32) != 0);
+    let has = font_source(task, a[0]).and_then(|s| task.source_face(&s)).is_some_and(|f| f.glyph(a[1] as u32) != 0);
     task.dw_put_u32(cx, a[2], u32::from(has));
     Reply::Value(S_OK)
 }
 
 fn font_create_font_face(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(face) = font_index(task, a[0]) else { return Reply::Value(E_INVALIDARG) };
-    if task.face(face).is_none() {
+    let Some(src) = font_source(task, a[0]) else { return Reply::Value(E_INVALIDARG) };
+    if task.source_face(&src).is_none() {
         let _ = task.write_ptr(cx, a[1], 0);
         return Reply::Value(DWRITE_E_FILEFORMAT);
     }
-    task.give(cx, a[1], Dw::Face(face))
+    task.give(cx, a[1], Dw::Face(src))
 }
 
 // ---- Localized strings ----
@@ -927,18 +1481,22 @@ fn strings_get_string(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 
 /// DWRITE_FONT_FACE_TYPE: CFF (0) for a face with CFF outlines, else TrueType (1).
 fn face_get_type(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let cff = font_index(task, a[0]).and_then(|i| task.face(i)).is_some_and(|f| f.host.tables().iter().any(|t| t == b"CFF " || t == b"CFF2"));
+    let cff = font_source(task, a[0]).and_then(|s| task.source_face(&s)).is_some_and(|f| f.host.tables().iter().any(|t| t == b"CFF " || t == b"CFF2"));
     Reply::Value(if cff { 0 } else { 1 })
 }
 
 /// `GetFiles(&count, files)`: its one file; with no array, how many.
 fn face_get_files(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(face) = font_index(task, a[0]) else { return Reply::Value(E_INVALIDARG) };
+    let Some(src) = font_source(task, a[0]) else { return Reply::Value(E_INVALIDARG) };
     task.dw_put_u32(cx, a[1], 1);
     if a[2] == 0 {
         return Reply::Value(S_OK);
     }
-    task.give(cx, a[2], Dw::File(face))
+    let file = match src {
+        FontSource::System(face) => FileSource::System(face),
+        FontSource::Custom(cf) => FileSource::Custom { id: cf.id, loader: cf.loader, key: cf.key.clone(), bytes: cf.bytes.clone(), faces: vec![cf] },
+    };
+    task.give(cx, a[2], Dw::File(file))
 }
 
 fn face_get_simulations(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
@@ -954,7 +1512,7 @@ fn face_get_metrics(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 }
 
 fn face_get_glyph_count(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
-    Reply::Value(font_index(task, a[0]).and_then(|i| task.face(i)).map_or(0, |f| u64::from(f.metrics.glyph_count)))
+    Reply::Value(font_source(task, a[0]).and_then(|s| task.source_face(&s)).map_or(0, |f| u64::from(f.metrics.glyph_count)))
 }
 
 /// DWRITE_GLYPH_METRICS for a glyph, in font units: its side bearings, advances and vertical origin.
@@ -994,21 +1552,21 @@ fn put_glyph_metrics(task: &mut Task, cx: &mut Cx<'_>, face: &Face, indices_at: 
 
 /// `GetDesignGlyphMetrics(&indices, count, &metrics, sideways)`.
 fn face_get_design_glyph_metrics(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(face) = font_index(task, a[0]).and_then(|i| task.face(i)) else { return Reply::Value(E_INVALIDARG) };
+    let Some(face) = font_source(task, a[0]).and_then(|s| task.source_face(&s)) else { return Reply::Value(E_INVALIDARG) };
     put_glyph_metrics(task, cx, &face, a[1], (a[2] as u32 as usize).min(1 << 16), a[3], a[4] as u32 != 0)
 }
 
 /// `GetGdiCompatibleGlyphMetrics(size, ppd, &transform, natural, &indices, count, &metrics, sideways)`: the design
 /// metrics, as outlines aren't hinted here.
 fn face_get_gdi_compatible_glyph_metrics(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(face) = font_index(task, a[0]).and_then(|i| task.face(i)) else { return Reply::Value(E_INVALIDARG) };
+    let Some(face) = font_source(task, a[0]).and_then(|s| task.source_face(&s)) else { return Reply::Value(E_INVALIDARG) };
     let (indices, count, out, sideways) = (task.int_arg(a, 5, 3), task.int_arg(a, 6, 4), task.int_arg(a, 7, 5), task.int_arg(a, 8, 6));
     put_glyph_metrics(task, cx, &face, indices, (count as u32 as usize).min(1 << 16), out, sideways as u32 != 0)
 }
 
 /// `GetGdiCompatibleMetrics(size, ppd, &transform, &metrics)`: the design metrics.
 fn face_get_gdi_compatible_metrics(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(face) = font_index(task, a[0]).and_then(|i| task.face(i)) else { return Reply::Value(E_INVALIDARG) };
+    let Some(face) = font_source(task, a[0]).and_then(|s| task.source_face(&s)) else { return Reply::Value(E_INVALIDARG) };
     let out = task.int_arg(a, 4, 2);
     let b = metrics_bytes(&face);
     task.dw_put(cx, out, &b);
@@ -1017,7 +1575,7 @@ fn face_get_gdi_compatible_metrics(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) 
 
 /// `GetGlyphIndices(&code_points, count, &indices)`: 0 for a character it hasn't.
 fn face_get_glyph_indices(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(face) = font_index(task, a[0]).and_then(|i| task.face(i)) else { return Reply::Value(E_INVALIDARG) };
+    let Some(face) = font_source(task, a[0]).and_then(|s| task.source_face(&s)) else { return Reply::Value(E_INVALIDARG) };
     let count = (a[2] as u32 as usize).min(1 << 16);
     let points = task.mem(cx, false, |t| user::read_vec(&t.space(), a[1], count * 4)).unwrap_or_default();
     let out: Vec<u8> = points.chunks(4).flat_map(|c| face.glyph(u32::from_le_bytes([c[0], c[1], c[2], c[3]])).to_le_bytes()).collect();
@@ -1030,14 +1588,160 @@ fn face_get_glyph_indices(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply 
 /// `TryGetFontTable(tag, &data, &size, &context, &exists)`: the table in the process's memory, kept there (so
 /// ReleaseFontTable has nothing to do); with the tag as OpenType has it, a little-endian number of its four bytes.
 fn face_try_get_font_table(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(index) = font_index(task, a[0]) else { return Reply::Value(E_INVALIDARG) };
+    let Some(src) = font_source(task, a[0]) else { return Reply::Value(E_INVALIDARG) };
+    let id = task.source_id(&src);
     let tag = (a[1] as u32).to_le_bytes();
-    let table = task.face(index).and_then(|f| f.table(tag));
-    let at = table.as_ref().and_then(|t| task.copy(cx, index, a[1] as u32, t));
+    let table = task.source_face(&src).and_then(|f| f.table(tag));
+    let at = table.as_ref().and_then(|t| task.copy(cx, id, a[1] as u32, t));
     let _ = task.write_ptr(cx, a[2], at.unwrap_or(0));
     task.dw_put_u32(cx, a[3], table.as_ref().map_or(0, |t| t.len() as u32));
     let _ = task.write_ptr(cx, a[4], 0);
     task.dw_put_u32(cx, a[5], u32::from(at.is_some()));
+    Reply::Value(S_OK)
+}
+
+/// `IDWriteFontFace::GetGlyphRunOutline(em, &indices, &advances, &offsets, count, sideways, rtl, sink)`:
+/// streams each glyph's outline into the guest's `IDWriteGeometrySink` (`ID2D1SimplifiedGeometrySink`).
+fn face_get_glyph_run_outline(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let em = task.f32_arg(cx, a, 1, 0);
+    let indices_at = task.int_arg(a, 2, 1);
+    let advances_at = task.int_arg(a, 3, 2);
+    let offsets_at = task.int_arg(a, 4, 3);
+    let count = (task.int_arg(a, 5, 4) as u32 as usize).min(4096);
+    let sink = task.int_arg(a, 8, 7);
+    if sink == 0 {
+        return Reply::Value(E_INVALIDARG);
+    }
+    let Some(face) = font_source(task, a[0]).and_then(|s| task.source_face(&s)) else { return Reply::Value(E_INVALIDARG) };
+    if count == 0 {
+        return Reply::Value(S_OK);
+    }
+    if indices_at == 0 {
+        return Reply::Value(E_INVALIDARG);
+    }
+    let indices = task.read_u16s(cx, indices_at, count);
+    let advances = if advances_at != 0 { task.read_f32s(cx, advances_at, count) } else { Vec::new() };
+    let offsets = if offsets_at != 0 { task.read_f32s(cx, offsets_at, 2 * count) } else { Vec::new() };
+    let scale = em / f32::from(face.metrics.units_per_em);
+    let w = task.abi().width;
+
+    // Collect figures (start point + segments) in D2D coordinates (y down) so we can batch AddLines / AddBeziers.
+    enum Seg {
+        Lines(Vec<(f32, f32)>),
+        Beziers(Vec<[(f32, f32); 3]>),
+    }
+    let mut figures: Vec<((f32, f32), Vec<Seg>)> = Vec::new();
+    let mut pen = 0f32;
+    for (i, &g) in indices.iter().enumerate() {
+        let (dx, dy) = if offsets.len() >= 2 * i + 2 { (offsets[2 * i], offsets[2 * i + 1]) } else { (0.0, 0.0) };
+        let (ox, oy) = (pen + dx, -dy);
+        let pt = |x: f32, y: f32| (ox + x * scale, oy - y * scale);
+        if let Some(ops) = face.host.outline(g) {
+            let mut cur_fig: Option<((f32, f32), Vec<Seg>)> = None;
+            let mut cur = (0.0f32, 0.0f32);
+            for op in ops {
+                match op {
+                    host::PathOp::Move(x, y) => {
+                        if let Some(fig) = cur_fig.take() {
+                            figures.push(fig);
+                        }
+                        let p = pt(x, y);
+                        cur = p;
+                        cur_fig = Some((p, Vec::new()));
+                    }
+                    host::PathOp::Line(x, y) => {
+                        let p = pt(x, y);
+                        if let Some((_, segs)) = cur_fig.as_mut() {
+                            match segs.last_mut() {
+                                Some(Seg::Lines(pts)) => pts.push(p),
+                                _ => segs.push(Seg::Lines(vec![p])),
+                            }
+                        }
+                        cur = p;
+                    }
+                    host::PathOp::Quad(cx0, cy0, x, y) => {
+                        let c = pt(cx0, cy0);
+                        let p = pt(x, y);
+                        let c1 = (cur.0 + (2.0 / 3.0) * (c.0 - cur.0), cur.1 + (2.0 / 3.0) * (c.1 - cur.1));
+                        let c2 = (p.0 + (2.0 / 3.0) * (c.0 - p.0), p.1 + (2.0 / 3.0) * (c.1 - p.1));
+                        if let Some((_, segs)) = cur_fig.as_mut() {
+                            match segs.last_mut() {
+                                Some(Seg::Beziers(bs)) => bs.push([c1, c2, p]),
+                                _ => segs.push(Seg::Beziers(vec![[c1, c2, p]])),
+                            }
+                        }
+                        cur = p;
+                    }
+                    host::PathOp::Cubic(c1x, c1y, c2x, c2y, x, y) => {
+                        let (c1, c2, p) = (pt(c1x, c1y), pt(c2x, c2y), pt(x, y));
+                        if let Some((_, segs)) = cur_fig.as_mut() {
+                            match segs.last_mut() {
+                                Some(Seg::Beziers(bs)) => bs.push([c1, c2, p]),
+                                _ => segs.push(Seg::Beziers(vec![[c1, c2, p]])),
+                            }
+                        }
+                        cur = p;
+                    }
+                    host::PathOp::Close => {
+                        if let Some(fig) = cur_fig.take() {
+                            figures.push(fig);
+                        }
+                    }
+                }
+            }
+            if let Some(fig) = cur_fig.take() {
+                figures.push(fig);
+            }
+        }
+        pen += advances.get(i).copied().unwrap_or_else(|| f32::from(face.h_metrics(g).0) * scale);
+    }
+
+    for (start, segs) in figures {
+        let begin_res = if w == 4 {
+            task.com_call(cx, sink, 5, &[u64::from(start.0.to_bits()), u64::from(start.1.to_bits()), 0])
+        } else {
+            let packed = u64::from(start.0.to_bits()) | (u64::from(start.1.to_bits()) << 32);
+            task.com_call(cx, sink, 5, &[packed, 0])
+        };
+        if let Err(reply) = begin_res {
+            return reply;
+        }
+        for seg in segs {
+            match seg {
+                Seg::Lines(pts) => {
+                    let mut raw = Vec::with_capacity(pts.len() * 8);
+                    for (x, y) in &pts {
+                        raw.extend(x.to_le_bytes());
+                        raw.extend(y.to_le_bytes());
+                    }
+                    let res = task.with_scratch(cx, raw.len(), |_| raw.clone(), |task, cx, at| {
+                        task.com_call(cx, sink, 6, &[at, pts.len() as u64])
+                    });
+                    if let Err(reply) = res {
+                        return reply;
+                    }
+                }
+                Seg::Beziers(bs) => {
+                    let mut raw = Vec::with_capacity(bs.len() * 24);
+                    for [p1, p2, p3] in &bs {
+                        for (x, y) in [p1, p2, p3] {
+                            raw.extend(x.to_le_bytes());
+                            raw.extend(y.to_le_bytes());
+                        }
+                    }
+                    let res = task.with_scratch(cx, raw.len(), |_| raw.clone(), |task, cx, at| {
+                        task.com_call(cx, sink, 7, &[at, bs.len() as u64])
+                    });
+                    if let Err(reply) = res {
+                        return reply;
+                    }
+                }
+            }
+        }
+        if let Err(reply) = task.com_call(cx, sink, 8, &[1]) {
+            return reply;
+        }
+    }
     Reply::Value(S_OK)
 }
 
@@ -1053,62 +1757,208 @@ fn face_get_recommended_rendering_mode(task: &mut Task, cx: &mut Cx<'_>, a: &[u6
 
 // ---- Font files, their loader and streams ----
 
-/// `GetReferenceKey(&key, &size)`: the face's number, four bytes, kept with the process's copies.
+/// `GetReferenceKey(&key, &size)`: the face's number (system) or the caller's reference key (custom).
 fn file_get_reference_key(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(Dw::File(face)) = task.of(a[0]) else { return Reply::Value(E_INVALIDARG) };
-    let key = (face as u32).to_le_bytes();
-    let at = task.copy(cx, face, u32::from_le_bytes(*b"key "), &key);
-    let _ = task.write_ptr(cx, a[1], at.unwrap_or(0));
-    task.dw_put_u32(cx, a[2], 4);
-    Reply::Value(if at.is_some() { S_OK } else { E_OUTOFMEMORY })
+    match task.of(a[0]) {
+        Some(Dw::File(FileSource::System(face))) => {
+            let key = (face as u32).to_le_bytes();
+            let at = task.copy(cx, face, u32::from_le_bytes(*b"key "), &key);
+            let _ = task.write_ptr(cx, a[1], at.unwrap_or(0));
+            task.dw_put_u32(cx, a[2], 4);
+            Reply::Value(if at.is_some() { S_OK } else { E_OUTOFMEMORY })
+        }
+        Some(Dw::File(FileSource::Custom { id, key, .. })) => {
+            let at = task.copy(cx, id, u32::from_le_bytes(*b"key "), &key);
+            let _ = task.write_ptr(cx, a[1], at.unwrap_or(0));
+            task.dw_put_u32(cx, a[2], key.len() as u32);
+            Reply::Value(if at.is_some() { S_OK } else { E_OUTOFMEMORY })
+        }
+        _ => Reply::Value(E_INVALIDARG),
+    }
 }
 
 fn file_get_loader(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if let Some(Dw::File(FileSource::Custom { loader, .. })) = task.of(a[0])
+        && loader != 0
+    {
+        if let Err(reply) = task.com_call(cx, loader, 1, &[]) {
+            return reply;
+        }
+        let _ = task.write_ptr(cx, a[1], loader);
+        return Reply::Value(S_OK);
+    }
     task.give(cx, a[1], Dw::Loader)
 }
 
-/// `Analyze(&supported, &file_type, &face_type, &faces)`: an OpenType file (DWRITE_FONT_FILE_TYPE_TRUETYPE or _CFF),
-/// with one face.
+/// `Analyze(&supported, &file_type, &face_type, &faces)`: an OpenType/TrueType file or collection.
 fn file_analyze(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(Dw::File(face)) = task.of(a[0]) else { return Reply::Value(E_INVALIDARG) };
-    let cff = task.face(face).is_some_and(|f| f.host.tables().iter().any(|t| t == b"CFF " || t == b"CFF2"));
-    task.dw_put_u32(cx, a[1], 1);
-    task.dw_put_u32(cx, a[2], if cff { 1 } else { 2 });
-    task.dw_put_u32(cx, a[3], if cff { 0 } else { 1 });
-    task.dw_put_u32(cx, a[4], 1);
+    match task.of(a[0]) {
+        Some(Dw::File(FileSource::System(face))) => {
+            let cff = task.face(face).is_some_and(|f| f.host.tables().iter().any(|t| t == b"CFF " || t == b"CFF2"));
+            task.dw_put_u32(cx, a[1], 1);
+            task.dw_put_u32(cx, a[2], if cff { 1 } else { 2 });
+            task.dw_put_u32(cx, a[3], if cff { 0 } else { 1 });
+            task.dw_put_u32(cx, a[4], 1);
+            Reply::Value(S_OK)
+        }
+        Some(Dw::File(FileSource::Custom { bytes, faces, .. })) => {
+            let Some(first) = faces.first() else {
+                task.dw_put_u32(cx, a[1], 0);
+                task.dw_put_u32(cx, a[2], 0);
+                task.dw_put_u32(cx, a[3], 9);
+                task.dw_put_u32(cx, a[4], 0);
+                return Reply::Value(S_OK);
+            };
+            let ttc = bytes.get(0..4) == Some(b"ttcf");
+            let cff = first.face.host.tables().iter().any(|t| t == b"CFF " || t == b"CFF2");
+            task.dw_put_u32(cx, a[1], 1);
+            task.dw_put_u32(cx, a[2], if ttc { 3 } else if cff { 1 } else { 2 });
+            task.dw_put_u32(cx, a[3], if ttc { 2 } else if cff { 0 } else { 1 });
+            task.dw_put_u32(cx, a[4], faces.len() as u32);
+            Reply::Value(S_OK)
+        }
+        _ => Reply::Value(E_INVALIDARG),
+    }
+}
+
+/// Parses `C:\Windows\Fonts\atlas_{idx}.ttf` (case-insensitive, either slash) back into its system face index.
+fn virtual_font_index(path: &str) -> Option<usize> {
+    let norm = path.replace('/', "\\").to_ascii_lowercase();
+    let rest = norm.strip_prefix("c:\\windows\\fonts\\atlas_").or_else(|| norm.strip_prefix("\\windows\\fonts\\atlas_"))?;
+    rest.strip_suffix(".ttf")?.parse::<usize>().ok()
+}
+
+/// Decodes a `Dw::Loader` reference key (either a 4-byte system face index or a UTF-16 path) into its Windows path.
+fn local_loader_path(task: &mut Task, cx: &mut Cx<'_>, key_ptr: u64, key_size: u32) -> Option<String> {
+    if key_ptr == 0 || key_size == 0 {
+        return None;
+    }
+    let raw = task.mem(cx, false, |t| user::read_vec(&t.space(), key_ptr, (key_size as usize).min(65536))).ok()?;
+    if raw.len() == 4 {
+        let face = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
+        if face < task.fonts().faces.len() {
+            return Some(format!("C:\\Windows\\Fonts\\atlas_{face}.ttf"));
+        }
+        return None;
+    }
+    if raw.len() >= 2 && raw.len().is_multiple_of(2) {
+        let mut units: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        while units.last() == Some(&0) {
+            units.pop();
+        }
+        if !units.is_empty() {
+            return Some(String::from_utf16_lossy(&units));
+        }
+    }
+    None
+}
+
+/// `IDWriteLocalFontFileLoader::GetFilePathLengthFromKey(key, key_size, &len)`: length in UTF-16 code units,
+/// excluding the NUL terminator.
+fn local_loader_get_file_path_length_from_key(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(path) = local_loader_path(task, cx, a[1], a[2] as u32) else { return Reply::Value(E_INVALIDARG) };
+    let len = path.encode_utf16().count() as u32;
+    if !task.dw_put_u32(cx, a[3], len) {
+        return Reply::Value(E_POINTER);
+    }
     Reply::Value(S_OK)
 }
 
-/// `CreateStreamFromKey(&key, size, &stream)`: a key one of this loader's files gave.
-fn loader_create_stream_from_key(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let key = task.mem(cx, false, |t| user::read_vec(&t.space(), a[1], 4)).unwrap_or_default();
-    let face = if a[2] == 4 && key.len() == 4 { u32::from_le_bytes([key[0], key[1], key[2], key[3]]) as usize } else { usize::MAX };
-    if face >= task.fonts().faces.len() || task.face(face).is_none() {
-        let _ = task.write_ptr(cx, a[3], 0);
+/// `IDWriteLocalFontFileLoader::GetFilePathFromKey(key, key_size, path, path_size)`.
+fn local_loader_get_file_path_from_key(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(path) = local_loader_path(task, cx, a[1], a[2] as u32) else { return Reply::Value(E_INVALIDARG) };
+    let units: Vec<u16> = path.encode_utf16().collect();
+    let room = a[4] as u32 as usize;
+    if room <= units.len() {
+        return Reply::Value(E_NOT_SUFFICIENT_BUFFER);
+    }
+    let bytes: Vec<u8> = units.into_iter().chain([0]).flat_map(u16::to_le_bytes).collect();
+    if !task.dw_put(cx, a[3], &bytes) {
+        return Reply::Value(E_POINTER);
+    }
+    Reply::Value(S_OK)
+}
+
+/// `IDWriteLocalFontFileLoader::GetLastWriteTimeFromKey(key, key_size, &filetime)`.
+fn local_loader_get_last_write_time_from_key(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if local_loader_path(task, cx, a[1], a[2] as u32).is_none() {
         return Reply::Value(E_INVALIDARG);
     }
-    task.give(cx, a[3], Dw::Stream(face))
+    if !task.dw_put(cx, a[3], &132_223_104_000_000_000u64.to_le_bytes()) {
+        return Reply::Value(E_POINTER);
+    }
+    Reply::Value(S_OK)
+}
+
+/// `CreateStreamFromKey(&key, size, &stream)`: a key one of this loader's files gave (system index or local path).
+fn loader_create_stream_from_key(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let key_size = a[2] as u32;
+    if key_size == 4 {
+        let key = task.mem(cx, false, |t| user::read_vec(&t.space(), a[1], 4)).unwrap_or_default();
+        let face = if key.len() == 4 { u32::from_le_bytes([key[0], key[1], key[2], key[3]]) as usize } else { usize::MAX };
+        if face >= task.fonts().faces.len() || task.face(face).is_none() {
+            let _ = task.write_ptr(cx, a[3], 0);
+            return Reply::Value(E_INVALIDARG);
+        }
+        return task.give(cx, a[3], Dw::Stream(StreamSource::System(face)));
+    }
+    let Some(path) = local_loader_path(task, cx, a[1], key_size) else {
+        let _ = task.write_ptr(cx, a[3], 0);
+        return Reply::Value(E_INVALIDARG);
+    };
+    if let Some(idx) = virtual_font_index(&path)
+        && idx < task.fonts().faces.len()
+        && task.face(idx).is_some()
+    {
+        return task.give(cx, a[3], Dw::Stream(StreamSource::System(idx)));
+    }
+    let bytes = match task.open_file(&path, 0x8000_0000, FILE_SHARE_ALL, 3, 0) {
+        Ok((file, _)) => match &file.node {
+            Node::File(ino) => lock(&task.k.disk).contents(*ino).ok().map(|c| Arc::new(c.to_vec())),
+            Node::System(image) => Some(image.clone()),
+            _ => None,
+        },
+        Err(_) => None,
+    };
+    match bytes {
+        Some(b) => {
+            let id = NEXT_CUSTOM_ID.fetch_add(1, Ordering::Relaxed);
+            task.give(cx, a[3], Dw::Stream(StreamSource::Custom(id, b)))
+        }
+        None => {
+            let _ = task.write_ptr(cx, a[3], 0);
+            Reply::Value(DWRITE_E_FILENOTFOUND)
+        }
+    }
 }
 
 /// `ReadFileFragment(&start, offset, size, &context)`: where the bytes are, in the process's copy of the file.
 fn stream_read_file_fragment(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(Dw::Stream(face)) = task.of(a[0]) else { return Reply::Value(E_INVALIDARG) };
-    let Some(f) = task.face(face) else { return Reply::Value(E_INVALIDARG) };
-    let file = f.file();
+    let (id, file) = match task.of(a[0]) {
+        Some(Dw::Stream(StreamSource::System(face))) => match task.face(face) {
+            Some(f) => (face, f.file()),
+            None => return Reply::Value(E_INVALIDARG),
+        },
+        Some(Dw::Stream(StreamSource::Custom(id, bytes))) => (id, bytes),
+        _ => return Reply::Value(E_INVALIDARG),
+    };
     let (offset, size) = (a[2], a[3]);
     if offset.checked_add(size).is_none_or(|end| end > file.len() as u64) {
         let _ = task.write_ptr(cx, a[1], 0);
         return Reply::Value(E_INVALIDARG);
     }
-    let Some(at) = task.copy(cx, face, 0, &file) else { return Reply::Value(E_OUTOFMEMORY) };
+    let Some(at) = task.copy(cx, id, 0, &file) else { return Reply::Value(E_OUTOFMEMORY) };
     let _ = task.write_ptr(cx, a[1], at + offset);
     let _ = task.write_ptr(cx, a[4], 0);
     Reply::Value(S_OK)
 }
 
 fn stream_get_file_size(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(Dw::Stream(face)) = task.of(a[0]) else { return Reply::Value(E_INVALIDARG) };
-    let size = task.face(face).map_or(0, |f| f.file().len() as u64);
+    let size = match task.of(a[0]) {
+        Some(Dw::Stream(StreamSource::System(face))) => task.face(face).map_or(0, |f| f.file().len() as u64),
+        Some(Dw::Stream(StreamSource::Custom(_, bytes))) => bytes.len() as u64,
+        _ => return Reply::Value(E_INVALIDARG),
+    };
     task.dw_put(cx, a[1], &size.to_le_bytes());
     Reply::Value(S_OK)
 }
@@ -1159,22 +2009,23 @@ const TEXTURE_CLEAR_TYPE: u32 = 1;
 
 /// `GetAlphaTextureBounds(type, &rect)`: the run's box for the texture its mode makes, empty for the other.
 fn analysis_get_alpha_texture_bounds(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(Dw::Analysis { left, top, width, height, aliased, .. }) = task.of(a[0]) else { return Reply::Value(E_INVALIDARG) };
+    let Some(Dw::Analysis { left, top, width, height, texture, .. }) = task.of(a[0]) else { return Reply::Value(E_INVALIDARG) };
     let kind = a[1] as u32;
     if kind > TEXTURE_CLEAR_TYPE {
         return Reply::Value(E_INVALIDARG);
     }
-    let wanted = (kind == TEXTURE_ALIASED) == aliased && width > 0;
+    let is_1x1 = matches!(texture, AlphaTexture::Aliased | AlphaTexture::Grayscale);
+    let wanted = (kind == TEXTURE_ALIASED) == is_1x1 && width > 0;
     let rect = if wanted { [left, top, left + width as i32, top + height as i32] } else { [0; 4] };
     let b: Vec<u8> = rect.iter().flat_map(|v| v.to_le_bytes()).collect();
     task.dw_put(cx, a[2], &b);
     Reply::Value(S_OK)
 }
 
-/// `CreateAlphaTexture(type, &bounds, buffer, size)`: a byte a pixel (0 or 255, aliased) or three alike (grey, as
-/// ClearType's three would be), for the bounds asked, the run's pixels where they fall in them.
+/// `CreateAlphaTexture(type, &bounds, buffer, size)`: a byte a pixel (0 or 255 when aliased, 0..=255 when grayscale)
+/// or three alike (grey, as ClearType's three would be), for the bounds asked, the run's pixels where they fall in them.
 fn analysis_create_alpha_texture(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(Dw::Analysis { left, top, width, height, alpha, aliased }) = task.of(a[0]) else { return Reply::Value(E_INVALIDARG) };
+    let Some(Dw::Analysis { left, top, width, height, alpha, texture }) = task.of(a[0]) else { return Reply::Value(E_INVALIDARG) };
     let kind = a[1] as u32;
     if kind > TEXTURE_CLEAR_TYPE {
         return Reply::Value(E_INVALIDARG);
@@ -1190,7 +2041,8 @@ fn analysis_create_alpha_texture(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) ->
     if (a[4] as u32 as usize) < w * h * bpp {
         return Reply::Value(E_NOT_SUFFICIENT_BUFFER);
     }
-    let matches = (kind == TEXTURE_ALIASED) == aliased;
+    let is_1x1 = matches!(texture, AlphaTexture::Aliased | AlphaTexture::Grayscale);
+    let matches = (kind == TEXTURE_ALIASED) == is_1x1;
     let mut out = vec![0u8; w * h * bpp];
     if matches && !alpha.is_empty() {
         for y in 0..h {
@@ -1204,7 +2056,7 @@ fn analysis_create_alpha_texture(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) ->
                     continue;
                 }
                 let c = alpha[sy as usize * width + sx as usize];
-                let c = if aliased { if c >= 128 { 255 } else { 0 } } else { c };
+                let c = if texture == AlphaTexture::Aliased { if c >= 128 { 255 } else { 0 } } else { c };
                 out[(y * w + x) * bpp..(y * w + x + 1) * bpp].fill(c);
             }
         }
@@ -1241,7 +2093,7 @@ fn interop_create_font_from_logfont(task: &mut Task, cx: &mut Cx<'_>, a: &[u64])
     let name = String::from_utf16_lossy(&units);
     let fonts = task.fonts();
     match fonts.find(&name).and_then(|f| fonts.matching(f, weight, 5, lf[20] != 0)) {
-        Some(face) => task.give(cx, a[2], Dw::Font(face)),
+        Some(face) => task.give(cx, a[2], Dw::Font(FontSource::System(face))),
         None => {
             let _ = task.write_ptr(cx, a[2], 0);
             Reply::Value(DWRITE_E_NOFONT)
@@ -1250,8 +2102,7 @@ fn interop_create_font_from_logfont(task: &mut Task, cx: &mut Cx<'_>, a: &[u64])
 }
 
 /// A LOGFONTW for a face: its family's name, weight and slant, 0 height.
-fn logfont_of(task: &Task, face: usize) -> Vec<u8> {
-    let f = &task.fonts().faces[face];
+fn logfont_of(f: &FontFace) -> Vec<u8> {
     let mut lf = vec![0u8; LOGFONT_SIZE];
     lf[16..20].copy_from_slice(&i32::from(f.weight).to_le_bytes());
     lf[20] = u8::from(f.italic);
@@ -1264,16 +2115,16 @@ fn logfont_of(task: &Task, face: usize) -> Vec<u8> {
 }
 
 fn interop_convert_font_to_logfont(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(face) = font_index(task, a[1]) else { return Reply::Value(E_INVALIDARG) };
-    let lf = logfont_of(task, face);
+    let Some(src) = font_source(task, a[1]) else { return Reply::Value(E_INVALIDARG) };
+    let lf = logfont_of(&task.source_info(&src));
     task.dw_put(cx, a[2], &lf);
     task.dw_put_u32(cx, a[3], 1);
     Reply::Value(S_OK)
 }
 
 fn interop_convert_font_face_to_logfont(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
-    let Some(face) = font_index(task, a[1]) else { return Reply::Value(E_INVALIDARG) };
-    let lf = logfont_of(task, face);
+    let Some(src) = font_source(task, a[1]) else { return Reply::Value(E_INVALIDARG) };
+    let lf = logfont_of(&task.source_info(&src));
     task.dw_put(cx, a[2], &lf);
     Reply::Value(S_OK)
 }

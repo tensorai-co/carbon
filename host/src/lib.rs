@@ -192,6 +192,11 @@ pub trait Host: Send + Sync + 'static {
         let _ = id;
         None
     }
+    /// A font face from OpenType/TrueType file bytes, for custom font collections and web fonts.
+    fn open_font_bytes(&self, bytes: &[u8]) -> Option<Arc<dyn HostFont>> {
+        let _ = bytes;
+        None
+    }
 }
 
 /// What's been read from the host's stdin and not yet given out, filled by a thread of its own, so a kernel can wait
@@ -400,6 +405,10 @@ impl Host for Std {
 
     fn open_font(&self, id: &str) -> Option<Arc<dyn HostFont>> {
         sys::open_font(id)
+    }
+
+    fn open_font_bytes(&self, bytes: &[u8]) -> Option<Arc<dyn HostFont>> {
+        sys::open_font_bytes(bytes)
     }
 }
 

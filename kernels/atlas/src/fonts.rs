@@ -231,6 +231,55 @@ impl Face {
             })
             .clone()
     }
+
+    /// Parses one face (by index, for a TrueType Collection) from raw SFNT/TTC bytes.
+    pub fn from_bytes(host: &Arc<dyn Host>, bytes: &[u8], index: usize) -> Option<(FontFace, Arc<Face>)> {
+        let single = if bytes.get(0..4) == Some(b"ttcf") {
+            let extracted: Vec<([u8; 4], Vec<u8>)> = sfnt::tables(bytes, index)?.into_iter().map(|(t, b)| (t, b.to_vec())).collect();
+            sfnt::build(&extracted)
+        } else if index == 0 {
+            bytes.to_vec()
+        } else {
+            return None;
+        };
+        let host_font: Arc<dyn HostFont> = host.open_font_bytes(&single).unwrap_or_else(|| Arc::new(RawSfntFont(single.clone())));
+        let face = Face::new(host_font)?;
+        let _ = face.file.set(Arc::new(single));
+        let name_tbl = face.table(*b"name");
+        let n = |id: u16| name_tbl.as_deref().and_then(|t| sfnt::name(t, id));
+        let family = n(21).or_else(|| n(16)).or_else(|| n(1)).unwrap_or_else(|| "Custom".into());
+        let style = n(22).or_else(|| n(17)).or_else(|| n(2)).unwrap_or_else(|| "Regular".into());
+        let full_name = n(4).unwrap_or_else(|| format!("{family} {style}"));
+        let id = n(6).unwrap_or_else(|| full_name.clone());
+        let info = FontFace {
+            id,
+            family,
+            style,
+            full_name,
+            weight: face.metrics.weight,
+            stretch: face.metrics.width,
+            italic: face.metrics.italic,
+            monospace: face.metrics.fixed_pitch,
+        };
+        Some((info, face))
+    }
+}
+
+/// Fallback `HostFont` over raw SFNT bytes when the host doesn't implement `open_font_bytes`.
+struct RawSfntFont(Vec<u8>);
+
+impl HostFont for RawSfntFont {
+    fn tables(&self) -> Vec<[u8; 4]> {
+        sfnt::tables(&self.0, 0).map_or_default(|t| t.into_iter().map(|(tag, _)| tag).collect())
+    }
+
+    fn table(&self, tag: [u8; 4]) -> Option<Vec<u8>> {
+        sfnt::tables(&self.0, 0)?.into_iter().find(|(t, _)| *t == tag).map(|(_, b)| b.to_vec())
+    }
+
+    fn outline(&self, _glyph: u16) -> Option<Vec<PathOp>> {
+        Some(Vec::new())
+    }
 }
 
 #[cfg(test)]

@@ -412,10 +412,15 @@ impl Task {
         }
     }
 
-    /// A system-layer file: one of atlas's DLLs, as `System32` or `SysWOW64` has it.
+    /// A system-layer file: one of atlas's DLLs in `System32` / `SysWOW64`, or a virtual font file in `Windows/Fonts`.
     fn system_file(&self, disk_path: &str) -> Option<Arc<Vec<u8>>> {
         let lower = disk_path.to_ascii_lowercase();
         let (dir, name) = lower.rsplit_once('/')?;
+        if dir == "/windows/fonts"
+            && let Some(idx) = name.strip_prefix("atlas_").and_then(|s| s.strip_suffix(".ttf")).and_then(|s| s.parse::<usize>().ok())
+        {
+            return crate::fonts::get(&self.k.host).open(&self.k.host, idx).map(|f| f.file());
+        }
         let isa = self.system_isa(dir)?;
         if name == "ntdll.dll" {
             return images::guest(isa).map(|image| Arc::new(image.to_vec()));

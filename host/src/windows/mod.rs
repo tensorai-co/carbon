@@ -93,6 +93,10 @@ pub fn open_font(_id: &str) -> Option<std::sync::Arc<dyn crate::HostFont>> {
     None
 }
 
+pub fn open_font_bytes(_bytes: &[u8]) -> Option<std::sync::Arc<dyn crate::HostFont>> {
+    None
+}
+
 /// Extended attributes aren't kept on Windows hosts yet (an alternate data stream could): a volume's files' kernel
 /// metadata is kept in memory while the machine runs.
 pub fn xattr_get(_path: &std::path::Path, _name: &str) -> Option<Vec<u8>> {

@@ -63,6 +63,10 @@ pub fn open_font(_id: &str) -> Option<std::sync::Arc<dyn crate::HostFont>> {
     None
 }
 
+pub fn open_font_bytes(_bytes: &[u8]) -> Option<std::sync::Arc<dyn crate::HostFont>> {
+    None
+}
+
 /// A file's extended attribute, if it has it (not following a link).
 pub fn xattr_get(path: &std::path::Path, name: &str) -> Option<Vec<u8>> {
     use std::os::unix::ffi::OsStrExt;
