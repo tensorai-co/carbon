@@ -92,9 +92,10 @@ impl Task {
         let Ok(raw) = self.mem(cx, false, |t| user::read_vec(&t.space(), name_at, len.min(259) as usize)) else { return status::ACCESS_VIOLATION };
         let raw = String::from_utf8_lossy(&raw).into_owned();
         let name = module_name(&raw);
-        // An API set is its DLL's other name: the loader learns which from the path it's given.
+        // An API set (and KernelBase, whose functions live in kernel32 here) is its DLL's other name.
         let (raw, name) = match crate::imports::api_set(&name) {
             Some(dll) => (dll.to_string(), dll.to_string()),
+            None if name == "kernelbase.dll" => ("kernel32.dll".to_string(), "kernel32.dll".to_string()),
             None => (raw, name),
         };
         let new = !lock(&self.process.state).mapped.contains_key(&name);
@@ -186,9 +187,12 @@ impl Task {
             state.mapped.insert(name.to_string(), (base, path.clone()));
             return Ok((base, path));
         }
-        // A file: by its path, or found as Windows looks.
+        // A file: by its path (resolved against cwd for relative paths like `../../../...`), or found as Windows looks.
         let candidates: Vec<String> = if raw.contains(['\\', '/']) {
-            vec![disk_path(raw)]
+            match self.resolve(raw) {
+                Ok((_, resolved)) => vec![resolved],
+                Err(_) => vec![disk_path(raw)],
+            }
         } else {
             self.dll_search_dirs(cx).iter().flat_map(|dir| [format!("{dir}/{raw}"), format!("{dir}/{name}")]).collect()
         };

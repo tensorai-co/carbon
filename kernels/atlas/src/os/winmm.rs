@@ -17,7 +17,7 @@ use crate::process::Task;
 
 dll! {
     "WINMM.dll";
-    missing PlaySoundW;
+    host PlaySoundW(3) => play_sound;
     host mixerClose(1) => bad_handle;
     host mixerGetControlDetailsA(3) => bad_handle;
     host mixerGetDevCapsA(3) => bad_device;
@@ -65,7 +65,7 @@ dll! {
     missing midiInAddBuffer;
     missing midiInClose;
     missing midiInGetDevCapsW;
-    missing midiInGetNumDevs;
+    host midiInGetNumDevs(0) => no_devices;
     missing midiInOpen;
     missing midiInPrepareHeader;
     missing midiInReset;
@@ -73,7 +73,7 @@ dll! {
     missing midiInUnprepareHeader;
     missing midiOutClose;
     missing midiOutGetDevCapsW;
-    missing midiOutGetNumDevs;
+    host midiOutGetNumDevs(0) => no_devices;
     missing midiOutLongMsg;
     missing midiOutOpen;
     missing midiOutPrepareHeader;
@@ -92,6 +92,10 @@ const MMSYSERR_INVALPARAM: u64 = 11;
 const WAVERR_BADFORMAT: u64 = 32;
 const WAVERR_STILLPLAYING: u64 = 33;
 const WAVERR_UNPREPARED: u64 = 34;
+
+fn play_sound(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(1)
+}
 
 const WAVE_MAPPER: u32 = u32::MAX;
 const WAVE_FORMAT_QUERY: u32 = 0x0001;

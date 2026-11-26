@@ -13,6 +13,7 @@ dll! {
     host WinHttpGetProxyForUrl(4) => win_http_get_proxy_for_url;
     host WinHttpOpen(5) => win_http_open;
     host WinHttpGetIEProxyConfigForCurrentUser(1) => win_http_get_ie_proxy_config_for_current_user;
+    host WinHttpGetDefaultProxyConfiguration(1) => win_http_get_default_proxy_configuration;
     // Not written yet: what larger programs import.
     missing WinHttpAddRequestHeaders;
     missing WinHttpConnect;
@@ -54,4 +55,12 @@ fn win_http_get_ie_proxy_config_for_current_user(task: &mut Task, cx: &mut Cx<'_
     let w = task.abi().width as usize;
     let zero = vec![0u8; w * 4];
     Reply::Value(u64::from(task.mem(cx, true, |t| user::write(&mut t.space(), a[0], &zero)).is_ok()))
+}
+
+/// `WinHttpGetDefaultProxyConfiguration(&info)`: direct access (WINHTTP_ACCESS_TYPE_NO_PROXY = 1).
+fn win_http_get_default_proxy_configuration(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let w = task.abi().width as usize;
+    let mut buf = vec![0u8; w * 3];
+    buf[0..4].copy_from_slice(&1u32.to_le_bytes());
+    Reply::Value(u64::from(task.mem(cx, true, |t| user::write(&mut t.space(), a[0], &buf)).is_ok()))
 }

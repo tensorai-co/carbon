@@ -15,12 +15,68 @@ dll! {
     host PathFileExistsA(1) => path_file_exists_a;
     host PathAppendA(2) => path_append_a;
     host PathIsRelativeA(1) => path_is_relative_a;
-    // Not written yet: what larger programs import.
-    missing AssocQueryStringW;
-    missing PathFindExtensionW;
-    missing PathFindFileNameW;
+    host AssocQueryStringW(6) => assoc_query_string_w;
+    host PathFindExtensionW(1) => path_find_extension_w;
+    host PathFindFileNameW(1) => path_find_file_name_w;
     host PathMatchSpecW(2) => path_match_spec_w;
-    missing PathRemoveExtensionW;
+    host PathRemoveExtensionW(1) => path_remove_extension_w;
+}
+
+fn assoc_query_string_w(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(0x8007_0483) // HRESULT_FROM_WIN32(ERROR_NO_ASSOCIATION)
+}
+
+fn path_find_file_name_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[0] == 0 {
+        return Reply::Value(0);
+    }
+    let s = task.text_arg(cx, a[0], true);
+    let units: Vec<u16> = s.encode_utf16().collect();
+    let mut start = 0usize;
+    for (i, &c) in units.iter().enumerate() {
+        if (c == b'\\' as u16 || c == b'/' as u16 || c == b':' as u16) && i + 1 < units.len() {
+            start = i + 1;
+        }
+    }
+    Reply::Value(a[0] + (start as u64) * 2)
+}
+
+fn path_find_extension_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[0] == 0 {
+        return Reply::Value(0);
+    }
+    let s = task.text_arg(cx, a[0], true);
+    let units: Vec<u16> = s.encode_utf16().collect();
+    let mut dot = None;
+    for (i, &c) in units.iter().enumerate() {
+        if c == b'\\' as u16 || c == b'/' as u16 || c == b' ' as u16 {
+            dot = None;
+        } else if c == b'.' as u16 {
+            dot = Some(i);
+        }
+    }
+    let pos = dot.unwrap_or(units.len());
+    Reply::Value(a[0] + (pos as u64) * 2)
+}
+
+fn path_remove_extension_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[0] == 0 {
+        return Reply::Value(0);
+    }
+    let s = task.text_arg(cx, a[0], true);
+    let units: Vec<u16> = s.encode_utf16().collect();
+    let mut dot = None;
+    for (i, &c) in units.iter().enumerate() {
+        if c == b'\\' as u16 || c == b'/' as u16 || c == b' ' as u16 {
+            dot = None;
+        } else if c == b'.' as u16 {
+            dot = Some(i);
+        }
+    }
+    if let Some(pos) = dot {
+        let _ = task.mem(cx, true, |t| kernels_core::user::write(&mut t.space(), a[0] + (pos as u64) * 2, &[0, 0]));
+    }
+    Reply::Value(0)
 }
 
 /// `PathFileExistsW(path)` and `A`: whether there's a file or folder there.

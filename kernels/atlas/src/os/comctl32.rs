@@ -27,7 +27,7 @@ dll! {
     host AtlasListViewWndProc(4) => list_view_wnd_proc;
     missing CreatePropertySheetPageW;
     missing PropertySheetW;
-    missing TaskDialogIndirect;
+    missing TaskDialogIndirect @ 345;
 }
 
 /// `InitCommonControls()`: its classes are there already.

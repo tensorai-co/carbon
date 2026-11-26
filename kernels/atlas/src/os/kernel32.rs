@@ -17,6 +17,7 @@ use super::nlsapi::*;
 use super::pipeapi::*;
 use super::procapi::*;
 use super::resapi::*;
+use super::secapi::open_process_token;
 use super::synch::*;
 use super::sysapi::*;
 use super::{Reply, dll};
@@ -527,10 +528,10 @@ dll! {
     host FormatMessageA(7) => format_message_a;
     host FormatMessageW(7) => format_message_w;
     missing GenerateConsoleCtrlEvent;
-    missing GetBinaryTypeW;
+    host GetBinaryTypeW(2) => get_binary_type_w;
     host GetConsoleScreenBufferInfo(2) => get_console_screen_buffer_info;
     host GetCurrentProcessorNumber(0) => zero;
-    missing GetFileInformationByHandleEx;
+    host GetFileInformationByHandleEx(4) => get_file_information_by_handle_ex;
     host GetLocaleInfoA(4) => get_locale_info_a;
     host GetLocaleInfoEx(4) => get_locale_info_ex;
     host GetLocaleInfoW(4) => get_locale_info_w;
@@ -571,7 +572,7 @@ dll! {
     host SetConsoleTextAttribute(2) => accept;
     host SetDllDirectoryA(1) => set_dll_directory_a;
     host SetDllDirectoryW(1) => set_dll_directory_w;
-    missing SetFileInformationByHandle;
+    host SetFileInformationByHandle(4) => accept;
     host SetHandleCount(1) => handle_count;
     host SetInformationJobObject(4) => accept;
     host SetPriorityClass(2) => accept;
@@ -580,7 +581,7 @@ dll! {
     missing SetThreadContext;
     host SetThreadErrorMode(2) => set_thread_error_mode;
     host SetThreadExecutionState(1) => set_thread_execution_state;
-    missing SignalObjectAndWait;
+    host SignalObjectAndWait(4) => signal_object_and_wait;
     host VirtualAllocEx(5) => virtual_alloc_ex;
     host VirtualProtectEx(5) => virtual_protect_ex;
     host VirtualQueryEx(4) => virtual_query_ex;
@@ -603,11 +604,11 @@ dll! {
     missing ClearCommError;
     host CompareStringOrdinal(5) => compare_string_ordinal;
     host CreateJobObjectW(2) => create_job_object;
-    missing CreateMemoryResourceNotification;
+    host CreateMemoryResourceNotification(1) => create_memory_resource_notification;
     host DeleteProcThreadAttributeList(1) => accept;
     // Pages whose contents may go: kept as they are, which Windows allows.
     host DiscardVirtualMemory(2) => zero;
-    missing EnumSystemLocalesEx;
+    host EnumSystemLocalesEx(4) => accept;
     missing EscapeCommFunction;
     missing FindFirstVolumeW;
     missing FindNextVolumeW;
@@ -616,10 +617,10 @@ dll! {
     missing GetCommModemStatus;
     missing GetCommState;
     missing GetConsoleDisplayMode;
-    missing GetCurrencyFormatEx;
+    host GetCurrencyFormatEx(7) => get_number_format_ex;
     host GetFirmwareType(1) => get_firmware_type;
     host GetGeoInfoW(5) => get_geo_info_w;
-    missing GetNumberFormatEx;
+    host GetNumberFormatEx(7) => get_number_format_ex;
     host GetPriorityClass(1) => get_priority_class;
     host GetProcessHandleCount(2) => get_process_handle_count;
     host GetProcessMitigationPolicy(4) => get_process_mitigation_policy;
@@ -682,6 +683,39 @@ dll! {
     host RegDeleteValueW(2) => reg_delete_value_w;
     host ReclaimVirtualMemory(2) => zero;
     host OfferVirtualMemory(3) => zero;
+    host GetDllDirectoryW(2) => get_dll_directory_w;
+    host GetLargePageMinimum(0) => zero;
+    host GetNumaNodeProcessorMask(2) => get_numa_node_processor_mask;
+    host GetNumaNodeProcessorMaskEx(2) => get_numa_node_processor_mask_ex;
+    host GetNumaProcessorNode(2) => get_numa_processor_node;
+    host GetNumaProcessorNodeEx(2) => get_numa_processor_node_ex;
+    host GetPrivateProfileIntW(4) => get_private_profile_int_w;
+    host GetThreadIdealProcessorEx(2) => get_thread_ideal_processor_ex;
+    host GetUserPreferredUILanguages(4) => get_preferred_ui_languages;
+    host IsProcessInJob(3) => is_process_in_job;
+    host K32EnumProcessModulesEx(5) => enum_process_modules;
+    host QueryMemoryResourceNotification(2) => query_memory_resource_notification;
+    host ReOpenFile(4) => re_open_file;
+    host SetConsoleScreenBufferSize(2) => accept;
+    host SetConsoleWindowInfo(3) => accept;
+    host SetCriticalSectionSpinCount(2) => zero;
+    host SetThreadGroupAffinity(3) => set_thread_group_affinity;
+    host VirtualUnlock(2) => accept;
+    host SetThreadDescription(2) => zero;
+    host WerRegisterCustomMetadata(2) => zero;
+    host WerUnregisterCustomMetadata(1) => zero;
+    host OpenProcessToken(3) => open_process_token;
+    host GetWriteWatch(6) => invalid;
+    host IsApiSetImplemented(1) => zero;
+    host GetNumberOfConsoleInputEvents(2) => get_number_of_console_input_events;
+    host PeekConsoleInputA(4) => peek_console_input_a;
+    host ReadConsoleInputW(4) => read_console_input_w;
+    host SetLocalTime(1) => accept;
+    host FindCloseChangeNotification(1) => accept;
+    host FindFirstChangeNotificationW(3) => invalid;
+    host GetProcessIoCounters(2) => get_process_io_counters;
+    host K32EmptyWorkingSet(1) => accept;
+    host RaiseFailFastException(3) => raise_fail_fast_exception;
 }
 
 const TRUE: u64 = 1;
@@ -1074,4 +1108,273 @@ fn get_system_time_adjustment(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Re
         }
     }
     Reply::Value(u64::from(ok))
+}
+
+fn invalid(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(INVALID)
+}
+
+fn get_dll_directory_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let cap = a[0] as u32 as usize;
+    let buf = a[1];
+    let dir = lock(&task.process.state).dll_directory.clone().unwrap_or_default();
+    if dir.is_empty() {
+        return Reply::Value(0);
+    }
+    let units: Vec<u16> = dir.encode_utf16().collect();
+    if cap <= units.len() || buf == 0 {
+        return Reply::Value((units.len() + 1) as u64);
+    }
+    let bytes: Vec<u8> = units.iter().copied().chain([0]).flat_map(u16::to_le_bytes).collect();
+    if task.mem(cx, true, |t| user::write(&mut t.space(), buf, &bytes)).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(units.len() as u64)
+}
+
+fn get_numa_node_processor_mask(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if (a[0] as u8) != 0 {
+        return task.fail(cx, 87);
+    }
+    let bits = task.cpus().min(64);
+    let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    if a[1] == 0 || task.mem(cx, true, |t| user::write(&mut t.space(), a[1], &mask.to_le_bytes())).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(TRUE)
+}
+
+fn get_numa_node_processor_mask_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if (a[0] as u16) != 0 {
+        return task.fail(cx, 87);
+    }
+    get_thread_group_affinity(task, cx, &[0, a[1]])
+}
+
+fn get_numa_processor_node(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[1] == 0 || task.mem(cx, true, |t| user::write(&mut t.space(), a[1], &[0u8])).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(TRUE)
+}
+
+fn get_numa_processor_node_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[1] == 0 || task.mem(cx, true, |t| user::write(&mut t.space(), a[1], &0u16.to_le_bytes())).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(TRUE)
+}
+
+fn get_private_profile_int_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let default = a[2] as u32;
+    let Some(section) = (if a[0] != 0 { task.path_arg(cx, a[0], true) } else { None }) else {
+        return Reply::Value(u64::from(default));
+    };
+    let Some(key) = (if a[1] != 0 { task.path_arg(cx, a[1], true) } else { None }) else {
+        return Reply::Value(u64::from(default));
+    };
+    let path = task.ini_path(cx, a[3]);
+    let ini = task.ini_read(&path);
+    let val = ini
+        .section(&section)
+        .and_then(|keys| keys.iter().find(|(n, _)| n.eq_ignore_ascii_case(&key)))
+        .and_then(|(_, v)| {
+            let s = v.trim();
+            if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                u32::from_str_radix(hex, 16).ok()
+            } else {
+                s.parse::<i32>().ok().map(|n| n as u32)
+            }
+        })
+        .unwrap_or(default);
+    Reply::Value(u64::from(val))
+}
+
+fn get_thread_ideal_processor_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[1] == 0 || task.mem(cx, true, |t| user::write(&mut t.space(), a[1], &[0u8; 4])).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(TRUE)
+}
+
+fn is_process_in_job(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[2] == 0 || task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[2], 0)).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(TRUE)
+}
+
+fn create_memory_resource_notification(task: &mut Task, cx: &mut Cx<'_>, _: &[u64]) -> Reply {
+    create_event_w(task, cx, &[0, 1, 0, 0])
+}
+
+fn query_memory_resource_notification(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[1] == 0 || task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[1], 0)).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(TRUE)
+}
+
+fn re_open_file(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(Handle::File(file)) = lock(&task.process.state).handles.get(a[0]) else {
+        task.set_last_error(cx, 6);
+        return Reply::Value(INVALID);
+    };
+    let new_h = lock(&task.process.state).handles.add(Handle::File(file));
+    Reply::Value(new_h)
+}
+
+fn set_thread_group_affinity(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[2] != 0 {
+        let _ = get_thread_group_affinity(task, cx, &[a[0], a[2]]);
+    }
+    Reply::Value(TRUE)
+}
+
+fn get_number_of_console_input_events(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[1] == 0 || task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[1], 0)).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(TRUE)
+}
+
+fn peek_console_input_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[3] != 0 {
+        let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[3], 0));
+    }
+    Reply::Value(TRUE)
+}
+
+fn read_console_input_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[3] != 0 {
+        let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[3], 0));
+    }
+    Reply::Value(TRUE)
+}
+
+fn get_binary_type_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Some(path) = task.path_arg(cx, a[0], true) else {
+        return task.fail(cx, 2);
+    };
+    let Ok(bytes) = task.read_whole(&path) else {
+        return task.fail(cx, 2);
+    };
+    if bytes.len() < 0x40 || &bytes[0..2] != b"MZ" {
+        return task.fail(cx, 193); // ERROR_BAD_EXE_FORMAT
+    }
+    let off = u32::from_le_bytes([bytes[0x3c], bytes[0x3d], bytes[0x3e], bytes[0x3f]]) as usize;
+    if off + 26 > bytes.len() || &bytes[off..off + 4] != b"PE\0\0" {
+        return task.fail(cx, 193);
+    }
+    let opt_magic = u16::from_le_bytes([bytes[off + 24], bytes[off + 25]]);
+    let kind: u32 = if opt_magic == 0x20b { 6 } else { 0 }; // SCS_64BIT_BINARY / SCS_32BIT_BINARY
+    if a[1] != 0 {
+        let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[1], kind));
+    }
+    Reply::Value(TRUE)
+}
+
+fn get_file_information_by_handle_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (h, class, buf, size) = (a[0], a[1] as u32, a[2], a[3] as u32 as usize);
+    let Some(file) = task.file_handle(h) else {
+        return task.fail(cx, 6);
+    };
+    let Ok(info) = task.file_info(&file) else {
+        return task.fail(cx, 6);
+    };
+    let is_dir = (info.attributes & 0x10) != 0;
+    let out: Vec<u8> = match class {
+        0 => {
+            // FileBasicInfo (40 bytes): CreationTime, LastAccessTime, LastWriteTime, ChangeTime, FileAttributes, pad
+            if size < 40 {
+                return task.fail(cx, 122);
+            }
+            let mut b = Vec::with_capacity(40);
+            b.extend_from_slice(&info.created.to_le_bytes());
+            b.extend_from_slice(&info.accessed.to_le_bytes());
+            b.extend_from_slice(&info.modified.to_le_bytes());
+            b.extend_from_slice(&info.modified.to_le_bytes());
+            b.extend_from_slice(&info.attributes.to_le_bytes());
+            b.extend_from_slice(&0u32.to_le_bytes());
+            b
+        }
+        1 => {
+            // FileStandardInfo (24 bytes): AllocationSize(8), EndOfFile(8), NumberOfLinks(4), DeletePending(1), Directory(1), pad(2)
+            if size < 24 {
+                return task.fail(cx, 122);
+            }
+            let mut b = Vec::with_capacity(24);
+            let alloc = (info.size + 4095) & !4095;
+            b.extend_from_slice(&alloc.to_le_bytes());
+            b.extend_from_slice(&info.size.to_le_bytes());
+            b.extend_from_slice(&info.links.to_le_bytes());
+            b.push(0);
+            b.push(u8::from(is_dir));
+            b.extend_from_slice(&[0, 0]);
+            b
+        }
+        2 => {
+            // FileNameInfo: FileNameLength(4, bytes), FileName(UTF-16)
+            let win = file.path.replace('/', "\\");
+            let units: Vec<u16> = win.encode_utf16().collect();
+            let byte_len = units.len() * 2;
+            if size < 4 + byte_len {
+                return task.fail(cx, 234); // ERROR_MORE_DATA
+            }
+            let mut b = Vec::with_capacity(4 + byte_len);
+            b.extend_from_slice(&(byte_len as u32).to_le_bytes());
+            for u in units {
+                b.extend_from_slice(&u.to_le_bytes());
+            }
+            b
+        }
+        9 => {
+            // FileAttributeTagInfo (8 bytes): FileAttributes(4), ReparseTag(4)
+            if size < 8 {
+                return task.fail(cx, 122);
+            }
+            let mut b = Vec::with_capacity(8);
+            b.extend_from_slice(&info.attributes.to_le_bytes());
+            b.extend_from_slice(&0u32.to_le_bytes());
+            b
+        }
+        _ => return task.fail(cx, 50), // ERROR_NOT_SUPPORTED
+    };
+    if buf == 0 || task.mem(cx, true, |t| user::write(&mut t.space(), buf, &out)).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(TRUE)
+}
+
+fn get_number_format_ex(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let val = task.text_arg(cx, a[2], true);
+    let units: Vec<u16> = val.encode_utf16().chain([0]).collect();
+    let cap = a[5] as u32 as usize;
+    if cap == 0 || a[4] == 0 {
+        return Reply::Value(units.len() as u64);
+    }
+    if cap < units.len() {
+        return task.fail(cx, 122);
+    }
+    let bytes: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+    if task.mem(cx, true, |t| user::write(&mut t.space(), a[4], &bytes)).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(units.len() as u64)
+}
+
+fn get_process_io_counters(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[1] == 0 || task.mem(cx, true, |t| user::write(&mut t.space(), a[1], &[0u8; 48])).is_err() {
+        return task.fail(cx, 998);
+    }
+    Reply::Value(TRUE)
+}
+
+fn raise_fail_fast_exception(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::ExitProcess(0xc000_0409)
+}
+
+fn signal_object_and_wait(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let _ = set_event(task, cx, &[a[0]]);
+    wait_for_single_object_ex(task, cx, &[a[1], a[2], a[3]])
 }

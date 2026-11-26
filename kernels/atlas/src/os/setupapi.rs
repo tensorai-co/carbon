@@ -11,6 +11,7 @@ dll! {
     "SETUPAPI.dll";
     missing CM_Get_DevNode_Status;
     host CM_Get_Device_IDA(4) => cm_no_devnode;
+    host CM_Get_Device_IDW(4) => cm_no_devnode;
     host CM_Get_Parent(3) => cm_no_devnode;
     host CM_Locate_DevNodeA(3) => cm_no_devnode;
     missing SetupCopyOEMInfW;
@@ -26,20 +27,24 @@ dll! {
     missing SetupDiEnumDriverInfoW;
     host SetupDiGetClassDevsA(4) => new_set;
     host SetupDiGetClassDevsW(4) => new_set;
+    host SetupDiGetClassDevsExW(7) => new_set;
     missing SetupDiGetDeviceInstanceIdA;
     missing SetupDiGetDeviceInterfaceDetailA;
     missing SetupDiGetDeviceInterfaceDetailW;
-    missing SetupDiGetDevicePropertyW;
+    host SetupDiGetDevicePropertyW(8) => no_device;
     missing SetupDiGetDeviceRegistryPropertyA;
     missing SetupDiGetDeviceRegistryPropertyW;
     missing SetupDiGetDriverInfoDetailW;
     missing SetupDiOpenClassRegKey;
-    missing SetupDiOpenDevRegKey;
+    host SetupDiOpenDevRegKey(6) => open_dev_reg_key;
     missing SetupDiSetClassInstallParamsW;
     missing SetupDiSetDeviceRegistryPropertyW;
     // Not written yet: what larger programs import.
     host SetupDiOpenDeviceInfoW(5) => no_device;
     host SetupDiOpenDeviceInterfaceW(4) => no_interface;
+    host SetupDiDeleteDeviceInfo(2) => no_device;
+    host SetupDiGetDeviceInstanceIdW(5) => no_device;
+    host SetupDiOpenDeviceInterfaceRegKey(4) => open_dev_reg_key;
 }
 
 /// ERROR_INVALID_HANDLE, ERROR_NO_MORE_ITEMS, ERROR_NO_SUCH_DEVINST and ERROR_NO_SUCH_DEVICE_INTERFACE.
@@ -83,6 +88,11 @@ fn no_more(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 /// `SetupDiOpenDeviceInfoW(set, instance ID, window, flags, &data)`: no device has that ID.
 fn no_device(task: &mut Task, cx: &mut Cx<'_>, _: &[u64]) -> Reply {
     task.fail(cx, ERROR_NO_SUCH_DEVINST)
+}
+
+fn open_dev_reg_key(task: &mut Task, cx: &mut Cx<'_>, _: &[u64]) -> Reply {
+    task.set_last_error(cx, ERROR_NO_SUCH_DEVINST);
+    Reply::Value(u64::MAX)
 }
 
 /// `SetupDiOpenDeviceInterfaceW(set, path, flags, &data)`: no interface has that path.

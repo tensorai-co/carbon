@@ -79,6 +79,7 @@ pub fn api_set(dll: &str) -> Option<&'static str> {
         ("core-registry-", "advapi32.dll"),
         ("core-com-", "combase.dll"),
         ("core-winrt-", "combase.dll"),
+        ("core-version-", "version.dll"),
         ("core-", "kernel32.dll"),
         ("security-", "advapi32.dll"),
         ("eventing-", "advapi32.dll"),

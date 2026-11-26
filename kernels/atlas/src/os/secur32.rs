@@ -21,7 +21,7 @@ dll! {
     host QueryContextAttributesA(3) => unsupported;
     host SetContextAttributesA(4) => unsupported;
     host AcquireCredentialsHandleW(9) => unsupported;
-    missing GetUserNameExW;
+    host GetUserNameExW(3) => get_user_name_ex_w;
     host InitializeSecurityContextW(12) => unsupported;
     missing LsaConnectUntrusted;
     missing LsaDeregisterLogonProcess;
@@ -75,4 +75,32 @@ fn init_security_interface_a(task: &mut Task, cx: &mut Cx<'_>, _: &[u64]) -> Rep
     }
     let _ = task.mem(cx, true, |t| user::write(&mut t.space(), base, &buf));
     Reply::Value(base)
+}
+
+/// `GetUserNameExW(format, buffer, &size)`: reports the local workstation user name.
+fn get_user_name_ex_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (fmt, buf, size_ptr) = (a[0] as u32, a[1], a[2]);
+    if size_ptr == 0 {
+        task.set_last_error(cx, 87);
+        return Reply::Value(0);
+    }
+    let name = match fmt {
+        2 => "WORKGROUP\\User", // NameSamCompatible
+        3 => "User",            // NameDisplay
+        8 => "User@workgroup",  // NameUserPrincipal
+        _ => "User",
+    };
+    let units: Vec<u16> = name.encode_utf16().chain([0]).collect();
+    let cap = task.mem(cx, false, |t| user::read_u32(&t.space(), size_ptr)).unwrap_or(0) as usize;
+    let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), size_ptr, units.len() as u32));
+    if buf == 0 || cap < units.len() {
+        task.set_last_error(cx, 234); // ERROR_MORE_DATA
+        return Reply::Value(0);
+    }
+    let bytes: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+    if task.mem(cx, true, |t| user::write(&mut t.space(), buf, &bytes)).is_err() {
+        task.set_last_error(cx, 87);
+        return Reply::Value(0);
+    }
+    Reply::Value(1)
 }

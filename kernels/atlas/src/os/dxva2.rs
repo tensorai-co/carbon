@@ -1,10 +1,16 @@
-//! dxva2.dll: declared so the programs that import it load; each export says it isn't written yet when called.
+//! dxva2.dll: DirectX Video Acceleration 2 (not available).
 
-use super::dll;
+use kernels_core::thread::Cx;
+
+use super::{Reply, dll};
+use crate::process::Task;
 
 dll! {
     "DXVA2.dll";
-    missing DXVA2CreateVideoService;
-    // Not written yet: what larger programs import.
-    missing DXVA2CreateDirect3DDeviceManager9;
+    host DXVA2CreateVideoService(3) => not_impl;
+    host DXVA2CreateDirect3DDeviceManager9(2) => not_impl;
+}
+
+fn not_impl(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(0x8000_4001) // E_NOTIMPL
 }

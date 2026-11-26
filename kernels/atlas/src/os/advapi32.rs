@@ -5,7 +5,7 @@ use kernels_core::lock;
 use kernels_core::thread::Cx;
 use kernels_core::user;
 
-use super::procapi::create_process_as_user_w;
+use super::procapi::{create_process_as_user_w, create_process_w};
 use super::secapi::*;
 use super::etw::{event_register, get_trace_logger_handle, register_trace_guids};
 use super::{Reply, dll};
@@ -160,11 +160,11 @@ dll! {
     missing ControlService;
     host CreateProcessAsUserW(11) => create_process_as_user_w;
     host CryptAcquireContextA(5) => crypt_acquire_context;
-    missing CryptCreateHash;
-    missing CryptDestroyHash;
+    host CryptCreateHash(5) => crypt_bad_key;
+    host CryptDestroyHash(1) => crypt_release_context;
     host CryptGenRandom(3) => crypt_gen_random;
-    missing CryptGetHashParam;
-    missing CryptHashData;
+    host CryptGetHashParam(5) => crypt_bad_key;
+    host CryptHashData(4) => crypt_bad_key;
     host CryptReleaseContext(2) => crypt_release_context;
     host EventRegister(4) => event_register;
     host EventSetInformation(4) => etw_zero;
@@ -173,30 +173,30 @@ dll! {
     missing OpenEventLogA;
     host OpenSCManagerW(3) => open_sc_manager;
     host OpenServiceW(3) => open_service;
-    missing QueryServiceConfigW;
-    missing QueryServiceStatus;
-    missing QueryServiceStatusEx;
+    host QueryServiceConfigW(4) => svc_unsupported;
+    host QueryServiceStatus(2) => svc_unsupported;
+    host QueryServiceStatusEx(5) => svc_unsupported;
     missing ReadEventLogW;
     missing RegDeleteKeyValueW;
     missing RegSetKeyValueW;
-    missing StartServiceW;
-    missing AllocateLocallyUniqueId;
+    host StartServiceW(3) => svc_unsupported;
+    host AllocateLocallyUniqueId(1) => allocate_locally_unique_id;
     host BuildExplicitAccessWithNameW(5) => build_explicit_access_with_name_w;
     missing BuildSecurityDescriptorW;
     host BuildTrusteeWithSidW(2) => build_trustee_with_sid;
     missing CloseTrace;
     missing ControlTraceW;
     host CreateRestrictedToken(9) => create_restricted_token;
-    missing CryptGetProvParam;
-    missing CryptSetHashParam;
-    missing CryptSignHashW;
+    host CryptGetProvParam(5) => crypt_no_more;
+    host CryptSetHashParam(4) => crypt_bad_key;
+    host CryptSignHashW(6) => crypt_bad_key;
     host EventWrite(3) => etw_zero;
     host GetTraceEnableFlags(1) => etw_zero;
     host GetTraceEnableLevel(1) => etw_zero;
     host GetTraceLoggerHandle(1) => get_trace_logger_handle;
     host ImpersonateAnonymousToken(1) => impersonate_anonymous_token;
     missing LogonUserW;
-    missing LsaNtStatusToWinError;
+    host LsaNtStatusToWinError(1) => lsa_nt_status_to_win_error;
     missing OpenTraceW;
     missing ProcessTrace;
     host RegDisablePredefinedCache(0) => reg_disable_predefined_cache;
@@ -213,6 +213,28 @@ dll! {
     host BuildExplicitAccessWithNameA(5) => build_explicit_access_with_name_a;
     host SetEntriesInAclA(4) => set_entries_in_acl_a;
     host RegisterTraceGuidsA(8) => register_trace_guids;
+    host CreateProcessWithTokenW(9) => create_process_with_token_w;
+    host CryptDecrypt(6) => crypt_bad_key;
+    host CryptDestroyKey(1) => crypt_release_context;
+    host CryptEncrypt(7) => crypt_bad_key;
+    host CryptEnumProvidersW(6) => crypt_no_more;
+    host CryptExportKey(6) => crypt_bad_key;
+    host CryptGetUserKey(3) => crypt_no_key;
+    host CryptImportKey(6) => crypt_bad_key;
+    host CredDeleteW(3) => cred_ok;
+    host CredFree(1) => etw_zero;
+    host CredReadW(4) => cred_not_found;
+    host CredWriteW(2) => cred_ok;
+    host ChangeServiceConfig2W(3) => svc_unsupported;
+    host ChangeServiceConfigW(11) => svc_unsupported;
+    host CreateServiceW(13) => svc_unsupported;
+    host DeleteService(1) => svc_unsupported;
+    host QueryServiceConfig2W(5) => svc_unsupported;
+    host QueryServiceObjectSecurity(5) => svc_unsupported;
+    host RegisterServiceCtrlHandlerW(2) => svc_unsupported;
+    host SetServiceObjectSecurity(3) => svc_unsupported;
+    host SetServiceStatus(2) => svc_unsupported;
+    host StartServiceCtrlDispatcherW(1) => svc_no_scm;
 }
 
 const SUCCESS: u64 = 0;
@@ -950,4 +972,57 @@ fn crypt_gen_random(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 
 fn crypt_release_context(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
     Reply::Value(1)
+}
+
+fn crypt_bad_key(task: &mut Task, cx: &mut Cx<'_>, _: &[u64]) -> Reply {
+    task.set_last_error(cx, 0x8009_0003); // NTE_BAD_KEY
+    Reply::Value(0)
+}
+
+fn crypt_no_key(task: &mut Task, cx: &mut Cx<'_>, _: &[u64]) -> Reply {
+    task.set_last_error(cx, 0x8009_000d); // NTE_NO_KEY
+    Reply::Value(0)
+}
+
+fn crypt_no_more(task: &mut Task, cx: &mut Cx<'_>, _: &[u64]) -> Reply {
+    task.set_last_error(cx, ERROR_NO_MORE_ITEMS);
+    Reply::Value(0)
+}
+
+fn cred_not_found(task: &mut Task, cx: &mut Cx<'_>, _: &[u64]) -> Reply {
+    task.set_last_error(cx, 1168); // ERROR_NOT_FOUND
+    Reply::Value(0)
+}
+
+fn cred_ok(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(1)
+}
+
+fn svc_unsupported(task: &mut Task, cx: &mut Cx<'_>, _: &[u64]) -> Reply {
+    task.set_last_error(cx, ERROR_SERVICE_DOES_NOT_EXIST);
+    Reply::Value(0)
+}
+
+fn svc_no_scm(task: &mut Task, cx: &mut Cx<'_>, _: &[u64]) -> Reply {
+    task.set_last_error(cx, 1063); // ERROR_FAILED_SERVICE_CONTROLLER_CONNECT
+    Reply::Value(0)
+}
+
+fn create_process_with_token_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    create_process_w(task, cx, &[a[2], a[3], 0, 0, 0, a[4], a[5], a[6], a[7], a[8]])
+}
+
+static NEXT_LUID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x1000);
+
+fn allocate_locally_unique_id(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let v = NEXT_LUID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if a[0] == 0 || task.mem(cx, true, |t| user::write(&mut t.space(), a[0], &v.to_le_bytes())).is_err() {
+        task.set_last_error(cx, 87);
+        return Reply::Value(0);
+    }
+    Reply::Value(1)
+}
+
+fn lsa_nt_status_to_win_error(_: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(if (a[0] as u32) == 0 { 0 } else { 1 })
 }

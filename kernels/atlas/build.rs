@@ -65,6 +65,10 @@ fn rustflags(arch: &str) -> String {
         "AtlasSwitchToFiber",
         "AtlasWsprintfW",
         "AtlasWsprintfA",
+        "AtlasCrtMsvcrtSscanf",
+        "AtlasCrtMsvcrtSprintfS",
+        "AtlasCrtMsvcrtSwprintfS",
+        "AtlasCrtMsvcrtSnwprintfS",
         "AtlasCrtSetjmp",
         "AtlasCrtLongjmp",
     ];

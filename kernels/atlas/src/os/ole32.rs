@@ -70,18 +70,18 @@ dll! {
     host ReleaseStgMedium(1) => nothing;
     host RevokeDragDrop(1) => s_ok;
     host StringFromIID(2) => string_from_iid;
-    missing CoAddRefServerProcess;
-    missing CoAllowSetForegroundWindow;
-    missing CoCreateFreeThreadedMarshaler;
-    missing CoCreateGuid;
-    missing CoGetApartmentType;
+    host CoAddRefServerProcess(0) => co_one;
+    host CoAllowSetForegroundWindow(2) => s_ok;
+    host CoCreateFreeThreadedMarshaler(2) => co_create_free_threaded_marshaler;
+    host CoCreateGuid(1) => co_create_guid;
+    host CoGetApartmentType(2) => co_get_apartment_type;
     missing CoGetContextToken;
     missing CoGetInterfaceAndReleaseStream;
     guest CoGetMalloc => AtlasCoGetMalloc;
     missing CoGetObjectContext;
     missing CoMarshalInterThreadInterfaceInStream;
     missing CoRegisterInitializeSpy;
-    missing CoReleaseServerProcess;
+    host CoReleaseServerProcess(0) => nothing;
     missing CoRevokeInitializeSpy;
     missing CreateILockBytesOnHGlobal;
     missing CreateStreamOnHGlobal;
@@ -90,7 +90,9 @@ dll! {
     missing OleDuplicateData;
     missing PropVariantCopy;
     missing StgCreateDocfileOnILockBytes;
-    missing StringFromGUID2;
+    host StringFromGUID2(3) => string_from_guid2;
+    host CreateBindCtx(2) => co_create_free_threaded_marshaler;
+    host GetRunningObjectTable(2) => co_create_free_threaded_marshaler;
 }
 
 const S_OK: u64 = 0;
@@ -104,6 +106,64 @@ fn co_initialize(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
 
 fn nothing(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
     Reply::Value(0)
+}
+
+fn co_one(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(1)
+}
+
+fn co_get_apartment_type(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[0] != 0 {
+        let _ = task.mem(cx, true, |t| kernels_core::user::write_u32(&mut t.space(), a[0], 1)); // APTTYPE_MTA
+    }
+    if a[1] != 0 {
+        let _ = task.mem(cx, true, |t| kernels_core::user::write_u32(&mut t.space(), a[1], 0));
+    }
+    Reply::Value(S_OK)
+}
+
+pub(super) fn co_create_guid(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[0] == 0 {
+        return Reply::Value(0x8007_0057); // E_INVALIDARG
+    }
+    let mut b = [0u8; 16];
+    task.k.host.random(&mut b);
+    // RFC 4122 version 4 UUID (stored in Windows GUID mixed-endian layout).
+    b[7] = (b[7] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    if task.mem(cx, true, |t| kernels_core::user::write(&mut t.space(), a[0], &b)).is_err() {
+        return Reply::Value(0x8000_4003); // E_POINTER
+    }
+    Reply::Value(S_OK)
+}
+
+fn co_create_free_threaded_marshaler(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[1] != 0 {
+        let _ = task.write_ptr(cx, a[1], 0);
+    }
+    Reply::Value(0x8000_4001) // E_NOTIMPL
+}
+
+fn string_from_guid2(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (rguid, buf, cch) = (a[0], a[1], a[2] as u32 as usize);
+    if rguid == 0 || buf == 0 || cch < 39 {
+        return Reply::Value(0);
+    }
+    let Ok(b) = task.mem(cx, false, |t| kernels_core::user::read_vec(&t.space(), rguid, 16)) else {
+        return Reply::Value(0);
+    };
+    let d1 = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    let d2 = u16::from_le_bytes([b[4], b[5]]);
+    let d3 = u16::from_le_bytes([b[6], b[7]]);
+    let s = format!(
+        "{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}\0",
+        d1, d2, d3, b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
+    );
+    let bytes: Vec<u8> = s.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    if task.mem(cx, true, |t| kernels_core::user::write(&mut t.space(), buf, &bytes)).is_err() {
+        return Reply::Value(0);
+    }
+    Reply::Value(39)
 }
 
 /// `CoCreateInstance(&clsid, outer, context, &iid, &object)`: one of atlas's classes, through the interface asked for;

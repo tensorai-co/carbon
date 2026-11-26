@@ -365,7 +365,7 @@ dll! {
     missing BeginDeferWindowPos;
     missing CharToOemBuffW;
     host CharUpperW(1) => char_upper_w;
-    missing CloseTouchInputHandle;
+    host CloseTouchInputHandle(1) => succeed;
     host CloseWindowStation(1) => close_window_station;
     host CreateDesktopW(6) => create_desktop_w;
     host CreateWindowStationW(4) => create_window_station_w;
@@ -383,12 +383,12 @@ dll! {
     missing DrawFocusRect;
     missing DrawFrameControl;
     missing EndDeferWindowPos;
-    missing EnumDisplaySettingsExW;
+    host EnumDisplaySettingsExW(4) => enum_display_settings_w;
     host EnumThreadWindows(3) => enum_thread_windows;
     host EqualRect(2) => equal_rect;
     host GetCaretBlinkTime(0) => get_caret_blink_time;
     host GetGuiResources(2) => zero;
-    missing GetLastInputInfo;
+    host GetLastInputInfo(1) => get_last_input_info;
     host GetLayeredWindowAttributes(4) => get_layered_window_attributes;
     missing GetMenuInfo;
     host GetPointerDevice(2) => no_pointer;
@@ -396,7 +396,7 @@ dll! {
     host GetPointerPenInfo(2) => no_pointer;
     host GetPointerType(2) => no_pointer;
     host GetRawInputDeviceInfoW(4) => get_raw_input_device_info_w;
-    missing GetWindowDC;
+    host GetWindowDC(1) => get_dc;
     host GetWindowRgn(2) => get_window_rgn;
     host InflateRect(3) => inflate_rect;
     missing InvertRect;
@@ -405,8 +405,8 @@ dll! {
     host NotifyWinEvent(4) => zero;
     missing OemToCharA;
     missing OemToCharBuffA;
-    missing PrintWindow;
-    missing RegisterHotKey;
+    host PrintWindow(3) => zero;
+    host RegisterHotKey(4) => succeed;
     host RegisterPointerDeviceNotifications(2) => succeed;
     host RegisterPowerSettingNotification(3) => register_notification;
     host RegisterSuspendResumeNotification(2) => register_notification;
@@ -417,15 +417,31 @@ dll! {
     host SetProcessWindowStation(1) => set_process_window_station;
     host SetRect(5) => set_rect;
     host SetThreadDesktop(1) => set_thread_desktop;
-    missing SetWindowPlacement;
+    host SetWindowPlacement(2) => succeed;
     host ToUnicodeEx(7) => to_unicode;
-    missing UnregisterHotKey;
+    host UnregisterHotKey(2) => succeed;
     host UnregisterPowerSettingNotification(1) => succeed;
     host UnregisterSuspendResumeNotification(1) => succeed;
     host UpdateLayeredWindow(9) => update_layered_window;
     host SendNotifyMessageW(4) => post_message_w;
     host ShowCaret(1) => succeed;
     host HideCaret(1) => succeed;
+    host AddClipboardFormatListener(1) => succeed;
+    host RemoveClipboardFormatListener(1) => succeed;
+    host DestroyAcceleratorTable(1) => succeed;
+    host DisableProcessWindowsGhosting(0) => zero;
+    host GetDCEx(3) => get_dc;
+    host GetTouchInputInfo(4) => zero;
+    host LoadAcceleratorsW(2) => zero;
+    host LoadCursorFromFileW(1) => load_cursor_from_file_w;
+    host TranslateAcceleratorW(3) => zero;
+    host SwitchToThisWindow(2) => zero;
+    host CharLowerW(1) => char_lower_w;
+    host DrawTextExW(6) => draw_text_w;
+    host EndMenu(0) => succeed;
+    host GetClipboardFormatNameW(3) => zero;
+    host GetKeyboardLayoutNameW(1) => get_keyboard_layout_name_w;
+    host PrivateExtractIconsW(8) => zero;
 }
 
 const TRUE: u64 = 1;
@@ -464,6 +480,40 @@ fn load_image_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 
 fn load_image_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     load_image(task, cx, a, false)
+}
+
+fn load_cursor_from_file_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    load_image(task, cx, &[0, a[0], 2, 0, 0, 0x10], true)
+}
+
+fn get_last_input_info(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[0] == 0 {
+        return Reply::Value(FALSE);
+    }
+    let ms = (task.k.host.monotonic() / 1_000_000) as u32;
+    let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[0] + 4, ms));
+    Reply::Value(TRUE)
+}
+
+fn char_lower_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let v = a[0];
+    if v >> 16 == 0 {
+        let ch = char::from_u32(v as u32).unwrap_or('\0');
+        let lo = ch.to_lowercase().next().unwrap_or(ch) as u16;
+        return Reply::Value(u64::from(lo));
+    }
+    let s = task.text_arg(cx, v, true);
+    let lower: Vec<u8> = s.to_lowercase().encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+    let _ = task.mem(cx, true, |t| user::write(&mut t.space(), v, &lower));
+    Reply::Value(v)
+}
+
+fn get_keyboard_layout_name_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[0] == 0 {
+        return Reply::Value(FALSE);
+    }
+    let bytes: Vec<u8> = "00000409\0".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    Reply::Value(u64::from(task.mem(cx, true, |t| user::write(&mut t.space(), a[0], &bytes)).is_ok()))
 }
 
 /// `LoadIcon`, `LoadCursor` and `LoadBitmap`: `LoadImage` at the default size.

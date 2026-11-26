@@ -29,6 +29,8 @@ dll! {
     host ImmSetConversionStatus(3) => zero;
     host ImmSetOpenStatus(2) => zero;
     host ImmGetIMEFileNameW(3) => zero;
+    host ImmGetDescriptionW(3) => zero;
+    host ImmAssociateContextEx(3) => zero;
 }
 
 /// No context, no IME: NULL, FALSE, or nothing written. `ImmAssociateContext` had none before; `ImmReleaseContext`

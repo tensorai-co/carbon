@@ -521,6 +521,14 @@ impl Asm {
     pub fn addv_8b(&mut self, vd: u8, vn: u8) {
         self.put(0x0E31_B800 | r(vn) << 5 | r(vd));
     }
+    /// Bit count of each of the low 8 bytes (`cnt vd.8b, vn.8b`).
+    pub fn cnt_8b(&mut self, vd: u8, vn: u8) {
+        self.put(0x0E20_5800 | r(vn) << 5 | r(vd));
+    }
+    /// Castagnoli CRC32C (`size`: 0 byte, 1 halfword, 2 word, 3 doubleword).
+    pub fn crc32c(&mut self, size: u8, rd: u8, rn: u8, rm: u8) {
+        self.put(0x1AC0_5000 | u32::from(size == 3) << 31 | u32::from(size & 3) << 10 | r(rm) << 16 | r(rn) << 5 | r(rd));
+    }
     /// Bytes `index..` of `vn` then of `vm`.
     pub fn ext_16b(&mut self, vd: u8, vn: u8, vm: u8, index: u8) {
         self.put(0x6E00_0000 | r(vm) << 16 | u32::from(index & 15) << 11 | r(vn) << 5 | r(vd));
@@ -685,6 +693,54 @@ impl Asm {
     /// Rounded to an integral value as FPCR says.
     pub fn frinti(&mut self, double: bool, vd: u8, vn: u8) {
         self.put(0x1E27_C000 | u32::from(double) << 22 | r(vn) << 5 | r(vd));
+    }
+    /// 128-bit vector floating-point round to integral: `mode` is 0 nearest (`frintn`), 1 floor (`frintm`),
+    /// 2 ceil (`frintp`), 3 trunc (`frintz`), 4 current FPCR (`frinti`).
+    pub fn v_frint(&mut self, mode: u8, double: bool, vd: u8, vn: u8) {
+        let base = match mode {
+            0 => 0x4E21_8800,
+            1 => 0x4E21_9800,
+            2 => 0x4EA1_8800,
+            3 => 0x4EA1_9800,
+            _ => 0x6EA1_9800,
+        };
+        self.put(base | u32::from(double) << 22 | r(vn) << 5 | r(vd));
+    }
+    /// 128-bit vector integer absolute value (`abs v.16b / .8h / .4s`).
+    pub fn v_abs(&mut self, size: u8, vd: u8, vn: u8) {
+        self.put(0x4E20_B800 | u32::from(size & 3) << 22 | r(vn) << 5 | r(vd));
+    }
+    /// Sign-extend low half of `vn` (`size`: 0 `8b->8h`, 1 `4h->4s`, 2 `2s->2d`).
+    pub fn v_sxtl(&mut self, size: u8, vd: u8, vn: u8) {
+        self.put(0x0F00_A400 | (8u32 << size) << 16 | r(vn) << 5 | r(vd));
+    }
+    /// Sign-extend high half of `vn` (`size`: 0 `16b->8h`, 1 `8h->4s`, 2 `4s->2d`).
+    pub fn v_sxtl2(&mut self, size: u8, vd: u8, vn: u8) {
+        self.put(0x4F00_A400 | (8u32 << size) << 16 | r(vn) << 5 | r(vd));
+    }
+    /// Zero-extend low half of `vn` (`size`: 0 `8b->8h`, 1 `4h->4s`, 2 `2s->2d`).
+    pub fn v_uxtl(&mut self, size: u8, vd: u8, vn: u8) {
+        self.put(0x2F00_A400 | (8u32 << size) << 16 | r(vn) << 5 | r(vd));
+    }
+    /// Zero-extend high half of `vn` (`size`: 0 `16b->8h`, 1 `8h->4s`, 2 `4s->2d`).
+    pub fn v_uxtl2(&mut self, size: u8, vd: u8, vn: u8) {
+        self.put(0x6F00_A400 | (8u32 << size) << 16 | r(vn) << 5 | r(vd));
+    }
+    /// 128-bit vector integer negate (`neg v.16b / .8h / .4s`).
+    pub fn v_neg(&mut self, size: u8, vd: u8, vn: u8) {
+        self.put(0x6E20_B800 | u32::from(size & 3) << 22 | r(vn) << 5 | r(vd));
+    }
+    /// 128-bit vector compare signed > 0 (`cmgt v.16b / .8h / .4s, vn, #0`).
+    pub fn v_cmgt0(&mut self, size: u8, vd: u8, vn: u8) {
+        self.put(0x4E20_8800 | u32::from(size & 3) << 22 | r(vn) << 5 | r(vd));
+    }
+    /// 128-bit vector compare signed < 0 (`cmlt v.16b / .8h / .4s, vn, #0`).
+    pub fn v_cmlt0(&mut self, size: u8, vd: u8, vn: u8) {
+        self.put(0x4E20_A800 | u32::from(size & 3) << 22 | r(vn) << 5 | r(vd));
+    }
+    /// Rounding shift right narrow by 15 (`rshrn v.4h, v.4s, #15` / `rshrn2 v.8h, v.4s, #15`).
+    pub fn rshrn_h15(&mut self, high: bool, vd: u8, vn: u8) {
+        self.put(0x0F11_8C00 | u32::from(high) << 30 | r(vn) << 5 | r(vd));
     }
     pub fn mrs_fpcr(&mut self, rt: u8) {
         self.put(0xD53B_4400 | r(rt));

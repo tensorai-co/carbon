@@ -1,6 +1,9 @@
-//! wintrust.dll: declared so the programs that import it load; each export says it isn't written yet when called.
+//! wintrust.dll: Authenticode trust verification.
 
-use super::dll;
+use kernels_core::thread::Cx;
+
+use super::{Reply, dll};
+use crate::process::Task;
 
 dll! {
     "WINTRUST.dll";
@@ -13,5 +16,9 @@ dll! {
     missing WTHelperGetProvCertFromChain;
     missing WTHelperGetProvSignerFromChain;
     missing WTHelperProvDataFromStateData;
-    missing WinVerifyTrust;
+    host WinVerifyTrust(3) => win_verify_trust;
+}
+
+fn win_verify_trust(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(0)
 }

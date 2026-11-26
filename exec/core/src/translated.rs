@@ -272,8 +272,13 @@ fn cpuid(r: &mut Arm64VcpuRegs) {
     let word = |s: &[u8; 4]| u32::from_le_bytes(*s);
     let (eax, ebx, ecx, edx): (u32, u32, u32, u32) = match r.x[0] as u32 {
         0 => (1, word(b"Genu"), word(b"ntel"), word(b"ineI")),
-        // Family 6; FPU, TSC, CX8, CMOV, MMX, FXSR, SSE, SSE2.
-        1 => (0x0006_0F00, 0, 0, 1 | 1 << 4 | 1 << 8 | 1 << 15 | 1 << 23 | 1 << 24 | 1 << 25 | 1 << 26),
+        // Family 6; ECX: SSE3, SSSE3, SSE4.1, SSE4.2, POPCNT; EDX: FPU, TSC, CX8, CMOV, MMX, FXSR, SSE, SSE2.
+        1 => (
+            0x0006_0F00,
+            0,
+            1 | 1 << 9 | 1 << 19 | 1 << 20 | 1 << 23,
+            1 | 1 << 4 | 1 << 8 | 1 << 15 | 1 << 23 | 1 << 24 | 1 << 25 | 1 << 26,
+        ),
         0x8000_0000 => (0x8000_0001, 0, 0, 0),
         // SYSCALL, NX, long mode.
         0x8000_0001 => (0, 0, 0, 1 << 11 | 1 << 20 | 1 << 29),
@@ -283,6 +288,159 @@ fn cpuid(r: &mut Arm64VcpuRegs) {
     r.x[3] = u64::from(ebx);
     r.x[1] = u64::from(ecx);
     r.x[2] = u64::from(edx);
+}
+
+/// Emulates SSE4.2 `pcmpestrm`/`pcmpestri`/`pcmpistrm`/`pcmpistri` from operands placed in scratch GPRs.
+fn pcmpstr(r: &mut Arm64VcpuRegs) {
+    let meta = r.x[17];
+    let op = ((meta >> 16) & 0xff) as u8;
+    let imm = ((meta >> 8) & 0xff) as u8;
+    let rex_w = (meta & 1) != 0;
+
+    let mut a_bytes = [0u8; 16];
+    a_bytes[..8].copy_from_slice(&r.x[19].to_le_bytes());
+    a_bytes[8..].copy_from_slice(&r.x[20].to_le_bytes());
+    let mut b_bytes = [0u8; 16];
+    b_bytes[..8].copy_from_slice(&r.x[22].to_le_bytes());
+    b_bytes[8..].copy_from_slice(&r.x[26].to_le_bytes());
+
+    let is_word = (imm & 1) != 0;
+    let is_signed = (imm & 2) != 0;
+    let agg = (imm >> 2) & 3;
+    let pol = (imm >> 4) & 3;
+    let explicit = matches!(op, 0x60 | 0x61);
+    let mask_out = matches!(op, 0x60 | 0x62);
+    let n: usize = if is_word { 8 } else { 16 };
+
+    let elem = |buf: &[u8; 16], i: usize| -> i32 {
+        if is_word {
+            let v = u16::from_le_bytes([buf[i * 2], buf[i * 2 + 1]]);
+            if is_signed { i32::from(v as i16) } else { i32::from(v) }
+        } else {
+            let v = buf[i];
+            if is_signed { i32::from(v as i8) } else { i32::from(v) }
+        }
+    };
+
+    let (la, lb) = if explicit {
+        let ra = if rex_w { r.x[0] as i64 } else { i64::from(r.x[0] as i32) };
+        let rb = if rex_w { r.x[2] as i64 } else { i64::from(r.x[2] as i32) };
+        (ra.unsigned_abs().min(n as u64) as usize, rb.unsigned_abs().min(n as u64) as usize)
+    } else {
+        let la = (0..n).position(|i| elem(&a_bytes, i) == 0).unwrap_or(n);
+        let lb = (0..n).position(|i| elem(&b_bytes, i) == 0).unwrap_or(n);
+        (la, lb)
+    };
+
+    let mut res1: u16 = 0;
+    match agg {
+        // Equal any.
+        0 => {
+            for j in 0..lb {
+                let bj = elem(&b_bytes, j);
+                if (0..la).any(|i| elem(&a_bytes, i) == bj) {
+                    res1 |= 1u16 << j;
+                }
+            }
+        }
+        // Ranges.
+        1 => {
+            for j in 0..lb {
+                let bj = elem(&b_bytes, j);
+                let mut hit = false;
+                let mut i = 0;
+                while i + 1 < la {
+                    if bj >= elem(&a_bytes, i) && bj <= elem(&a_bytes, i + 1) {
+                        hit = true;
+                        break;
+                    }
+                    i += 2;
+                }
+                if hit {
+                    res1 |= 1u16 << j;
+                }
+            }
+        }
+        // Equal each.
+        2 => {
+            for j in 0..n {
+                let hit = match (j < la, j < lb) {
+                    (false, false) => true,
+                    (true, true) => elem(&a_bytes, j) == elem(&b_bytes, j),
+                    _ => false,
+                };
+                if hit {
+                    res1 |= 1u16 << j;
+                }
+            }
+        }
+        // Equal ordered (substring search).
+        _ => {
+            for j in 0..n {
+                let mut ok = true;
+                for k in 0..(n - j) {
+                    if k >= la {
+                        break;
+                    }
+                    if j + k >= lb || elem(&a_bytes, k) != elem(&b_bytes, j + k) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    res1 |= 1u16 << j;
+                }
+            }
+        }
+    }
+
+    let full_mask = ((1u32 << n) - 1) as u16;
+    let res2: u16 = match pol {
+        1 => (!res1) & full_mask,
+        3 => (res1 ^ (((1u32 << lb) - 1) as u16)) & full_mask,
+        _ => res1 & full_mask,
+    };
+
+    if mask_out {
+        if (imm & 0x40) == 0 {
+            r.x[19] = u64::from(res2);
+            r.x[20] = 0;
+        } else {
+            let mut out = [0u8; 16];
+            for j in 0..n {
+                if (res2 >> j) & 1 != 0 {
+                    if is_word {
+                        out[j * 2] = 0xff;
+                        out[j * 2 + 1] = 0xff;
+                    } else {
+                        out[j] = 0xff;
+                    }
+                }
+            }
+            r.x[19] = u64::from_le_bytes(out[..8].try_into().unwrap());
+            r.x[20] = u64::from_le_bytes(out[8..].try_into().unwrap());
+        }
+    } else {
+        let idx = if res2 == 0 {
+            n as u64
+        } else if (imm & 0x40) != 0 {
+            u64::from(15 - res2.leading_zeros())
+        } else {
+            u64::from(res2.trailing_zeros())
+        };
+        r.x[1] = idx;
+    }
+
+    let cf = res2 != 0;
+    let zf = lb < n;
+    let sf = la < n;
+    let of = (res2 & 1) != 0;
+    // ARM64 NZCV: N=SF, Z=ZF, C=!CF (inverted carry convention), V=OF.
+    r.spsr = (r.spsr & !NZCV)
+        | (u64::from(sf) << 31)
+        | (u64::from(zf) << 30)
+        | (u64::from(!cf) << 29)
+        | (u64::from(of) << 28);
 }
 
 impl<V: Vm, S: Sandbox> Core<V, S> {
@@ -441,6 +599,11 @@ impl<V: Vm, S: Sandbox> Core<V, S> {
                 // Another CPU linked this exit while this one was taking it: it's a branch now, so just take that.
                 let word = u32::from_le_bytes([words[0], words[1], words[2], words[3]]);
                 if word & 0xFC00_0000 == 0x1400_0000 {
+                    return None;
+                }
+                if kind == Ok(exit::PCMPSTR) {
+                    pcmpstr(r);
+                    r.elr = pc + 4;
                     return None;
                 }
                 if kind == Ok(exit::CHAIN) {

@@ -11,5 +11,9 @@ dll! {
     missing GetPrinterDriverW;
     missing GetPrinterW;
     missing OpenPrinterW;
+    missing FindClosePrinterChangeNotification;
+    missing FindFirstPrinterChangeNotification;
+    missing FindNextPrinterChangeNotification;
+    missing GetJobW;
     missing Ordinal203 @ 203;
 }

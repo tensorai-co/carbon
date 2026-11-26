@@ -28,46 +28,92 @@ dll! {
     host CertGetCertificateChain(8) => cert_get_certificate_chain;
     host CertFreeCertificateChain(1) => cert_free_certificate_chain;
     // Not written yet: what larger programs import.
-    missing CertCreateCertificateChainEngine;
+    host CertCreateCertificateChainEngine(2) => cert_create_chain_engine;
     missing CertCreateSelfSignCertificate;
     host CertEnumCertificatesInStore(2) => cert_enum_certificates_in_store;
     host CertFindCertificateInStore(6) => cert_find_certificate_in_store;
     host CertFindExtension(3) => cert_find_extension;
-    missing CertFreeCertificateChainEngine;
-    missing CertGetNameStringA;
-    missing CertSetCertificateContextProperty;
+    host CertFreeCertificateChainEngine(1) => crypt_zero;
+    host CertGetNameStringA(6) => cert_get_name_string_a;
+    host CertSetCertificateContextProperty(4) => crypt_msg_close;
     missing CertStrToNameA;
     missing CryptBinaryToStringA;
-    missing CryptDecodeObjectEx;
+    host CryptDecodeObjectEx(8) => crypt_not_found;
     missing CryptEncodeObjectEx;
     missing CryptHashCertificate2;
-    missing CryptQueryObject;
+    host CryptQueryObject(11) => crypt_not_found;
     missing CryptStringToBinaryA;
     missing PFXImportCertStore;
     host CertAddStoreToCollection(4) => cert_add_store_to_collection;
     host CertCompareCertificateName(3) => cert_compare_certificate_name;
     host CertControlStore(4) => cert_control_store;
-    missing CertFindChainInStore;
+    host CertFindChainInStore(6) => crypt_not_found;
     host CertGetCertificateContextProperty(4) => cert_get_certificate_context_property;
-    missing CertGetEnhancedKeyUsage;
-    missing CertGetIntendedKeyUsage;
-    missing CertGetNameStringW;
+    host CertGetEnhancedKeyUsage(4) => crypt_not_found;
+    host CertGetIntendedKeyUsage(4) => crypt_not_found;
+    host CertGetNameStringW(6) => cert_get_name_string_w;
     host CertOpenSystemStoreW(2) => cert_open_store;
-    missing CertVerifyTimeValidity;
-    missing CryptAcquireCertificatePrivateKey;
-    missing CryptMsgClose;
-    missing CryptMsgGetParam;
+    host CertOpenSystemStoreA(2) => cert_open_store;
+    host CertVerifyTimeValidity(2) => crypt_zero;
+    host CryptAcquireCertificatePrivateKey(6) => crypt_not_found;
+    host CryptMsgClose(1) => crypt_msg_close;
+    host CryptMsgGetParam(5) => crypt_not_found;
     host CryptProtectData(7) => crypt_protect_data;
     host CryptProtectMemory(3) => crypt_protect_memory;
     host CryptUnprotectData(7) => crypt_unprotect_data;
     host CryptUnprotectMemory(3) => crypt_protect_memory;
-    missing CryptVerifyCertificateSignatureEx;
+    host CryptVerifyCertificateSignatureEx(8) => crypt_msg_close;
+    host CertGetIssuerCertificateFromStore(4) => crypt_not_found;
+    host CertVerifyCertificateChainPolicy(4) => cert_verify_certificate_chain_policy;
+    host CryptInstallOIDFunctionAddress(6) => crypt_msg_close;
 }
 
 const X509_ASN_ENCODING: u32 = 1;
 const CRYPT_E_NOT_FOUND: u32 = 0x8009_2004;
 const CRYPT_E_ASN1_BADTAG: u32 = 0x8009_310b;
 const E_INVALIDARG: u32 = 0x8007_0057;
+
+fn crypt_not_found(task: &mut Task, cx: &mut Cx<'_>, _: &[u64]) -> Reply {
+    task.set_last_error(cx, CRYPT_E_NOT_FOUND);
+    Reply::Value(0)
+}
+
+fn crypt_msg_close(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(1)
+}
+
+fn crypt_zero(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(0)
+}
+
+fn cert_create_chain_engine(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[1] != 0 {
+        let _ = task.write_ptr(cx, a[1], 0xce00);
+    }
+    Reply::Value(1)
+}
+
+fn cert_verify_certificate_chain_policy(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[3] != 0 {
+        // CERT_CHAIN_POLICY_STATUS: cbSize(4), dwError(4), lChainIndex(4), lElementIndex(4), pvExtraPolicyStatus(ptr)
+        let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[3] + 4, 0));
+    }
+    Reply::Value(1)
+}
+
+fn cert_get_name_string_a(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[4] != 0 && (a[5] as u32) > 0 {
+        let _ = task.mem(cx, true, |t| user::write(&mut t.space(), a[4], &[0u8]));
+    }
+    Reply::Value(1)
+}
+
+fn cert_get_name_string_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[4] != 0 && (a[5] as u32) > 0 {
+        let _ = task.mem(cx, true, |t| user::write(&mut t.space(), a[4], &[0u8, 0u8]));
+    }
+    Reply::Value(1)
+}
 
 // ---- DER, as much of it as a certificate's fields need ----
 
@@ -250,9 +296,10 @@ impl Layout {
     }
 }
 
-/// What atlas keeps for each certificate context it gave: its DER and how many references there are.
+/// What atlas keeps for each certificate context it gave: its DER, the store it belongs to, and its refcount.
 struct Context {
     der: Vec<u8>,
+    store: u64,
     refs: u32,
 }
 
@@ -284,9 +331,10 @@ impl State {
         out
     }
 
-    /// Whether any collection still holds `store`.
+    /// Whether any collection or live certificate context still holds `store`.
     fn held(&self, pid: u64, store: u64) -> bool {
         self.members.iter().any(|((p, _), m)| *p == pid && m.contains(&store))
+            || self.contexts.iter().any(|((p, _), c)| *p == pid && c.store == store)
     }
 
     /// Lets go of a closed store, and of members only it held.
@@ -385,7 +433,7 @@ impl Task {
         block.extend(&tail);
         self.mem(cx, true, |t| user::write(&mut t.space(), base, &block)).map_err(|_| 998u32)?;
         let pid = self.process.pid;
-        with(|s| s.contexts.insert((pid, base), Context { der: der.to_vec(), refs: 1 }));
+        with(|s| s.contexts.insert((pid, base), Context { der: der.to_vec(), store, refs: 1 }));
         Ok(base)
     }
 
@@ -412,7 +460,13 @@ impl Task {
                 false
             }
             Some(_) => {
-                s.contexts.remove(&(pid, at));
+                if let Some(removed) = s.contexts.remove(&(pid, at))
+                    && removed.store != 0
+                    && s.closed.contains(&(pid, removed.store))
+                    && !s.held(pid, removed.store)
+                {
+                    s.forget(pid, removed.store);
+                }
                 true
             }
             None => false,

@@ -1344,6 +1344,13 @@ impl Task {
         kept.unwrap_or_else(|| match target {
             Target::File(_) => Descriptor::from_sddl(FILE_DEFAULT).expect("the files' default"),
             Target::Key(_) => Descriptor::from_sddl(KEY_DEFAULT).expect("the keys' default"),
+            Target::Token(t) => {
+                let state = lock(&t.state);
+                let mut d = Descriptor::defaults(&state);
+                d.control |= SE_SACL_PRESENT;
+                d.sacl = Some(Acl::new(vec![Ace::new(SYSTEM_MANDATORY_LABEL, 0, 1, state.integrity())]));
+                d
+            }
             _ => Descriptor::defaults(&lock(&self.effective_token().state)),
         })
     }

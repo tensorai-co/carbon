@@ -1,7 +1,10 @@
 //! oleaut32.dll: BSTRs and VARIANTs, guest code (`atlas-guest`'s `oleaut`), at Windows' own ordinals, which programs
 //! import them by.
 
-use super::dll;
+use kernels_core::thread::Cx;
+
+use super::{Reply, dll};
+use crate::process::Task;
 
 dll! {
     "OLEAUT32.dll" @ 2;
@@ -33,8 +36,21 @@ dll! {
     missing LoadTypeLibEx @ 183;
     missing Ordinal185 @ 185;
     missing Ordinal186;
+    host GetErrorInfo(2) @ 200 => get_error_info;
+    host SetErrorInfo(2) @ 201 => set_error_info;
     missing VarUI4FromStr @ 277;
     missing VarBstrCat @ 313;
     missing VarBstrCmp;
     missing SafeArrayCreateVector @ 411;
+}
+
+fn get_error_info(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[1] != 0 {
+        let _ = task.write_ptr(cx, a[1], 0);
+    }
+    Reply::Value(1) // S_FALSE
+}
+
+fn set_error_info(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(0) // S_OK
 }

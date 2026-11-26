@@ -244,21 +244,15 @@ impl Emitter {
             (0x5D | 0x5F, _) => {
                 // x86's min and max: the first operand if it's strictly less (greater), else the second, which is what
                 // comes back for a NaN or for two zeros. ARM's fmin and fmax answer those differently.
+                // Using vector fcmgt + bsl for both packed and scalar forms avoids touching NZCV flags.
                 let s = self.src_for(inst, p)?;
                 let min = op == 0x5D;
+                let size = u8::from(matches!(p, P::P66 | P::F2));
+                if min { self.asm.v3(vec::FCMGT, size, V0, s, d) } else { self.asm.v3(vec::FCMGT, size, V0, d, s) }
+                self.asm.bsl(V0, d, s);
                 match p {
-                    P::None | P::P66 => {
-                        let size = u8::from(p == P::P66);
-                        if min { self.asm.v3(vec::FCMGT, size, V0, s, d) } else { self.asm.v3(vec::FCMGT, size, V0, d, s) }
-                        self.asm.bsl(V0, d, s);
-                        self.asm.v_mov(d, V0);
-                    }
-                    _ => {
-                        let double = p == P::F2;
-                        self.asm.fcmp(double, d, s);
-                        self.asm.fcsel(double, V0, d, s, if min { Cond::Mi } else { Cond::Gt });
-                        self.scalar_result(p, d);
-                    }
+                    P::None | P::P66 => self.asm.v_mov(d, V0),
+                    _ => self.scalar_result(p, d),
                 }
             }
             (0x5A, _) => {
@@ -749,5 +743,401 @@ impl Emitter {
             a.bfi(true, F1, S3, 24, 1);
             a.msr_fpcr(F1);
         }
+    }
+
+    /// Loads `bytes` (2, 4, 8, or 16) from an `xmm/mN` operand into a register (returning the register number).
+    fn src_narrow(&mut self, inst: &Inst, bytes: u8) -> Result<u8, Unsupported> {
+        match inst.rm {
+            Some(Rm::Reg(n)) => Ok(n),
+            Some(Rm::Mem(mem)) => {
+                self.address(&mem, inst.next(), true);
+                match bytes {
+                    2 => {
+                        self.asm.ldr(16, S0, A);
+                        self.asm.fmov_s_w(V_TMP, S0);
+                    }
+                    4 => self.asm.ldr_s(V_TMP, A),
+                    8 => self.asm.ldr_d(V_TMP, A),
+                    16 => self.asm.ldr_q(V_TMP, A),
+                    _ => return Err(Unsupported),
+                }
+                Ok(V_TMP)
+            }
+            None => Err(Unsupported),
+        }
+    }
+
+    /// SSSE3 and SSE4.1/4.2 three-byte opcodes under `0F 38` (`inst.map == 2`).
+    pub(super) fn sse38(&mut self, inst: &Inst) -> Lowered {
+        // SSE4.2 crc32: F2 0F 38 F0 (r/m8) and F2 0F 38 F1 (r/m16/32/64).
+        if prefix(inst) == P::F2 && matches!(inst.op, 0xF0 | 0xF1) {
+            let (bits, sz) = if inst.op == 0xF0 {
+                (8u8, 0u8)
+            } else if inst.w() {
+                (64u8, 3u8)
+            } else if inst.opsize16 {
+                (16u8, 1u8)
+            } else {
+                (32u8, 2u8)
+            };
+            let src = self.rm(inst, bits)?;
+            self.load(src, bits, S1);
+            self.load(super::Op::Reg(inst.reg, false), 32, S0);
+            self.asm.crc32c(sz, S0, S0, S1);
+            self.asm.mov(false, inst.reg, S0);
+            return Ok(Next::Continue);
+        }
+        if prefix(inst) != P::P66 {
+            return Err(Unsupported);
+        }
+        let d = inst.reg;
+        match inst.op {
+            // pshufb: bit 7 set -> 0; else index = byte & 0x0f. ARM tbl returns 0 for any index >= 16,
+            // so masking with 0x8f turns 0x80..0xff into 0x80..0x8f (>= 16 -> 0) and 0x00..0x7f into 0..15.
+            0x00 => {
+                let s = self.src128(inst)?;
+                self.constant(V2, [0x8f; 16]);
+                self.asm.v_and(V0, s, V2);
+                self.asm.v_mov(V1, d);
+                self.asm.tbl(d, V1, false, V0);
+            }
+            // phaddw (01), phaddd (02)
+            0x01 | 0x02 => {
+                let s = self.src128(inst)?;
+                self.asm.v3(vec::ADDP, inst.op, d, d, s);
+            }
+            // phaddsw (03), phsubw (05), phsubd (06), phsubsw (07)
+            0x03 | 0x05..=0x07 => {
+                let s = self.src128(inst)?;
+                let (size, op_vec) = match inst.op {
+                    0x03 => (1, vec::SQADD),
+                    0x05 => (1, vec::SUB),
+                    0x06 => (2, vec::SUB),
+                    _ => (1, vec::SQSUB),
+                };
+                self.asm.v3(vec::UZP1, size, V0, d, s);
+                self.asm.v3(vec::UZP2, size, V1, d, s);
+                self.asm.v3(op_vec, size, d, V0, V1);
+            }
+            // pmaddubsw: unsigned bytes of d * signed bytes of s, adjacent pairs added with signed 16-bit saturation.
+            0x04 => {
+                let s = self.src128(inst)?;
+                self.asm.v_uxtl(0, V0, d);
+                self.asm.v_sxtl(0, V1, s);
+                self.asm.v3(vec::MUL, 1, V0, V0, V1);
+                self.asm.v_uxtl2(0, V1, d);
+                self.asm.v_sxtl2(0, V2, s);
+                self.asm.v3(vec::MUL, 1, V1, V1, V2);
+                self.asm.v3(vec::UZP1, 1, V2, V0, V1);
+                self.asm.v3(vec::UZP2, 1, V0, V0, V1);
+                self.asm.v3(vec::SQADD, 1, d, V2, V0);
+            }
+            // psignb (08), psignw (09), psignd (0A)
+            0x08..=0x0A => {
+                let s = self.src128(inst)?;
+                let size = inst.op - 0x08;
+                self.asm.v_cmgt0(size, V0, s);
+                self.asm.v_and(V0, V0, d);
+                self.asm.v_cmlt0(size, V1, s);
+                self.asm.v_neg(size, V2, d);
+                self.asm.v_and(V1, V1, V2);
+                self.asm.v_orr(d, V0, V1);
+            }
+            // pmulhrsw: ((i32(d) * i32(s) >> 14) + 1) >> 1 == rshrn(..., #15)
+            0x0B => {
+                let s = self.src128(inst)?;
+                self.asm.mull(true, false, 1, V0, d, s);
+                self.asm.mull(true, true, 1, V1, d, s);
+                self.asm.rshrn_h15(false, d, V0);
+                self.asm.rshrn_h15(true, d, V1);
+            }
+            // pblendvb (bytes), blendvps (dwords), blendvpd (qwords) with implicit mask in xmm0.
+            0x10 | 0x14 | 0x15 => {
+                let s = self.src128(inst)?;
+                let (size, shift) = match inst.op {
+                    0x10 => (0, 7),
+                    0x14 => (2, 31),
+                    _ => (3, 63),
+                };
+                self.asm.sshr(size, V0, 0, shift);
+                self.asm.bsl(V0, s, d);
+                self.asm.v_mov(d, V0);
+            }
+            // ptest: ZF = ((d & s) == 0), CF = ((!d & s) == 0), SF = OF = 0.
+            0x17 => {
+                let s = self.src128(inst)?;
+                let a = &mut self.asm;
+                a.v_and(V0, d, s);
+                a.umov(3, S0, V0, 0);
+                a.umov(3, S1, V0, 1);
+                a.orr(true, S0, S0, S1);
+                a.subs(true, ZR, S0, ZR);
+                a.mrs_nzcv(F0);
+                a.v_bic(V0, s, d);
+                a.umov(3, S0, V0, 0);
+                a.umov(3, S1, V0, 1);
+                a.orr(true, S0, S0, S1);
+                a.subs(true, ZR, S0, ZR);
+                a.mrs_nzcv(F1);
+                // Put ZF of (!d & s) into bit 29 (x86 CF), mask to Z|C, then invert C for ARM convention.
+                a.lsr_imm(true, F1, F1, 30);
+                a.bfi(true, F0, F1, 29, 1);
+                a.mov_imm(S2, 0x6000_0000);
+                a.and(true, F0, F0, S2);
+                a.msr_nzcv(F0);
+                a.cfinv();
+            }
+            // pabsb, pabsw, pabsd
+            0x1C..=0x1E => {
+                let s = self.src128(inst)?;
+                self.asm.v_abs(inst.op - 0x1C, d, s);
+            }
+            // pmovsx*: bw(20), bd(21), bq(22), wd(23), wq(24), dq(25)
+            // pmovzx*: bw(30), bd(31), bq(32), wd(33), wq(34), dq(35)
+            0x20..=0x25 | 0x30..=0x35 => {
+                let signed = inst.op < 0x30;
+                let kind = inst.op & 0x0f;
+                let bytes = match kind {
+                    0 | 3 | 5 => 8,
+                    1 | 4 => 4,
+                    _ => 2,
+                };
+                let s = self.src_narrow(inst, bytes)?;
+                let extend = |a: &mut super::super::asm::Asm, sz: u8, dst: u8, src: u8| {
+                    if signed { a.v_sxtl(sz, dst, src) } else { a.v_uxtl(sz, dst, src) }
+                };
+                match kind {
+                    0 => extend(&mut self.asm, 0, d, s),
+                    1 => {
+                        extend(&mut self.asm, 0, V0, s);
+                        extend(&mut self.asm, 1, d, V0);
+                    }
+                    2 => {
+                        extend(&mut self.asm, 0, V0, s);
+                        extend(&mut self.asm, 1, V0, V0);
+                        extend(&mut self.asm, 2, d, V0);
+                    }
+                    3 => extend(&mut self.asm, 1, d, s),
+                    4 => {
+                        extend(&mut self.asm, 1, V0, s);
+                        extend(&mut self.asm, 2, d, V0);
+                    }
+                    _ => extend(&mut self.asm, 2, d, s),
+                }
+            }
+            // pmuldq: signed 32x32->64 of even lanes (0 and 2).
+            0x28 => {
+                let s = self.src128(inst)?;
+                self.asm.v3(vec::UZP1, 2, V0, d, d);
+                self.asm.v3(vec::UZP1, 2, V1, s, s);
+                self.asm.mull(true, false, 2, d, V0, V1);
+            }
+            // pcmpeqq
+            0x29 => {
+                let s = self.src128(inst)?;
+                self.asm.v3(vec::CMEQ, 3, d, d, s);
+            }
+            // movntdqa
+            0x2A => {
+                let Some(Rm::Mem(mem)) = inst.rm else { return Err(Unsupported) };
+                self.address(&mem, inst.next(), true);
+                self.asm.ldr_q(d, A);
+            }
+            // packusdw
+            0x2B => {
+                let s = self.src128(inst)?;
+                self.asm.narrow(1, true, false, V0, d);
+                self.asm.narrow(1, true, true, V0, s);
+                self.asm.v_mov(d, V0);
+            }
+            // pcmpgtq
+            0x37 => {
+                let s = self.src128(inst)?;
+                self.asm.v3(vec::CMGT, 3, d, d, s);
+            }
+            // pminsb, pminsd, pminuw, pminud, pmaxsb, pmaxsd, pmaxuw, pmaxud
+            0x38 => { let s = self.src128(inst)?; self.asm.v3(vec::SMIN, 0, d, d, s); }
+            0x39 => { let s = self.src128(inst)?; self.asm.v3(vec::SMIN, 2, d, d, s); }
+            0x3A => { let s = self.src128(inst)?; self.asm.v3(vec::UMIN, 1, d, d, s); }
+            0x3B => { let s = self.src128(inst)?; self.asm.v3(vec::UMIN, 2, d, d, s); }
+            0x3C => { let s = self.src128(inst)?; self.asm.v3(vec::SMAX, 0, d, d, s); }
+            0x3D => { let s = self.src128(inst)?; self.asm.v3(vec::SMAX, 2, d, d, s); }
+            0x3E => { let s = self.src128(inst)?; self.asm.v3(vec::UMAX, 1, d, d, s); }
+            0x3F => { let s = self.src128(inst)?; self.asm.v3(vec::UMAX, 2, d, d, s); }
+            // pmulld
+            0x40 => {
+                let s = self.src128(inst)?;
+                self.asm.v3(vec::MUL, 2, d, d, s);
+            }
+            _ => return Err(Unsupported),
+        }
+        Ok(Next::Continue)
+    }
+
+    /// SSSE3 and SSE4.1 three-byte immediate opcodes under `0F 3A` (`inst.map == 3`).
+    pub(super) fn sse3a(&mut self, inst: &Inst) -> Lowered {
+        if prefix(inst) != P::P66 {
+            return Err(Unsupported);
+        }
+        let d = inst.reg;
+        let imm = inst.imm as u8;
+        match inst.op {
+            // roundps (08), roundpd (09), roundss (0A), roundsd (0B)
+            0x08 | 0x09 => {
+                let double = inst.op == 0x09;
+                let s = self.src128(inst)?;
+                let mode = if imm & 4 != 0 { 4 } else { imm & 3 };
+                self.asm.v_frint(mode, double, d, s);
+            }
+            0x0A | 0x0B => {
+                let double = inst.op == 0x0B;
+                let s = self.src_scalar(inst, double)?;
+                let op = if imm & 4 != 0 {
+                    15 // frinti
+                } else {
+                    match imm & 3 {
+                        0 => 8,  // frintn
+                        1 => 10, // frintm
+                        2 => 9,  // frintp
+                        _ => 11, // frintz
+                    }
+                };
+                self.asm.f_unary(op, double, V0, s);
+                self.scalar_result(if double { P::F2 } else { P::F3 }, d);
+            }
+            // blendps (0C), blendpd (0D), pblendw (0E)
+            0x0C..=0x0E => {
+                let s = self.src128(inst)?;
+                let elem_bytes = match inst.op {
+                    0x0C => 4usize,
+                    0x0D => 8usize,
+                    _ => 2usize,
+                };
+                let mut mask = [0u8; 16];
+                for (b, slot) in mask.iter_mut().enumerate() {
+                    let lane = b / elem_bytes;
+                    if (imm >> lane) & 1 != 0 {
+                        *slot = 0xff;
+                    }
+                }
+                self.constant(V0, mask);
+                self.asm.bsl(V0, s, d);
+                self.asm.v_mov(d, V0);
+            }
+            // palignr: (d:s) >> (imm * 8)
+            0x0F => {
+                let s = self.src128(inst)?;
+                if imm == 0 {
+                    self.asm.v_mov(d, s);
+                } else if imm < 16 {
+                    self.asm.ext_16b(d, s, d, imm);
+                } else if imm < 32 {
+                    self.asm.v_eor(V0, V0, V0);
+                    self.asm.ext_16b(d, d, V0, imm - 16);
+                } else {
+                    self.asm.v_eor(d, d, d);
+                }
+            }
+            // pextrb (14), pextrw (15), pextrd/pextrq (16), extractps (17)
+            0x14..=0x17 => {
+                let (size, lane, mem_bits) = match inst.op {
+                    0x14 => (0u8, imm & 15, 8u8),
+                    0x15 => (1u8, imm & 7, 16u8),
+                    0x16 if inst.w() => (3u8, imm & 1, 64u8),
+                    _ => (2u8, imm & 3, 32u8),
+                };
+                self.asm.umov(size, S0, d, lane);
+                match inst.rm {
+                    Some(Rm::Reg(n)) => self.asm.mov(mem_bits == 64, n, S0),
+                    Some(Rm::Mem(mem)) => {
+                        self.address(&mem, inst.next(), true);
+                        self.asm.str(mem_bits, S0, A);
+                    }
+                    None => return Err(Unsupported),
+                }
+            }
+            // pinsrb (20), pinsrd/pinsrq (22)
+            0x20 | 0x22 => {
+                let (size, lane, load_bits) = match inst.op {
+                    0x20 => (0u8, imm & 15, 8u8),
+                    _ if inst.w() => (3u8, imm & 1, 64u8),
+                    _ => (2u8, imm & 3, 32u8),
+                };
+                let src = self.rm(inst, load_bits)?;
+                self.load(src, load_bits, S0);
+                self.asm.ins_gen(size, d, lane, S0);
+            }
+            // insertps: copy lane count_s of s (0 if mem) into lane count_d of d, then zero lanes in imm[3:0].
+            0x21 => {
+                let (s, src_lane) = match inst.rm {
+                    Some(Rm::Reg(n)) => (n, (imm >> 6) & 3),
+                    Some(Rm::Mem(mem)) => {
+                        self.address(&mem, inst.next(), true);
+                        self.asm.ldr_s(V_TMP, A);
+                        (V_TMP, 0)
+                    }
+                    None => return Err(Unsupported),
+                };
+                let dst_lane = (imm >> 4) & 3;
+                self.asm.ins_elem(2, d, dst_lane, s, src_lane);
+                for lane in 0..4u8 {
+                    if (imm >> lane) & 1 != 0 {
+                        self.asm.ins_gen(2, d, lane, ZR);
+                    }
+                }
+            }
+            // dpps (40), dppd (41)
+            0x40 | 0x41 => {
+                let double = inst.op == 0x41;
+                let s = self.src128(inst)?;
+                let sz = u8::from(double);
+                self.asm.v3(vec::FMUL, sz, V0, d, s);
+                if double {
+                    for lane in 0..2u8 {
+                        if (imm >> (4 + lane)) & 1 == 0 {
+                            self.asm.ins_gen(3, V0, lane, ZR);
+                        }
+                    }
+                    self.asm.v3(vec::FADDP, 1, V0, V0, V0);
+                    self.asm.v_eor(d, d, d);
+                    for lane in 0..2u8 {
+                        if (imm >> lane) & 1 != 0 {
+                            self.asm.ins_elem(3, d, lane, V0, 0);
+                        }
+                    }
+                } else {
+                    for lane in 0..4u8 {
+                        if (imm >> (4 + lane)) & 1 == 0 {
+                            self.asm.ins_gen(2, V0, lane, ZR);
+                        }
+                    }
+                    self.asm.v3(vec::FADDP, 0, V0, V0, V0);
+                    self.asm.v3(vec::FADDP, 0, V0, V0, V0);
+                    self.asm.v_eor(d, d, d);
+                    for lane in 0..4u8 {
+                        if (imm >> lane) & 1 != 0 {
+                            self.asm.ins_elem(2, d, lane, V0, 0);
+                        }
+                    }
+                }
+            }
+            // SSE4.2 pcmpestrm (60), pcmpestri (61), pcmpistrm (62), pcmpistri (63).
+            0x60..=0x63 => {
+                let s = self.src128(inst)?;
+                self.asm.umov(3, S0, d, 0);
+                self.asm.umov(3, S1, d, 1);
+                self.asm.umov(3, S2, s, 0);
+                self.asm.umov(3, S3, s, 1);
+                let meta = (u64::from(inst.op) << 16) | (u64::from(imm) << 8) | u64::from(inst.w());
+                self.asm.mov_imm(A, meta);
+                self.asm.brk(super::exit::PCMPSTR);
+                if matches!(inst.op, 0x60 | 0x62) {
+                    self.asm.ins_gen(3, 0, 0, S0);
+                    self.asm.ins_gen(3, 0, 1, S1);
+                }
+            }
+            _ => return Err(Unsupported),
+        }
+        Ok(Next::Continue)
     }
 }

@@ -13,6 +13,8 @@ dll! {
     host GetThemeBackgroundContentRect(6) => e_handle;
     host GetThemePartSize(7) => e_handle;
     host OpenThemeData(2) => null;
+    host SetWindowTheme(3) => s_ok;
+    host DrawThemeBackgroundEx(6) @ 47 => e_handle;
 }
 
 const S_OK: u64 = 0;

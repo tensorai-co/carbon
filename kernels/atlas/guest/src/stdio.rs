@@ -60,6 +60,10 @@ pub struct File {
     /// What's been read and not taken: `buffer[at..have]`.
     at: usize,
     have: usize,
+    /// Exposed to C++ `basic_filebuf` via `_get_stream_buffer_pointers`.
+    crt_base: *mut u8,
+    crt_ptr: *mut u8,
+    crt_cnt: i32,
     buffer: [u8; BUFFER],
 }
 
@@ -79,6 +83,9 @@ impl File {
             standard: which + 1,
             at: 0,
             have: 0,
+            crt_base: core::ptr::null_mut(),
+            crt_ptr: core::ptr::null_mut(),
+            crt_cnt: 0,
             buffer: [0; BUFFER],
         }
     }
@@ -237,6 +244,9 @@ fn alloc_file(handle: u64, fd: i32, read: bool, write: bool, append: bool, text:
             standard: 0,
             at: 0,
             have: 0,
+            crt_base: core::ptr::null_mut(),
+            crt_ptr: core::ptr::null_mut(),
+            crt_cnt: 0,
             buffer: [0; BUFFER],
         });
     }
@@ -448,7 +458,23 @@ pub extern "C" fn AtlasCrtUngetwc(c: u32, f: *mut File) -> u32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn AtlasCrtGetStreamBufferPointers(_f: *mut File, _base: *mut usize, _ptr: *mut usize, _cnt: *mut usize) -> i32 {
+pub extern "C" fn AtlasCrtGetStreamBufferPointers(f: *mut File, base: *mut usize, ptr: *mut usize, cnt: *mut usize) -> i32 {
+    let Some(file) = stream(f) else {
+        crate::crt::set_errno(22);
+        return 22;
+    };
+    // SAFETY: caller-provided output slots for FILE's internal buffer pointers.
+    unsafe {
+        if !base.is_null() {
+            *base = (&raw mut file.crt_base) as usize;
+        }
+        if !ptr.is_null() {
+            *ptr = (&raw mut file.crt_ptr) as usize;
+        }
+        if !cnt.is_null() {
+            *cnt = (&raw mut file.crt_cnt) as usize;
+        }
+    }
     0
 }
 
@@ -2169,3 +2195,182 @@ macro_rules! wsprintf {
 }
 
 core::arch::global_asm!(wsprintf!("AtlasWsprintfW", "AtlasWvsprintfW"), wsprintf!("AtlasWsprintfA", "AtlasWvsprintfA"));
+
+// ---- Legacy msvcrt stdio wrappers ----
+
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtMsvcrtVsnprintf(buffer: *mut u8, count: usize, fmt: *const u8, args: *const u8) -> i32 {
+    AtlasCrtVsprintf(0, buffer, count, fmt, 0, args)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtMsvcrtVsnwprintf(buffer: *mut u16, count: usize, fmt: *const u16, args: *const u8) -> i32 {
+    AtlasCrtVswprintf(0, buffer, count, fmt, 0, args)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtMsvcrtVsprintfS(buffer: *mut u8, size: usize, fmt: *const u8, args: *const u8) -> i32 {
+    AtlasCrtVsprintfS(0, buffer, size, fmt, 0, args)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtMsvcrtVswprintfS(buffer: *mut u16, size: usize, fmt: *const u16, args: *const u8) -> i32 {
+    AtlasCrtVswprintfS(0, buffer, size, fmt, 0, args)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtMsvcrtVsnwprintfS(buffer: *mut u16, size: usize, max: usize, fmt: *const u16, args: *const u8) -> i32 {
+    AtlasCrtVsnwprintfS(0, buffer, size, max, fmt, 0, args)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtMsvcrtVsscanf(buf: *const u8, fmt: *const u8, args: *const u8) -> i32 {
+    unsafe { AtlasCrtVsscanf(0, buf, usize::MAX, fmt, 0, args) }
+}
+
+#[cfg(target_arch = "x86")]
+macro_rules! cdecl_vararg2 {
+    ($name:literal, $v:literal) => {
+        concat!(
+            ".globl _", $name, "\n",
+            "_", $name, ":\n",
+            "lea eax, [esp + 12]\n",
+            "push eax\n",
+            "push dword ptr [esp + 12]\n",
+            "push dword ptr [esp + 12]\n",
+            "call _", $v, "\n",
+            "add esp, 12\n",
+            "ret\n",
+        )
+    };
+}
+
+#[cfg(target_arch = "x86_64")]
+macro_rules! cdecl_vararg2 {
+    ($name:literal, $v:literal) => {
+        wsprintf!($name, $v)
+    };
+}
+
+#[cfg(target_arch = "aarch64")]
+macro_rules! cdecl_vararg2 {
+    ($name:literal, $v:literal) => {
+        wsprintf!($name, $v)
+    };
+}
+
+#[cfg(target_arch = "x86")]
+macro_rules! cdecl_vararg3 {
+    ($name:literal, $v:literal) => {
+        concat!(
+            ".globl _", $name, "\n",
+            "_", $name, ":\n",
+            "lea eax, [esp + 16]\n",
+            "push eax\n",
+            "push dword ptr [esp + 16]\n",
+            "push dword ptr [esp + 16]\n",
+            "push dword ptr [esp + 16]\n",
+            "call _", $v, "\n",
+            "add esp, 16\n",
+            "ret\n",
+        )
+    };
+}
+
+#[cfg(target_arch = "x86_64")]
+macro_rules! cdecl_vararg3 {
+    ($name:literal, $v:literal) => {
+        concat!(
+            ".globl ", $name, "\n",
+            $name, ":\n",
+            "mov [rsp + 32], r9\n",
+            "lea r9, [rsp + 32]\n",
+            "sub rsp, 40\n",
+            "call ", $v, "\n",
+            "add rsp, 40\n",
+            "ret\n",
+        )
+    };
+}
+
+#[cfg(target_arch = "aarch64")]
+macro_rules! cdecl_vararg3 {
+    ($name:literal, $v:literal) => {
+        concat!(
+            ".globl ", $name, "\n",
+            $name, ":\n",
+            "stp x29, x30, [sp, #-80]!\n",
+            "mov x29, sp\n",
+            "stp x0, x1, [sp, #16]\n",
+            "stp x2, x3, [sp, #32]\n",
+            "stp x4, x5, [sp, #48]\n",
+            "stp x6, x7, [sp, #64]\n",
+            "add x3, sp, #40\n",
+            "bl ", $v, "\n",
+            "ldp x29, x30, [sp], #80\n",
+            "ret\n",
+        )
+    };
+}
+
+#[cfg(target_arch = "x86")]
+macro_rules! cdecl_vararg4 {
+    ($name:literal, $v:literal) => {
+        concat!(
+            ".globl _", $name, "\n",
+            "_", $name, ":\n",
+            "lea eax, [esp + 20]\n",
+            "push eax\n",
+            "push dword ptr [esp + 20]\n",
+            "push dword ptr [esp + 20]\n",
+            "push dword ptr [esp + 20]\n",
+            "push dword ptr [esp + 20]\n",
+            "call _", $v, "\n",
+            "add esp, 20\n",
+            "ret\n",
+        )
+    };
+}
+
+#[cfg(target_arch = "x86_64")]
+macro_rules! cdecl_vararg4 {
+    ($name:literal, $v:literal) => {
+        concat!(
+            ".globl ", $name, "\n",
+            $name, ":\n",
+            "lea rax, [rsp + 40]\n",
+            "sub rsp, 56\n",
+            "mov [rsp + 32], rax\n",
+            "call ", $v, "\n",
+            "add rsp, 56\n",
+            "ret\n",
+        )
+    };
+}
+
+#[cfg(target_arch = "aarch64")]
+macro_rules! cdecl_vararg4 {
+    ($name:literal, $v:literal) => {
+        concat!(
+            ".globl ", $name, "\n",
+            $name, ":\n",
+            "stp x29, x30, [sp, #-80]!\n",
+            "mov x29, sp\n",
+            "stp x0, x1, [sp, #16]\n",
+            "stp x2, x3, [sp, #32]\n",
+            "stp x4, x5, [sp, #48]\n",
+            "stp x6, x7, [sp, #64]\n",
+            "add x4, sp, #48\n",
+            "bl ", $v, "\n",
+            "ldp x29, x30, [sp], #80\n",
+            "ret\n",
+        )
+    };
+}
+
+core::arch::global_asm!(
+    cdecl_vararg2!("AtlasCrtMsvcrtSscanf", "AtlasCrtMsvcrtVsscanf"),
+    cdecl_vararg3!("AtlasCrtMsvcrtSprintfS", "AtlasCrtMsvcrtVsprintfS"),
+    cdecl_vararg3!("AtlasCrtMsvcrtSwprintfS", "AtlasCrtMsvcrtVswprintfS"),
+    cdecl_vararg4!("AtlasCrtMsvcrtSnwprintfS", "AtlasCrtMsvcrtVsnwprintfS"),
+);

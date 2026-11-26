@@ -16,6 +16,7 @@ dependencies = [
  "audio",
  "display",
  "exec",
+ "flate2",
  "gpu-api",
  "gpu-wire",
  "hooks",

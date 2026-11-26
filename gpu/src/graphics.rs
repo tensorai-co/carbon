@@ -182,20 +182,22 @@ pub enum VertexFormat {
     I32(u8),
     /// Four bytes, each read as `n / 255`.
     Unorm8x4,
+    /// Four BGRA bytes, swizzled to RGBA as `n / 255`.
+    Bgra8Unorm,
 }
 
 impl VertexFormat {
     pub const fn bytes(self) -> u32 {
         match self {
             VertexFormat::F32(n) | VertexFormat::U32(n) | VertexFormat::I32(n) => 4 * n as u32,
-            VertexFormat::Unorm8x4 => 4,
+            VertexFormat::Unorm8x4 | VertexFormat::Bgra8Unorm => 4,
         }
     }
 
     /// The scalar a shader reads it as.
     pub const fn scalar(self) -> ir::Scalar {
         match self {
-            VertexFormat::F32(_) | VertexFormat::Unorm8x4 => ir::Scalar::F32,
+            VertexFormat::F32(_) | VertexFormat::Unorm8x4 | VertexFormat::Bgra8Unorm => ir::Scalar::F32,
             VertexFormat::U32(_) => ir::Scalar::U32,
             VertexFormat::I32(_) => ir::Scalar::I32,
         }

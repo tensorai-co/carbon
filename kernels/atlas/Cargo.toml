@@ -21,6 +21,7 @@ net.workspace = true
 gpu-api.workspace = true
 gpu-wire.workspace = true
 hooks.workspace = true
+flate2.workspace = true
 
 [dev-dependencies]
 layers.workspace = true

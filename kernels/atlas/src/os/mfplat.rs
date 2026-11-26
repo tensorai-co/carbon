@@ -29,6 +29,7 @@ dll! {
     missing MFLockDXGIDeviceManager;
     host MFShutdown(0) => mf_shutdown;
     host MFStartup(2) => mf_startup;
+    host MFTEnum(7) => mft_enum;
     host MFTEnumEx(6) => mft_enum_ex;
     missing MFUnlockDXGIDeviceManager;
 }
@@ -40,6 +41,17 @@ fn mf_startup(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
 }
 
 fn mf_shutdown(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(0)
+}
+
+/// `MFTEnum(category, flags, in_type, out_type, attrs, &clsids, &count)`: zero transforms.
+fn mft_enum(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[5] != 0 {
+        let _ = task.write_ptr(cx, a[5], 0);
+    }
+    if a[6] != 0 {
+        let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), a[6], 0));
+    }
     Reply::Value(0)
 }
 

@@ -9,16 +9,20 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use atlas_abi::ansi::{from_1252, to_1252};
 
 use crate::crt::{
-    self, AtlasCrtAbort, AtlasCrtFree, AtlasCrtIswalpha, AtlasCrtIswcntrl, AtlasCrtIswdigit,
+    self, AtlasCrtAbort, AtlasCrtFree, AtlasCrtGetenv, AtlasCrtIswalpha, AtlasCrtIswcntrl, AtlasCrtIswdigit,
     AtlasCrtIswlower, AtlasCrtIswprint, AtlasCrtIswpunct, AtlasCrtIswspace, AtlasCrtIswupper,
-    AtlasCrtIswxdigit, AtlasCrtMalloc, AtlasCrtStrcmp, AtlasCrtStrerror, AtlasCrtStrlen,
-    AtlasCrtStrnlen, AtlasCrtStrtod, AtlasCrtTolower, AtlasCrtToupper, AtlasCrtTowlower,
-    AtlasCrtTowupper, AtlasCrtWcscmp, AtlasCrtWcslen, set_errno,
+    AtlasCrtIswxdigit, AtlasCrtMalloc, AtlasCrtStrchr, AtlasCrtStrcmp, AtlasCrtStrerror, AtlasCrtStrlen,
+    AtlasCrtStrncmp, AtlasCrtStrncpy, AtlasCrtStrnlen, AtlasCrtStrpbrk, AtlasCrtStrtod, AtlasCrtTime64,
+    AtlasCrtTolower, AtlasCrtToupper, AtlasCrtTowlower, AtlasCrtTowupper, AtlasCrtWcscmp, AtlasCrtWcslen,
+    AtlasCrtWcstoll, set_errno,
 };
 use crate::sys::host;
 
 host!(create_thread, b"CreateThread", (sec, stack, start, param, flags, tid));
+host!(get_current_process_id, b"GetCurrentProcessId", ());
+host!(get_command_line_w, b"GetCommandLineW", ());
 host!(get_file_attributes_ex_a, b"GetFileAttributesExA", (name, level, info));
+host!(get_file_attributes_ex_w, b"GetFileAttributesExW", (name, level, info));
 host!(find_first_file_a, b"FindFirstFileA", (name, data));
 host!(find_next_file_a, b"FindNextFileA", (handle, data));
 host!(find_close, b"FindClose", (handle));
@@ -606,6 +610,276 @@ pub extern "C" fn AtlasCrtAlignedFree(ptr: *mut u8) {
     // SAFETY: allocated by `AtlasCrtAlignedOffsetMalloc`.
     let raw = unsafe { ptr.sub(size_of::<usize>()).cast::<*mut u8>().read_unaligned() };
     AtlasCrtFree(raw);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtAlignedRealloc(ptr: *mut u8, size: usize, alignment: usize) -> *mut u8 {
+    if ptr.is_null() {
+        return AtlasCrtAlignedMalloc(size, alignment);
+    }
+    if size == 0 {
+        AtlasCrtAlignedFree(ptr);
+        return core::ptr::null_mut();
+    }
+    let old_raw = unsafe { ptr.sub(size_of::<usize>()).cast::<*mut u8>().read_unaligned() };
+    let old_total = crate::RtlSizeHeap(crate::RtlGetProcessHeap(), 0, old_raw.cast());
+    let old_usable = if old_total != usize::MAX {
+        old_total.saturating_sub(ptr as usize - old_raw as usize)
+    } else {
+        size
+    };
+    let new_ptr = AtlasCrtAlignedMalloc(size, alignment);
+    if new_ptr.is_null() {
+        return core::ptr::null_mut();
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(ptr, new_ptr, old_usable.min(size));
+    }
+    AtlasCrtFree(old_raw);
+    new_ptr
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtGetHeapHandle() -> usize {
+    crate::RtlGetProcessHeap() as usize
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtHeapchk() -> i32 {
+    -2 // _HEAPOK
+}
+
+static mut SYS_ERRLIST: [*const u8; 43] = [core::ptr::null(); 43];
+static SYS_ERRLIST_INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtSysErrlist() -> *mut *const u8 {
+    if !SYS_ERRLIST_INIT.load(Ordering::Acquire) {
+        for i in 0..43 {
+            unsafe {
+                SYS_ERRLIST[i] = AtlasCrtStrerror(i as i32);
+            }
+        }
+        SYS_ERRLIST_INIT.store(true, Ordering::Release);
+    }
+    (&raw mut SYS_ERRLIST).cast()
+}
+
+static WCMDLN: AtomicU64 = AtomicU64::new(0);
+
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtWideWinmainCommandLine() -> *const u16 {
+    if WCMDLN.load(Ordering::Acquire) == 0 {
+        let p = get_command_line_w() as usize as *const u16;
+        if p.is_null() {
+            static EMPTY: [u16; 1] = [0];
+            return EMPTY.as_ptr();
+        }
+        let mut i = 0usize;
+        let mut quoted = false;
+        unsafe {
+            while *p.add(i) != 0 && (quoted || (*p.add(i) != b' ' as u16 && *p.add(i) != b'\t' as u16)) {
+                if *p.add(i) == b'"' as u16 {
+                    quoted = !quoted;
+                }
+                i += 1;
+            }
+            while *p.add(i) == b' ' as u16 || *p.add(i) == b'\t' as u16 {
+                i += 1;
+            }
+            WCMDLN.store(p.add(i) as u64, Ordering::Release);
+        }
+    }
+    WCMDLN.load(Ordering::Acquire) as usize as *const u16
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtWtof(s: *const u16) -> f64 {
+    unsafe { AtlasCrtWcstod(s, core::ptr::null_mut()) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtWtoi64(s: *const u16) -> i64 {
+    unsafe { AtlasCrtWcstoll(s, core::ptr::null_mut(), 10) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtGetenvS(
+    ret_sz: *mut usize,
+    buf: *mut u8,
+    cap: usize,
+    name: *const u8,
+) -> i32 {
+    if ret_sz.is_null() || name.is_null() || (buf.is_null() && cap > 0) {
+        set_errno(EINVAL);
+        return EINVAL;
+    }
+    let val = unsafe { AtlasCrtGetenv(name) };
+    if val.is_null() {
+        unsafe { *ret_sz = 0 };
+        if !buf.is_null() && cap > 0 {
+            unsafe { *buf = 0 };
+        }
+        return 0;
+    }
+    let need = unsafe { AtlasCrtStrlen(val) } + 1;
+    unsafe { *ret_sz = need };
+    if buf.is_null() || cap == 0 {
+        return 0;
+    }
+    if need > cap {
+        unsafe { *buf = 0 };
+        set_errno(ERANGE);
+        return ERANGE;
+    }
+    unsafe { core::ptr::copy_nonoverlapping(val, buf, need) };
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtWgetenvS(
+    ret_sz: *mut usize,
+    buf: *mut u16,
+    cap: usize,
+    name: *const u16,
+) -> i32 {
+    if ret_sz.is_null() || name.is_null() || (buf.is_null() && cap > 0) {
+        set_errno(EINVAL);
+        return EINVAL;
+    }
+    let val = unsafe { AtlasCrtWgetenv(name) };
+    if val.is_null() {
+        unsafe { *ret_sz = 0 };
+        if !buf.is_null() && cap > 0 {
+            unsafe { *buf = 0 };
+        }
+        return 0;
+    }
+    let need = unsafe { AtlasCrtWcslen(val) } + 1;
+    unsafe { *ret_sz = need };
+    if buf.is_null() || cap == 0 {
+        return 0;
+    }
+    if need > cap {
+        unsafe { *buf = 0 };
+        set_errno(ERANGE);
+        return ERANGE;
+    }
+    unsafe { core::ptr::copy_nonoverlapping(val, buf, need) };
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtAccess(path: *const u8, _mode: i32) -> i32 {
+    if path.is_null() {
+        set_errno(EINVAL);
+        return -1;
+    }
+    let mut info = [0u32; 9];
+    if get_file_attributes_ex_a(path as usize as u64, 0, info.as_mut_ptr() as usize as u64) == 0 {
+        set_errno(map_win32_errno());
+        return -1;
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtWaccess(path: *const u16, _mode: i32) -> i32 {
+    if path.is_null() {
+        set_errno(EINVAL);
+        return -1;
+    }
+    let mut info = [0u32; 9];
+    if get_file_attributes_ex_w(path as usize as u64, 0, info.as_mut_ptr() as usize as u64) == 0 {
+        set_errno(map_win32_errno());
+        return -1;
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtGetpid() -> i32 {
+    get_current_process_id() as i32
+}
+
+#[repr(C)]
+pub struct DivT {
+    pub quot: i32,
+    pub rem: i32,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn AtlasCrtDiv(numer: i32, denom: i32) -> DivT {
+    DivT { quot: numer / denom, rem: numer % denom }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtCputs(s: *const u8) -> i32 {
+    if s.is_null() {
+        return -1;
+    }
+    let n = unsafe { AtlasCrtStrlen(s) };
+    let out = crate::stdio::AtlasCrtIob(1);
+    unsafe { crate::stdio::AtlasCrtFwrite(s.cast(), 1, n, out) };
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtMbschr(s: *const u8, c: u32) -> *const u8 {
+    unsafe { AtlasCrtStrchr(s, c as i32) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtMbsnbcmp(s1: *const u8, s2: *const u8, n: usize) -> i32 {
+    unsafe { AtlasCrtStrncmp(s1, s2, n) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtMbsnbcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    unsafe { AtlasCrtStrncpy(dst, src, n) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtMbspbrk(s: *const u8, accept: *const u8) -> *const u8 {
+    unsafe { AtlasCrtStrpbrk(s, accept) }
+}
+
+#[repr(C)]
+pub struct Timespec32 {
+    pub tv_sec: i32,
+    pub tv_nsec: i32,
+}
+
+#[repr(C)]
+pub struct Timespec64 {
+    pub tv_sec: i64,
+    pub tv_nsec: i32,
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtTimespec32Get(ts: *mut Timespec32, base: i32) -> i32 {
+    if ts.is_null() || base != 1 {
+        return 0;
+    }
+    let sec = unsafe { AtlasCrtTime64(core::ptr::null_mut()) };
+    unsafe {
+        (*ts).tv_sec = sec as i32;
+        (*ts).tv_nsec = 0;
+    }
+    base
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtTimespec64Get(ts: *mut Timespec64, base: i32) -> i32 {
+    if ts.is_null() || base != 1 {
+        return 0;
+    }
+    let sec = unsafe { AtlasCrtTime64(core::ptr::null_mut()) };
+    unsafe {
+        (*ts).tv_sec = sec;
+        (*ts).tv_nsec = 0;
+    }
+    base
 }
 
 // ---- Errno, strings, numbers, assertions, terminate ----
@@ -1690,6 +1964,54 @@ pub unsafe extern "C" fn AtlasCrtStat64i32(path: *const u8, buf: *mut Stat64i32)
             st_atime: s.st_atime,
             st_mtime: s.st_mtime,
             st_ctime: s.st_ctime,
+        });
+    }
+    0
+}
+
+#[repr(C)]
+pub struct Stat32i64 {
+    pub st_dev: u32,
+    pub st_ino: u16,
+    pub st_mode: u16,
+    pub st_nlink: i16,
+    pub st_uid: i16,
+    pub st_gid: i16,
+    pub _pad0: u16,
+    pub st_rdev: u32,
+    pub _pad1: u32,
+    pub st_size: i64,
+    pub st_atime: i32,
+    pub st_mtime: i32,
+    pub st_ctime: i32,
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn AtlasCrtStat32i64(path: *const u8, buf: *mut Stat32i64) -> i32 {
+    if buf.is_null() {
+        set_errno(EINVAL);
+        return -1;
+    }
+    let mut st = core::mem::MaybeUninit::<Stat64>::uninit();
+    if unsafe { AtlasCrtStat64(path, st.as_mut_ptr()) } != 0 {
+        return -1;
+    }
+    let s = unsafe { st.assume_init() };
+    unsafe {
+        buf.write(Stat32i64 {
+            st_dev: s.st_dev,
+            st_ino: s.st_ino,
+            st_mode: s.st_mode,
+            st_nlink: s.st_nlink,
+            st_uid: s.st_uid,
+            st_gid: s.st_gid,
+            _pad0: 0,
+            st_rdev: s.st_rdev,
+            _pad1: 0,
+            st_size: s.st_size,
+            st_atime: s.st_atime as i32,
+            st_mtime: s.st_mtime as i32,
+            st_ctime: s.st_ctime as i32,
         });
     }
     0

@@ -67,6 +67,8 @@ pub mod exit {
     /// To a block known when translating, whose address is the 8 bytes after the `brk` (`x16` isn't set). Once
     /// that block is translated, the runtime turns the `brk` into a branch to it: the blocks are chained.
     pub const CHAIN: u16 = 11;
+    /// SSE4.2 `pcmpestri`/`pcmpestrm`/`pcmpistri`/`pcmpistrm`, emulated inline in the runtime (`elr += 4`).
+    pub const PCMPSTR: u16 = 12;
 }
 
 /// Where a translated space's code cache is, at the top of its own address space, mapped for EL0 to run.
@@ -666,6 +668,8 @@ impl Emitter {
         match inst.map {
             0 => self.one_byte(inst),
             1 => self.two_byte(inst),
+            2 => self.sse38(inst),
+            3 => self.sse3a(inst),
             _ => Err(Unsupported),
         }
     }
@@ -1496,6 +1500,19 @@ impl Emitter {
                     self.asm.sbfx(true, S0, S0, 0, from);
                 }
                 self.store(Op::Reg(inst.reg, false), v, S0)?;
+                Ok(Next::Continue)
+            }
+            0xB8 if inst.rep => {
+                // popcnt r16/32/64, r/m16/32/64
+                let src = self.rm(inst, v)?;
+                self.load(src, v, S0);
+                self.asm.fmov_d_x(28, S0);
+                self.asm.cnt_8b(28, 28);
+                self.asm.addv_8b(28, 28);
+                self.asm.umov(0, R, 28, 0);
+                // R is 0..=64: subs sets Z=(R==0), N=0, V=0, C=1 (!CF where CF=0).
+                self.asm.subs(true, ZR, R, ZR);
+                self.store(Op::Reg(inst.reg, false), v, R)?;
                 Ok(Next::Continue)
             }
             0xBC | 0xBD if v >= 32 => self.bit_scan(inst, v),

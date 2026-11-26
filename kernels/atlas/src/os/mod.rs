@@ -42,7 +42,9 @@ pub mod mf;
 pub mod mfplat;
 pub mod mfreadwrite;
 pub mod msdmo;
+pub mod msi;
 pub mod msimg32;
+pub mod msvcrt;
 pub mod mswsock;
 pub mod ncrypt;
 pub mod ndfapi;
@@ -60,6 +62,7 @@ pub mod propsys;
 pub mod psapi;
 pub mod resapi;
 pub mod rpcrt4;
+pub mod rstrtmgr;
 pub mod secapi;
 pub mod secur32;
 pub mod setupapi;
@@ -162,7 +165,7 @@ impl Dll {
 /// `missing Name`, numbered on from the one before; `@ 23` after its name gives it an ordinal of its own (the next
 /// follow on from there). `"NAME.dll" @ 17;` numbers its exports from 17.
 macro_rules! dll {
-    ($file:literal $(@ $first:literal)?; $($kind:ident $name:ident $(($args:literal))? $(@ $ord:literal)? $(=> $target:ident)?;)*) => {
+    ($file:literal $(@ $first:literal)?; $($kind:ident $name:tt $(($args:literal))? $(@ $ord:literal)? $(=> $target:ident)?;)*) => {
         pub static DLL: $crate::os::Dll = $crate::os::Dll {
             name: $file,
             exports: &[$(dll!(@export $kind $name $(($args))? [$($ord)?] $(=> $target)?)),*],
@@ -173,24 +176,26 @@ macro_rules! dll {
     (@first $first:literal) => { $first };
     (@ord) => { None };
     (@ord $ord:literal) => { Some($ord) };
-    (@export host $name:ident ($args:literal) [$($ord:literal)?] => $run:ident) => {
-        $crate::os::Export { name: stringify!($name), kind: $crate::os::Kind::Host { args: $args, run: $run }, ordinal: dll!(@ord $($ord)?) }
+    (@name $name:literal) => { $name };
+    (@name $name:ident) => { stringify!($name) };
+    (@export host $name:tt ($args:literal) [$($ord:literal)?] => $run:ident) => {
+        $crate::os::Export { name: dll!(@name $name), kind: $crate::os::Kind::Host { args: $args, run: $run }, ordinal: dll!(@ord $($ord)?) }
     };
-    (@export guest $name:ident [$($ord:literal)?] => $target:ident) => {
-        $crate::os::Export { name: stringify!($name), kind: $crate::os::Kind::Guest(stringify!($target)), ordinal: dll!(@ord $($ord)?) }
+    (@export guest $name:tt [$($ord:literal)?] => $target:ident) => {
+        $crate::os::Export { name: dll!(@name $name), kind: $crate::os::Kind::Guest(stringify!($target)), ordinal: dll!(@ord $($ord)?) }
     };
-    (@export guest $name:ident [$($ord:literal)?]) => {
-        $crate::os::Export { name: stringify!($name), kind: $crate::os::Kind::Guest(stringify!($name)), ordinal: dll!(@ord $($ord)?) }
+    (@export guest $name:tt [$($ord:literal)?]) => {
+        $crate::os::Export { name: dll!(@name $name), kind: $crate::os::Kind::Guest(dll!(@name $name)), ordinal: dll!(@ord $($ord)?) }
     };
-    (@export missing $name:ident [$($ord:literal)?]) => {
-        $crate::os::Export { name: stringify!($name), kind: $crate::os::Kind::Missing, ordinal: dll!(@ord $($ord)?) }
+    (@export missing $name:tt [$($ord:literal)?]) => {
+        $crate::os::Export { name: dll!(@name $name), kind: $crate::os::Kind::Missing, ordinal: dll!(@ord $($ord)?) }
     };
 }
 pub(crate) use dll;
 
 /// Every system DLL atlas has.
-pub static DLLS: &[&Dll] = &[&kernel32::DLL, &user32::DLL, &advapi32::DLL, &gdi32::DLL, &shell32::DLL, &version::DLL, &ucrtbase::DLL, &comctl32::DLL, &ole32::DLL, &psapi::DLL, &oleaut32::DLL, &bcrypt::DLL, &crypt32::DLL, &ws2_32::DLL, &wsock32::DLL,
-    &cfgmgr32::DLL, &comdlg32::DLL, &dwmapi::DLL, &dwrite::DLL, &dxgi::DLL, &dxva2::DLL, &hid::DLL, &imagehlp::DLL, &imm32::DLL, &iphlpapi::DLL, &msdmo::DLL, &msimg32::DLL, &mswsock::DLL, &ncrypt::DLL, &opengl32::DLL, &pdh::DLL, &powrprof::DLL, &rpcrt4::DLL, &secur32::DLL, &setupapi::DLL, &shlwapi::DLL, &usp10::DLL, &winhttp::DLL, &wininet::DLL, &winmm::DLL, &wtsapi32::DLL, &shcore::DLL,
+pub static DLLS: &[&Dll] = &[&kernel32::DLL, &user32::DLL, &advapi32::DLL, &gdi32::DLL, &shell32::DLL, &version::DLL, &ucrtbase::DLL, &msvcrt::DLL, &comctl32::DLL, &ole32::DLL, &psapi::DLL, &oleaut32::DLL, &bcrypt::DLL, &crypt32::DLL, &ws2_32::DLL, &wsock32::DLL,
+    &cfgmgr32::DLL, &comdlg32::DLL, &dwmapi::DLL, &dwrite::DLL, &dxgi::DLL, &dxva2::DLL, &hid::DLL, &imagehlp::DLL, &imm32::DLL, &iphlpapi::DLL, &msdmo::DLL, &msi::DLL, &msimg32::DLL, &mswsock::DLL, &ncrypt::DLL, &opengl32::DLL, &pdh::DLL, &powrprof::DLL, &rpcrt4::DLL, &rstrtmgr::DLL, &secur32::DLL, &setupapi::DLL, &shlwapi::DLL, &usp10::DLL, &winhttp::DLL, &wininet::DLL, &winmm::DLL, &wtsapi32::DLL, &shcore::DLL,
     &bcryptprimitives::DLL, &credui::DLL, &cryptui::DLL, &d3d11::DLL, &d3d12::DLL, &d3d9::DLL, &dbghelp::DLL, &dhcpcsvc::DLL, &esent::DLL, &fontsub::DLL, &mf::DLL, &mfplat::DLL, &mfreadwrite::DLL, &ndfapi::DLL, &netapi32::DLL, &oleacc::DLL, &propsys::DLL, &uiautomationcore::DLL, &urlmon::DLL, &userenv::DLL, &uxtheme::DLL, &wevtapi::DLL, &wintrust::DLL, &winusb::DLL, &combase::DLL, &winspool::DLL, &bthprops::DLL, &avrt::DLL, &wldap32::DLL];
 
 /// The DLL called `name` (`kernel32`, `KERNEL32.DLL`, …), by its index in [`DLLS`].
@@ -198,6 +203,7 @@ pub fn find(name: &str) -> Option<usize> {
     // `.dll` if it has no extension; another extension (`.drv`, `.cpl`) is part of its name.
     let name = name.to_ascii_lowercase();
     let name = if name.contains('.') { name } else { format!("{name}.dll") };
+    let name = if name == "kernelbase.dll" { "kernel32.dll" } else { &name };
     DLLS.iter().position(|d| d.name.to_ascii_lowercase() == name)
 }
 

@@ -14,20 +14,46 @@ dll! {
     "IPHLPAPI.dll";
     missing ConvertInterfaceGuidToLuid;
     host GetAdaptersAddresses(5) => get_adapters_addresses;
-    missing GetAdaptersInfo;
+    host GetAdaptersInfo(2) => get_adapters_info;
     host GetBestInterface(2) => get_best_interface;
     host GetExtendedTcpTable(6) => get_extended_tcp_table;
     missing GetIfEntry2;
     host NotifyAddrChange(2) => notify_change;
     // Not written yet: what larger programs import.
     host CancelIPChangeNotify(1) => cancel_ip_change_notify;
-    missing FreeMibTable;
-    missing GetIfTable2;
-    missing GetInterfaceInfo;
+    host FreeMibTable(1) => if_nametoindex;
+    host GetIfTable2(1) => ip_not_supported;
+    host GetInterfaceInfo(2) => get_adapters_info;
     missing IpReleaseAddress;
     missing IpRenewAddress;
     host NotifyRouteChange(2) => notify_change;
     host if_nametoindex(1) => if_nametoindex;
+    host IcmpCreateFile(0) => icmp_create_file;
+    host IcmpCloseHandle(1) => icmp_close_handle;
+    host IcmpSendEcho(8) => icmp_send_echo;
+}
+
+const ICMP_HANDLE: u64 = 0x7c00;
+
+fn icmp_create_file(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(ICMP_HANDLE)
+}
+
+fn icmp_close_handle(_: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(u64::from(a[0] == ICMP_HANDLE))
+}
+
+fn icmp_send_echo(task: &mut Task, cx: &mut Cx<'_>, _: &[u64]) -> Reply {
+    task.set_last_error(cx, 11010); // IP_REQ_TIMED_OUT
+    Reply::Value(0)
+}
+
+fn get_adapters_info(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(ERROR_NO_DATA)
+}
+
+fn ip_not_supported(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(ERROR_NOT_SUPPORTED)
 }
 
 fn if_nametoindex(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {

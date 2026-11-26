@@ -41,7 +41,7 @@ dll! {
     // Not written yet: what larger programs import.
     missing ExtractIconExA;
     host SHAppBarMessage(2) => sh_app_bar_message;
-    missing SHCreateItemFromParsingName;
+    host SHCreateItemFromParsingName(4) => sh_create_item_from_parsing_name;
     missing SHGetMalloc;
     missing SHOpenFolderAndSelectItems;
     missing SHOpenWithDialog;
@@ -114,6 +114,13 @@ fn drag_query_point(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 fn drag_finish(task: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
     task.win32k().hdrops.remove(&a[0]);
     Reply::Value(0)
+}
+
+fn sh_create_item_from_parsing_name(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[3] != 0 {
+        let _ = task.write_ptr(cx, a[3], 0);
+    }
+    Reply::Value(0x8000_4001) // E_NOTIMPL
 }
 
 fn value(result: Result<u64, Reply>) -> Reply {

@@ -199,6 +199,7 @@ fn vertex_format(dxgi: u32) -> Result<VertexFormat, Error> {
         R32G32_SINT => VertexFormat::I32(2),
         R32_SINT => VertexFormat::I32(1),
         R8G8B8A8_UNORM => VertexFormat::Unorm8x4,
+        B8G8R8A8_UNORM | B8G8R8A8_UNORM_SRGB => VertexFormat::Bgra8Unorm,
         f => return unsupported(format!("DXGI format {f} for a vertex attribute")),
     })
 }

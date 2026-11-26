@@ -1,10 +1,11 @@
-//! rpcrt4.dll: declared so the programs that import it load; each export says it isn't written yet when called.
+//! rpcrt4.dll: RPC runtime utilities.
 
 use super::dll;
+use super::ole32::co_create_guid;
 
 dll! {
     "RPCRT4.dll";
-    missing UuidCreate;
+    host UuidCreate(1) => co_create_guid;
     // Not written yet: what larger programs import.
     missing GetPriorityClass;
     missing RegCloseKey;

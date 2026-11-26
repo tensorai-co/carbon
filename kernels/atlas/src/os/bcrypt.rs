@@ -11,25 +11,34 @@ dll! {
     // Not written yet: what larger programs import.
     host BCryptCloseAlgorithmProvider(2) => b_crypt_close_algorithm_provider;
     host BCryptOpenAlgorithmProvider(4) => b_crypt_open_algorithm_provider;
-    missing BCryptCreateHash;
-    missing BCryptDestroyHash;
+    host BCryptCreateHash(7) => not_supported;
+    host BCryptDestroyHash(1) => ok;
     missing BCryptDestroyKey;
     missing BCryptDuplicateHash;
     missing BCryptEncrypt;
-    missing BCryptFinishHash;
+    host BCryptFinishHash(4) => not_supported;
     missing BCryptGenerateSymmetricKey;
     missing BCryptGetProperty;
-    missing BCryptHashData;
+    host BCryptHashData(4) => not_supported;
     missing BCryptSetProperty;
 }
 
 const STATUS_INVALID_HANDLE: u64 = 0xc000_0008;
 const STATUS_INVALID_PARAMETER: u64 = 0xc000_000d;
+const STATUS_NOT_SUPPORTED: u64 = 0xc000_00bb;
 const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u64 = 0x2;
+
+pub(super) fn ok(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(0)
+}
+
+pub(super) fn not_supported(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(STATUS_NOT_SUPPORTED)
+}
 
 /// `BCryptGenRandom(algorithm, buffer, length, flags)`: the system's generator, which is all there is, whether asked
 /// for by BCRYPT_USE_SYSTEM_PREFERRED_RNG or by a handle.
-fn b_crypt_gen_random(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+pub(super) fn b_crypt_gen_random(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     if a[0] == 0 && a[3] & BCRYPT_USE_SYSTEM_PREFERRED_RNG == 0 {
         return Reply::Value(STATUS_INVALID_HANDLE);
     }
@@ -44,13 +53,13 @@ fn b_crypt_gen_random(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 const PROVIDER: u64 = 0xbc00;
 
 /// `BCryptOpenAlgorithmProvider(&handle, algorithm, implementation, flags)`.
-fn b_crypt_open_algorithm_provider(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+pub(super) fn b_crypt_open_algorithm_provider(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     if a[0] == 0 || task.write_ptr(cx, a[0], PROVIDER).is_err() {
         return Reply::Value(STATUS_INVALID_PARAMETER);
     }
     Reply::Value(0)
 }
 
-fn b_crypt_close_algorithm_provider(_: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+pub(super) fn b_crypt_close_algorithm_provider(_: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
     Reply::Value(if a[0] == PROVIDER { 0 } else { STATUS_INVALID_HANDLE })
 }

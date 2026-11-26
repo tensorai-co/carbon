@@ -11,16 +11,42 @@ use crate::process::{Task, read_remote};
 dll! {
     "DBGHELP.dll";
     host MiniDumpWriteDump(7) => mini_dump_write_dump;
-    missing StackWalk64;
-    missing SymCleanup;
-    missing SymFromAddr;
-    missing SymFunctionTableAccess64;
-    missing SymGetLineFromAddr64;
-    missing SymGetModuleBase64;
-    missing SymGetSearchPathW;
-    missing SymInitialize;
-    missing SymSetOptions;
-    missing SymSetSearchPathW;
+    host StackWalk64(9) => zero;
+    host SymCleanup(1) => zero;
+    host SymFromAddr(4) => zero;
+    host SymFunctionTableAccess64(2) => zero;
+    host SymGetLineFromAddr64(4) => zero;
+    host SymGetModuleBase64(2) => zero;
+    host SymGetSearchPathW(3) => zero;
+    host SymInitialize(3) => zero;
+    host SymSetOptions(1) => zero;
+    host SymSetSearchPathW(2) => zero;
+    host ImageNtHeader(1) => image_nt_header;
+    host SymGetModuleInfo64(3) => zero;
+    host SymGetModuleInfoW64(3) => zero;
+    host SymGetOptions(0) => zero;
+    host SymInitializeW(3) => zero;
+    host SymLoadModuleExW(7) => zero;
+    host SymUnloadModule64(2) => zero;
+}
+
+fn zero(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(0)
+}
+
+fn image_nt_header(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let base = a[0];
+    if base == 0 {
+        return Reply::Value(0);
+    }
+    let Ok(dos) = task.mem(cx, false, |t| user::read_vec(&t.space(), base, 0x40)) else {
+        return Reply::Value(0);
+    };
+    if dos.len() < 0x40 || &dos[0..2] != b"MZ" {
+        return Reply::Value(0);
+    }
+    let lfanew = u32::from_le_bytes([dos[0x3c], dos[0x3d], dos[0x3e], dos[0x3f]]) as u64;
+    Reply::Value(base.wrapping_add(lfanew))
 }
 
 /// Logs crash information passed to `MiniDumpWriteDump` and returns FALSE (`ERROR_CALL_NOT_IMPLEMENTED`).

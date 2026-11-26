@@ -63,7 +63,7 @@ dll! {
     host EnumFontFamiliesExA(5) => enum_font_families_ex_a;
     host EnumFontFamiliesExW(5) => enum_font_families_ex_w;
     missing ExtTextOutA;
-    missing ExtTextOutW;
+    host ExtTextOutW(8) => ext_text_out_w;
     host GdiFlush(0) => one;
     missing GetBitmapBits;
     missing GetCharABCWidthsW;
@@ -138,6 +138,16 @@ dll! {
     missing StartPage;
     missing StrokeAndFillPath;
     missing StrokePath;
+    host CreateRoundRectRgn(6) => create_rect_rgn;
+    host RoundRect(7) => rectangle;
+    host Polygon(3) => one;
+    host CreatePolygonRgn(3) => create_polygon_rgn;
+    host GetBkColor(1) => nothing;
+    host GetFontUnicodeRanges(2) => nothing;
+    host GetGlyphIndicesW(5) => gdi_error;
+    host GetGlyphOutlineW(7) => gdi_error;
+    host GetTextExtentPointI(4) => nothing;
+    host GetTextFaceW(3) => get_text_face_w;
     missing WidenPath;
 }
 
@@ -410,6 +420,36 @@ fn text(task: &mut Task, cx: &mut Cx<'_>, at: u64, count: u64) -> String {
 fn text_out_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let s = text(task, cx, a[3], a[4]);
     Reply::Value(u64::from(task.win32k().text_out(a[0], a[1] as i32, a[2] as i32, &s)))
+}
+
+fn ext_text_out_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    if a[5] != 0 && (a[6] as u32) > 0 {
+        let s = text(task, cx, a[5], a[6]);
+        return Reply::Value(u64::from(task.win32k().text_out(a[0], a[1] as i32, a[2] as i32, &s)));
+    }
+    Reply::Value(1)
+}
+
+fn gdi_error(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(0xffff_ffff)
+}
+
+fn create_polygon_rgn(task: &mut Task, cx: &mut Cx<'_>, _: &[u64]) -> Reply {
+    create_rect_rgn(task, cx, &[0, 0, 1, 1])
+}
+
+fn get_text_face_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let units: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
+    let cap = a[1] as u32 as usize;
+    if cap == 0 || a[2] == 0 {
+        return Reply::Value(units.len() as u64);
+    }
+    let n = units.len().min(cap);
+    let mut out = units[..n].to_vec();
+    out[n - 1] = 0;
+    let bytes: Vec<u8> = out.iter().flat_map(|u| u.to_le_bytes()).collect();
+    let _ = task.mem(cx, true, |t| user::write(&mut t.space(), a[2], &bytes));
+    Reply::Value(n as u64)
 }
 
 /// `TextOutA`: its count is of bytes, in the ANSI code page.

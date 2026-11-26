@@ -1178,7 +1178,7 @@ pub fn search_path_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
 }
 
 /// An .ini file: its sections in order, each with its keys and values in order, and whether it was UTF-16.
-struct Ini {
+pub(super) struct Ini {
     sections: Vec<(String, Vec<(String, String)>)>,
     wide: bool,
 }
@@ -1221,19 +1221,19 @@ impl Ini {
         }
     }
 
-    fn section(&self, name: &str) -> Option<&Vec<(String, String)>> {
+    pub(super) fn section(&self, name: &str) -> Option<&Vec<(String, String)>> {
         self.sections.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, k)| k)
     }
 }
 
 impl Task {
     /// Where an .ini file is: a bare name is in the Windows folder, as Windows has it.
-    fn ini_path(&mut self, cx: &mut Cx<'_>, at: u64) -> String {
+    pub(super) fn ini_path(&mut self, cx: &mut Cx<'_>, at: u64) -> String {
         let name = self.path_arg(cx, at, true).unwrap_or_else(|| "win.ini".to_string());
         if name.contains(['\\', '/']) { name } else { format!("C:\\Windows\\{name}") }
     }
 
-    fn ini_read(&self, path: &str) -> Ini {
+    pub(super) fn ini_read(&self, path: &str) -> Ini {
         let bytes = self.resolve(path).ok().and_then(|(_, disk_path)| {
             let disk = lock(&self.k.disk);
             let ino = disk.resolve(layers::ROOT, &disk_path, true).ok()?;

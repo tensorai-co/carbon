@@ -1,15 +1,28 @@
-//! uiautomationcore.dll: declared so the programs that import it load; each export says it isn't written yet when called.
+//! uiautomationcore.dll: UI Automation providers. No accessibility clients are attached, so
+//! `UiaClientsAreListening` returns FALSE and provider calls succeed as no-ops.
 
-use super::dll;
+use kernels_core::thread::Cx;
+
+use super::{Reply, dll};
+use crate::process::Task;
 
 dll! {
     "UIAUTOMATIONCORE.dll";
-    missing UiaGetReservedMixedAttributeValue;
-    missing UiaGetReservedNotSupportedValue;
-    missing UiaHostProviderFromHwnd;
-    missing UiaRaiseAutomationEvent;
-    missing UiaRaiseAutomationPropertyChangedEvent;
-    missing UiaRaiseNotificationEvent;
-    missing UiaRaiseStructureChangedEvent;
-    missing UiaReturnRawElementProvider;
+    host UiaClientsAreListening(0) => zero;
+    host UiaGetReservedMixedAttributeValue(1) => e_notimpl;
+    host UiaGetReservedNotSupportedValue(1) => e_notimpl;
+    host UiaHostProviderFromHwnd(2) => e_notimpl;
+    host UiaRaiseAutomationEvent(2) => zero;
+    host UiaRaiseAutomationPropertyChangedEvent(4) => zero;
+    host UiaRaiseNotificationEvent(5) => zero;
+    host UiaRaiseStructureChangedEvent(4) => zero;
+    host UiaReturnRawElementProvider(4) => zero;
+}
+
+fn zero(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(0)
+}
+
+fn e_notimpl(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(0x8000_4001)
 }

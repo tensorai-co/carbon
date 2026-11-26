@@ -150,6 +150,7 @@ impl Device<'_> {
                 r
             }
             VertexFormat::Unorm8x4 => [0, 1, 2, 3].map(|i| bits(b[i] as f32 / 255.0)),
+            VertexFormat::Bgra8Unorm => [2, 1, 0, 3].map(|i| bits(b[i] as f32 / 255.0)),
         })
     }
 

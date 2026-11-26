@@ -47,7 +47,7 @@ fn encodings_match_llvm() {
 /// The vector and floating-point encodings SSE is lowered to, each checked against `llvm-mc`.
 #[test]
 fn sse_encodings_match_llvm() {
-    let cases: [(u32, u32, &str); 80] = [
+    let cases: [(u32, u32, &str); 90] = [
         (0x4e238441, { let mut a = Asm::new(); a.v3(vec::ADD, 0, 1, 2, 3); a.code[0] }, "add v1.16b, v2.16b, v3.16b"),
         (0x6ee38441, { let mut a = Asm::new(); a.v3(vec::SUB, 3, 1, 2, 3); a.code[0] }, "sub v1.2d, v2.2d, v3.2d"),
         (0x6e668ca4, { let mut a = Asm::new(); a.v3(vec::CMEQ, 1, 4, 5, 6); a.code[0] }, "cmeq v4.8h, v5.8h, v6.8h"),
@@ -128,6 +128,16 @@ fn sse_encodings_match_llvm() {
         (0x4e21d841, { let mut a = Asm::new(); a.put(0x4E21_D800 | 2 << 5 | 1); a.code[0] }, "scvtf v1.4s, v2.4s"),
         (0x4ea1b841, { let mut a = Asm::new(); a.put(0x4EA1_B800 | 2 << 5 | 1); a.code[0] }, "fcvtzs v1.4s, v2.4s"),
         (0x6ea19841, { let mut a = Asm::new(); a.put(0x6EA1_9800 | 2 << 5 | 1); a.code[0] }, "frinti v1.4s, v2.4s"),
+        (0x4e218841, { let mut a = Asm::new(); a.v_frint(0, false, 1, 2); a.code[0] }, "frintn v1.4s, v2.4s"),
+        (0x4e619841, { let mut a = Asm::new(); a.v_frint(1, true, 1, 2); a.code[0] }, "frintm v1.2d, v2.2d"),
+        (0x4ea18841, { let mut a = Asm::new(); a.v_frint(2, false, 1, 2); a.code[0] }, "frintp v1.4s, v2.4s"),
+        (0x4ee19841, { let mut a = Asm::new(); a.v_frint(3, true, 1, 2); a.code[0] }, "frintz v1.2d, v2.2d"),
+        (0x6ee19841, { let mut a = Asm::new(); a.v_frint(4, true, 1, 2); a.code[0] }, "frinti v1.2d, v2.2d"),
+        (0x4ea0b841, { let mut a = Asm::new(); a.v_abs(2, 1, 2); a.code[0] }, "abs v1.4s, v2.4s"),
+        (0x0f10a441, { let mut a = Asm::new(); a.v_sxtl(1, 1, 2); a.code[0] }, "sxtl v1.4s, v2.4h"),
+        (0x2f08a441, { let mut a = Asm::new(); a.v_uxtl(0, 1, 2); a.code[0] }, "uxtl v1.8h, v2.8b"),
+        (0x0e205b9c, { let mut a = Asm::new(); a.cnt_8b(28, 28); a.code[0] }, "cnt v28.8b, v28.8b"),
+        (0x9ad45e73, { let mut a = Asm::new(); a.crc32c(3, 19, 19, 20); a.code[0] }, "crc32cx w19, w19, x20"),
     ];
     for (llvm, ours, text) in cases {
         assert_eq!(ours, llvm, "{text}");
@@ -413,5 +423,15 @@ fn lse_atomics_round_trip() {
         for (word, want) in a.code.into_iter().zip(expected) {
             assert_eq!(decode_atomic(word), want);
         }
+    }
+}
+
+#[test]
+fn scalar_min_max_preserve_flags() {
+    let words = |t: &crate::emit::arm64::Translation| -> Vec<u32> { t.code.chunks(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect() };
+    // minss, maxss, minsd, maxsd: must not emit scalar fcmp (0x1e20_2000 / 0x1e60_2000), which clobbers NZCV.
+    for bytes in [&[0xf3, 0x0f, 0x5d, 0xc1][..], &[0xf3, 0x0f, 0x5f, 0xc1], &[0xf2, 0x0f, 0x5d, 0xc1], &[0xf2, 0x0f, 0x5f, 0xc1]] {
+        let w = words(&translate(0x1000, bytes, 1, false));
+        assert!(!w.iter().any(|&i| (i & 0xffa0_fc1f) == 0x1e20_2000), "unexpected fcmp in {bytes:02x?}");
     }
 }

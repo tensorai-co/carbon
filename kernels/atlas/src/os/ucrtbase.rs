@@ -239,7 +239,7 @@ dll! {
     guest _invoke_watson => AtlasCrtInvokeWatson;
     guest _lock_file => AtlasCrtLockFile;
     guest _lock_locales => AtlasCrtLockLocales;
-    missing _o___std_type_info_destroy_list;
+    host _o___std_type_info_destroy_list(1) => crt_zero;
     guest _o___stdio_common_vswprintf_s => AtlasCrtVswprintfS;
     guest _o__aligned_free => AtlasCrtAlignedFree;
     guest _o__aligned_malloc => AtlasCrtAlignedMalloc;
@@ -290,6 +290,7 @@ dll! {
     host cosh(1) => math_cosh;
     host erfc(1) => math_erfc;
     host exp(1) => math_exp;
+    host exp2(1) => math_exp2;
     host exp2f(1) => math_exp2f;
     host expf(1) => math_expf;
     host floor(1) => math_floor;
@@ -439,6 +440,129 @@ dll! {
     guest wcstod => AtlasCrtWcstod;
     guest wcstombs => AtlasCrtWcstombs;
     guest wcstombs_s => AtlasCrtWcstombsS;
+    guest _wcstoi64 => AtlasCrtWcstoll;
+    guest _wcstoui64 => AtlasCrtWcstoull;
+    guest _aligned_realloc => AtlasCrtAlignedRealloc;
+    guest _get_heap_handle => AtlasCrtGetHeapHandle;
+    guest _heapchk => AtlasCrtHeapchk;
+    guest __sys_errlist => AtlasCrtSysErrlist;
+    guest _get_wide_winmain_command_line => AtlasCrtWideWinmainCommandLine;
+    guest _wtof => AtlasCrtWtof;
+    guest _wtoi64 => AtlasCrtWtoi64;
+    guest getenv_s => AtlasCrtGetenvS;
+    guest _wgetenv_s => AtlasCrtWgetenvS;
+    guest _access => AtlasCrtAccess;
+    guest _waccess => AtlasCrtWaccess;
+    guest _stat32i64 => AtlasCrtStat32i64;
+    guest _getpid => AtlasCrtGetpid;
+    guest div => AtlasCrtDiv;
+    guest _cputs => AtlasCrtCputs;
+    guest _mbschr => AtlasCrtMbschr;
+    guest _mbsnbcmp => AtlasCrtMbsnbcmp;
+    guest _mbsnbcpy => AtlasCrtMbsnbcpy;
+    guest _mbspbrk => AtlasCrtMbspbrk;
+    guest _timespec32_get => AtlasCrtTimespec32Get;
+    guest _timespec64_get => AtlasCrtTimespec64Get;
+    host _dclass(1) => math_dclass;
+    host _fdclass(1) => math_fdclass;
+    host _dtest(1) => math_dtest;
+    host _dsign(1) => math_dsign;
+    host _fdsign(1) => math_fdsign;
+    host _dpcomp(2) => math_dpcomp;
+    host _finite(1) => math_finite;
+    host _isnan(1) => math_isnan;
+    host expm1(1) => math_expm1;
+    host llround(1) => math_llround;
+    host nan(1) => math_nan;
+    host tanhf(1) => math_tanhf;
+    // Private CRT wrappers (`api-ms-win-crt-private-l1-1-0`) and FP control.
+    missing _CxxThrowException;
+    host __unDName(7) => crt_zero;
+    host _clearfp(0) => crt_zero;
+    host _controlfp(2) => crt_zero;
+    host __isascii(1) => crt_isascii;
+    guest _o___stdio_common_vsnprintf_s => AtlasCrtVsnprintfS;
+    guest _o___stdio_common_vsnwprintf_s => AtlasCrtVsnwprintfS;
+    guest _o___stdio_common_vsprintf => AtlasCrtVsprintf;
+    guest _o___stdio_common_vsprintf_s => AtlasCrtVsprintfS;
+    guest _o___stdio_common_vsscanf => AtlasCrtVsscanf;
+    guest _o___stdio_common_vswprintf => AtlasCrtVswprintf;
+    guest _o__atoi64 => AtlasCrtAtoll;
+    guest _o__callnewh => AtlasCrtIgnore;
+    host _o__chsize_s(2) => crt_zero;
+    guest _o__close => AtlasCrtClose;
+    guest _o__crt_atexit => AtlasCrtAtexit;
+    guest _o__errno => AtlasCrtErrno;
+    host _o__filelengthi64(1) => crt_neg1;
+    host _o__fpclass(1) => math_fpclass;
+    guest _o__get_osfhandle => AtlasCrtGetOsfhandle;
+    guest _o__invalid_parameter_noinfo => AtlasCrtInvalidParameterNoinfo;
+    guest _o__lseeki64 => AtlasCrtLseeki64;
+    guest _o__mbscmp => AtlasCrtStrcmp;
+    guest _o__mbstrlen => AtlasCrtStrlen;
+    host _o__memicmp(3) => crt_memicmp;
+    host _o__open_osfhandle(2) => crt_neg1;
+    guest _o__read => AtlasCrtRead;
+    guest _o__register_onexit_function => AtlasCrtRegisterOnexitFunction;
+    guest _o__strdup => AtlasCrtStrdup;
+    guest _o__stricmp => AtlasCrtStricmp;
+    guest _o__strnicmp => AtlasCrtStrnicmp;
+    guest _o__strtoui64 => AtlasCrtStrtoull;
+    guest _o__wcsdup => AtlasCrtWcsdup;
+    guest _o__wfsopen => AtlasCrtWfsopen;
+    host _o__wfullpath(3) => crt_wfullpath;
+    guest _o__wgetenv => AtlasCrtWgetenv;
+    host _o__wmakepath_s(6) => crt_wmakepath_s;
+    guest _o__write => AtlasCrtWrite;
+    host _o__wsopen_s(5) => crt_einval;
+    guest _o__wtoi => AtlasCrtWtoi;
+    host _o_acos(1) => math_acos;
+    host _o_asin(1) => math_asin;
+    host _o_atan(1) => math_atan;
+    host _o_atan2(2) => math_atan2;
+    guest _o_atof => AtlasCrtAtof;
+    guest _o_atoi => AtlasCrtAtoi;
+    guest _o_bsearch => AtlasCrtBsearch;
+    guest _o_calloc => AtlasCrtCalloc;
+    host _o_ceil(1) => math_ceil;
+    host _o_cos(1) => math_cos;
+    host _o_cosh(1) => math_cosh;
+    host _o_exp(1) => math_exp;
+    guest _o_fclose => AtlasCrtFclose;
+    host _o_floor(1) => math_floor;
+    host _o_fmod(2) => math_fmod;
+    guest _o_fread => AtlasCrtFread;
+    guest _o_fseek => AtlasCrtFseek;
+    guest _o_ftell => AtlasCrtFtell;
+    guest _o_getenv => AtlasCrtGetenv;
+    guest _o_isalnum => AtlasCrtIsalnum;
+    guest _o_isalpha => AtlasCrtIsalpha;
+    guest _o_isdigit => AtlasCrtIsdigit;
+    guest _o_isspace => AtlasCrtIsspace;
+    guest _o_isxdigit => AtlasCrtIsxdigit;
+    host _o_log(1) => math_log;
+    host _o_modf(2) => math_modf;
+    host _o_pow(2) => math_pow;
+    guest _o_qsort => AtlasCrtQsort;
+    guest _o_setlocale => AtlasCrtSetlocale;
+    host _o_sin(1) => math_sin;
+    host _o_sinh(1) => math_sinh;
+    host _o_sqrt(1) => math_sqrt;
+    guest _o_strcat_s => AtlasCrtStrcatS;
+    guest _o_strcpy_s => AtlasCrtStrcpyS;
+    guest _o_strncpy_s => AtlasCrtStrncpyS;
+    guest _o_strtod => AtlasCrtStrtod;
+    guest _o_strtoul => AtlasCrtStrtoul;
+    host _o_tan(1) => math_tan;
+    host _o_tanh(1) => math_tanh;
+    guest _o_terminate => AtlasCrtTerminate;
+    guest _o_tolower => AtlasCrtTolower;
+    guest _o_toupper => AtlasCrtToupper;
+    host _o_wcscat_s(3) => crt_wcscat_s;
+    guest _o_wcscpy_s => AtlasCrtWcscpyS;
+    host _o_wcsncat_s(4) => crt_wcsncat_s;
+    guest _o_wcsncpy_s => AtlasCrtWcsncpyS;
+    guest _o_wcstoul => AtlasCrtWcstoul;
 }
 
 fn crt_rand_s(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
@@ -492,7 +616,7 @@ fn return_f32(task: &mut Task, cx: &mut Cx<'_>, v: f32) -> Reply {
 
 macro_rules! math_f64_1 {
     ($name:ident, $f:expr) => {
-        fn $name(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+        pub(crate) fn $name(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
             let x = f64_arg(task, cx, a, 0, 0);
             return_f64(task, cx, ($f)(x))
         }
@@ -501,7 +625,7 @@ macro_rules! math_f64_1 {
 
 macro_rules! math_f64_2 {
     ($name:ident, $f:expr) => {
-        fn $name(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+        pub(crate) fn $name(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
             let x = f64_arg(task, cx, a, 0, 0);
             let y = f64_arg(task, cx, a, 1, 1);
             return_f64(task, cx, ($f)(x, y))
@@ -511,7 +635,7 @@ macro_rules! math_f64_2 {
 
 macro_rules! math_f32_1 {
     ($name:ident, $f:expr) => {
-        fn $name(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+        pub(crate) fn $name(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
             let x = task.f32_arg(cx, a, 0, 0);
             return_f32(task, cx, ($f)(x))
         }
@@ -520,7 +644,7 @@ macro_rules! math_f32_1 {
 
 macro_rules! math_f32_2 {
     ($name:ident, $f:expr) => {
-        fn $name(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+        pub(crate) fn $name(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
             let x = task.f32_arg(cx, a, 0, 0);
             let y = task.f32_arg(cx, a, 1, 1);
             return_f32(task, cx, ($f)(x, y))
@@ -547,6 +671,7 @@ math_f64_1!(math_cos, f64::cos);
 math_f32_1!(math_cosf, f32::cos);
 math_f64_1!(math_cosh, f64::cosh);
 math_f64_1!(math_exp, f64::exp);
+math_f64_1!(math_exp2, f64::exp2);
 math_f32_1!(math_exp2f, f32::exp2);
 math_f32_1!(math_expf, f32::exp);
 math_f64_1!(math_floor, f64::floor);
@@ -614,7 +739,7 @@ fn math_lroundf(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     Reply::Value((x as i32) as u32 as u64)
 }
 
-fn math_modf(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+pub(crate) fn math_modf(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
     let x = f64_arg(task, cx, a, 0, 0);
     let iptr = if task.isa == Isa::Arm64 { a[0] } else { a[1] };
     let int = x.trunc();
@@ -719,4 +844,251 @@ fn math_erfc(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
             .exp();
     let r = if x >= 0.0 { tau } else { 2.0 - tau };
     return_f64(task, cx, r)
+}
+
+fn fp_class_f64(x: f64) -> i16 {
+    if x.is_nan() {
+        2 // FP_NAN
+    } else if x.is_infinite() {
+        1 // FP_INFINITE
+    } else if x == 0.0 {
+        0 // FP_ZERO
+    } else if x.is_subnormal() {
+        -2 // FP_SUBNORMAL
+    } else {
+        -1 // FP_NORMAL
+    }
+}
+
+fn fp_class_f32(x: f32) -> i16 {
+    if x.is_nan() {
+        2
+    } else if x.is_infinite() {
+        1
+    } else if x == 0.0 {
+        0
+    } else if x.is_subnormal() {
+        -2
+    } else {
+        -1
+    }
+}
+
+fn math_dclass(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let x = f64_arg(task, cx, a, 0, 0);
+    Reply::Value(u64::from(fp_class_f64(x) as u16))
+}
+
+fn math_fdclass(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let x = task.f32_arg(cx, a, 0, 0);
+    Reply::Value(u64::from(fp_class_f32(x) as u16))
+}
+
+fn math_dtest(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let Ok(bytes) = task.mem(cx, false, |t| user::read_vec(&t.space(), a[0], 8)) else {
+        return Reply::Value(0);
+    };
+    let x = f64::from_le_bytes(bytes.try_into().unwrap());
+    Reply::Value(u64::from(fp_class_f64(x) as u16))
+}
+
+fn math_dsign(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let x = f64_arg(task, cx, a, 0, 0);
+    Reply::Value(x.to_bits() >> 63)
+}
+
+fn math_fdsign(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let x = task.f32_arg(cx, a, 0, 0);
+    Reply::Value(u64::from(x.to_bits() >> 31))
+}
+
+fn math_dpcomp(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let x = f64_arg(task, cx, a, 0, 0);
+    let y = f64_arg(task, cx, a, 1, 1);
+    let r = if x < y {
+        1
+    } else if x == y {
+        2
+    } else if x > y {
+        4
+    } else {
+        0
+    };
+    Reply::Value(r)
+}
+
+pub(crate) fn math_finite(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let x = f64_arg(task, cx, a, 0, 0);
+    Reply::Value(u64::from(x.is_finite()))
+}
+
+pub(crate) fn math_isnan(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let x = f64_arg(task, cx, a, 0, 0);
+    Reply::Value(u64::from(x.is_nan()))
+}
+
+math_f64_1!(math_expm1, f64::exp_m1);
+math_f32_1!(math_tanhf, f32::tanh);
+
+fn math_llround(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let x = f64_arg(task, cx, a, 0, 0).round();
+    Reply::Value((x as i64) as u64)
+}
+
+fn math_nan(task: &mut Task, cx: &mut Cx<'_>, _: &[u64]) -> Reply {
+    return_f64(task, cx, f64::NAN)
+}
+
+pub(crate) fn crt_zero(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(0)
+}
+
+pub(crate) fn crt_neg1(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(u64::MAX)
+}
+
+fn crt_einval(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(22)
+}
+
+pub(crate) fn crt_isascii(_: &mut Task, _: &mut Cx<'_>, a: &[u64]) -> Reply {
+    Reply::Value(u64::from((a[0] as u32) < 0x80))
+}
+
+pub(crate) fn math_fpclass(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let x = f64_arg(task, cx, a, 0, 0);
+    let neg = (x.to_bits() >> 63) != 0;
+    let c: u64 = if x.is_nan() {
+        0x0002 // _FPCLASS_QNAN
+    } else if x.is_infinite() {
+        if neg { 0x0004 } else { 0x0200 }
+    } else if x == 0.0 {
+        if neg { 0x0020 } else { 0x0040 }
+    } else if x.is_subnormal() {
+        if neg { 0x0010 } else { 0x0080 }
+    } else if neg {
+        0x0008
+    } else {
+        0x0100
+    };
+    Reply::Value(c)
+}
+
+pub(crate) fn crt_memicmp(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let n = a[2] as usize;
+    if n == 0 {
+        return Reply::Value(0);
+    }
+    let Ok(b1) = task.mem(cx, false, |t| user::read_vec(&t.space(), a[0], n)) else {
+        return Reply::Value(0);
+    };
+    let Ok(b2) = task.mem(cx, false, |t| user::read_vec(&t.space(), a[1], n)) else {
+        return Reply::Value(0);
+    };
+    for (x, y) in b1.iter().zip(b2.iter()) {
+        let lx = x.to_ascii_lowercase();
+        let ly = y.to_ascii_lowercase();
+        if lx != ly {
+            return Reply::Value((lx as i32 - ly as i32) as u32 as u64);
+        }
+    }
+    Reply::Value(0)
+}
+
+pub(crate) fn crt_wcscat_s(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (dst, cap, src) = (a[0], a[1] as usize, a[2]);
+    if dst == 0 || src == 0 || cap == 0 {
+        return Reply::Value(22);
+    }
+    let cur = task.text_arg(cx, dst, true);
+    let add = task.text_arg(cx, src, true);
+    let combined: Vec<u16> = cur.encode_utf16().chain(add.encode_utf16()).chain([0]).collect();
+    if combined.len() > cap {
+        return Reply::Value(34);
+    }
+    let bytes: Vec<u8> = combined.iter().flat_map(|u| u.to_le_bytes()).collect();
+    let _ = task.mem(cx, true, |t| user::write(&mut t.space(), dst, &bytes));
+    Reply::Value(0)
+}
+
+pub(crate) fn crt_wcsncat_s(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (dst, cap, src, count) = (a[0], a[1] as usize, a[2], a[3] as usize);
+    if dst == 0 || src == 0 || cap == 0 {
+        return Reply::Value(22);
+    }
+    let cur = task.text_arg(cx, dst, true);
+    let add = task.text_arg(cx, src, true);
+    let mut combined: Vec<u16> = cur.encode_utf16().collect();
+    let take = if count == usize::MAX { cap.saturating_sub(combined.len() + 1) } else { count };
+    combined.extend(add.encode_utf16().take(take));
+    combined.push(0);
+    if combined.len() > cap {
+        return Reply::Value(34);
+    }
+    let bytes: Vec<u8> = combined.iter().flat_map(|u| u.to_le_bytes()).collect();
+    let _ = task.mem(cx, true, |t| user::write(&mut t.space(), dst, &bytes));
+    Reply::Value(0)
+}
+
+pub(crate) fn crt_wfullpath(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (dst, rel, cap) = (a[0], a[1], a[2] as usize);
+    if rel == 0 || dst == 0 || cap == 0 {
+        return Reply::Value(0);
+    }
+    let path = task.text_arg(cx, rel, true);
+    let full = task.resolve(&path).map(|(w, _)| w).unwrap_or(path);
+    let units: Vec<u16> = full.encode_utf16().chain([0]).collect();
+    if units.len() > cap {
+        return Reply::Value(0);
+    }
+    let bytes: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+    if task.mem(cx, true, |t| user::write(&mut t.space(), dst, &bytes)).is_err() {
+        return Reply::Value(0);
+    }
+    Reply::Value(dst)
+}
+
+pub(crate) fn crt_wmakepath_s(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (dst, cap) = (a[0], a[1] as usize);
+    if dst == 0 || cap == 0 {
+        return Reply::Value(22);
+    }
+    let mut out = String::new();
+    if a[2] != 0 {
+        let d = task.text_arg(cx, a[2], true);
+        if !d.is_empty() {
+            out.push_str(&d);
+            if !d.ends_with(':') {
+                out.push(':');
+            }
+        }
+    }
+    if a[3] != 0 {
+        let dir = task.text_arg(cx, a[3], true);
+        if !dir.is_empty() {
+            out.push_str(&dir);
+            if !dir.ends_with(['\\', '/']) {
+                out.push('\\');
+            }
+        }
+    }
+    if a[4] != 0 {
+        out.push_str(&task.text_arg(cx, a[4], true));
+    }
+    if a[5] != 0 {
+        let ext = task.text_arg(cx, a[5], true);
+        if !ext.is_empty() {
+            if !ext.starts_with('.') {
+                out.push('.');
+            }
+            out.push_str(&ext);
+        }
+    }
+    let units: Vec<u16> = out.encode_utf16().chain([0]).collect();
+    if units.len() > cap {
+        return Reply::Value(34);
+    }
+    let bytes: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+    let _ = task.mem(cx, true, |t| user::write(&mut t.space(), dst, &bytes));
+    Reply::Value(0)
 }

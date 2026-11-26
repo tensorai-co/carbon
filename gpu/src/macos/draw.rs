@@ -165,6 +165,7 @@ fn vertex_format(f: VertexFormat) -> air::Format {
         VertexFormat::U32(n) => air::Format::U32(n),
         VertexFormat::I32(n) => air::Format::I32(n),
         VertexFormat::Unorm8x4 => air::Format::Unorm8x4,
+        VertexFormat::Bgra8Unorm => air::Format::Bgra8Unorm,
     }
 }
 

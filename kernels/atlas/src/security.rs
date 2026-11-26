@@ -740,10 +740,16 @@ impl Descriptor {
             d.control |= self.control & (SE_DACL_PRESENT | SE_DACL_DEFAULTED | SE_DACL_PROTECTED | SE_DACL_AUTO_INHERITED | SE_DACL_AUTO_INHERIT_REQ);
             d.dacl = self.dacl.clone();
         }
-        if info & (SACL_INFO | LABEL_INFO) != 0 && let Some(sacl) = &self.sacl {
-            let aces: Vec<Ace> = sacl.aces.iter().filter(|a| if a.kind == SYSTEM_MANDATORY_LABEL { info & LABEL_INFO != 0 } else { info & SACL_INFO != 0 }).cloned().collect();
-            d.control |= SE_SACL_PRESENT | self.control & (SE_SACL_PROTECTED | SE_SACL_AUTO_INHERITED);
-            d.sacl = Some(Acl::new(aces));
+        if info & (SACL_INFO | LABEL_INFO) != 0 {
+            if let Some(sacl) = &self.sacl {
+                let aces: Vec<Ace> = sacl.aces.iter().filter(|a| if a.kind == SYSTEM_MANDATORY_LABEL { info & LABEL_INFO != 0 } else { info & SACL_INFO != 0 }).cloned().collect();
+                d.control |= SE_SACL_PRESENT | self.control & (SE_SACL_PROTECTED | SE_SACL_AUTO_INHERITED);
+                d.sacl = Some(Acl::new(aces));
+            } else if info & LABEL_INFO != 0 {
+                // Every Windows kernel object carries an implicit Medium (no-write-up) mandatory label when none is set.
+                d.control |= SE_SACL_PRESENT;
+                d.sacl = Some(Acl::new(vec![Ace::new(SYSTEM_MANDATORY_LABEL, 0, 1, Sid::new(16, &[0x2000]))]));
+            }
         }
         d
     }

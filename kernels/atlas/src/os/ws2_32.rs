@@ -48,8 +48,8 @@ dll! {
     host shutdown(2) => shutdown;
     host socket(3) => socket;
     missing gethostbyaddr @ 51;
-    missing gethostbyname;
-    missing getprotobyname;
+    host gethostbyname(1) => gethostbyname;
+    host getprotobyname(1) => getprotobyname;
     missing getprotobynumber;
     missing getservbyname;
     missing getservbyport;
@@ -88,17 +88,20 @@ dll! {
     missing WSASendMsg;
     host WSASetEvent(1) => set_event;
     host WSAWaitForMultipleEvents(5) => wait_for_multiple_objects_ex;
-    missing WSCEnumProtocols;
-    missing getnameinfo;
+    host WSCEnumProtocols(4) => wsa_zero;
+    host getnameinfo(7) => getnameinfo;
     host inet_ntop(4) => inet_ntop;
+    host InetNtopW(4) => inet_ntop_w;
     host inet_pton(3) => inet_pton;
+    host WSAAddressToStringW(5) => wsa_address_to_string_w;
+    host WSAStringToAddressW(5) => wsa_string_to_address_w;
     missing WSADuplicateSocketW;
-    missing WSAEnumNameSpaceProvidersW;
+    host WSAEnumNameSpaceProvidersW(2) => wsa_zero;
     host WSALookupServiceBeginW(3) => wsa_lookup_service;
     host WSALookupServiceEnd(1) => wsa_lookup_service;
     host WSALookupServiceNextW(4) => wsa_lookup_service;
-    missing WSASetServiceW;
-    missing WSCGetProviderPath;
+    host WSASetServiceW(3) => wsa_zero;
+    host WSCGetProviderPath(4) => wsc_fail;
     host WSALookupServiceBeginA(3) => wsa_lookup_service;
     host WSALookupServiceNextA(4) => wsa_lookup_service;
 }
@@ -140,6 +143,149 @@ fn inet_ntop(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
         return Reply::Value(0);
     }
     Reply::Value(dst_ptr)
+}
+
+fn inet_ntop_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (family, addr_ptr, dst_ptr, size) = (a[0] as u16, a[1], a[2], a[3] as usize);
+    if addr_ptr == 0 || dst_ptr == 0 || size == 0 {
+        task.set_last_error(cx, WSAEFAULT);
+        return Reply::Value(0);
+    }
+    let text = match family {
+        AF_INET => {
+            let Ok(b) = task.mem(cx, false, |t| user::read_vec(&t.space(), addr_ptr, 4)) else { return Reply::Value(0) };
+            std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]).to_string()
+        }
+        AF_INET6 => {
+            let Ok(b) = task.mem(cx, false, |t| user::read_vec(&t.space(), addr_ptr, 16)) else { return Reply::Value(0) };
+            let arr: [u8; 16] = b.try_into().unwrap();
+            std::net::Ipv6Addr::from(arr).to_string()
+        }
+        _ => {
+            task.set_last_error(cx, WSAEAFNOSUPPORT);
+            return Reply::Value(0);
+        }
+    };
+    let units: Vec<u16> = text.encode_utf16().chain([0]).collect();
+    if units.len() > size {
+        task.set_last_error(cx, WSAEINVAL);
+        return Reply::Value(0);
+    }
+    let out: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+    if task.mem(cx, true, |t| user::write(&mut t.space(), dst_ptr, &out)).is_err() {
+        return Reply::Value(0);
+    }
+    Reply::Value(dst_ptr)
+}
+
+fn wsa_address_to_string_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (sa_ptr, sa_len, out_ptr, len_ptr) = (a[0], a[1] as u32 as usize, a[3], a[4]);
+    if sa_ptr == 0 || len_ptr == 0 {
+        return fail(task, cx, WSAEFAULT);
+    }
+    let Ok(raw) = task.mem(cx, false, |t| user::read_vec(&t.space(), sa_ptr, sa_len.min(128))) else {
+        return fail(task, cx, WSAEFAULT);
+    };
+    let Ok(sa) = parse_sockaddr(&raw) else {
+        return fail(task, cx, WSAEINVAL);
+    };
+    let text = match sa {
+        SocketAddr::V4(v4) if v4.port() != 0 => format!("{}:{}", v4.ip(), v4.port()),
+        SocketAddr::V4(v4) => v4.ip().to_string(),
+        SocketAddr::V6(v6) if v6.port() != 0 => format!("[{}]:{}", v6.ip(), v6.port()),
+        SocketAddr::V6(v6) => v6.ip().to_string(),
+    };
+    let units: Vec<u16> = text.encode_utf16().chain([0]).collect();
+    let cap = task.mem(cx, false, |t| user::read_u32(&t.space(), len_ptr)).unwrap_or(0) as usize;
+    let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), len_ptr, units.len() as u32));
+    if out_ptr == 0 || cap < units.len() {
+        return fail(task, cx, WSAEFAULT);
+    }
+    let bytes: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+    if task.mem(cx, true, |t| user::write(&mut t.space(), out_ptr, &bytes)).is_err() {
+        return fail(task, cx, WSAEFAULT);
+    }
+    Reply::Value(0)
+}
+
+fn wsa_string_to_address_w(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (str_ptr, family, sa_ptr, len_ptr) = (a[0], a[1] as u32 as u16, a[3], a[4]);
+    if str_ptr == 0 || sa_ptr == 0 || len_ptr == 0 {
+        return fail(task, cx, WSAEFAULT);
+    }
+    let text = task.text_arg(cx, str_ptr, true);
+    let parsed: Option<SocketAddr> = match family {
+        AF_INET => text
+            .parse::<std::net::SocketAddrV4>()
+            .map(SocketAddr::V4)
+            .ok()
+            .or_else(|| text.parse::<std::net::Ipv4Addr>().ok().map(|ip| SocketAddr::new(ip.into(), 0))),
+        AF_INET6 => text
+            .parse::<std::net::SocketAddrV6>()
+            .map(SocketAddr::V6)
+            .ok()
+            .or_else(|| text.parse::<std::net::Ipv6Addr>().ok().map(|ip| SocketAddr::new(ip.into(), 0))),
+        _ => return fail(task, cx, WSAEAFNOSUPPORT),
+    };
+    let Some(sa) = parsed else {
+        return fail(task, cx, WSAEINVAL);
+    };
+    let bytes = sockaddr(&sa);
+    let cap = task.mem(cx, false, |t| user::read_u32(&t.space(), len_ptr)).unwrap_or(0) as usize;
+    let _ = task.mem(cx, true, |t| user::write_u32(&mut t.space(), len_ptr, bytes.len() as u32));
+    if cap < bytes.len() {
+        return fail(task, cx, WSAEFAULT);
+    }
+    if task.mem(cx, true, |t| user::write(&mut t.space(), sa_ptr, &bytes)).is_err() {
+        return fail(task, cx, WSAEFAULT);
+    }
+    Reply::Value(0)
+}
+
+fn getnameinfo(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {
+    let (sa_ptr, sa_len, host_ptr, host_len, serv_ptr, serv_len) =
+        (a[0], a[1] as u32 as usize, a[2], a[3] as u32 as usize, a[4], a[5] as u32 as usize);
+    let Ok(raw) = task.mem(cx, false, |t| user::read_vec(&t.space(), sa_ptr, sa_len.min(128))) else {
+        return Reply::Value(u64::from(WSAEFAULT));
+    };
+    let Ok(sa) = parse_sockaddr(&raw) else {
+        return Reply::Value(u64::from(WSAEINVAL));
+    };
+    if host_ptr != 0 && host_len > 0 {
+        let mut h = sa.ip().to_string().into_bytes();
+        h.push(0);
+        if h.len() > host_len {
+            return Reply::Value(u64::from(WSAEFAULT));
+        }
+        let _ = task.mem(cx, true, |t| user::write(&mut t.space(), host_ptr, &h));
+    }
+    if serv_ptr != 0 && serv_len > 0 {
+        let mut s = sa.port().to_string().into_bytes();
+        s.push(0);
+        if s.len() > serv_len {
+            return Reply::Value(u64::from(WSAEFAULT));
+        }
+        let _ = task.mem(cx, true, |t| user::write(&mut t.space(), serv_ptr, &s));
+    }
+    Reply::Value(0)
+}
+
+fn gethostbyname(task: &mut Task, cx: &mut Cx<'_>, _: &[u64]) -> Reply {
+    task.set_last_error(cx, 11001); // WSAHOST_NOT_FOUND
+    Reply::Value(0)
+}
+
+fn getprotobyname(task: &mut Task, cx: &mut Cx<'_>, _: &[u64]) -> Reply {
+    task.set_last_error(cx, 11004); // WSANO_DATA
+    Reply::Value(0)
+}
+
+fn wsa_zero(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(0)
+}
+
+fn wsc_fail(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(SOCKET_ERROR)
 }
 
 fn inet_pton(task: &mut Task, cx: &mut Cx<'_>, a: &[u64]) -> Reply {

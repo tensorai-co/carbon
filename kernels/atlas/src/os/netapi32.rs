@@ -15,7 +15,11 @@ dll! {
     host NetFreeAadJoinInformation(1) => zero;
     host NetGetAadJoinInformation(2) => net_get_aad_join_information;
     host NetGetJoinInformation(3) => net_get_join_information;
-    missing NetUserGetInfo;
+    host NetUserGetInfo(4) => net_user_get_info;
+}
+
+fn net_user_get_info(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {
+    Reply::Value(2221) // NERR_UserNotFound
 }
 
 fn zero(_: &mut Task, _: &mut Cx<'_>, _: &[u64]) -> Reply {

@@ -128,6 +128,7 @@ pub enum Format {
     I32(u8),
     /// Four bytes, each `n / 255`.
     Unorm8x4,
+    Bgra8Unorm,
 }
 
 /// A value's MSL type name, for a descriptor: `float4`, `uint`.
@@ -685,20 +686,21 @@ impl Lower<'_> {
             Format::F32(n) => (n as u32, self.mem_load(p, if n == 1 { Type::F32 } else { Type::Vector(Scalar::F32, n) })),
             Format::U32(n) => (n as u32, self.mem_load(p, if n == 1 { Type::U32 } else { Type::Vector(Scalar::U32, n) })),
             Format::I32(n) => (n as u32, self.mem_load(p, if n == 1 { Type::I32 } else { Type::Vector(Scalar::I32, n) })),
-            Format::Unorm8x4 => {
+            Format::Unorm8x4 | Format::Bgra8Unorm => {
                 let word = self.mem_load(p, Type::U32);
                 let (f, v4) = (self.m.ty(Ty::Float), self.ty(Type::Vector(Scalar::F32, 4)));
                 let i32 = self.m.int(32);
                 let mut v = self.m.undef(v4);
-                for lane in 0..4u32 {
-                    let shift = self.m.i32(lane * 8);
+                let order = if matches!(a.format, Format::Bgra8Unorm) { [2u32, 1, 0, 3] } else { [0u32, 1, 2, 3] };
+                for (lane, byte_idx) in order.into_iter().enumerate() {
+                    let shift = self.m.i32(byte_idx * 8);
                     let byte = self.bin(LSHR, word, shift);
                     let mask = self.m.i32(0xff);
                     let byte = self.bin(AND, byte, mask);
                     let x = self.call("air.convert.f.f32.u.i32", f, vec![byte], attr::PURE);
                     let k = self.m.konst(Const::Float(f, 255.0f32.to_bits()));
                     let x = self.bin(FDIV, x, k);
-                    let l = self.m.i32(lane);
+                    let l = self.m.i32(lane as u32);
                     v = self.emit(v4, Op::InsertElement(v, x, l));
                 }
                 let _ = i32;
